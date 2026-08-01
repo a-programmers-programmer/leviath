@@ -1759,7 +1759,7 @@ mod tests {
             .get::<crate::components::ContextWindow>(entity)
             .unwrap();
         assert_eq!(
-            win.get_region("conversation").unwrap().content[0].content,
+            win.get_region("conversation").unwrap().content[0].content(),
             "restored turn"
         );
     }

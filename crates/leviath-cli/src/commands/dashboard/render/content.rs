@@ -655,7 +655,7 @@ impl Dashboard {
                             ),
                         ]));
                         let rendered = crate::render::markdown_to_text(
-                            &entry.content,
+                            entry.content(),
                             render_width.saturating_sub(2),
                         );
                         for mut l in rendered.lines {

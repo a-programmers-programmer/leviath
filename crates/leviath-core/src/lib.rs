@@ -16,6 +16,7 @@ pub mod config;
 pub mod credentials;
 pub mod error;
 pub mod interaction;
+pub(crate) mod intern;
 pub mod layout;
 pub mod lifecycle;
 pub mod manifest;

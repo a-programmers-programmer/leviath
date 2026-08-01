@@ -76,7 +76,7 @@ fn render(run_id: &str, history: &[RunPoint], json: bool, full: bool) -> String 
             ));
             if full {
                 for entry in &region.entries {
-                    for line in entry.content.lines() {
+                    for line in entry.content().lines() {
                         out.push_str(&format!("          {line}\n"));
                     }
                 }
