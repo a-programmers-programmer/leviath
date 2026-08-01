@@ -2190,7 +2190,7 @@ fn conversation_text(world: &World, e: Entity) -> String {
         .unwrap()
         .content
         .iter()
-        .map(|entry| entry.content.clone())
+        .map(|entry| entry.content_owned())
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -2894,7 +2894,7 @@ fn routing_away_pointer_previews_and_truncates_long_results() {
         .unwrap()
         .content
         .iter()
-        .map(|e| e.content.clone())
+        .map(|e| e.content_owned())
         .collect();
     assert!(
         conv_txt.contains('…'),
@@ -2905,7 +2905,7 @@ fn routing_away_pointer_previews_and_truncates_long_results() {
             .unwrap()
             .content
             .iter()
-            .any(|e| e.content.contains(&long)),
+            .any(|e| e.content().contains(&long)),
         "full result stored in the region"
     );
 }
@@ -2955,7 +2955,7 @@ fn routing_away_keeps_pair_in_conversation_and_text_in_region() {
     assert!(
         cb.content
             .iter()
-            .any(|e| e.content.contains("FULL FILE BODY"))
+            .any(|e| e.content().contains("FULL FILE BODY"))
     );
     assert!(
         cb.content
@@ -3019,7 +3019,7 @@ fn routing_override_matches_bash_alias_to_shell() {
             .unwrap()
             .content
             .iter()
-            .any(|e| e.content.contains("All tests passed")),
+            .any(|e| e.content().contains("All tests passed")),
         "a `bash` override must route the canonical `shell` tool's result"
     );
 }
@@ -4133,7 +4133,7 @@ fn compacting_window() -> ContextWindow {
         },
         100,
     );
-    let _ = conv.add_entry("x".repeat(380), 95); // 95 tokens: over threshold, <10 free
+    let _ = conv.add_entry(&leviath_core::ContentInterner::new(), "x".repeat(380), 95); // 95 tokens: over threshold, <10 free
     w.add_region(conv);
     w.add_region(Region::new(
         "history".to_string(),
@@ -4275,7 +4275,7 @@ async fn compaction_evicts_but_needs_no_summary() {
     let (mut world, _rx) = build_world(InferencePools::new(InferencePoolConfig::new()));
     let mut w = ContextWindow::new(100);
     let mut scratch = Region::new("scratch".to_string(), RegionKind::Clearable, 100);
-    let _ = scratch.add_entry("y".repeat(360), 95);
+    let _ = scratch.add_entry(&leviath_core::ContentInterner::new(), "y".repeat(360), 95);
     w.add_region(scratch);
     w.current_tokens = w.calculate_tokens();
     let e = world
@@ -4310,7 +4310,7 @@ async fn compaction_skips_when_eviction_errors() {
     let (mut world, _rx) = build_world(InferencePools::new(InferencePoolConfig::new()));
     let mut w = ContextWindow::new(100);
     let mut pinned = Region::new("id".to_string(), RegionKind::Pinned, 500);
-    let _ = pinned.add_entry("p".repeat(600), 150); // pinned 150 > budget 100
+    let _ = pinned.add_entry(&leviath_core::ContentInterner::new(), "p".repeat(600), 150); // pinned 150 > budget 100
     w.add_region(pinned);
     w.current_tokens = w.calculate_tokens();
     let e = world
@@ -4341,7 +4341,7 @@ async fn compaction_skips_region_with_empty_content() {
         },
         100,
     );
-    let _ = conv.add_entry(String::new(), 95); // empty content, 95 tokens
+    let _ = conv.add_entry(&leviath_core::ContentInterner::new(), String::new(), 95); // empty content, 95 tokens
     w.add_region(conv);
     w.current_tokens = w.calculate_tokens();
     let e = world
@@ -4369,10 +4369,10 @@ use leviath_core::blueprint::EdgeTransform;
 fn transform_window() -> ContextWindow {
     let mut w = ContextWindow::new(1000);
     let mut sys = Region::new("sys".to_string(), RegionKind::Pinned, 500);
-    let _ = sys.add_entry("identity".to_string(), 10);
+    let _ = sys.add_entry(&leviath_core::ContentInterner::new(), "identity", 10);
     w.add_region(sys);
     let mut scratch = Region::new("scratch".to_string(), RegionKind::Clearable, 500);
-    let _ = scratch.add_entry("work".to_string(), 10);
+    let _ = scratch.add_entry(&leviath_core::ContentInterner::new(), "work", 10);
     w.add_region(scratch);
     w.current_tokens = w.calculate_tokens();
     w
@@ -4408,7 +4408,7 @@ fn edge_transforms_respect_custom_region_persistence() {
         },
         500,
     );
-    let _ = scratch_custom.add_entry("wipe me".to_string(), 10);
+    let _ = scratch_custom.add_entry(&leviath_core::ContentInterner::new(), "wipe me", 10);
     w.add_region(scratch_custom);
     let mut vault = Region::new(
         "vault".to_string(),
@@ -4418,7 +4418,7 @@ fn edge_transforms_respect_custom_region_persistence() {
         },
         500,
     );
-    let _ = vault.add_entry("keep me".to_string(), 10);
+    let _ = vault.add_entry(&leviath_core::ContentInterner::new(), "keep me", 10);
     w.add_region(vault);
     w.current_tokens = w.calculate_tokens();
 
@@ -4442,10 +4442,10 @@ fn apply_edge_transform_compact_returns_stage_specific_with_content() {
 fn apply_edge_transform_custom_respects_carry_clear_and_compact() {
     let mut w = transform_window();
     let mut keep = Region::new("keep".to_string(), RegionKind::Clearable, 500);
-    let _ = keep.add_entry("keepme".to_string(), 10);
+    let _ = keep.add_entry(&leviath_core::ContentInterner::new(), "keepme", 10);
     w.add_region(keep);
     let mut drop = Region::new("drop".to_string(), RegionKind::Clearable, 500);
-    let _ = drop.add_entry("dropme".to_string(), 10);
+    let _ = drop.add_entry(&leviath_core::ContentInterner::new(), "dropme", 10);
     w.add_region(drop);
     w.current_tokens = w.calculate_tokens();
 
@@ -4475,7 +4475,11 @@ fn apply_edge_transform_custom_respects_carry_clear_and_compact() {
 fn scratch_window() -> ContextWindow {
     let mut w = ContextWindow::new(1000);
     let mut scratch = Region::new("scratch".to_string(), RegionKind::Clearable, 500);
-    let _ = scratch.add_entry("work to summarize".to_string(), 20);
+    let _ = scratch.add_entry(
+        &leviath_core::ContentInterner::new(),
+        "work to summarize",
+        20,
+    );
     w.add_region(scratch);
     w.current_tokens = w.calculate_tokens();
     w
@@ -4549,7 +4553,7 @@ async fn edge_compact_drops_marker_when_nothing_to_summarize() {
     // A present-but-empty region + an absent region ⇒ no requests.
     let mut w = ContextWindow::new(1000);
     let mut empty = Region::new("empty".to_string(), RegionKind::Clearable, 500);
-    let _ = empty.add_entry(String::new(), 5);
+    let _ = empty.add_entry(&leviath_core::ContentInterner::new(), String::new(), 5);
     w.add_region(empty);
     let e = world
         .spawn((
@@ -4933,7 +4937,7 @@ fn note_stuck_prefers_the_stuck_report_region_then_conversation() {
     let mut fallback = ctx(&[("conversation", 10_000)]);
     note_stuck(&mut fallback, "implement", "you are looping");
     let conv = fallback.get_region("conversation").unwrap();
-    let text: String = conv.content.iter().map(|e| e.content.as_str()).collect();
+    let text: String = conv.content.iter().map(|e| e.content()).collect();
     assert!(
         text.contains("Stuck detected in stage 'implement'"),
         "{text}"
@@ -5022,7 +5026,9 @@ fn detect_stuck_stage_fires_once_and_routes_to_resolve_transition() {
     let window = world.get::<ContextWindow>(e).unwrap();
     let conv = window.get_region("conversation").unwrap();
     assert!(
-        conv.content.iter().any(|c| c.content.contains("where.py")),
+        conv.content
+            .iter()
+            .any(|c| c.content().contains("where.py")),
         "the diagnosis must reach the next stage's context"
     );
     assert!(world.get::<StageProgress>(e).unwrap().stuck_fired);
@@ -5495,7 +5501,7 @@ fn require_context_regions_injects_default_message() {
         .unwrap()
         .content
         .iter()
-        .map(|entry| entry.content.clone())
+        .map(|entry| entry.content_owned())
         .collect::<String>();
     assert!(conv.contains("Required context region 'plan' is still empty"));
 }
@@ -5750,7 +5756,7 @@ fn resolve_transition_holds_the_stage_when_a_gate_blocks() {
         .unwrap()
         .content
         .iter()
-        .map(|entry| entry.content.clone())
+        .map(|entry| entry.content_owned())
         .collect::<String>();
     assert!(conv.contains("[System] No file modifications"));
     // Not yet forced - the budget hasn't run out.
@@ -6396,7 +6402,7 @@ fn collect_tools_injects_repetition_nudge_when_looping() {
         .unwrap()
         .content
         .iter()
-        .map(|entry| entry.content.clone())
+        .map(|entry| entry.content_owned())
         .collect();
     assert!(
         joined.contains("[System]"),
@@ -6641,7 +6647,7 @@ fn collect_compaction_summary_for_unpaired_region_is_skipped() {
         },
         100,
     );
-    let _ = lone.add_entry("z".repeat(80), 20);
+    let _ = lone.add_entry(&leviath_core::ContentInterner::new(), "z".repeat(80), 20);
     w.add_region(lone);
     w.current_tokens = w.calculate_tokens();
     let e = world.spawn((w, AwaitingCompaction)).id();

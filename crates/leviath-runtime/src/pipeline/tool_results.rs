@@ -223,10 +223,11 @@ pub(crate) fn apply_file_tracking(
         };
         let body = truncate_file(body, ft.max_file_tokens);
         let tokens = leviath_core::estimate_tokens(&body);
+        let interner = window.interner.clone();
         window
             .get_region_mut(&ft.region)
             .expect("region presence checked above")
-            .upsert_by_key(path, body, tokens)
+            .upsert_by_key(&interner, path, body, tokens)
             .ok();
         *result = format!(
             "File {verb} in [{}] → ### [{}] ({} tokens). Reference it there; do not re-read this path.",

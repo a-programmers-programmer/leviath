@@ -42,7 +42,7 @@ pub(crate) enum OnWriteOutcome {
 /// hooks return instructions (drop indices, replacement text), never entries.
 fn entry_to_json(entry: &RegionEntry) -> serde_json::Value {
     let mut obj = serde_json::json!({
-        "content": entry.content,
+        "content": entry.content(),
         "tokens": entry.tokens,
         "timestamp": entry.timestamp,
         "key": entry.key,
@@ -92,7 +92,7 @@ fn fallback_block(region: &Region) -> leviath_providers::SystemBlock {
     let text = region
         .content
         .iter()
-        .map(|e| e.content.as_str())
+        .map(|e| e.content())
         .collect::<Vec<_>>()
         .join("\n\n");
     leviath_providers::SystemBlock {
@@ -535,7 +535,12 @@ mod tests {
         );
         for (content, kind) in entries {
             region
-                .add_typed_entry(content.to_string(), 10, kind.clone())
+                .add_typed_entry(
+                    &leviath_core::ContentInterner::new(),
+                    *content,
+                    10,
+                    kind.clone(),
+                )
                 .unwrap();
         }
         region
@@ -943,7 +948,7 @@ mod tests {
         let freed = with_tracing(|| apply_overflow(&s, &mut region, 15));
         assert_eq!(freed, 20);
         assert_eq!(region.content.len(), 1);
-        assert_eq!(region.content[0].content, "b");
+        assert_eq!(region.content[0].content(), "b");
         assert_eq!(region.current_tokens, 10);
     }
 
