@@ -646,7 +646,7 @@ impl ContextWindow {
                     let text = region
                         .content
                         .iter()
-                        .map(|e| e.content.as_str())
+                        .map(|e| e.content())
                         .collect::<Vec<_>>()
                         .join("\n\n");
                     system_blocks.push(leviath_providers::SystemBlock {
@@ -658,7 +658,7 @@ impl ContextWindow {
                     let text = region
                         .content
                         .iter()
-                        .map(|e| e.content.as_str())
+                        .map(|e| e.content())
                         .collect::<Vec<_>>()
                         .join("\n\n");
                     system_blocks.push(leviath_providers::SystemBlock {
@@ -692,7 +692,7 @@ impl ContextWindow {
                             EntryKind::UserMessage => {
                                 messages.push(leviath_providers::Message {
                                     role: "user".to_string(),
-                                    content: entry.content.as_str().into(),
+                                    content: entry.content().into(),
                                     cache_breakpoint: false,
                                 });
                             }
@@ -700,14 +700,14 @@ impl ContextWindow {
                                 if tool_calls.is_empty() {
                                     messages.push(leviath_providers::Message {
                                         role: "assistant".to_string(),
-                                        content: entry.content.as_str().into(),
+                                        content: entry.content().into(),
                                         cache_breakpoint: false,
                                     });
                                 } else {
                                     let mut blocks = Vec::new();
-                                    if !entry.content.is_empty() {
+                                    if !entry.content().is_empty() {
                                         blocks.push(leviath_providers::ContentBlock::Text {
-                                            text: entry.content.to_string(),
+                                            text: entry.content_owned(),
                                         });
                                     }
                                     for tc in tool_calls {
@@ -734,13 +734,13 @@ impl ContextWindow {
                                 pending_tool_results.push(
                                     leviath_providers::ContentBlock::ToolResult {
                                         tool_use_id: tool_call_id.clone(),
-                                        content: entry.content.to_string(),
+                                        content: entry.content_owned(),
                                         is_error: *is_error,
                                     },
                                 );
                             }
                             EntryKind::Text => {
-                                let trimmed = entry.content.trim();
+                                let trimmed = entry.content().trim();
                                 if let Some(rest) = trimmed.strip_prefix("Assistant: ") {
                                     messages.push(leviath_providers::Message {
                                         role: "assistant".to_string(),
@@ -756,7 +756,7 @@ impl ContextWindow {
                                 } else {
                                     messages.push(leviath_providers::Message {
                                         role: "user".to_string(),
-                                        content: entry.content.as_str().into(),
+                                        content: entry.content().into(),
                                         cache_breakpoint: false,
                                     });
                                 }
@@ -781,7 +781,7 @@ impl ContextWindow {
                     let text = region
                         .content
                         .iter()
-                        .map(|e| e.content.as_str())
+                        .map(|e| e.content())
                         .collect::<Vec<_>>()
                         .join("\n\n");
                     system_blocks.push(leviath_providers::SystemBlock {
@@ -793,7 +793,7 @@ impl ContextWindow {
                     let text = region
                         .content
                         .iter()
-                        .map(|e| e.content.as_str())
+                        .map(|e| e.content())
                         .collect::<Vec<_>>()
                         .join("\n\n");
                     system_blocks.push(leviath_providers::SystemBlock {
@@ -805,7 +805,7 @@ impl ContextWindow {
                     let text = region
                         .content
                         .iter()
-                        .map(|e| e.content.as_str())
+                        .map(|e| e.content())
                         .collect::<Vec<_>>()
                         .join("\n\n");
                     system_blocks.push(leviath_providers::SystemBlock {
@@ -838,9 +838,9 @@ impl ContextWindow {
                         .iter()
                         .map(|e| {
                             if let Some(key) = &e.key {
-                                format!("### [{}]\n{}", key, e.content.as_str())
+                                format!("### [{}]\n{}", key, e.content())
                             } else {
-                                e.content.to_string()
+                                e.content_owned()
                             }
                         })
                         .collect::<Vec<_>>()
@@ -1177,7 +1177,7 @@ mod tests {
         assert!(window.replace_region("plan", "new plan".to_string(), 3));
         let plan = window.get_region("plan").unwrap();
         assert_eq!(plan.content.len(), 1);
-        assert_eq!(plan.content[0].content, "new plan");
+        assert_eq!(plan.content[0].content(), "new plan");
 
         // A missing region is a no-op that reports false.
         assert!(!window.replace_region("nope", "x".to_string(), 1));
@@ -1225,7 +1225,7 @@ mod tests {
         // Check that oldest was removed
         let region = window.get_region("temp").unwrap();
         assert_eq!(region.content.len(), 2);
-        assert_eq!(region.content[0].content, "middle content");
+        assert_eq!(region.content[0].content(), "middle content");
     }
 
     fn assert_sliding_window_unreduced(initial_count: usize, after_count: usize) {
@@ -2469,7 +2469,7 @@ mod tests {
         assert!(result.tokens_freed >= 40);
         let brain = window.get_region("brain").unwrap();
         assert_eq!(brain.content.len(), 1);
-        assert_eq!(brain.content[0].content, "new");
+        assert_eq!(brain.content[0].content(), "new");
     }
 
     #[test]
@@ -2549,7 +2549,7 @@ mod tests {
             .unwrap()
             .content
             .iter()
-            .map(|e| e.content.as_str())
+            .map(|e| e.content())
             .collect();
         assert_eq!(
             contents,
@@ -2562,7 +2562,7 @@ mod tests {
         assert!(window.replace_region("brain", "e".to_string(), 1));
         let region = window.get_region("brain").unwrap();
         assert_eq!(region.content.len(), 1);
-        assert_eq!(region.content[0].content, "text:e");
+        assert_eq!(region.content[0].content(), "text:e");
     }
 
     #[test]
@@ -2649,7 +2649,11 @@ mod tests {
         assert!(result.tokens_freed >= 40);
         let brain = window.get_region("brain").unwrap();
         assert_eq!(brain.content.len(), 1);
-        assert_eq!(brain.content[0].content, "new", "oldest-first fallback ran");
+        assert_eq!(
+            brain.content[0].content(),
+            "new",
+            "oldest-first fallback ran"
+        );
     }
 
     #[test]
@@ -2698,7 +2702,7 @@ mod tests {
             .add_to_region("plain", "untouched".to_string(), 2)
             .unwrap();
         assert_eq!(
-            window.get_region("plain").unwrap().content[0].content,
+            window.get_region("plain").unwrap().content[0].content(),
             "untouched"
         );
     }
@@ -2730,7 +2734,7 @@ mod tests {
 
         let region = window.get_region("brain").unwrap();
         assert_eq!(region.content.len(), 1);
-        assert_eq!(region.content[0].content, "next");
+        assert_eq!(region.content[0].content(), "next");
         assert_eq!(window.current_tokens, 20);
     }
 
@@ -2809,7 +2813,7 @@ mod tests {
             .unwrap()
             .content
             .iter()
-            .map(|e| e.content.as_str())
+            .map(|e| e.content())
             .collect();
         assert_eq!(
             contents,

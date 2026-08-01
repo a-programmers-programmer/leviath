@@ -96,7 +96,7 @@ pub fn handle_context_tool(
                         .to_string();
                 };
                 if let Some(existing) = region.get_by_key(k) {
-                    let new_content = format!("{}\n{}", existing.content, content);
+                    let new_content = format!("{}\n{}", existing.content(), content);
                     let new_tokens = leviath_core::estimate_tokens(&new_content);
                     // Upserting an already-present key updates in place with no
                     // budget check, so this cannot fail.
@@ -132,7 +132,7 @@ pub fn handle_context_tool(
             if matches!(region.kind, RegionKind::HashMap { .. }) {
                 if let Some(k) = key {
                     match region.get_by_key(k) {
-                        Some(entry) => entry.content.to_string(),
+                        Some(entry) => entry.content_owned(),
                         None => {
                             format!("[not found] No entry with key '{k}' in region '{region_name}'")
                         }
@@ -154,7 +154,7 @@ pub fn handle_context_tool(
                 let text = region
                     .content
                     .iter()
-                    .map(|e| e.content.as_str())
+                    .map(|e| e.content())
                     .collect::<Vec<_>>()
                     .join("\n\n");
                 if text.is_empty() {

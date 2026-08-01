@@ -16,7 +16,7 @@ pub mod config;
 pub mod credentials;
 pub mod error;
 pub mod interaction;
-pub mod intern;
+pub(crate) mod intern;
 pub mod layout;
 pub mod lifecycle;
 pub mod manifest;
@@ -42,7 +42,6 @@ pub use credentials::{
     CredentialStore, CredentialStoreKind, MemoryStore, mcp_account, provider_account,
 };
 pub use error::{Error, Result, ValidationError};
-pub use intern::InternedString;
 pub use layout::{BudgetSpec, ContextLayout, RegionDefinition};
 pub use lifecycle::CompactionConfig;
 pub use net::{

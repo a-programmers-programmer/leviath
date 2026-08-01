@@ -204,15 +204,6 @@ impl Interner {
         bucket.push(Arc::downgrade(&arc));
         arc
     }
-
-    #[cfg(test)]
-    fn live_unique_count(&self) -> usize {
-        self.buckets
-            .values()
-            .flat_map(|b| b.iter())
-            .filter(|w| w.strong_count() > 0)
-            .count()
-    }
 }
 
 fn global() -> &'static Mutex<Interner> {
@@ -226,15 +217,6 @@ fn intern(s: &str) -> Arc<str> {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     guard.intern(s)
-}
-
-/// Number of unique strings currently held live by the interner (test/metrics).
-#[cfg(test)]
-pub fn interned_live_count() -> usize {
-    let guard = global()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    guard.live_unique_count()
 }
 
 #[cfg(test)]

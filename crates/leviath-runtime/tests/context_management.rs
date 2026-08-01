@@ -165,7 +165,7 @@ fn test_region_content_management() {
 
     // Remove oldest
     let removed = region.remove_oldest().unwrap();
-    assert_eq!(removed.content, "entry 1");
+    assert_eq!(removed.content(), "entry 1");
     assert_eq!(removed.tokens, 100);
     assert_eq!(region.entry_count(), 2);
     assert_eq!(region.current_tokens, 500);

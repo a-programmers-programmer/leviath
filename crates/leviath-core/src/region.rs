@@ -331,14 +331,14 @@ impl Region {
         }
 
         // Add entry
-        self.content.push(RegionEntry {
-            content: InternedString::new(content),
+        self.content.push(RegionEntry::make(
+            content,
             tokens,
-            timestamp: chrono::Utc::now().timestamp(),
-            metadata: None,
-            kind: EntryKind::default(),
-            key: None,
-        });
+            EntryKind::default(),
+            None,
+            None,
+            None,
+        ));
         self.current_tokens += tokens;
 
         // Update taint tracking
@@ -381,14 +381,8 @@ impl Region {
         }
 
         // Add entry
-        self.content.push(RegionEntry {
-            content: InternedString::new(content),
-            tokens,
-            timestamp: chrono::Utc::now().timestamp(),
-            metadata: None,
-            kind,
-            key: None,
-        });
+        self.content
+            .push(RegionEntry::make(content, tokens, kind, None, None, None));
         self.current_tokens += tokens;
 
         // Update taint tracking with the supplied level
@@ -427,14 +421,14 @@ impl Region {
         }
 
         // Add entry
-        self.content.push(RegionEntry {
-            content: InternedString::new(content),
+        self.content.push(RegionEntry::make(
+            content,
             tokens,
-            timestamp: chrono::Utc::now().timestamp(),
-            metadata: None,
-            kind: EntryKind::default(),
-            key: None,
-        });
+            EntryKind::default(),
+            None,
+            None,
+            None,
+        ));
         self.current_tokens += tokens;
 
         // Track taint as Public for untagged entries
@@ -469,14 +463,14 @@ impl Region {
         }
 
         // Add entry
-        self.content.push(RegionEntry {
-            content: InternedString::new(content),
+        self.content.push(RegionEntry::make(
+            content,
             tokens,
-            timestamp: chrono::Utc::now().timestamp(),
-            metadata: Some(metadata),
-            kind: EntryKind::default(),
-            key: None,
-        });
+            EntryKind::default(),
+            Some(metadata),
+            None,
+            None,
+        ));
         self.current_tokens += tokens;
 
         // Track taint as Public for untagged entries
@@ -515,14 +509,8 @@ impl Region {
         }
 
         // Add entry
-        self.content.push(RegionEntry {
-            content: InternedString::new(content),
-            tokens,
-            timestamp: chrono::Utc::now().timestamp(),
-            metadata: None,
-            kind,
-            key: None,
-        });
+        self.content
+            .push(RegionEntry::make(content, tokens, kind, None, None, None));
         self.current_tokens += tokens;
 
         // Track taint as Public for untagged entries
@@ -583,7 +571,7 @@ impl Region {
         {
             let old_tokens = self.content[pos].tokens;
             self.current_tokens -= old_tokens;
-            self.content[pos].content = InternedString::new(content);
+            self.content[pos].set_content(content);
             self.content[pos].tokens = tokens;
             self.content[pos].timestamp = chrono::Utc::now().timestamp();
             self.current_tokens += tokens;
@@ -617,14 +605,14 @@ impl Region {
             ));
         }
 
-        self.content.push(RegionEntry {
-            content: InternedString::new(content),
+        self.content.push(RegionEntry::make(
+            content,
             tokens,
-            timestamp: chrono::Utc::now().timestamp(),
-            metadata: None,
-            kind: EntryKind::default(),
-            key: Some(key.to_string()),
-        });
+            EntryKind::default(),
+            None,
+            Some(key.to_string()),
+            None,
+        ));
         self.current_tokens += tokens;
         Ok(())
     }
@@ -807,7 +795,7 @@ impl Region {
     pub fn remove_entries_by_prefix(&mut self, prefix: &str) {
         let mut i = 0;
         while i < self.content.len() {
-            if self.content[i].content.starts_with(prefix) {
+            if self.content[i].content().starts_with(prefix) {
                 let tokens = self.content[i].tokens;
                 self.content.remove(i);
                 self.current_tokens -= tokens;
@@ -838,13 +826,15 @@ impl Region {
 /// A single entry within a region.
 ///
 /// Each entry has content and metadata tracking its token usage.
+///
+/// Text is interned **inside** this type (and [`Region`]'s write methods). Callers
+/// only see plain `&str` via [`Self::content`]; they never construct or name the
+/// storage representation. That keeps interning a private storage concern.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegionEntry {
-    /// The actual content of this entry.
-    ///
-    /// Stored as an [`InternedString`] so identical text (e.g. pinned system
-    /// material shared across many agents) reuses one heap allocation.
-    pub content: InternedString,
+    /// Interned payload. Private so only constructors / [`Self::set_content`]
+    /// perform interning; external code reads via [`Self::content`].
+    content: InternedString,
 
     /// Token count for this entry
     pub tokens: usize,
@@ -867,16 +857,65 @@ pub struct RegionEntry {
 }
 
 impl RegionEntry {
-    /// Build an entry with interned content. Prefer this over struct literals so
-    /// callers do not need to name [`InternedString`] at every construction site.
+    /// Build an entry. `content` is interned here — the only place callers need
+    /// to supply text when constructing an entry directly.
     pub fn new(content: impl AsRef<str>, tokens: usize) -> Self {
+        Self::make(content, tokens, EntryKind::default(), None, None, None)
+    }
+
+    /// Borrow the entry text. Always a plain `&str` — no storage type leaks.
+    #[inline]
+    pub fn content(&self) -> &str {
+        self.content.as_str()
+    }
+
+    /// Replace the entry text (re-interns). Prefer this over field assignment.
+    #[inline]
+    pub fn set_content(&mut self, content: impl AsRef<str>) {
+        self.content = InternedString::new(content);
+    }
+
+    /// Owned copy of the text (snapshots, provider payloads, etc.).
+    #[inline]
+    pub fn content_owned(&self) -> String {
+        self.content.as_str().to_owned()
+    }
+
+    /// True when both entries share the same interned allocation (tests / metrics).
+    #[inline]
+    pub fn shares_content_with(&self, other: &Self) -> bool {
+        self.content.ptr_eq(&other.content)
+    }
+
+    /// Full constructor for restore / carry paths. Interns `content` once.
+    pub fn from_parts(
+        content: impl AsRef<str>,
+        tokens: usize,
+        timestamp: i64,
+        metadata: Option<serde_json::Value>,
+        kind: EntryKind,
+        key: Option<String>,
+    ) -> Self {
+        Self::make(content, tokens, kind, metadata, key, Some(timestamp))
+    }
+
+    /// Single place that calls [`InternedString::new`]. All public constructors
+    /// and [`Region`] write methods funnel through here.
+    fn make(
+        content: impl AsRef<str>,
+        tokens: usize,
+        kind: EntryKind,
+        metadata: Option<serde_json::Value>,
+        key: Option<String>,
+        timestamp: Option<i64>,
+    ) -> Self {
         Self {
             content: InternedString::new(content),
             tokens,
-            timestamp: chrono::Utc::now().timestamp(),
-            metadata: None,
-            kind: EntryKind::default(),
-            key: None,
+            timestamp: timestamp.unwrap_or_else(|| chrono::Utc::now().timestamp()),
+            metadata,
+            kind,
+            key,
         }
     }
 }
@@ -1172,7 +1211,7 @@ mod tests {
             dest.carry_entry(entry.clone()).unwrap();
         }
         assert_eq!(dest.content.len(), 3);
-        assert_eq!(dest.content[0].content, "msg1");
+        assert_eq!(dest.content[0].content(), "msg1");
     }
 
     #[test]
@@ -1195,14 +1234,14 @@ mod tests {
         // Adding a 4th entry should evict the oldest
         region.add_entry("msg4".to_string(), 40).unwrap();
         assert_eq!(region.entry_count(), 3);
-        assert_eq!(region.content[0].content, "msg2");
-        assert_eq!(region.content[2].content, "msg4");
+        assert_eq!(region.content[0].content(), "msg2");
+        assert_eq!(region.content[2].content(), "msg4");
         assert_eq!(region.current_tokens, 90); // 20 + 30 + 40
 
         // Adding a 5th entry should evict again
         region.add_entry("msg5".to_string(), 50).unwrap();
         assert_eq!(region.entry_count(), 3);
-        assert_eq!(region.content[0].content, "msg3");
+        assert_eq!(region.content[0].content(), "msg3");
         assert_eq!(region.current_tokens, 120); // 30 + 40 + 50
     }
 
@@ -1228,8 +1267,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(region.entry_count(), 2);
-        assert_eq!(region.content[0].content, "b");
-        assert_eq!(region.content[1].content, "c");
+        assert_eq!(region.content[0].content(), "b");
+        assert_eq!(region.content[1].content(), "c");
         assert_eq!(region.current_tokens, 50);
     }
 
@@ -1380,7 +1419,7 @@ mod tests {
         region.add_entry("second".to_string(), 20).unwrap();
 
         let removed = region.remove_oldest().unwrap();
-        assert_eq!(removed.content, "first");
+        assert_eq!(removed.content(), "first");
         assert_eq!(region.entry_count(), 1);
         assert_eq!(region.current_tokens, 20);
     }
@@ -1997,11 +2036,11 @@ mod tests {
         let removed = region.remove_oldest().unwrap();
         // The returned entry is the AssistantTurn, with tokens adjusted to
         // include the extra tokens from the 2 ToolResult entries.
-        assert_eq!(removed.content, "assistant");
+        assert_eq!(removed.content(), "assistant");
         assert_eq!(removed.tokens, 100 + 30 + 20); // 150
         // Only the user message remains
         assert_eq!(region.entry_count(), 1);
-        assert_eq!(region.content[0].content, "user msg");
+        assert_eq!(region.content[0].content(), "user msg");
         assert_eq!(region.current_tokens, 10);
     }
 
@@ -2056,7 +2095,7 @@ mod tests {
 
         // Evict the turn group (AssistantTurn + ToolResult)
         let removed = region.remove_oldest().unwrap();
-        assert_eq!(removed.content, "assistant");
+        assert_eq!(removed.content(), "assistant");
         assert_eq!(region.entry_count(), 1);
         // Taint should have called remove_oldest twice (once per group member),
         // leaving only the Public entry's taint.
@@ -2133,7 +2172,7 @@ mod tests {
 
         // After eviction: only the new user message remains
         assert_eq!(region.entry_count(), 1);
-        assert_eq!(region.content[0].content, "user msg");
+        assert_eq!(region.content[0].content(), "user msg");
         assert_eq!(region.current_tokens, 15);
     }
 
@@ -2195,9 +2234,9 @@ mod tests {
             region.add_entry(format!("msg{}", i), 10).unwrap();
         }
         assert_eq!(region.entry_count(), 3);
-        assert_eq!(region.content[0].content, "msg2");
-        assert_eq!(region.content[1].content, "msg3");
-        assert_eq!(region.content[2].content, "msg4");
+        assert_eq!(region.content[0].content(), "msg2");
+        assert_eq!(region.content[1].content(), "msg3");
+        assert_eq!(region.content[2].content(), "msg4");
     }
 
     #[test]
@@ -2220,7 +2259,7 @@ mod tests {
         // Adding one more (9 total > 5+3=8) triggers bulk eviction → down to 5
         region.add_entry("msg8".to_string(), 10).unwrap();
         assert_eq!(region.entry_count(), 5);
-        assert_eq!(region.content[0].content, "msg4");
+        assert_eq!(region.content[0].content(), "msg4");
     }
 
     #[test]
@@ -2271,7 +2310,7 @@ mod tests {
         // Turn group (assistant+result=2) evicted together, then msg2 evicted
         // to get down to max_items=3
         assert_eq!(region.entry_count(), 3);
-        assert_eq!(region.content[0].content, "msg3");
+        assert_eq!(region.content[0].content(), "msg3");
     }
 
     #[test]
@@ -2330,7 +2369,7 @@ mod tests {
         }
         // Should have bulk-evicted down to max_items=5
         assert_eq!(region.entry_count(), 5);
-        assert_eq!(region.content[0].content, "msg7");
+        assert_eq!(region.content[0].content(), "msg7");
         // Compaction flag should be cleared after fallback
         assert!(!region.needs_message_compaction);
     }
@@ -2356,7 +2395,7 @@ mod tests {
         assert_eq!(region.entry_count(), 3);
         region.remove_entries_by_prefix("[Stage instructions:");
         assert_eq!(region.entry_count(), 1);
-        assert_eq!(region.content[0].content, "Core identity block");
+        assert_eq!(region.content[0].content(), "Core identity block");
         assert_eq!(region.current_tokens, 20);
     }
 
@@ -2394,7 +2433,7 @@ mod tests {
 
         region.remove_entries_by_prefix("[Stage instructions:");
         assert_eq!(region.entry_count(), 1);
-        assert_eq!(region.content[0].content, "Core identity block");
+        assert_eq!(region.content[0].content(), "Core identity block");
         assert_eq!(region.current_tokens, 20);
         // After removing Private and Internal entries, only Public remains
         assert_eq!(region.taint_level(), Some(crate::taint::TaintLevel::Public));
@@ -2560,7 +2599,7 @@ mod tests {
         assert_eq!(region.current_tokens, 18);
 
         let entry = region.get_by_key("src/main.rs").unwrap();
-        assert_eq!(entry.content, "fn main() {}");
+        assert_eq!(entry.content(), "fn main() {}");
         assert_eq!(entry.key.as_deref(), Some("src/main.rs"));
     }
 
@@ -2581,7 +2620,7 @@ mod tests {
             .unwrap();
         assert_eq!(region.entry_count(), 1);
         assert_eq!(region.current_tokens, 15);
-        assert_eq!(region.get_by_key("file.rs").unwrap().content, "version 2");
+        assert_eq!(region.get_by_key("file.rs").unwrap().content(), "version 2");
     }
 
     #[test]
@@ -2710,28 +2749,21 @@ mod tests {
 
     #[test]
     fn test_region_entry_key_serde_skip_when_none() {
-        let entry = RegionEntry {
-            content: InternedString::new("test"),
-            tokens: 5,
-            timestamp: 0,
-            metadata: None,
-            kind: EntryKind::default(),
-            key: None,
-        };
+        let entry = RegionEntry::from_parts("test", 5, 0, None, EntryKind::default(), None);
         let json = serde_json::to_string(&entry).unwrap();
         assert!(!json.contains("key"));
     }
 
     #[test]
     fn test_region_entry_key_serde_roundtrip() {
-        let entry = RegionEntry {
-            content: InternedString::new("test"),
-            tokens: 5,
-            timestamp: 0,
-            metadata: None,
-            kind: EntryKind::default(),
-            key: Some("mykey".to_string()),
-        };
+        let entry = RegionEntry::from_parts(
+            "test",
+            5,
+            0,
+            None,
+            EntryKind::default(),
+            Some("mykey".to_string()),
+        );
         let json = serde_json::to_string(&entry).unwrap();
         assert!(json.contains("mykey"));
         let back: RegionEntry = serde_json::from_str(&json).unwrap();
@@ -2779,7 +2811,7 @@ mod tests {
         assert_eq!(region.current_tokens, 12);
 
         let entry = region.get_by_key("config.toml").unwrap();
-        assert_eq!(entry.content, "[package]\nname = \"foo\"");
+        assert_eq!(entry.content(), "[package]\nname = \"foo\"");
         assert_eq!(entry.tokens, 12);
         assert_eq!(entry.key.as_deref(), Some("config.toml"));
     }
@@ -2803,7 +2835,7 @@ mod tests {
         assert_eq!(region.current_tokens, 35);
 
         let entry = region.get_by_key("readme.md").unwrap();
-        assert_eq!(entry.content, "# New and improved");
+        assert_eq!(entry.content(), "# New and improved");
         assert_eq!(entry.tokens, 35);
     }
 
@@ -2886,7 +2918,7 @@ mod tests {
         // Found
         let found = region.get_by_key("exists");
         assert!(found.is_some());
-        assert_eq!(found.unwrap().content, "hello");
+        assert_eq!(found.unwrap().content(), "hello");
 
         // Not found
         let missing = region.get_by_key("does_not_exist");
@@ -2957,34 +2989,34 @@ mod tests {
     #[test]
     fn test_region_entry_serialization_with_key_field() {
         // Entry with key
-        let entry_with_key = RegionEntry {
-            content: InternedString::new("some data"),
-            tokens: 10,
-            timestamp: 1234567890,
-            metadata: None,
-            kind: EntryKind::default(),
-            key: Some("mykey".to_string()),
-        };
+        let entry_with_key = RegionEntry::from_parts(
+            "some data",
+            10,
+            1234567890,
+            None,
+            EntryKind::default(),
+            Some("mykey".to_string()),
+        );
         let json = serde_json::to_string(&entry_with_key).unwrap();
         let deserialized: RegionEntry = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.key.as_deref(), Some("mykey"));
-        assert_eq!(deserialized.content, "some data");
+        assert_eq!(deserialized.content(), "some data");
         assert_eq!(deserialized.tokens, 10);
 
         // Entry without key
-        let entry_no_key = RegionEntry {
-            content: InternedString::new("no key data"),
-            tokens: 7,
-            timestamp: 1234567890,
-            metadata: None,
-            kind: EntryKind::default(),
-            key: None,
-        };
+        let entry_no_key = RegionEntry::from_parts(
+            "no key data",
+            7,
+            1234567890,
+            None,
+            EntryKind::default(),
+            None,
+        );
         let json = serde_json::to_string(&entry_no_key).unwrap();
         assert!(!json.contains("\"key\""));
         let deserialized: RegionEntry = serde_json::from_str(&json).unwrap();
         assert!(deserialized.key.is_none());
-        assert_eq!(deserialized.content, "no key data");
+        assert_eq!(deserialized.content(), "no key data");
     }
 
     #[test]
@@ -3099,16 +3131,16 @@ mod tests {
         a.add_entry(text.to_string(), 20).unwrap();
         b.add_entry(text.to_string(), 20).unwrap();
         assert!(
-            a.content[0].content.ptr_eq(&b.content[0].content),
-            "identical entry text must share one InternedString allocation"
+            a.content[0].shares_content_with(&b.content[0]),
+            "identical entry text must share one interned allocation"
         );
         // Mutation of one region must not affect the other (immutability of Arc payload).
         b.add_entry("private conversation turn".to_string(), 5)
             .unwrap();
-        assert_eq!(a.content[0].content.as_str(), text);
+        assert_eq!(a.content[0].content(), text);
         assert_eq!(a.content.len(), 1);
         assert_eq!(b.content.len(), 2);
-        assert!(!a.content[0].content.ptr_eq(&b.content[1].content));
+        assert!(!a.content[0].shares_content_with(&b.content[1]));
     }
 
     #[test]
@@ -3118,9 +3150,7 @@ mod tests {
         let json = serde_json::to_string(&region).unwrap();
         let restored: Region = serde_json::from_str(&json).unwrap();
         assert!(
-            region.content[0]
-                .content
-                .ptr_eq(&restored.content[0].content),
+            region.content[0].shares_content_with(&restored.content[0]),
             "deserialize must re-intern into the process table"
         );
     }
