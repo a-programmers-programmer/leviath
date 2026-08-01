@@ -6,6 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::intern::InternedString;
+
 /// The kind of content stored in a region entry.
 ///
 /// Entries carry typed metadata instead of relying on text-prefix parsing
@@ -330,7 +332,7 @@ impl Region {
 
         // Add entry
         self.content.push(RegionEntry {
-            content,
+            content: InternedString::new(content),
             tokens,
             timestamp: chrono::Utc::now().timestamp(),
             metadata: None,
@@ -380,7 +382,7 @@ impl Region {
 
         // Add entry
         self.content.push(RegionEntry {
-            content,
+            content: InternedString::new(content),
             tokens,
             timestamp: chrono::Utc::now().timestamp(),
             metadata: None,
@@ -426,7 +428,7 @@ impl Region {
 
         // Add entry
         self.content.push(RegionEntry {
-            content,
+            content: InternedString::new(content),
             tokens,
             timestamp: chrono::Utc::now().timestamp(),
             metadata: None,
@@ -468,7 +470,7 @@ impl Region {
 
         // Add entry
         self.content.push(RegionEntry {
-            content,
+            content: InternedString::new(content),
             tokens,
             timestamp: chrono::Utc::now().timestamp(),
             metadata: Some(metadata),
@@ -514,7 +516,7 @@ impl Region {
 
         // Add entry
         self.content.push(RegionEntry {
-            content,
+            content: InternedString::new(content),
             tokens,
             timestamp: chrono::Utc::now().timestamp(),
             metadata: None,
@@ -581,7 +583,7 @@ impl Region {
         {
             let old_tokens = self.content[pos].tokens;
             self.current_tokens -= old_tokens;
-            self.content[pos].content = content;
+            self.content[pos].content = InternedString::new(content);
             self.content[pos].tokens = tokens;
             self.content[pos].timestamp = chrono::Utc::now().timestamp();
             self.current_tokens += tokens;
@@ -616,7 +618,7 @@ impl Region {
         }
 
         self.content.push(RegionEntry {
-            content,
+            content: InternedString::new(content),
             tokens,
             timestamp: chrono::Utc::now().timestamp(),
             metadata: None,
@@ -838,8 +840,11 @@ impl Region {
 /// Each entry has content and metadata tracking its token usage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegionEntry {
-    /// The actual content of this entry
-    pub content: String,
+    /// The actual content of this entry.
+    ///
+    /// Stored as an [`InternedString`] so identical text (e.g. pinned system
+    /// material shared across many agents) reuses one heap allocation.
+    pub content: InternedString,
 
     /// Token count for this entry
     pub tokens: usize,
@@ -859,6 +864,21 @@ pub struct RegionEntry {
     /// Optional key for HashMap regions. When set, upsert semantics apply.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
+}
+
+impl RegionEntry {
+    /// Build an entry with interned content. Prefer this over struct literals so
+    /// callers do not need to name [`InternedString`] at every construction site.
+    pub fn new(content: impl AsRef<str>, tokens: usize) -> Self {
+        Self {
+            content: InternedString::new(content),
+            tokens,
+            timestamp: chrono::Utc::now().timestamp(),
+            metadata: None,
+            kind: EntryKind::default(),
+            key: None,
+        }
+    }
 }
 
 /// Validation schema for a region's content.
@@ -2691,7 +2711,7 @@ mod tests {
     #[test]
     fn test_region_entry_key_serde_skip_when_none() {
         let entry = RegionEntry {
-            content: "test".to_string(),
+            content: InternedString::new("test"),
             tokens: 5,
             timestamp: 0,
             metadata: None,
@@ -2705,7 +2725,7 @@ mod tests {
     #[test]
     fn test_region_entry_key_serde_roundtrip() {
         let entry = RegionEntry {
-            content: "test".to_string(),
+            content: InternedString::new("test"),
             tokens: 5,
             timestamp: 0,
             metadata: None,
@@ -2938,7 +2958,7 @@ mod tests {
     fn test_region_entry_serialization_with_key_field() {
         // Entry with key
         let entry_with_key = RegionEntry {
-            content: "some data".to_string(),
+            content: InternedString::new("some data"),
             tokens: 10,
             timestamp: 1234567890,
             metadata: None,
@@ -2953,7 +2973,7 @@ mod tests {
 
         // Entry without key
         let entry_no_key = RegionEntry {
-            content: "no key data".to_string(),
+            content: InternedString::new("no key data"),
             tokens: 7,
             timestamp: 1234567890,
             metadata: None,
@@ -3069,5 +3089,39 @@ mod tests {
         region.evict_lru_entry();
         assert_eq!(region.entry_count(), 0);
         assert_eq!(region.current_tokens, 0);
+    }
+
+    #[test]
+    fn identical_entry_text_shares_allocation_across_regions() {
+        let mut a = Region::new("pin".into(), RegionKind::Pinned, 10_000);
+        let mut b = Region::new("pin".into(), RegionKind::Pinned, 10_000);
+        let text = "architecture: always shared across agents of this blueprint";
+        a.add_entry(text.to_string(), 20).unwrap();
+        b.add_entry(text.to_string(), 20).unwrap();
+        assert!(
+            a.content[0].content.ptr_eq(&b.content[0].content),
+            "identical entry text must share one InternedString allocation"
+        );
+        // Mutation of one region must not affect the other (immutability of Arc payload).
+        b.add_entry("private conversation turn".to_string(), 5)
+            .unwrap();
+        assert_eq!(a.content[0].content.as_str(), text);
+        assert_eq!(a.content.len(), 1);
+        assert_eq!(b.content.len(), 2);
+        assert!(!a.content[0].content.ptr_eq(&b.content[1].content));
+    }
+
+    #[test]
+    fn snapshot_roundtrip_reinterns_content() {
+        let mut region = Region::new("pin".into(), RegionKind::Pinned, 1000);
+        region.add_entry("hello shared".to_string(), 3).unwrap();
+        let json = serde_json::to_string(&region).unwrap();
+        let restored: Region = serde_json::from_str(&json).unwrap();
+        assert!(
+            region.content[0]
+                .content
+                .ptr_eq(&restored.content[0].content),
+            "deserialize must re-intern into the process table"
+        );
     }
 }

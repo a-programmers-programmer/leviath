@@ -692,7 +692,7 @@ impl ContextWindow {
                             EntryKind::UserMessage => {
                                 messages.push(leviath_providers::Message {
                                     role: "user".to_string(),
-                                    content: entry.content.clone().into(),
+                                    content: entry.content.as_str().into(),
                                     cache_breakpoint: false,
                                 });
                             }
@@ -700,14 +700,14 @@ impl ContextWindow {
                                 if tool_calls.is_empty() {
                                     messages.push(leviath_providers::Message {
                                         role: "assistant".to_string(),
-                                        content: entry.content.clone().into(),
+                                        content: entry.content.as_str().into(),
                                         cache_breakpoint: false,
                                     });
                                 } else {
                                     let mut blocks = Vec::new();
                                     if !entry.content.is_empty() {
                                         blocks.push(leviath_providers::ContentBlock::Text {
-                                            text: entry.content.clone(),
+                                            text: entry.content.to_string(),
                                         });
                                     }
                                     for tc in tool_calls {
@@ -734,7 +734,7 @@ impl ContextWindow {
                                 pending_tool_results.push(
                                     leviath_providers::ContentBlock::ToolResult {
                                         tool_use_id: tool_call_id.clone(),
-                                        content: entry.content.clone(),
+                                        content: entry.content.to_string(),
                                         is_error: *is_error,
                                     },
                                 );
@@ -756,7 +756,7 @@ impl ContextWindow {
                                 } else {
                                     messages.push(leviath_providers::Message {
                                         role: "user".to_string(),
-                                        content: entry.content.clone().into(),
+                                        content: entry.content.as_str().into(),
                                         cache_breakpoint: false,
                                     });
                                 }
@@ -838,9 +838,9 @@ impl ContextWindow {
                         .iter()
                         .map(|e| {
                             if let Some(key) = &e.key {
-                                format!("### [{}]\n{}", key, e.content)
+                                format!("### [{}]\n{}", key, e.content.as_str())
                             } else {
-                                e.content.clone()
+                                e.content.to_string()
                             }
                         })
                         .collect::<Vec<_>>()

@@ -108,7 +108,7 @@ pub fn restore_agent(
                     .entries
                     .iter()
                     .map(|e| RegionEntry {
-                        content: e.content.clone(),
+                        content: e.content.clone().into(),
                         tokens: e.tokens,
                         timestamp: 0,
                         metadata: e.metadata.clone(),

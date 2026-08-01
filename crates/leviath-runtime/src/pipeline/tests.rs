@@ -2190,7 +2190,7 @@ fn conversation_text(world: &World, e: Entity) -> String {
         .unwrap()
         .content
         .iter()
-        .map(|entry| entry.content.clone())
+        .map(|entry| entry.content.as_str())
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -2894,7 +2894,7 @@ fn routing_away_pointer_previews_and_truncates_long_results() {
         .unwrap()
         .content
         .iter()
-        .map(|e| e.content.clone())
+        .map(|e| e.content.as_str())
         .collect();
     assert!(
         conv_txt.contains('…'),
@@ -5495,7 +5495,7 @@ fn require_context_regions_injects_default_message() {
         .unwrap()
         .content
         .iter()
-        .map(|entry| entry.content.clone())
+        .map(|entry| entry.content.as_str())
         .collect::<String>();
     assert!(conv.contains("Required context region 'plan' is still empty"));
 }
@@ -5750,7 +5750,7 @@ fn resolve_transition_holds_the_stage_when_a_gate_blocks() {
         .unwrap()
         .content
         .iter()
-        .map(|entry| entry.content.clone())
+        .map(|entry| entry.content.as_str())
         .collect::<String>();
     assert!(conv.contains("[System] No file modifications"));
     // Not yet forced - the budget hasn't run out.
@@ -6396,7 +6396,7 @@ fn collect_tools_injects_repetition_nudge_when_looping() {
         .unwrap()
         .content
         .iter()
-        .map(|entry| entry.content.clone())
+        .map(|entry| entry.content.as_str())
         .collect();
     assert!(
         joined.contains("[System]"),
