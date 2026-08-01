@@ -112,6 +112,17 @@ pub fn resolves_within(path: &Path, root: &Path) -> bool {
     }
 }
 
+/// Canonicalize a path for allowlist matching, failing closed.
+///
+/// The same machinery [`resolves_within`] uses, exposed for the `[read_paths]`
+/// resolver in `leviath-tools`: the deepest existing ancestor is
+/// canonicalized (which is where any symlink lives) and the unresolved tail
+/// re-appended. `None` means nothing along the path could be verified, and an
+/// unverifiable path must be refused, never matched.
+pub fn canonicalize_for_match(path: &Path) -> Option<PathBuf> {
+    canonicalize_existing_prefix(path)
+}
+
 /// Canonicalize the deepest existing ancestor of `path` and re-append whatever
 /// tail did not exist, so a path to a not-yet-created file still has any
 /// symlinks in its parents resolved.
@@ -285,6 +296,23 @@ mod tests {
         // `dir.path()` is already whatever the OS handed us; canonicalizing the
         // path alone would diverge from it on macOS.
         assert!(resolves_within(&root.join("f.txt"), root));
+    }
+
+    /// The `[read_paths]` resolver's canonicalizer is the same machinery as
+    /// `resolves_within`, exposed fail-closed: a real path resolves (symlinks
+    /// and all), an unverifiable one is `None`.
+    #[test]
+    fn canonicalize_for_match_resolves_real_paths_and_refuses_unverifiable_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), b"x").unwrap();
+        assert_eq!(
+            canonicalize_for_match(&dir.path().join("f.txt")),
+            Some(std::fs::canonicalize(dir.path().join("f.txt")).unwrap())
+        );
+        assert_eq!(
+            canonicalize_for_match(Path::new("no-such-relative-name")),
+            None
+        );
     }
 
     #[test]

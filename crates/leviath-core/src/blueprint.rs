@@ -78,6 +78,33 @@ pub struct Blueprint {
     /// discovered once at spawn and an agent cannot grow its own toolchain.
     #[serde(default)]
     pub dynamic_tools: bool,
+
+    /// Read paths this agent *declares* beyond its workdir - directories a
+    /// planner-style agent needs to see, like run archives or design docs.
+    /// Declaring is not granting: entries only take effect when the user's
+    /// config also grants them (`[security] read_paths`,
+    /// `[agent_read_paths.<name>]`, or `allow_blueprint_read_paths = true`),
+    /// so an installed manifest cannot widen its own sandbox. Read-only in
+    /// every case; `write_file` and `edit_file` stay confined to the workdir.
+    /// Semantics live in [`crate::read_paths`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_paths: Option<ReadPathsConfig>,
+}
+
+/// The `[read_paths]` section of a manifest: raw declared entries, compiled
+/// against the run's workdir and home at spawn.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadPathsConfig {
+    /// Declared entries. Each may be:
+    /// - an exact path, granting its subtree: `"~/.leviath/runs"` or
+    ///   `"../shared-docs"` (relative to the run's workdir)
+    /// - a glob: `"glob:~/.leviath/runs/**"`
+    /// - a regex, auto-anchored: `"regex:/data/design-docs/.*"`
+    ///
+    /// Patterns are written with `/` separators on every OS and match the
+    /// symlink-resolved real path.
+    #[serde(default)]
+    pub allow: Vec<String>,
 }
 
 impl Blueprint {
@@ -105,6 +132,7 @@ impl Blueprint {
             file_tracking: None,
             sandbox: None,
             dynamic_tools: false,
+            read_paths: None,
         }
     }
 

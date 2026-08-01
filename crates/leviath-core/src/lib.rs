@@ -16,6 +16,7 @@ pub mod config;
 pub mod credentials;
 pub mod error;
 pub mod interaction;
+pub mod intern;
 pub mod layout;
 pub mod lifecycle;
 pub mod manifest;
@@ -23,6 +24,7 @@ pub mod net;
 pub mod panic_payload;
 pub mod paths;
 pub mod policy;
+pub mod read_paths;
 pub mod region;
 pub mod run_archive;
 pub mod run_meta;
@@ -33,14 +35,16 @@ pub mod telemetry;
 pub mod text;
 
 pub use blueprint::{
-    Blueprint, ContextTransform, EdgeTransform, FileTrackingConfig, RepetitionDetectionConfig,
-    Stage, StuckConfig, ToolResultRouting, TransitionCondition, TransitionEdge,
+    Blueprint, ContextTransform, EdgeTransform, FileTrackingConfig, ReadPathsConfig,
+    RepetitionDetectionConfig, Stage, StuckConfig, ToolResultRouting, TransitionCondition,
+    TransitionEdge,
 };
 pub use cache::CacheHint;
 pub use credentials::{
     CredentialStore, CredentialStoreKind, MemoryStore, mcp_account, provider_account,
 };
 pub use error::{Error, Result, ValidationError};
+pub use intern::ContentInterner;
 pub use layout::{BudgetSpec, ContextLayout, RegionDefinition};
 pub use lifecycle::CompactionConfig;
 pub use net::{
@@ -49,10 +53,13 @@ pub use net::{
 };
 pub use panic_payload::panic_message;
 pub use paths::{
-    agents_dir, data_dir, home_dir, is_safe_path_component, providers_dir, resolves_within,
-    tools_dir,
+    agents_dir, canonicalize_for_match, data_dir, home_dir, is_safe_path_component, providers_dir,
+    resolves_within, tools_dir,
 };
 pub use policy::{AllowlistRule, McpToolOverride, PolicyConfig};
+pub use read_paths::{
+    ReadPathDecision, ReadPathEntry, ReadPathPolicy, ReadPathSet, validate_entry_syntax,
+};
 pub use region::{
     ContentFormat, EntryKind, EvictionStrategy, Region, RegionEntry, RegionKind, RegionSchema,
     SerializedToolCall,

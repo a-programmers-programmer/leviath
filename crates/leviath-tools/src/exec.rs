@@ -73,6 +73,99 @@ impl BuiltinTools {
         Self::resolve_within(requested, &self.ctx.workdir, resolves_within)
     }
 
+    /// Resolve a requested path for a *read-only* tool.
+    ///
+    /// Identical to [`resolve`](Self::resolve) - same two checks, same
+    /// errors - until the workdir refuses. Only then, and only when the
+    /// agent's `[read_paths]` policy is active, the path is checked against
+    /// that policy: canonicalized first (fail closed), then both predicates
+    /// of [`leviath_core::ReadPathPolicy::decide`] must hold - the blueprint
+    /// declared it AND the user's config grants it.
+    ///
+    /// This function is deliberately not called by `write_file`/`edit_file`.
+    /// `[read_paths]` grants reads; the write tools stay on
+    /// [`resolve`](Self::resolve) so an allowlisted directory can be read but
+    /// never written.
+    pub(crate) fn resolve_read(&self, requested: &str) -> anyhow::Result<PathBuf> {
+        match Self::resolve_within(requested, &self.ctx.workdir, resolves_within) {
+            Ok(path) => Ok(path),
+            Err(workdir_err) => {
+                if !self.ctx.read_paths.is_active() {
+                    return Err(workdir_err);
+                }
+                Self::resolve_outside(
+                    requested,
+                    &self.ctx.workdir,
+                    &self.ctx.read_paths,
+                    leviath_core::canonicalize_for_match,
+                )
+            }
+        }
+    }
+
+    /// The out-of-workdir arm of [`resolve_read`](Self::resolve_read), with
+    /// the canonicalizer injected (`fn` pointer, same seam idiom as
+    /// [`resolve_within`](Self::resolve_within)) so the fail-closed refusal is
+    /// testable on every platform.
+    ///
+    /// The returned path is the *canonicalized* one - the path that was
+    /// actually vetted - so the subsequent `open` operates on what the policy
+    /// approved rather than re-walking any symlinks.
+    pub(crate) fn resolve_outside(
+        requested: &str,
+        workdir: &Path,
+        policy: &leviath_core::ReadPathPolicy,
+        canon: fn(&Path) -> Option<PathBuf>,
+    ) -> anyhow::Result<PathBuf> {
+        // Relative requests resolve against the workdir here too, so a
+        // relative `[read_paths]` entry like "../shared" is reachable by the
+        // matching relative request. Canonicalization below is what decides
+        // containment; the workdir join is just the base.
+        let raw = if Path::new(requested).is_absolute() {
+            PathBuf::from(requested)
+        } else {
+            workdir.join(requested)
+        };
+
+        // Fold `..` lexically; popping past the filesystem root is
+        // unresolvable no matter what any allowlist says. `Path::components`
+        // already drops interior `.`, and `raw` is absolute here (an absolute
+        // request, or a relative one joined onto the canonicalized workdir),
+        // so no `CurDir` survives to this loop - the catch-all mirrors
+        // `resolve_within`.
+        let mut normalized = PathBuf::new();
+        for component in raw.components() {
+            match component {
+                Component::ParentDir => {
+                    if !normalized.pop() {
+                        anyhow::bail!("path '{requested}' cannot be resolved");
+                    }
+                }
+                other => normalized.push(other),
+            }
+        }
+
+        // The policy only ever sees the real, symlink-resolved path. A path
+        // that cannot be verified is refused, never matched.
+        let Some(canonical) = canon(&normalized) else {
+            anyhow::bail!("path '{requested}' cannot be verified against [read_paths]");
+        };
+
+        match policy.decide(&canonical) {
+            leviath_core::ReadPathDecision::Allowed => Ok(canonical),
+            leviath_core::ReadPathDecision::NotDeclared => anyhow::bail!(
+                "path '{requested}' is outside the working directory and not in this \
+                 agent's [read_paths]"
+            ),
+            leviath_core::ReadPathDecision::NotGranted => anyhow::bail!(
+                "path '{requested}' matches this agent's [read_paths], but your config \
+                 does not grant it; add it under [agent_read_paths.{agent}] (or set \
+                 allow_blueprint_read_paths = true under [security]) in your config.toml",
+                agent = policy.agent
+            ),
+        }
+    }
+
     /// Core of [`resolve`](Self::resolve) with the containment check injected.
     ///
     /// A `fn` pointer (not `impl Fn`) so there is one monomorphization, matching
@@ -125,7 +218,7 @@ impl BuiltinTools {
             None => return "[error] missing 'path' argument".to_string(),
         };
 
-        let path = match self.resolve(path_str) {
+        let path = match self.resolve_read(path_str) {
             Ok(p) => p,
             Err(e) => return format!("[error] {}", e),
         };
@@ -156,7 +249,7 @@ impl BuiltinTools {
                 }
             };
 
-            let path = match self.resolve(path_str) {
+            let path = match self.resolve_read(path_str) {
                 Ok(p) => p,
                 Err(e) => {
                     results.push(format!("### [{}]\n[error] {}", path_str, e));
@@ -276,7 +369,7 @@ impl BuiltinTools {
     pub(crate) async fn list_dir(&self, args: &Value) -> String {
         let path_str = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
 
-        let path = match self.resolve(path_str) {
+        let path = match self.resolve_read(path_str) {
             Ok(p) => p,
             Err(e) => return format!("[error] {}", e),
         };
