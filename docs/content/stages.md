@@ -123,6 +123,7 @@ somewhere else.
 | `input.as_text` | `[]` | Mime types whose parts reach this stage's model as text whatever the model takes |
 | `output.artifacts` | `[]` | The files the stage hands back beside its answer, by name and type. See [Final outputs](/docs/outputs#large-results) |
 | `tool_accepts` | `{}` | What each tool may be handed at this stage, as `tool = ["image/*"]`: a stored part outside the list is out of that tool's reach here. See [Mime](/docs/mime#what-a-tool-may-be-handed) |
+| `available_global_tools` | `false` | Also advertises every Rhai tool installed in `~/.leviath/tools/` at spawn. See [which tools a stage gets](/docs/agents#which-tools-a-stage-gets) |
 
 Three of those need a sentence more.
 
