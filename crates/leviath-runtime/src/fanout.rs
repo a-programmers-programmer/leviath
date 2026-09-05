@@ -1023,10 +1023,31 @@ fn worker_terminal_result(world: &World, worker: Entity) -> Option<Result<String
                 None if worker_requires_output(world, worker) => Some(Err(
                     "worker finished without the final output its stage requires".to_string(),
                 )),
-                None => Some(Ok(world
-                    .get::<InferenceResult>(worker)
-                    .map(|r| r.response.clone())
-                    .unwrap_or_default())),
+                None => Some(Ok(
+                    // MoA convergence: when a worker finished without explicit
+                    // submit_output, relay its last non-empty conversation text
+                    // (a real assistant/analysis message on tool-call-ending
+                    // runs) before falling back to InferenceResult.response.
+                    world
+                        .get::<ContextWindow>(worker)
+                        .and_then(|w| w.get_region("conversation"))
+                        .and_then(|region| {
+                            region
+                                .content
+                                .iter()
+                                .rev()
+                                .find_map(|entry| {
+                                    let text = entry.content.trim();
+                                    (!text.is_empty()).then(|| text.to_owned())
+                                })
+                        })
+                        .or_else(|| {
+                            world
+                                .get::<InferenceResult>(worker)
+                                .map(|r| r.response.clone())
+                        })
+                        .unwrap_or_default(),
+                )),
             }
         }
         Some(AgentStatus::Error { message }) => Some(Err(message)),
