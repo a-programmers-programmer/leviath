@@ -317,7 +317,10 @@ pub(crate) fn resolve_stage_candidates(
         //
         // Models keep blueprint order, except that the user's own
         // `default_model` leads - that IS a model preference, and someone who
-        // named a model meant it.
+        // named a model meant it. But a stage that explicitly pinned a
+        // provider+model pair already named its model, and the user's default
+        // must not displace it: the pin is taken on trust, and moving the
+        // default ahead of it overrides the stage author's deliberate choice.
         let default_model = user_default.as_ref().map(|(_, m)| m.as_str());
         let mut order: Vec<String> = Vec::new();
         for c in &candidates {
@@ -326,11 +329,23 @@ pub(crate) fn resolve_stage_candidates(
                 order.push(key);
             }
         }
+        // Only promote the user's default_model to the front when the current
+        // head is NOT an explicit stage pin. A pinned provider+model pair is
+        // the stage author's deliberate choice and must win over the global
+        // default.
+        let head_is_stage_pin = candidates.first().is_some_and(|head| {
+            !head.provider.is_empty()
+                && model_cfg.models.iter().any(|e| {
+                    e.provider == head.provider && !e.provider.is_empty()
+                })
+        });
         if let Some(dm) = default_model
             && let Some(at) = order.iter().position(|k| k == model_key(dm))
         {
-            let key = order.remove(at);
-            order.insert(0, key);
+            if !head_is_stage_pin || at == 0 {
+                let key = order.remove(at);
+                order.insert(0, key);
+            }
         }
         let mut grouped: Vec<ModelEntry> = Vec::with_capacity(candidates.len());
         for key in order {
