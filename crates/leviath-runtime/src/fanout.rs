@@ -1015,40 +1015,46 @@ fn worker_terminal_result(world: &World, worker: Entity) -> Option<Result<String
     match agent_status(world, worker) {
         None => Some(Err("worker vanished".to_string())),
         Some(AgentStatus::Complete) => {
-            match world
+            // Explicit submit_output always wins.
+            if let Some(content) = world
                 .get::<crate::persistence::FinalOutput>(worker)
                 .map(|o| o.0.content.clone())
             {
-                Some(content) => Some(Ok(content)),
-                None if worker_requires_output(world, worker) => Some(Err(
-                    "worker finished without the final output its stage requires".to_string(),
-                )),
-                None => Some(Ok(
-                    // MoA convergence: when a worker finished without explicit
-                    // submit_output, relay its last non-empty conversation text
-                    // (a real assistant/analysis message on tool-call-ending
-                    // runs) before falling back to InferenceResult.response.
-                    world
-                        .get::<ContextWindow>(worker)
-                        .and_then(|w| w.get_region("conversation"))
-                        .and_then(|region| {
-                            region
-                                .content
-                                .iter()
-                                .rev()
-                                .find_map(|entry| {
-                                    let text = entry.content.trim();
-                                    (!text.is_empty()).then(|| text.to_owned())
-                                })
-                        })
-                        .or_else(|| {
-                            world
-                                .get::<InferenceResult>(worker)
-                                .map(|r| r.response.clone())
-                        })
-                        .unwrap_or_default(),
-                )),
+                return Some(Ok(content));
             }
+
+            // No explicit submit_output: fall back to the worker's last
+            // non-empty conversation text (a real assistant/analysis message on
+            // tool-call-ending runs), then to InferenceResult.response.
+            let fallback = world
+                .get::<ContextWindow>(worker)
+                .and_then(|w| w.get_region("conversation"))
+                .and_then(|region| {
+                    region.content.iter().rev().find_map(|entry| {
+                        let text = entry.content.trim();
+                        (!text.is_empty()).then(|| text.to_owned())
+                    })
+                })
+                .or_else(|| {
+                    world
+                        .get::<InferenceResult>(worker)
+                        .map(|r| r.response.clone())
+                })
+                .unwrap_or_default();
+
+            // If the stage requires an output and even the fallback is empty,
+            // that is a real failure: the worker had nothing to say.  But a
+            // worker that produced real content (just never called
+            // submit_output) still relays it — the require_output guard catches
+            // genuinely-empty workers, not workers that used the wrong delivery
+            // channel.
+            if worker_requires_output(world, worker) && fallback.is_empty() {
+                return Some(Err(
+                    "worker finished without the final output its stage requires".to_string(),
+                ));
+            }
+
+            Some(Ok(fallback))
         }
         Some(AgentStatus::Error { message }) => Some(Err(message)),
         Some(AgentStatus::Cancelled) => Some(Err("worker cancelled".to_string())),
