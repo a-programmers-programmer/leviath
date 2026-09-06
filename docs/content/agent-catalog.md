@@ -32,9 +32,9 @@ these. `lev validate <agent>` prints every one of them.
 >
 > `coder` aside, every agent that has more than one thing to cover
 > [fans out](/docs/sub-agents): `data-analyst`, `deep-researcher`, `log-analyzer`, `orchestrator`,
-> `reviewer`, `wide-researcher`, and `oracle` all work on several at once instead of one after another.
+> `reviewer`, `wide-researcher`, and `oracle-workflow` all work on several at once instead of one after another.
 
-## oracle (experimental)
+## oracle-workflow (experimental)
 
 Keeps a high-tier model in a tool-free decision stage while cheaper readers,
 coders, and independent verifiers perform bounded repository work. The runtime
@@ -43,7 +43,7 @@ snapshot. Requires Git, Python 3, and a POSIX shell. See the
 [workflow and configuration](https://github.com/a-programmers-programmer/leviath/blob/main/docs/design/oracle-workflow.md).
 
 ```sh
-lev run oracle --task "Add request validation to the users endpoint"
+lev run oracle-workflow --task "Add request validation to the users endpoint"
 ```
 
 ## coder
