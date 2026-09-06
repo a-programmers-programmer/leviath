@@ -193,6 +193,7 @@ pub(crate) mod fixtures {
             max_workers: 1,
             on_worker_failure: WorkerFailurePolicy::Continue,
             split_prompt: "s".to_string(),
+            items_region: None,
             results_region: None,
             max_items: None,
             max_attempts: None,

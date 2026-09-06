@@ -126,6 +126,9 @@ lev run . --task "Your task here"
 
 This writes an `agent.leviath` config you can customize: models per stage, context regions and their budgets, tools, and the workflow graph. [Agent configuration →](https://leviath.dev/docs/agents)
 
+For an experimental repository workflow with evidence orders and snapshot-backed
+acceptance, see the bundled [Oracle workflow](docs/design/oracle-workflow.md).
+
 ## Agents
 
 Eight agents ship out of the box, covering coding, orchestration, review, research, data

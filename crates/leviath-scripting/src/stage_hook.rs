@@ -378,6 +378,59 @@ mod tests {
         assert_eq!(got, HookOutcome::Modify(serde_json::json!("review")));
     }
 
+    #[test]
+    fn oracle_protocol_compiles_and_round_trips_json_through_hooks() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../leviath-cli/agents/oracle/hooks/protocol.rhai");
+        let source = std::fs::read_to_string(&path).expect("oracle protocol hook");
+        let script = compile(
+            path.to_str().expect("utf-8 hook path"),
+            &source,
+            &[
+                "on_stage_enter",
+                "before_inference",
+                "after_inference",
+                "on_stage_exit",
+                "on_tool_call",
+            ],
+        )
+        .expect("oracle hook functions compile");
+
+        let after = run(
+            &script,
+            "after_inference",
+            serde_json::json!({
+                "stage": "oracle",
+                "regions": {"dossier": "{}"},
+                "response": r#"{"action":"ACCEPT"}"#,
+                "tool_calls": [],
+                "truncated": false,
+                "cut_off_at": null,
+            }),
+        )
+        .expect("oracle decision parses");
+        assert_eq!(after, HookOutcome::Allow);
+
+        let exit = run(
+            &script,
+            "on_stage_exit",
+            serde_json::json!({
+                "stage": "bootstrap",
+                "regions": {
+                    "control_result": r#"{"ok":true,"run_id":"r1","route":"report","report":"done","items":[],"dossier":{}}"#,
+                    "run_id": "",
+                },
+            }),
+        )
+        .expect("controller receipt parses and serializes");
+        let HookOutcome::Modify(value) = exit else {
+            panic!("expected the controller receipt rewrite");
+        };
+        assert_eq!(value["route"], "report");
+        assert_eq!(value["items"], "[]");
+        assert_eq!(value["dossier"], "{}");
+    }
+
     // ─── malformed decisions ──────────────────────────────────────────────
 
     /// A typo must not read as `Allow`. This is the whole reason an unknown

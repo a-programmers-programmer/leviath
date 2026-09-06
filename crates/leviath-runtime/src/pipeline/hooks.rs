@@ -21,6 +21,29 @@
 use super::*;
 use crate::components::StageHookScripts;
 use leviath_scripting::stage_hook::{HookOutcome, run};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Hook-generated tool calls do not carry a provider ID. Keep their IDs unique
+/// across batches so provider history and tool-result routing cannot mistake a
+/// later rewritten call for an earlier one.
+static NEXT_HOOK_TOOL_ID: AtomicU64 = AtomicU64::new(1);
+static HOOK_TOOL_ID_PREFIX: OnceLock<String> = OnceLock::new();
+
+fn next_hook_tool_id(name: &str) -> String {
+    let prefix = HOOK_TOOL_ID_PREFIX.get_or_init(|| {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        format!("{nanos:x}-{:x}", std::process::id())
+    });
+    format!(
+        "hook-{name}-{prefix}-{}",
+        NEXT_HOOK_TOOL_ID.fetch_add(1, Ordering::Relaxed)
+    )
+}
 
 /// The `ctx` a stage hook is shown.
 ///
@@ -241,6 +264,7 @@ type AfterInferenceHookQuery = (
     &'static StageCursor,
     &'static AgentBlueprint,
     &'static StageHookScripts,
+    &'static ContextWindow,
     &'static mut crate::components::InferenceResult,
     &'static mut AgentState,
 );
@@ -258,9 +282,10 @@ type AfterInferenceHookQuery = (
 /// see it.
 pub(crate) fn run_after_inference_hooks(
     mut agents: Query<AfterInferenceHookQuery, With<ProcessResponse>>,
+    mut commands: Commands,
 ) {
     crate::tick_scope::clear();
-    for (entity, cursor, bp, scripts, mut result, mut state) in agents.iter_mut() {
+    for (entity, cursor, bp, scripts, window, mut result, mut state) in agents.iter_mut() {
         crate::tick_scope::enter(entity);
         let Some(stage) = bp.0.stages.get(cursor.index) else {
             continue;
@@ -269,26 +294,47 @@ pub(crate) fn run_after_inference_hooks(
             continue;
         };
 
-        let ctx = serde_json::json!({
-            "stage": stage.name,
-            "stage_index": cursor.index,
-            "response": result.response,
-            "tokens_used": result.tokens_used,
-            // Names only: enough for a hook to notice "it wants to run shell"
-            // without implying it can rewrite the call.
-            "tool_calls": result
-                .tool_calls
-                .iter()
-                .map(|c| c.name.clone())
-                .collect::<Vec<_>>(),
-        });
+        let mut ctx = stage_ctx(&stage.name, cursor.index, window);
+        let object = ctx
+            .as_object_mut()
+            .expect("stage_ctx always returns an object");
+        object.insert(
+            "response".to_string(),
+            serde_json::Value::String(result.response.clone()),
+        );
+        object.insert("tokens_used".to_string(), serde_json::json!(result.tokens_used));
+        object.insert("cut_off_at".to_string(), serde_json::json!(result.cut_off_at));
+        object.insert(
+            "truncated".to_string(),
+            serde_json::Value::Bool(result.cut_off_at.is_some()),
+        );
+        // Names only: enough for a hook to notice "it wants to run shell"
+        // without implying it can rewrite the call.
+        object.insert(
+            "tool_calls".to_string(),
+            serde_json::Value::Array(
+                result
+                    .tool_calls
+                    .iter()
+                    .map(|c| serde_json::Value::String(c.name.clone()))
+                    .collect(),
+            ),
+        );
 
         match run(&script, "after_inference", ctx) {
-            Err(e) => refuse(&mut state, "after_inference", format!("hook failed: {e}")),
+            Err(e) => refuse_after_inference(
+                &mut commands,
+                entity,
+                &mut state,
+                "after_inference",
+                format!("hook failed: {e}"),
+            ),
             Ok(HookOutcome::Allow) => {}
             Ok(HookOutcome::Modify(value)) => match value.as_str() {
                 Some(text) => result.response = text.to_string(),
-                None => refuse(
+                None => refuse_after_inference(
+                    &mut commands,
+                    entity,
                     &mut state,
                     "after_inference",
                     format!("'value' must be the replacement response text, got: {value}"),
@@ -296,7 +342,9 @@ pub(crate) fn run_after_inference_hooks(
             },
             Ok(HookOutcome::Cancel(reason)) => {
                 let why = reason.unwrap_or_else(|| "no reason given".to_string());
-                refuse(
+                refuse_after_inference(
+                    &mut commands,
+                    entity,
                     &mut state,
                     "after_inference",
                     format!("rejected the response: {why}"),
@@ -306,7 +354,9 @@ pub(crate) fn run_after_inference_hooks(
             // but it needs the request rebuilt and the attempt counted, or a
             // hook that always retries wedges the run. Refused explicitly until
             // that is built, rather than silently ignored.
-            Ok(HookOutcome::Retry) => refuse(
+            Ok(HookOutcome::Retry) => refuse_after_inference(
+                &mut commands,
+                entity,
                 &mut state,
                 "after_inference",
                 "returned 'retry', which is not implemented yet - re-inference needs an \
@@ -315,6 +365,26 @@ pub(crate) fn run_after_inference_hooks(
             ),
         }
     }
+}
+
+/// Refuse an after-inference outcome and clear every marker that could route
+/// the response. The hook runs before `process_response`; leaving
+/// `ProcessResponse` in place would let the same tick dispatch or transition
+/// a response the hook rejected.
+fn refuse_after_inference(
+    commands: &mut Commands,
+    entity: Entity,
+    state: &mut AgentState,
+    hook: &str,
+    what: String,
+) {
+    refuse(state, hook, what);
+    commands
+        .entity(entity)
+        .remove::<ProcessResponse>()
+        .remove::<ReadyForTools>()
+        .remove::<ReadyForTransition>()
+        .remove::<ResolveTransition>();
 }
 
 /// Read a hook's replacement tool calls, or say why they are not usable.
@@ -336,7 +406,7 @@ fn tool_calls_from(value: &serde_json::Value) -> Result<Vec<crate::components::T
             // A fresh id: the hook is proposing a call, not editing one in
             // place, and reusing an id would tie a rewritten call to a
             // provider record that no longer describes it.
-            tool_id: format!("hook-{name}-{}", out.len()),
+            tool_id: next_hook_tool_id(name),
             name: name.to_string(),
             arguments: item
                 .get("arguments")
@@ -360,6 +430,7 @@ type ToolCallHookQuery = (
     &'static StageCursor,
     &'static AgentBlueprint,
     &'static StageHookScripts,
+    &'static ContextWindow,
     &'static mut crate::components::InferenceResult,
     &'static mut AgentState,
 );
@@ -384,7 +455,7 @@ type ToolCallHookQuery = (
 /// rewrites everything.
 pub(crate) fn run_tool_call_hooks(mut agents: Query<ToolCallHookQuery, With<ReadyForTools>>) {
     crate::tick_scope::clear();
-    for (entity, cursor, bp, scripts, mut result, mut state) in agents.iter_mut() {
+    for (entity, cursor, bp, scripts, window, mut result, mut state) in agents.iter_mut() {
         crate::tick_scope::enter(entity);
         let Some(stage) = bp.0.stages.get(cursor.index) else {
             continue;
@@ -396,15 +467,20 @@ pub(crate) fn run_tool_call_hooks(mut agents: Query<ToolCallHookQuery, With<Read
             continue;
         }
 
-        let ctx = serde_json::json!({
-            "stage": stage.name,
-            "stage_index": cursor.index,
-            "tool_calls": result
-                .tool_calls
-                .iter()
-                .map(|c| serde_json::json!({ "name": c.name, "arguments": c.arguments }))
-                .collect::<Vec<_>>(),
-        });
+        let mut ctx = stage_ctx(&stage.name, cursor.index, window);
+        let object = ctx
+            .as_object_mut()
+            .expect("stage_ctx always returns an object");
+        object.insert(
+            "tool_calls".to_string(),
+            serde_json::Value::Array(
+                result
+                    .tool_calls
+                    .iter()
+                    .map(|c| serde_json::json!({ "name": c.name, "arguments": c.arguments }))
+                    .collect(),
+            ),
+        );
 
         match run(&script, "on_tool_call", ctx) {
             Err(e) => refuse(&mut state, "on_tool_call", format!("hook failed: {e}")),
@@ -584,7 +660,10 @@ type StageExitHookQuery = (
 /// The window is still the finishing stage's, so `modify` writes there. A
 /// `cancel` errors the run rather than blocking the transition: a stage that
 /// refuses to be left has nowhere to go, and wedging is worse than stopping.
-pub(crate) fn run_stage_exit_hooks(mut agents: Query<StageExitHookQuery, With<ResolveTransition>>) {
+pub(crate) fn run_stage_exit_hooks(
+    mut agents: Query<StageExitHookQuery, With<ResolveTransition>>,
+    mut commands: Commands,
+) {
     crate::tick_scope::clear();
     for (entity, cursor, bp, scripts, mut window, mut state) in agents.iter_mut() {
         crate::tick_scope::enter(entity);
@@ -597,11 +676,15 @@ pub(crate) fn run_stage_exit_hooks(mut agents: Query<StageExitHookQuery, With<Re
 
         let ctx = stage_ctx(&stage.name, cursor.index, &window);
         match run(&script, "on_stage_exit", ctx) {
-            Err(e) => refuse(&mut state, "on_stage_exit", format!("hook failed: {e}")),
+            Err(e) => {
+                refuse(&mut state, "on_stage_exit", format!("hook failed: {e}"));
+                commands.entity(entity).remove::<ResolveTransition>();
+            }
             Ok(HookOutcome::Allow) => {}
             Ok(HookOutcome::Modify(value)) => {
                 if let Err(e) = apply_modify(&mut window, &value) {
                     refuse(&mut state, "on_stage_exit", e);
+                    commands.entity(entity).remove::<ResolveTransition>();
                 }
             }
             Ok(HookOutcome::Cancel(reason)) => {
@@ -611,13 +694,17 @@ pub(crate) fn run_stage_exit_hooks(mut agents: Query<StageExitHookQuery, With<Re
                     "on_stage_exit",
                     format!("refused to leave stage '{}': {why}", stage.name),
                 );
+                commands.entity(entity).remove::<ResolveTransition>();
             }
-            Ok(HookOutcome::Retry) => refuse(
-                &mut state,
-                "on_stage_exit",
-                "returned 'retry', which this hook cannot honour (the stage is already over)"
-                    .to_string(),
-            ),
+            Ok(HookOutcome::Retry) => {
+                refuse(
+                    &mut state,
+                    "on_stage_exit",
+                    "returned 'retry', which this hook cannot honour (the stage is already over)"
+                        .to_string(),
+                );
+                commands.entity(entity).remove::<ResolveTransition>();
+            }
         }
     }
 }

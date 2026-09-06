@@ -1,10 +1,31 @@
 # Contributing to Leviath
 
 Contributions are welcome: bug reports, docs fixes, and code. This page covers
-both the *process* (how a change lands) and the *tooling* (hooks, lints, and the
-coverage gate).
+this fork's contribution process and the inherited hooks, lints, and coverage
+tooling.
 
-## How a change lands
+## Validation in this fork
+
+For owner-directed work in `a-programmers-programmer/leviath`, validation is
+discretionary and based on the risk of the change. A full workspace build, test
+suite, lint run, coverage run, or live daemon exercise is not a mandatory step
+before committing or merging. Choose focused checks when they help establish
+that the changed behavior works; expand them when there is a concrete unresolved
+risk. Documentation-only changes can be reviewed directly.
+
+Record the checks actually run and their results in the change description.
+When checks were not run, say so; do not imply that unperformed checks passed.
+Owner authorization to implement and merge an agreed design does not require
+another issue or permission request solely to satisfy the upstream process.
+
+This policy does not disable installed Git hooks, GitHub Actions workflows, or
+repository protection rules. The sections below describe the inherited tooling
+and upstream process so contributors can use them when useful or when preparing
+a contribution to `GEMISIS/leviath`. Any checks enforced by the active repository
+configuration still operate as configured; this document does not establish
+that a particular fork has upstream's protection rules enabled.
+
+## How a change lands upstream
 
 ```mermaid
 flowchart LR
@@ -15,13 +36,13 @@ flowchart LR
   E --> F["Merge queue<br/>(rebase)"]
 ```
 
-Merges to `main` go through GitHub's merge queue: once a PR is approved and green, queueing it
+The upstream contribution process uses GitHub's merge queue for `main`: once a PR is approved and green, queueing it
 re-runs the required checks on the exact tree that will land, then rebase-merges automatically.
 
 - **Start with an issue** for anything non-trivial. Agreeing on the approach
   first saves you from writing code that can't be merged. Small fixes (typos,
   doc corrections, obvious bugs) can go straight to a PR.
-- **Direct pushes to `main` are disabled** for everyone, maintainers included.
+- **Direct pushes to upstream `main` are disabled** for everyone, maintainers included.
   Every change arrives as a pull request, must pass all required CI checks, and
   needs maintainer approval before it can merge.
 - **History is rebase-only**, with no merge commits. Keep your branch rebased on
@@ -38,8 +59,11 @@ re-runs the required checks on the exact tree that will land, then rebase-merges
 
 ## Getting the code building
 
+Use the fork URL for owner-directed work. The test and lint commands are
+available checks, not a required sequence for every change in this fork.
+
 ```bash
-git clone https://github.com/GEMISIS/leviath.git
+git clone https://github.com/a-programmers-programmer/leviath.git
 cd leviath
 cargo build
 cargo test --workspace
@@ -50,15 +74,19 @@ cargo clippy --workspace
 
 The hook installs itself the first time you build or test, with no setup step. `cargo test` / `cargo build` pulls in `xtask`'s dev-dependencies, which include [`cargo-husky`](https://github.com/rhysd/cargo-husky). On the first build it installs `.cargo-husky/hooks/pre-commit` into `.git/hooks/pre-commit` automatically.
 
-The hook enforces, before every commit:
+When installed and invoked, the hook checks:
 
 - **formatting** (`cargo fmt --check`)
 - **clippy** with warnings-as-errors
 - **doc lints** (`cargo doc` with `-D warnings`, so no broken or private intra-doc links and no stray HTML)
-- the **full test suite**
 - the **coverage-suppression-marker lint** (`ast-grep scan`, if `ast-grep` is installed; CI always enforces it)
+- **structural limits** (`cargo xtask structure`)
+- **documentation content** (`cargo xtask docs`)
 
-It does **not** run the full `cargo xtask coverage` check, which is several minutes, too slow for a local commit gate. CI runs it on every push instead, enforcing 100% for real.
+The checked-in hook does **not** run `cargo test` or the full `cargo xtask
+coverage` check. The inherited CI workflow contains separate test and coverage
+jobs, including a 100% coverage threshold. Whether those jobs run and block a
+merge depends on the repository's Actions and protection configuration.
 
 If the hook script itself changes (e.g. a commit edits `.cargo-husky/hooks/pre-commit`), `cargo-husky` only reinstalls it on a *fresh* compile of its crate, not on incremental builds. Force it with:
 
@@ -78,12 +106,22 @@ npm install -g @ast-grep/cli     # via npm
 
 ## Testing policy
 
-The workspace is gated at a hard **100%** on lines, regions, and functions, with no way to opt out. Coverage-suppression markers (`#[cfg(not(test))]`, `coverage(off)`, tarpaulin/lcov/grcov annotations) are banned by the ast-grep lint above, so code can't be hidden from measurement; it has to be refactored until it's testable. The *only* un-unit-tested code is the thin `lev` binary entrypoint (`crates/leviath-cli/src/main.rs`): the composition root that wires real terminal, stdin, network, and subprocess I/O into the library's tested cores. It's excluded from coverage measurement and guarded by a CI check that requires maintainer sign-off to change.
+This fork uses the discretionary validation policy above. The inherited coverage
+command and CI configuration retain a **100%** threshold on lines, regions, and
+functions; choosing not to run coverage locally does not change that threshold.
+Coverage-suppression markers (`#[cfg(not(test))]`, `coverage(off)`,
+tarpaulin/lcov/grcov annotations) are rejected by the ast-grep lint above. Prefer
+testable code rather than hiding it from measurement. The thin `lev` binary
+entrypoint (`crates/leviath-cli/src/main.rs`) is excluded from coverage measurement:
+it wires real terminal, stdin, network, and subprocess I/O into the library's
+tested cores. The inherited CI configuration also guards entrypoint changes
+with a maintainer-sign-off check.
 
 ### Suppressing a lint
 
-You cannot. The pre-commit hook and CI's `check-exclusions` job run `ast-grep
-scan`, whose rules fail the build on `#[allow(...)]` or
+The inherited lint rules reject the suppressions listed here. The pre-commit
+hook (when `ast-grep` is installed) and CI's `check-exclusions` job run `ast-grep
+scan`, whose rules fail the check on `#[allow(...)]` or
 `#[expect(...)]` for `too_many_arguments`, `type_complexity`, `dead_code`,
 `deprecated`, `async_fn_in_trait`, `match_same_arms`, `new_without_default`,
 `permissions_set_readonly_false` and `enum_variant_names`.
@@ -164,10 +202,12 @@ The summary's exit status is the number of findings, so a shell can gate on it. 
 
 ## Live-testing against a real daemon
 
-A green test suite and a 100% coverage number are not the same thing as
-"tested": this repository has shipped fixes that a unit test certified and a
-running daemon ignored. Anything that changes what the daemon does on a tool
-call, a spawn or an HTTP request gets driven through a real daemon as well.
+A green test suite and a 100% coverage number do not establish every runtime
+behavior: this repository has shipped fixes that a unit test certified and a
+running daemon ignored. A live daemon exercise can help when a change affects
+tool calls, spawning, or HTTP requests. Use it when that additional evidence is
+useful under this fork's risk-based validation policy; it is not mandatory for
+every such change.
 
 `perf-tools/` holds the harness. `perf-tools/harness.sh CMD...` runs `CMD`
 in an isolated environment (`LEVIATH_HOME=/tmp/lv`, the repo `.env` skipped,
@@ -188,8 +228,8 @@ that makes the good thing happen. A probe whose control is also silent proves
 that the harness is broken, not that the fix works. `mock.py`'s `GET /count`
 exists so "no provider call was made" can be asserted rather than assumed.
 
-The same directory holds the measuring sticks a performance change is gated
-on (`dash_pty.py`, `serve_latency.py`, `binsize.sh`) and the baseline numbers
+The same directory holds tools for measuring performance changes
+(`dash_pty.py`, `serve_latency.py`, `binsize.sh`) and the baseline numbers
 under `perf-tools/baselines/`; see `perf-tools/README.md`.
 
 ## Dependencies

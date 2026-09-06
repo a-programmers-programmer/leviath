@@ -215,6 +215,82 @@ pub(crate) fn resolve_transition_sync(
     }
 }
 
+/// Resolve a stage's optional authoritative transition destination.
+///
+/// A transition region is a control-plane input prepared by deterministic
+/// runtime code. It is intentionally read as one plain string and matched only
+/// against an existing, eligible `always` edge. Returning an error here keeps a
+/// missing, malformed, or stale control value from falling through to an LLM
+/// routing call.
+fn resolve_transition_from_region(
+    blueprint: &leviath_core::Blueprint,
+    stage: &leviath_core::Stage,
+    window: &ContextWindow,
+    visits: &std::collections::HashMap<String, usize>,
+) -> Result<Option<(usize, leviath_core::blueprint::EdgeTransform, Option<Box<leviath_core::blueprint::TransitionGate>>)>, String> {
+    let Some(region_name) = stage.transition_region.as_deref() else {
+        return Ok(None);
+    };
+    let region_name = region_name.trim();
+    if region_name.is_empty() {
+        return Err(format!("stage '{}' transition_region is empty", stage.name));
+    }
+    let region = window
+        .get_region(region_name)
+        .ok_or_else(|| format!("transition_region '{region_name}' does not exist"))?;
+    if region.content.len() != 1 {
+        return Err(format!(
+            "transition_region '{region_name}' must contain exactly one destination entry"
+        ));
+    }
+    let target = region.content[0].content.trim();
+    if target.is_empty() || target.contains('\n') || target.contains('\r') {
+        return Err(format!(
+            "transition_region '{region_name}' must contain one plain destination stage name"
+        ));
+    }
+    let transitions = stage.transitions.as_ref().ok_or_else(|| {
+        format!(
+            "transition_region '{region_name}' selected '{target}', but stage '{}' has no transitions",
+            stage.name
+        )
+    })?;
+    let edge = transitions.get(target).ok_or_else(|| {
+        format!(
+            "transition_region '{region_name}' selected '{target}', which is not an outgoing edge from stage '{}'",
+            stage.name
+        )
+    })?;
+    if edge.condition != leviath_core::blueprint::TransitionCondition::Always {
+        return Err(format!(
+            "transition_region '{region_name}' selected '{target}', but that edge is not an always edge"
+        ));
+    }
+    let target_stage = blueprint.find_stage(target).ok_or_else(|| {
+        format!(
+            "transition_region '{region_name}' selected unknown stage '{target}'"
+        )
+    })?;
+    if target_stage
+        .max_revisits
+        .is_some_and(|max| visits.get(target).copied().unwrap_or(0) > max)
+    {
+        return Err(format!(
+            "transition_region '{region_name}' selected exhausted stage '{target}'"
+        ));
+    }
+    let index = blueprint
+        .stages
+        .iter()
+        .position(|candidate| candidate.name == target)
+        .expect("find_stage returned an existing stage");
+    Ok(Some((
+        index,
+        edge.transform.clone(),
+        edge.gate.clone().map(Box::new),
+    )))
+}
+
 /// Marks a parent agent held at a `requires_children` stage boundary until all
 /// its spawned sub-agents are terminal. Distinct from `FanOutWaiting` (which is
 /// the fan-out split/merge wait).
@@ -368,6 +444,16 @@ pub(crate) fn resolve_transition(
         // How the stage ended governs the transition: an error/max-iterations
         // outcome follows its conditioned edge (e.g. → error_recovery) if present.
         let resolution = match outcome {
+            None => match resolve_transition_from_region(&bp.0, stage, &window, &visits.0) {
+                Ok(Some((idx, transform, gate))) => StageResolution::Next(idx, transform, gate),
+                Ok(None) => resolve_transition_sync(&bp.0, stage, cursor.index, &visits.0),
+                Err(message) => {
+                    state.status = AgentStatus::Error {
+                        message: message.clone(),
+                    };
+                    StageResolution::TerminalError
+                }
+            },
             // An error/max-iterations edge is never gated: the stage already
             // failed, and holding it back to demand file changes would strand a
             // run that can't make any.
@@ -405,8 +491,24 @@ pub(crate) fn resolve_transition(
                 note_max_iterations(&mut window, &stage.name, stage.max_iterations.unwrap_or(0));
                 find_conditioned_edge(&bp.0, stage, &visits.0, TransitionCondition::MaxIterations)
                     .map(|(i, t)| StageResolution::Next(i, t, None))
-                    .unwrap_or_else(|| {
-                        resolve_transition_sync(&bp.0, stage, cursor.index, &visits.0)
+                    .unwrap_or_else(|| match resolve_transition_from_region(
+                        &bp.0,
+                        stage,
+                        &window,
+                        &visits.0,
+                    ) {
+                        Ok(Some((idx, transform, gate))) => {
+                            StageResolution::Next(idx, transform, gate)
+                        }
+                        Ok(None) => {
+                            resolve_transition_sync(&bp.0, stage, cursor.index, &visits.0)
+                        }
+                        Err(message) => {
+                            state.status = AgentStatus::Error {
+                                message: message.clone(),
+                            };
+                            StageResolution::TerminalError
+                        }
                     })
             }
             Some(StageOutcome::Stuck(_)) => {
@@ -420,7 +522,6 @@ pub(crate) fn resolve_transition(
                     .map(|(i, t)| StageResolution::Next(i, t, None))
                     .unwrap_or(StageResolution::Resume)
             }
-            None => resolve_transition_sync(&bp.0, stage, cursor.index, &visits.0),
         };
         // A dead end resolves like a stage error: down the `error` edge when one
         // has budget left (this is what finally makes `error_recovery` reachable
@@ -501,7 +602,14 @@ pub(crate) fn resolve_transition(
             StageResolution::Next(idx, transform, gate) => {
                 // Check the edge's gate BEFORE the transform runs: the transform
                 // compacts/clears regions, and a held stage must keep its context.
-                let gate = outcome.is_none().then_some(gate).flatten();
+                // A capped deterministic controller still selected a normal
+                // edge, so that edge retains its gate. Explicit error/cap
+                // edges carry no gate in the resolution above.
+                let normal_control_edge = stage.transition_region.is_some()
+                    && matches!(outcome, Some(StageOutcome::MaxIterations));
+                let gate = (outcome.is_none() || normal_control_edge)
+                    .then_some(gate)
+                    .flatten();
                 match gate_blocks(gate.as_deref(), stage, &progress, &window) {
                     GateDecision::Block(nudge) => {
                         hold_for_gate(entity, &nudge, &mut progress, &mut window, &mut commands);
@@ -842,6 +950,7 @@ pub(crate) fn attach_stage_components(
         // one already covered.
         .remove::<FanOutReentries>()
         .remove::<crate::fanout::FannedOut>()
+        .remove::<crate::fanout::AuthoritativeFanOutPending>()
         .insert(ReadyToInfer);
     match &setup.routing {
         Some(routing) => {

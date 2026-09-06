@@ -15,6 +15,10 @@ same list.
 
 ### Added
 
+- An experimental bundled `oracle` blueprint for repository work. It uses
+  tool-free JSON decisions, deterministic reader/coder/verifier fan-out, and a
+  workspace kernel with bounded orders, receipts, snapshots, and path-scoped
+  compare-and-swap patches. See [the Oracle workflow design](docs/design/oracle-workflow.md).
 - `lev mcp serve` turns Leviath into an MCP server over stdio, so a host agent
   (Claude Code, Grok, Codex, Gemini, Hermes) delegates a task with a tool call
   instead of hunting for the `lev` binary. The `run` tool starts an agent and

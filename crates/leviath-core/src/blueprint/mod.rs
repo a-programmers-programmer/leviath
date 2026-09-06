@@ -405,6 +405,27 @@ impl Blueprint {
                 }
             }
 
+            if let StageMode::FanOut { config } = &stage.mode
+                && let Some(region) = &config.items_region
+                && !known.contains(region.as_str())
+            {
+                return Err(bad(format!(
+                    "fan_out items_region names region '{region}', which no layout in this blueprint declares"
+                )));
+            }
+            if let Some(region) = stage.transition_region.as_deref().map(str::trim) {
+                if region.is_empty() {
+                    return Err(bad(
+                        "transition_region must be a non-empty region name".to_string(),
+                    ));
+                }
+                if !known.contains(region) {
+                    return Err(bad(format!(
+                        "transition_region names region '{region}', which no layout in this blueprint declares"
+                    )));
+                }
+            }
+
             if let Some(routing) = &stage.tool_result_routing {
                 // Routing is checked against what *this* stage can see, not
                 // against every name in the blueprint. A stage that omits a
@@ -1941,6 +1962,7 @@ criteria = { kind = "pinned", max_tokens = 10, seed = "criteria" }"#,
             max_workers: 3,
             on_worker_failure: WorkerFailurePolicy::Continue,
             split_prompt: "split".to_string(),
+            items_region: None,
             results_region: None,
             max_items: None,
             max_attempts: None,

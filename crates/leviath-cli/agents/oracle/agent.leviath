@@ -1,0 +1,386 @@
+[agent]
+name = "oracle"
+version = "0.1.0"
+description = "A bounded evidence workflow that lets an oracle authorize, repair, and report repository changes"
+entry_stage = "bootstrap"
+max_child_depth = 1
+
+
+# The protocol hook is the policy boundary for every workspace operation. The
+# blueprint intentionally exposes no generic filesystem, context, or shell tool.
+
+[stages.bootstrap]
+mode = "autonomous"
+model = { models = ["gpt-5.4-mini", "gemini-3.5-flash"], allow_user_default = false }
+description = "Initialize the evidence workflow and choose its first route"
+available_tools = ["oracle_workspace"]
+available_connectors = []
+available_global_tools = false
+max_iterations = 2
+max_revisits = 64
+transition_region = "route"
+system_prompt = """
+Call oracle_workspace exactly once with request={}. The protocol hook replaces
+the arguments with the sanctioned request and records an opaque result. Return
+only a plain completion marker after the call; do not infer a route or call any
+other tool. Routing is written to the route region by the protocol.
+"""
+
+
+[stages.bootstrap.nudge]
+enabled = false
+[stages.bootstrap.tool_routing]
+default_region = "control_result"
+max_result_tokens = 32768
+
+[stages.bootstrap.hooks]
+on_stage_enter = "hooks/protocol.rhai"
+on_tool_call = "hooks/protocol.rhai"
+on_stage_exit = "hooks/protocol.rhai"
+
+[stages.bootstrap.context.regions]
+task = { kind = "pinned", max_tokens = 4096 }
+run_id = { kind = "pinned", max_tokens = 256 }
+route = { kind = "pinned", max_tokens = 128 }
+decision = { kind = "clearable", max_tokens = 8192 }
+control_result = { kind = "clearable", max_tokens = 32768 }
+
+[stages.bootstrap.transitions.readers]
+[stages.bootstrap.transitions.oracle]
+[stages.bootstrap.transitions.report]
+
+[stages.oracle]
+mode = "autonomous"
+description = "Decide the next authorized evidence or repair action"
+accepts_messages = false
+available_tools = []
+available_connectors = []
+available_global_tools = false
+max_iterations = 1
+max_revisits = 8
+system_prompt = """
+Return exactly one plain JSON object and no markdown or prose. Decide only from
+the dossier and these instructions. Shape:
+{"action":"REQUEST_EVIDENCE|AUTHORIZE|REMEDIATE|ACCEPT|ASK_USER|STOP","snapshot_id":"...","supersedes":[],"dispositions":[{"order_id":"...","reason":"..."}],"orders":[{"id":"...","objective":"...","paths":["exact/relative/path"],"depends_on":[],"checks":[{"id":"...","argv":[],"cwd":".","expect_tests":true}]}],"reason":"..."}
+Use REQUEST_EVIDENCE for read orders with no checks. AUTHORIZE or REMEDIATE
+must name exact paths and checks. REMEDIATE also requires a nonempty
+supersedes array of failed order ids plus reason. Old orders are superseded only
+after their replacements verify. ACCEPT has no orders and matches the verified
+snapshot. For each order with unread or contradictory evidence, ACCEPT must
+include a disposition explaining why that evidence is resolved or nonblocking.
+ASK_USER puts the question in reason; STOP puts the stop reason there.
+Preserve negative evidence, gaps, unread paths, and conflicts. The kernel
+validates the object; do not invent facts or prose outside it.
+"""
+
+
+[stages.oracle.nudge]
+enabled = false
+[stages.oracle.model]
+models = ["claude-opus-5", "gpt-5.5"]
+allow_user_default = false
+
+[stages.oracle.model.parameters]
+max_output_tokens = 2048
+leviath_max_input_tokens = 8000
+
+[stages.oracle.hooks]
+on_stage_enter = "hooks/protocol.rhai"
+before_inference = "hooks/protocol.rhai"
+after_inference = "hooks/protocol.rhai"
+on_stage_exit = "hooks/protocol.rhai"
+
+[stages.oracle.context.regions]
+dossier = { kind = "pinned", max_tokens = 4400 }
+
+[stages.oracle.transitions.control]
+
+[stages.control]
+mode = "autonomous"
+model = { models = ["gpt-5.4-mini", "gemini-3.5-flash"], allow_user_default = false }
+description = "Apply the oracle decision and prepare the next deterministic route"
+available_tools = ["oracle_workspace"]
+available_connectors = []
+available_global_tools = false
+max_iterations = 2
+max_revisits = 64
+transition_region = "route"
+system_prompt = """
+Call oracle_workspace exactly once with request={}. The protocol hook replaces
+the arguments, records the opaque controller result, and writes the deterministic
+route. Return only a plain completion marker after the call. Do not call another
+tool, choose a route, or summarize the workspace.
+"""
+
+
+[stages.control.nudge]
+enabled = false
+[stages.control.tool_routing]
+default_region = "control_result"
+max_result_tokens = 32768
+
+[stages.control.hooks]
+on_stage_enter = "hooks/protocol.rhai"
+on_tool_call = "hooks/protocol.rhai"
+on_stage_exit = "hooks/protocol.rhai"
+
+[stages.control.context.regions]
+task = { kind = "pinned", max_tokens = 4096 }
+run_id = { kind = "pinned", max_tokens = 256 }
+route = { kind = "pinned", max_tokens = 128 }
+decision = { kind = "clearable", max_tokens = 8192 }
+control_result = { kind = "clearable", max_tokens = 32768 }
+
+[stages.control.transitions.oracle]
+[stages.control.transitions.readers]
+[stages.control.transitions.coders]
+[stages.control.transitions.verifiers]
+[stages.control.transitions.report]
+[stages.readers]
+mode = "fan_out"
+model = { models = ["gpt-5.4-mini", "gemini-3.5-flash"], allow_user_default = false }
+description = "Run the authoritative read orders in parallel"
+available_tools = []
+available_connectors = []
+available_global_tools = false
+worker_stage = "reader"
+merge_stage = "collect"
+items_region = "items"
+results_region = "worker_results"
+max_workers = 4
+max_items = 8
+max_iterations = 2
+max_revisits = 32
+
+[stages.readers.nudge]
+enabled = false
+
+[stages.coders]
+mode = "fan_out"
+model = { models = ["gpt-5.4-mini", "gemini-3.5-flash"], allow_user_default = false }
+description = "Run the authorized patches serially"
+available_tools = []
+available_connectors = []
+available_global_tools = false
+worker_stage = "coder"
+merge_stage = "collect"
+items_region = "items"
+results_region = "worker_results"
+max_workers = 1
+max_items = 8
+max_iterations = 2
+max_revisits = 32
+
+[stages.coders.nudge]
+enabled = false
+
+[stages.verifiers]
+mode = "fan_out"
+model = { models = ["gpt-5.4-mini", "gemini-3.5-flash"], allow_user_default = false }
+description = "Run the authoritative checks in parallel"
+available_tools = []
+available_connectors = []
+available_global_tools = false
+worker_stage = "verifier"
+merge_stage = "collect"
+items_region = "items"
+results_region = "worker_results"
+max_workers = 4
+max_items = 8
+max_iterations = 2
+max_revisits = 32
+
+[stages.verifiers.nudge]
+enabled = false
+
+[stages.collect]
+mode = "autonomous"
+model = { models = ["gpt-5.4-mini", "gemini-3.5-flash"], allow_user_default = false }
+description = "Collect durable worker receipts and prepare the next route"
+available_tools = ["oracle_workspace"]
+available_connectors = []
+available_global_tools = false
+max_iterations = 2
+max_revisits = 64
+transition_region = "route"
+system_prompt = """
+Call oracle_workspace exactly once with request={}. The protocol hook replaces
+the arguments, records the opaque controller result, and writes the deterministic
+route from durable worker receipts. Return only a plain completion marker. Do
+not infer a route or summarize model prose.
+"""
+
+
+[stages.collect.nudge]
+enabled = false
+[stages.collect.tool_routing]
+default_region = "control_result"
+max_result_tokens = 32768
+
+[stages.collect.hooks]
+on_stage_enter = "hooks/protocol.rhai"
+on_tool_call = "hooks/protocol.rhai"
+on_stage_exit = "hooks/protocol.rhai"
+
+[stages.collect.context.regions]
+task = { kind = "pinned", max_tokens = 4096 }
+run_id = { kind = "pinned", max_tokens = 256 }
+route = { kind = "pinned", max_tokens = 128 }
+decision = { kind = "clearable", max_tokens = 8192 }
+control_result = { kind = "clearable", max_tokens = 32768 }
+worker_results = { kind = "clearable", max_tokens = 32768 }
+worker_receipts = { kind = "clearable", max_tokens = 32768 }
+
+[stages.collect.transitions.oracle]
+[stages.collect.transitions.readers]
+[stages.collect.transitions.coders]
+[stages.collect.transitions.verifiers]
+[stages.collect.transitions.report]
+
+[stages.reader]
+mode = "autonomous"
+model = { models = ["gpt-5.4-mini", "gemini-3.5-flash"], allow_user_default = false }
+description = "Read exactly one authorized order and seal its receipt"
+available_tools = ["oracle_workspace"]
+available_connectors = []
+available_global_tools = false
+allow_as_worker = true
+allow_complete = true
+max_iterations = 24
+system_prompt = """
+You are one reader worker. The task is immutable and your fresh window contains
+only task and worker receipts. For the initial read-001 order, you must inspect
+with kind='inventory' before sealing. Your first action must be inspect with kind='order' to retrieve the canonical
+order, role, and paths; generic inventory is not authority. Then use
+oracle_workspace only for that order: read requests carry top-level string
+action='read', path, start, and end (for example
+request={action:'read',path:'README.md',start:1,end:3}). Plain messages
+are ignored. Finish with action seal using summary, negative[], contradictions[], and unread[];
+the kernel records the receipt and decides
+completion. Never patch, run an unrequested check, or submit output.
+"""
+
+
+[stages.reader.nudge]
+enabled = false
+[stages.reader.tool_routing]
+default_region = "worker_receipts"
+max_result_tokens = 32768
+
+[stages.reader.hooks]
+on_tool_call = "hooks/protocol.rhai"
+
+[stages.reader.context.regions]
+task = { kind = "pinned", max_tokens = 4096 }
+worker_receipts = { kind = "clearable", max_tokens = 32768 }
+[stages.coder]
+mode = "autonomous"
+model = { models = ["gpt-5.4-mini", "gemini-3.5-flash"], allow_user_default = false }
+description = "Apply exactly one authorized patch and seal its receipt"
+available_tools = ["oracle_workspace"]
+available_connectors = []
+available_global_tools = false
+allow_as_worker = true
+allow_complete = true
+max_iterations = 24
+system_prompt = """
+You are one coder worker. The task is immutable and your fresh window contains
+only task and worker receipts. Use oracle_workspace only for the order in your
+worker context. Your first action must be inspect with kind='order' to retrieve the canonical
+order, role, and paths; generic inventory is not authority. Read the complete
+file before editing with request={action:'inspect',kind:'file',path:'...'}.
+This returns UTF-8 content up to 32768 bytes and its SHA-256; use a read action
+for a short exact-line citation. Do not reconstruct unread file content.
+A patch is a full replacement with path, before_sha256, and content.
+Do not run checks; verifier workers own them. Finish with action seal using
+summary, negative[], contradictions[], and unread[], then reply done.
+Never submit output or invent a check.
+"""
+
+
+[stages.coder.nudge]
+enabled = false
+[stages.coder.tool_routing]
+default_region = "worker_receipts"
+max_result_tokens = 32768
+
+[stages.coder.hooks]
+on_tool_call = "hooks/protocol.rhai"
+
+[stages.coder.context.regions]
+task = { kind = "pinned", max_tokens = 4096 }
+worker_receipts = { kind = "clearable", max_tokens = 32768 }
+
+[stages.verifier]
+mode = "autonomous"
+model = { models = ["gpt-5.4-mini", "gemini-3.5-flash"], allow_user_default = false }
+description = "Run exactly one authorized check and seal its receipt"
+available_tools = ["oracle_workspace"]
+available_connectors = []
+available_global_tools = false
+allow_as_worker = true
+allow_complete = true
+max_iterations = 24
+system_prompt = """
+You are one verifier worker. The task is immutable and your fresh window contains
+only task and worker receipts. Use oracle_workspace only for the order in your
+worker context. Your first action must be inspect with kind='order' to retrieve the canonical
+order, role, paths, and checks; generic inventory is not authority. Run the
+check by check_id and report
+exact evidence; do not patch or substitute commands. Plain messages are ignored. Finish with
+action seal using summary, negative[], contradictions[], and unread[]. Never
+submit output or infer success from missing evidence.
+"""
+
+
+[stages.verifier.nudge]
+enabled = false
+[stages.verifier.tool_routing]
+default_region = "worker_receipts"
+max_result_tokens = 32768
+
+[stages.verifier.hooks]
+on_tool_call = "hooks/protocol.rhai"
+
+[stages.verifier.context.regions]
+task = { kind = "pinned", max_tokens = 4096 }
+worker_receipts = { kind = "clearable", max_tokens = 32768 }
+
+[stages.report]
+mode = "output"
+model = { models = ["gpt-5.4-mini", "gemini-3.5-flash"], allow_user_default = false }
+description = "Submit the canonical report finalized by the protocol hook"
+available_tools = []
+available_connectors = []
+available_global_tools = false
+max_iterations = 2
+system_prompt = """
+Call submit_output exactly once. The protocol hook replaces its value with the
+canonical report from durable receipts. Do not write a report in prose, call
+another tool, or expose controller or worker transcripts.
+"""
+
+
+[stages.report.nudge]
+enabled = false
+[stages.report.hooks]
+on_stage_enter = "hooks/protocol.rhai"
+on_tool_call = "hooks/protocol.rhai"
+
+[stages.report.context.regions]
+report = { kind = "pinned", max_tokens = 16000 }
+
+# Global workflow state. The runtime also carries conversation, tool_results,
+# final_output, and stage_instructions; protocol hooks clear the raw transcript
+# regions before sensitive stages assemble their windows.
+[context.regions]
+task = { kind = "pinned", max_tokens = 4096, required = true, seed = "task", required_message = "Provide the repository task via --task.", volatility = "stable" }
+run_id = { kind = "pinned", max_tokens = 256, volatility = "stable" }
+dossier = { kind = "pinned", max_tokens = 4400, volatility = "stable" }
+items = { kind = "clearable", max_tokens = 12000 }
+route = { kind = "pinned", max_tokens = 128, volatility = "stable" }
+decision = { kind = "clearable", max_tokens = 8192 }
+report = { kind = "pinned", max_tokens = 16000 }
+control_result = { kind = "clearable", max_tokens = 32768 }
+worker_results = { kind = "clearable", max_tokens = 32768 }
+worker_receipts = { kind = "clearable", max_tokens = 32768 }

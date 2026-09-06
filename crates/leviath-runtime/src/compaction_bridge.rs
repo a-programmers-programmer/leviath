@@ -90,14 +90,14 @@ pub(crate) async fn run_compaction_job(
     let mut summaries = Vec::new();
     let mut usage = Vec::new();
     let mut result = Ok(());
-    for (region, request) in requests {
+    for (region, mut request) in requests {
         // Guarded before it is sent, like every other lane's request, and
         // inside the same deadline so a count that hangs cannot hold the slot
         // past it. No calibration: that corrects the agent's own window on
         // the agent's own model, and this request goes to the compaction
         // model, whose framing it has never measured.
         let call = async {
-            crate::inference_bridge::guard_context_window(provider.as_ref(), &request, None)
+            crate::inference_bridge::guard_context_window(provider.as_ref(), &mut request, None)
                 .await?;
             provider.infer(&request).await
         };
