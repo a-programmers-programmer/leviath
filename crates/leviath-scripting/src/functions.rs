@@ -1,6 +1,6 @@
 //! Leviath functions exposed to Rhai scripts.
 
-use rhai::Engine;
+use rhai::{Dynamic, Engine, EvalAltResult, Map, Position};
 
 /// Register Leviath functions in the Rhai engine.
 pub fn register_functions(engine: &mut Engine) {
@@ -57,6 +57,43 @@ pub fn register_functions(engine: &mut Engine) {
     });
 
     engine.register_fn("is_empty", |text: &str| -> bool { text.trim().is_empty() });
+
+    // Pure JSON helpers are shared by every sandboxed script engine, including
+    // stage and region hooks. Keeping these here prevents the hook engine from
+    // accidentally receiving the I/O host functions that script tools use.
+    engine.register_fn("parse_json", |s: &str| -> JsonResult<Dynamic> {
+        parse_json(s)
+    });
+    engine.register_fn("to_json", |v: Dynamic| -> JsonResult<String> {
+        to_json(&v)
+    });
+    // Rhai's map package can register a more-specific `to_json(&mut Map)`;
+    // register the same strict serializer for maps so object values do not
+    // fall through to Rhai's debug formatter (`\\u{...}` is not JSON).
+    engine.register_fn("to_json", |map: Map| -> JsonResult<String> {
+        let value = Dynamic::from_map(map);
+        to_json(&value)
+    });
+}
+
+type JsonResult<T> = std::result::Result<T, Box<EvalAltResult>>;
+
+/// Parse a JSON string into the plain Rhai data representation.
+pub(crate) fn parse_json(s: &str) -> JsonResult<Dynamic> {
+    let value: serde_json::Value = serde_json::from_str(s).map_err(|e| {
+        Box::new(EvalAltResult::ErrorRuntime(
+            format!("parse_json: {e}").into(),
+            Position::NONE,
+        ))
+    })?;
+    rhai::serde::to_dynamic(value)
+}
+
+/// Serialize a plain Rhai value with serde_json's strict escaping and shape
+/// rules. Values without a JSON representation remain script errors.
+pub(crate) fn to_json(value: &Dynamic) -> JsonResult<String> {
+    let json: serde_json::Value = rhai::serde::from_dynamic(value)?;
+    Ok(json.to_string())
 }
 
 #[cfg(test)]
@@ -309,5 +346,20 @@ mod tests {
         let e = engine();
         let result: bool = e.eval(r#"is_empty("hi")"#).unwrap();
         assert!(!result);
+    }
+
+    #[test]
+    fn json_helpers_round_trip_arrays_maps_and_unicode_strictly() {
+        let e = engine();
+        let result: String = e
+            .eval(r##"to_json(parse_json("{\"items\":[1,true,null],\"text\":\"é\\n\"}"))"##)
+            .unwrap();
+        assert_eq!(
+            result,
+            r#"{"items":[1,true,null],"text":"é\n"}"#
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&result).expect("strict JSON");
+        assert_eq!(parsed["items"][1], true);
+        assert_eq!(parsed["text"], "é\n");
     }
 }

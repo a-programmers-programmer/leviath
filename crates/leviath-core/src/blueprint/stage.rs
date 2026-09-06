@@ -187,6 +187,14 @@ pub struct FanOutConfig {
     #[serde(default)]
     pub split_prompt: String,
 
+    /// Optional authoritative context region containing the work-item JSON
+    /// array. When set, the runtime consumes exactly one strict array of
+    /// `{ "id": string, "context": value }` objects from this region; the
+    /// model-provided fan-out arguments cannot replace it or override the
+    /// worker/cap settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub items_region: Option<String>,
+
     /// Context region the consolidated worker report is written to. `None`
     /// means `conversation`.
     ///
@@ -567,6 +575,12 @@ pub struct Stage {
     /// Custom prompt for transition decisions (overrides default)
     pub transition_prompt: Option<String>,
 
+    /// Optional authoritative context region containing one plain destination
+    /// stage name. The runtime uses it for deterministic routing and refuses
+    /// missing or ineligible destinations without invoking a routing model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transition_region: Option<String>,
+
     /// Whether this stage accepts mid-run user messages.
     /// When true, messages sent to the agent are injected into context
     /// between inference calls. Default: true.
@@ -710,6 +724,7 @@ impl Stage {
             transitions: None,
             max_revisits: None,
             transition_prompt: None,
+            transition_region: None,
             accepts_messages: true,
             allow_complete: false,
             allow_as_worker: false,

@@ -1,0 +1,34 @@
+flowchart TD
+    bootstrap{{bootstrap}}
+    oracle(oracle)
+    control{{control}}
+    readers(readers)
+    coders(coders)
+    verifiers(verifiers)
+    collect{{collect}}
+    reader(reader)
+    coder(coder)
+    verifier(verifier)
+    report(report)
+    bootstrap --> readers
+    bootstrap --> oracle
+    bootstrap --> report
+    oracle --> control
+    control --> oracle
+    control --> readers
+    control --> coders
+    control --> verifiers
+    control --> report
+    readers ==>|×4 workers| reader
+    reader ==>|merge| collect
+    coders ==>|×1 workers| coder
+    coder ==>|merge| collect
+    verifiers ==>|×4 workers| verifier
+    verifier ==>|merge| collect
+    collect --> oracle
+    collect --> readers
+    collect --> coders
+    collect --> verifiers
+    collect --> report
+    classDef entry stroke-width:3px
+    class bootstrap entry

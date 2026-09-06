@@ -200,14 +200,31 @@ pub(crate) struct InferenceJob {
 /// line is counted with the provider's own tokenizer before it is sent.
 pub const COUNT_ABOVE_WINDOW_FRACTION: usize = 2;
 
+/// Reserved stage parameter for an opt-in conservative input budget.
+///
+/// This travels through `InferenceConfig.extra_params` and
+/// `InferenceRequest.extra` with the other provider parameters, but is a
+/// Leviath control value and is removed before a provider sees the request.
+pub const MAX_INPUT_TOKENS_PARAM: &str = "leviath_max_input_tokens";
+
+/// Bytes kept for provider-specific message and request framing. The budget
+/// deliberately treats one UTF-8 byte as one possible token, so it is a
+/// conservative upper bound rather than a claim about the provider's actual
+/// tokenizer. This fixed allowance makes the bound stricter than the model's
+/// billed token count and covers framing that is not represented by the shared
+/// request types.
+const INPUT_BUDGET_FRAMING_ALLOWANCE_BYTES: usize = 256;
+
 /// Measure a request against the model's context window before it is sent.
 ///
 /// Returns `Ok(None)` when the request was small enough to skip the count,
 /// `Ok(Some(used))` with the provider's exact prompt count when it was measured
 /// and fits, and `Err(TokenLimitExceeded)` when it was measured and would
-/// overflow. Every inference lane - the stage's own call, the routing call,
-/// compaction and titling - goes through this one function, so a window is
-/// guarded the same way whichever lane assembled the request.
+/// overflow. An opt-in `leviath_max_input_tokens` is checked first against a
+/// conservative serialized byte bound and is removed from the request before
+/// any provider operation. Every inference lane - the stage's own call, the
+/// routing call, compaction and titling - goes through this one function, so a
+/// window is guarded the same way whichever lane assembled the request.
 ///
 /// A provider that reports no window for the model (`max_context_tokens` of
 /// zero) cannot be guarded, and is not: refusing everything on the strength of
@@ -220,9 +237,23 @@ pub const COUNT_ABOVE_WINDOW_FRACTION: usize = 2;
 /// the overflow check.
 pub async fn guard_context_window(
     provider: &dyn Provider,
-    request: &InferenceRequest,
+    request: &mut InferenceRequest,
     calibration: Option<&crate::pipeline::PromptCalibration>,
 ) -> Result<Option<usize>, ProviderError> {
+    let input_budget = consume_input_budget(request)?;
+    if let Some(max_input_tokens) = input_budget {
+        let serialized = serialize_budget_input(request)?;
+        let used = serialized
+            .len()
+            .saturating_add(INPUT_BUDGET_FRAMING_ALLOWANCE_BYTES);
+        if used > max_input_tokens {
+            return Err(ProviderError::Other(format!(
+                "input budget exceeded: serialized system/messages/tools input is {used} bytes \
+                 including {INPUT_BUDGET_FRAMING_ALLOWANCE_BYTES} bytes of framing allowance, \
+                 above leviath_max_input_tokens={max_input_tokens}"
+            )));
+        }
+    }
     let max = provider.max_context_tokens(&request.model);
     if max == 0 {
         return Ok(None);
@@ -249,6 +280,58 @@ pub async fn guard_context_window(
         "request measured before sending"
     );
     Ok(Some(used))
+}
+
+/// Remove and validate the reserved input-budget parameter before dispatch.
+///
+/// A zero, fractional, negative, string, boolean, or otherwise unrepresentable
+/// value is rejected. The value is consumed even when the context-window
+/// provider has no reported maximum, so it can never leak as an unknown
+/// provider parameter. The request is never logged or included in the error.
+fn consume_input_budget(
+    request: &mut InferenceRequest,
+) -> Result<Option<usize>, ProviderError> {
+    let Some(extra) = request.extra.as_object_mut() else {
+        return Ok(None);
+    };
+    let Some(value) = extra.remove(MAX_INPUT_TOKENS_PARAM) else {
+        return Ok(None);
+    };
+    let budget = value
+        .as_u64()
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            ProviderError::Other(format!(
+                "{MAX_INPUT_TOKENS_PARAM} must be a positive integer"
+            ))
+        })?;
+    Ok(Some(budget))
+}
+
+/// Serialize the complete assembled model input represented by the shared
+/// request fields. Provider parameters in `extra` are intentionally excluded:
+/// they are controls or provider-specific values (and may contain credentials),
+/// rather than prompt input. Serialization is used only for its byte length;
+/// no request contents are logged.
+fn serialize_budget_input(request: &InferenceRequest) -> Result<Vec<u8>, ProviderError> {
+    #[derive(serde::Serialize)]
+    struct BudgetInput<'a> {
+        system: &'a [leviath_providers::SystemBlock],
+        messages: &'a [leviath_providers::Message],
+        tools: &'a [leviath_providers::Tool],
+    }
+
+    serde_json::to_vec(&BudgetInput {
+        system: &request.system,
+        messages: &request.messages,
+        tools: &request.tools,
+    })
+    .map_err(|_| {
+        ProviderError::Other(
+            "could not serialize system/messages/tools for the input budget".to_string(),
+        )
+    })
 }
 
 /// Flatten a request into the text whose tokens we count for the budget guard:
@@ -375,6 +458,7 @@ pub(crate) async fn run_inference_job(
         calibration,
         stream,
     } = job;
+    let mut request = request;
     let started = std::time::Instant::now();
     // Retry transient failures (connection reset, timeout, 429, 5xx) with
     // exponential backoff, holding the permit across the backoff; a permanent
@@ -393,7 +477,7 @@ pub(crate) async fn run_inference_job(
         // the request is, and a cancelled run does not wait for one. Before the
         // loop rather than in it, because a refusal here is a fact about the
         // request and a retry would only restate it.
-        guard_context_window(provider.as_ref(), &request, calibration.as_ref()).await?;
+        guard_context_window(provider.as_ref(), &mut request, calibration.as_ref()).await?;
         let mut attempt = 1u32;
         let mut spent = Duration::ZERO;
         loop {
@@ -936,11 +1020,67 @@ mod tests {
     #[tokio::test]
     async fn an_unknown_window_is_never_guarded() {
         let provider = Arc::new(Counter::new(1_000_000, 0));
-        let verdict = guard_context_window(provider.as_ref(), &sized_request(1_600), None)
+        let mut request = sized_request(1_600);
+        let verdict = guard_context_window(provider.as_ref(), &mut request, None)
             .await
             .expect("nothing to measure against");
         assert_eq!(verdict, None);
         assert_eq!(provider.count_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn input_budget_is_conservative_and_stripped_before_dispatch() {
+        let provider = Arc::new(Counter::new(1_000_000, 0));
+        let mut request = test_request();
+        request.extra = serde_json::json!({"provider_option": "kept"});
+        request
+            .extra
+            .as_object_mut()
+            .unwrap()
+            .insert(MAX_INPUT_TOKENS_PARAM.to_string(), serde_json::json!(1_000));
+        guard_context_window(provider.as_ref(), &mut request, None)
+            .await
+            .expect("the empty assembled input fits");
+        assert_eq!(
+            request.extra,
+            serde_json::json!({"provider_option": "kept"})
+        );
+
+        let mut request = test_request();
+        request.extra = serde_json::Map::from_iter([(
+            MAX_INPUT_TOKENS_PARAM.to_string(),
+            serde_json::json!(1),
+        )])
+        .into();
+        let error = guard_context_window(provider.as_ref(), &mut request, None)
+            .await
+            .expect_err("the framing allowance alone exceeds a one-token budget");
+        assert!(error.to_string().contains("input budget exceeded"));
+        assert_eq!(request.extra, serde_json::Value::Object(Default::default()));
+    }
+
+    #[tokio::test]
+    async fn invalid_input_budget_fails_closed_and_is_consumed() {
+        let provider = Arc::new(Counter::new(1, 0));
+        for value in [
+            serde_json::json!(0),
+            serde_json::json!(1.5),
+            serde_json::json!("1"),
+        ] {
+            let mut request = test_request();
+            request.extra = serde_json::Map::from_iter([(
+                MAX_INPUT_TOKENS_PARAM.to_string(),
+                value,
+            )])
+            .into();
+            let error = guard_context_window(provider.as_ref(), &mut request, None)
+                .await
+                .expect_err("invalid budget must refuse before dispatch");
+            assert!(error
+                .to_string()
+                .contains("leviath_max_input_tokens must be a positive integer"));
+            assert_eq!(request.extra, serde_json::Value::Object(Default::default()));
+        }
     }
 
     /// What the guard hands back when it did measure: the provider's count, so
@@ -948,7 +1088,8 @@ mod tests {
     #[tokio::test]
     async fn a_measured_request_reports_its_count() {
         let provider = Arc::new(Counter::new(800, 1000));
-        let verdict = guard_context_window(provider.as_ref(), &sized_request(1_600), None)
+        let mut request = sized_request(1_600);
+        let verdict = guard_context_window(provider.as_ref(), &mut request, None)
             .await
             .expect("fits");
         assert_eq!(verdict, Some(800));

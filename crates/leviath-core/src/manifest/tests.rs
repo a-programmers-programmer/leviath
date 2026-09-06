@@ -2383,6 +2383,7 @@ mode = "autonomous"
             max_workers: 7,
             on_worker_failure: crate::blueprint::WorkerFailurePolicy::FailAll,
             split_prompt: "split the work".to_string(),
+            items_region: None,
             results_region: None,
             max_items: None,
             max_attempts: None,
@@ -2415,6 +2416,7 @@ split_prompt = "go"
             max_workers: crate::blueprint::DEFAULT_MAX_WORKERS,
             on_worker_failure: crate::blueprint::WorkerFailurePolicy::Continue,
             split_prompt: "go".to_string(),
+            items_region: None,
             results_region: None,
             max_items: None,
             max_attempts: None,
@@ -2438,6 +2440,7 @@ name = "fanout-region"
 mode = "fan_out"
 worker_agent = "w"
 split_prompt = "go"
+items_region = "work_items"
 results_region = "worker_rows"
 max_items = 12
 "#;
@@ -2452,6 +2455,7 @@ max_items = 12
             max_workers: crate::blueprint::DEFAULT_MAX_WORKERS,
             on_worker_failure: crate::blueprint::WorkerFailurePolicy::Continue,
             split_prompt: "go".to_string(),
+            items_region: Some("work_items".to_string()),
             results_region: Some("worker_rows".to_string()),
             max_items: Some(12),
             max_attempts: None,
@@ -2487,6 +2491,7 @@ max_workers = 0
             max_workers: 0,
             on_worker_failure: crate::blueprint::WorkerFailurePolicy::Continue,
             split_prompt: "go".to_string(),
+            items_region: None,
             results_region: None,
             max_items: None,
             max_attempts: None,

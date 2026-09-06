@@ -456,6 +456,10 @@ impl PipelineWorld {
                 // `before_inference` runs with the window assembled and before
                 // the request is built from it.
                 (
+                    // Hold authoritative fan-out stages out of inference while
+                    // their entry hooks run; the matching starter below consumes
+                    // the region after the hook and current tool resolution.
+                    crate::fanout::prepare_authoritative_fanouts,
                     run_before_inference_hooks,
                     crate::pipeline::rotate_open_circuits,
                     dispatch_inference,
@@ -549,7 +553,13 @@ impl PipelineWorld {
                     crate::fanout::frame_split_round,
                 )
                     .chain(),
-                sync_tool_stages,
+                (
+                    sync_tool_stages,
+                    // Start region-backed fan-outs after entry hooks and dynamic
+                    // tool resolution, before the next tick can queue inference.
+                    crate::fanout::start_authoritative_fanouts,
+                )
+                    .chain(),
                 // Store any finished run title, then start newly-marked ones.
                 // Collect precedes persistence so a landed title is written on
                 // this same tick.

@@ -291,6 +291,10 @@
         "transition_prompt": {
           "type": "string"
         },
+        "transition_region": {
+          "type": "string",
+          "description": "Authoritative context region containing one plain destination stage name. The runtime accepts only an eligible always edge to that exact stage; missing, malformed, exhausted, or non-edge destinations fail closed without routing inference."
+        },
         "available_tools": {
           "type": "array",
           "description": "The only tools the model is offered here. Anything absent is refused at dispatch.",
@@ -485,6 +489,10 @@
         "split_prompt": {
           "type": "string"
         },
+        "items_region": {
+          "type": "string",
+          "description": "Authoritative context region containing one strict JSON array of {id, context} work items. When set, the fan_out call must use an empty items array and cannot override the worker or concurrency settings. Invalid, duplicate, missing, or over-cap items fail closed."
+        },
         "results_region": {
           "type": "string",
           "description": "Context region the consolidated worker report is written to. Defaults to conversation, which is also carrying the message history. Worth naming when the results are bulky: the region's budget is what each worker's share is divided from."
@@ -539,7 +547,7 @@
         },
         "parameters": {
           "type": "object",
-          "description": "Passed to the provider verbatim, so the accepted keys are the provider's. The one key Leviath reads itself is max_output_tokens: a token count, a percentage of the model's context window (\"40%\"), or a percentage of a region's budget (\"100% of claims\").",
+          "description": "Provider parameters, with two runtime controls: max_output_tokens accepts a token count, a window percentage (\"40%\"), or a region percentage (\"100% of claims\"); leviath_max_input_tokens is a positive integer conservative input ceiling checked against serialized system/messages/tools bytes plus framing before dispatch, then removed before the provider call. It is deliberately stricter than an estimated token count.",
           "additionalProperties": true
         }
       }

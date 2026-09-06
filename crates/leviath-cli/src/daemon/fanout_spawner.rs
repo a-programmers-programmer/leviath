@@ -262,6 +262,7 @@ mod tests {
             worker_query: query.map(String::from),
             max_workers: 4,
             split_prompt: "split".to_string(),
+            items_region: None,
             ..fixtures::fanout_config()
         }
     }

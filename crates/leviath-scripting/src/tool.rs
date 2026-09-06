@@ -11,7 +11,8 @@
 //! them (`http_get`, `http_post`, `shell`, `read_file`, `env_var`) do I/O and go
 //! through a [`ScriptHost`] trait object so the host can enforce permissions and
 //! tests can inject a fake; the other three (`parse_json`, `to_json`,
-//! `encode_uri`) are pure and defined here.
+//! `encode_uri`) are pure; the JSON helpers are shared with the other
+//! sandboxed script engines through [`crate::functions`].
 //!
 //! Errors never bubble as a `Result` to the agent - [`execute`] always returns a
 //! `String`, using the `[error] …` prefix convention the rest of the tool layer
@@ -581,14 +582,13 @@ fn headers_from_map(map: &Map) -> BTreeMap<String, String> {
         .collect()
 }
 
-/// Register the eight host functions. Five delegate to [`ScriptHost`]; three
-/// (`parse_json`, `to_json`, `encode_uri`) are pure.
+/// Register the host and utility functions that are specific to script tools.
+/// The pure JSON helpers are registered by [`crate::functions::register_functions`]
+/// and are shared with stage and region hooks.
 ///
-/// **Every** registration goes through [`guard_str`] / [`guard_dyn`], so a panic
-/// anywhere in a native function becomes an ordinary Rhai runtime error instead
-/// of unwinding into Rhai and aborting the process. The pure
-/// helpers are guarded too - they run on untrusted, model- and network-supplied
-/// input, so "this one can't panic" is not a property worth betting the daemon on.
+/// **Every** tool-specific registration goes through [`guard_str`] /
+/// [`guard_dyn`], so a panic anywhere in a native function becomes an ordinary
+/// Rhai runtime error instead of unwinding into Rhai and aborting the process.
 fn register_host_functions(engine: &mut Engine, host: Arc<dyn ScriptHost>) {
     // http_get(url) / http_get(url, headers)
     let h = host.clone();
@@ -642,24 +642,20 @@ fn register_host_functions(engine: &mut Engine, host: Arc<dyn ScriptHost>) {
         guard_str("env_var", &mut || to_rhai(h.env_var(name)))
     });
 
-    // Pure helpers. Their bodies live in named free functions (not inline
-    // closures) so they get a single, cleanly-attributed monomorphization under
-    // coverage instrumentation instead of being inlined into rhai's generic
-    // `register_fn` wrapper (a known attribution artifact).
+    // Keep the tool engine's native boundary around the shared pure helpers.
+    // The shared registrations make these available to every sandbox; these
+    // wrappers preserve the tool engine's panic-to-error guarantee.
     engine.register_fn("parse_json", |s: &str| -> HostRes<Dynamic> {
         guard_dyn("parse_json", &mut || parse_json_fn(s))
     });
     engine.register_fn("to_json", |v: Dynamic| -> HostRes<String> {
         guard_str("to_json", &mut || to_json_fn(&v))
     });
-    // An object map needs its own registration to shadow Rhai's `map_basic`
-    // `to_json(&mut Map)`, whose more specific signature would otherwise win.
-    // Rhai's formatter writes strings with Rust's `Debug`, so a non-printable
-    // character comes out as `\u{202f}` and the result is no longer JSON.
     engine.register_fn("to_json", |map: Map| -> HostRes<String> {
         let value = Dynamic::from_map(map);
         guard_str("to_json", &mut || to_json_fn(&value))
     });
+
     engine.register_fn("encode_uri", |s: &str| -> HostRes<String> {
         guard_str("encode_uri", &mut || Ok(percent_encode(s)))
     });
@@ -674,23 +670,14 @@ fn register_host_functions(engine: &mut Engine, host: Arc<dyn ScriptHost>) {
     });
 }
 
-/// `parse_json(str)` host function: JSON string → Rhai value.
+/// Compatibility wrapper for the shared `parse_json(str)` helper.
 fn parse_json_fn(s: &str) -> HostRes<Dynamic> {
-    let value: serde_json::Value = serde_json::from_str(s).map_err(|e| {
-        Box::new(EvalAltResult::ErrorRuntime(
-            format!("parse_json: {e}").into(),
-            Position::NONE,
-        ))
-    })?;
-    rhai::serde::to_dynamic(value)
+    crate::functions::parse_json(s)
 }
 
-/// `to_json(value)` host function: Rhai value → JSON string. `from_dynamic`
-/// fails for values with no JSON representation (e.g. a function pointer);
-/// `Value::to_string` (Display) is then infallible.
+/// Compatibility wrapper for the shared `to_json(value)` helper.
 fn to_json_fn(v: &Dynamic) -> HostRes<String> {
-    let json: serde_json::Value = rhai::serde::from_dynamic(v)?;
-    Ok(json.to_string())
+    crate::functions::to_json(v)
 }
 
 /// Standard base64, with padding.
