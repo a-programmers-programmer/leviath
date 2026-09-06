@@ -15,11 +15,12 @@ full of items one through eight.
 A **sub-agent** is a child agent started by another one. Give each item its own sub-agent and they
 run at the same time, each with a clean context, and the parent gets the results back.
 
-Six bundled agents work this way: `data-analyst` gathers one slice of a subject per worker,
+Seven bundled agents work this way: `data-analyst` gathers one slice of a subject per worker,
 `reviewer` takes a file or hunk group each, `log-analyzer` a log file or time window,
-`orchestrator` hands each work item to a whole `coder` run, and `deep-researcher` and
-`wide-researcher` hand each sub-question to a whole `researcher` run. See the
-[agent catalog](/docs/agent-catalog) for all six.
+`orchestrator` hands each work item to a whole `coder` run, `deep-researcher` and
+`wide-researcher` hand each sub-question to a whole `researcher` run, and `oracle`
+executes bounded reader, coder, and verifier workers. See the
+[agent catalog](/docs/agent-catalog) for all seven.
 
 Sub-agents cost very little here. They are more entities in the same [world](/docs/engine), so there
 are no extra processes to start and nothing has to be serialized between a parent and its children.

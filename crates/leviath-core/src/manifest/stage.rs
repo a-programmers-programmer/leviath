@@ -21,6 +21,7 @@ pub(super) const STAGE_KEYS: &[&str] = &[
     "description",
     "hooks",
     "interaction_points",
+    "items_region",
     "max_attempts",
     "max_items",
     "max_iterations",
@@ -44,6 +45,7 @@ pub(super) const STAGE_KEYS: &[&str] = &[
     "tool_permissions",
     "tool_routing",
     "transition_prompt",
+    "transition_region",
     "transitions",
     "worker_agent",
     "worker_query",
@@ -260,6 +262,13 @@ pub(super) fn parse_stage(stage_name: &str, stage_value: &toml::Value) -> Result
     let mut stage = Stage::new(stage_name.to_string(), model_config);
 
     stage = apply_stage_mode(stage, stage_name, stage_value)?;
+    if stage_value.get("items_region").is_some()
+        && !matches!(stage.mode, StageMode::FanOut { .. })
+    {
+        return Err(Error::Other(format!(
+            "stage '{stage_name}': items_region is only valid with mode = \"fan_out\""
+        )));
+    }
 
     let where_ = format!("stage '{stage_name}'");
     if let Some(max_iter) = count_of(stage_value, &where_, "max_iterations")? {
@@ -304,6 +313,21 @@ pub(super) fn parse_stage(stage_name: &str, stage_value: &toml::Value) -> Result
             "system_prompt".to_string(),
             serde_json::Value::String(sp.trim().to_string()),
         );
+    }
+
+    if let Some(value) = stage_value.get("transition_region") {
+        let name = value.as_str().ok_or_else(|| {
+            Error::Other(format!(
+                "stage '{stage_name}': transition_region must be a region name"
+            ))
+        })?;
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(Error::Other(format!(
+                "stage '{stage_name}': transition_region cannot be empty"
+            )));
+        }
+        stage.transition_region = Some(name.to_string());
     }
 
     // Warn on a common authoring mistake: a `system_prompt` written
@@ -745,6 +769,23 @@ pub(super) fn apply_stage_mode(
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string())
             };
+            let items_region = match stage_value.get("items_region") {
+                None => None,
+                Some(value) => {
+                    let name = value.as_str().ok_or_else(|| {
+                        Error::Other(format!(
+                            "stage '{stage_name}': items_region must be a region name"
+                        ))
+                    })?;
+                    let name = name.trim();
+                    if name.is_empty() {
+                        return Err(Error::Other(format!(
+                            "stage '{stage_name}': items_region cannot be empty"
+                        )));
+                    }
+                    Some(name.to_string())
+                }
+            };
             let on_worker_failure = match str_of(stage_value, "on_worker_failure") {
                 Some("fail_all") => crate::blueprint::WorkerFailurePolicy::FailAll,
                 Some("continue") | None => crate::blueprint::WorkerFailurePolicy::Continue,
@@ -768,6 +809,7 @@ pub(super) fn apply_stage_mode(
                     .unwrap_or(crate::blueprint::DEFAULT_MAX_WORKERS),
                 on_worker_failure,
                 split_prompt: str_field("split_prompt").unwrap_or_default(),
+                items_region,
                 results_region: str_field("results_region"),
                 max_items: fan_out_number(stage_value, stage_name, "max_items", "unlimited")?
                     .filter(|n| *n > 0),

@@ -38,7 +38,7 @@ mod worker_sources;
 use report::*;
 use worker_sources::merge_worker_sources;
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
 use bevy_ecs::prelude::*;
@@ -240,6 +240,13 @@ pub fn restore_fan_out_waiting(
 #[derive(Component, Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct FannedOut;
 
+/// A deterministic fan-out stage waiting for its entry hooks to finish before
+/// the authoritative item region is consumed. This marker is installed before
+/// normal inference dispatch so a region-backed split never spends a model
+/// turn on the old splitter prompt.
+#[derive(Component, Debug, Clone, Copy, Default)]
+pub(crate) struct AuthoritativeFanOutPending;
+
 /// The ids a fan-out stage's last split handed out, so a later split of the same
 /// stage can be told what has already been researched.
 ///
@@ -301,6 +308,123 @@ pub(crate) fn frame_split_round(
             &mut window,
             &split_round_framing(round, previous.map_or(&[], |p| p.0.as_slice())),
         );
+    }
+}
+
+/// Hold a region-backed fan-out stage out of ordinary inference dispatch.
+///
+/// This runs before `run_before_inference_hooks`/`dispatch_inference`. The
+/// second half, [`start_authoritative_fanouts`], runs after stage-entry hooks
+/// and current tool resolution, so hooks can prepare the region while the
+/// model still receives no splitter request.
+pub(crate) fn prepare_authoritative_fanouts(
+    mut agents: Query<
+        (Entity, &'static AgentBlueprint, &'static StageCursor),
+        With<crate::pipeline::ReadyToInfer>,
+    >,
+    mut commands: Commands,
+) {
+    crate::tick_scope::clear();
+    for (entity, blueprint, cursor) in agents.iter_mut() {
+        let Some(stage) = blueprint.0.stages.get(cursor.index) else {
+            continue;
+        };
+        let deterministic = matches!(
+            &stage.mode,
+            StageMode::FanOut { config } if config.items_region.is_some()
+        );
+        if !deterministic {
+            continue;
+        }
+        crate::tick_scope::enter(entity);
+        commands
+            .entity(entity)
+            .remove::<crate::pipeline::ReadyToInfer>()
+            .insert(AuthoritativeFanOutPending);
+    }
+}
+
+/// Consume deterministic fan-out inputs after stage-entry hooks and current
+/// tool resolution have run. This validates the authoritative region, then
+/// enters the ordinary tool-dispatch path so stage grants, taint checks, and
+/// consent still apply before workers are launched.
+pub(crate) fn start_authoritative_fanouts(world: &mut World) {
+    crate::tick_scope::clear();
+    let candidates: Vec<Entity> = {
+        let mut query = world.query_filtered::<
+            (
+                Entity,
+                &AgentBlueprint,
+                &StageCursor,
+                &AgentState,
+                &ContextWindow,
+            ),
+            With<AuthoritativeFanOutPending>,
+        >();
+        query
+            .iter(world)
+            .filter_map(|(entity, _, _, state, _)| {
+                matches!(state.status, AgentStatus::Active).then_some(entity)
+            })
+            .collect()
+    };
+    for entity in candidates {
+        crate::tick_scope::enter(entity);
+        let Some((_config, items_result)) = (|| {
+            let blueprint = world.get::<AgentBlueprint>(entity)?;
+            let cursor = world.get::<StageCursor>(entity)?;
+            let stage = blueprint.0.stages.get(cursor.index)?;
+            let StageMode::FanOut { config } = &stage.mode else {
+                return None;
+            };
+            let window = world.get::<ContextWindow>(entity)?;
+            let region = config.items_region.as_deref()?;
+            let items = authoritative_items(window, region, config.max_items);
+            Some((config.clone(), items))
+        })() else {
+            world.entity_mut(entity).remove::<AuthoritativeFanOutPending>();
+            continue;
+        };
+        world
+            .entity_mut(entity)
+            .remove::<AuthoritativeFanOutPending>()
+            .remove::<crate::pipeline::ReadyToInfer>()
+            .remove::<crate::pipeline::ProcessResponse>();
+        match items_result {
+            Ok(_) => {}
+            Err(message) => {
+                crate::pipeline::fail_stage_world(world, entity, message);
+                continue;
+            }
+        }
+        // Feed the normal tool-dispatch path. In particular, do not call
+        // `begin_fan_out` here: available tools are only an advertisement,
+        // while the dispatcher owns stage grants, taint checks, and consent.
+        // The authoritative items have already been validated; the empty
+        // request tells `start_pending_fan_outs` to read them again from the
+        // approved region without allowing a model-shaped override.
+        world.entity_mut(entity).insert((
+            InferenceResult {
+                response: String::new(),
+                tool_calls: vec![crate::components::ToolCall {
+                    tool_id: format!(
+                        "authoritative-fan-out-{}-{}",
+                        entity.to_bits(),
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_nanos()
+                    ),
+                    name: leviath_core::blueprint::FAN_OUT_TOOL.to_string(),
+                    arguments: serde_json::json!({ "items": [] }),
+                    thought_signature: None,
+                }],
+                tokens_used: 0,
+                cut_off_at: None,
+                reasoning: None,
+            },
+            crate::pipeline::ReadyForTools,
+        ));
     }
 }
 
@@ -407,6 +531,80 @@ pub(crate) fn parse_fan_out_call(arguments: &serde_json::Value) -> Result<FanOut
     })
 }
 
+/// Read a fan-out split supplied by an authoritative context region.
+///
+/// This path deliberately does not reuse [`parse_fan_out_call`]. The model's
+/// tool arguments are an untrusted trigger; the region is the run's canonical
+/// work inventory. Exactly one region entry must contain one JSON array, each
+/// item must contain exactly `id` and `context`, and all ids must be unique.
+/// Any ambiguity is an error instead of a best-effort split or a truncation.
+fn authoritative_items(
+    window: &ContextWindow,
+    region_name: &str,
+    max_items: Option<usize>,
+) -> Result<Vec<WorkItem>, String> {
+    let region = window
+        .get_region(region_name)
+        .ok_or_else(|| format!("fan_out items_region '{region_name}' does not exist"))?;
+    if region.content.len() != 1 {
+        return Err(format!(
+            "fan_out items_region '{region_name}' must contain exactly one JSON array entry"
+        ));
+    }
+    let value: serde_json::Value = serde_json::from_str(&region.content[0].content)
+        .map_err(|e| format!("fan_out items_region '{region_name}' is not valid JSON: {e}"))?;
+    let array = value.as_array().ok_or_else(|| {
+        format!("fan_out items_region '{region_name}' must contain a JSON array")
+    })?;
+    if let Some(cap) = max_items.filter(|cap| array.len() > *cap) {
+        return Err(format!(
+            "fan_out items_region '{region_name}' contains {} items, over max_items {cap}",
+            array.len()
+        ));
+    }
+
+    let mut ids = HashSet::with_capacity(array.len());
+    let mut items = Vec::with_capacity(array.len());
+    for (index, value) in array.iter().enumerate() {
+        let object = value.as_object().ok_or_else(|| {
+            format!(
+                "fan_out items_region '{region_name}' item {index} must be an object"
+            )
+        })?;
+        if object.len() != 2 || !object.contains_key("id") || !object.contains_key("context") {
+            return Err(format!(
+                "fan_out items_region '{region_name}' item {index} must contain exactly id and context"
+            ));
+        }
+        let id = object
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "fan_out items_region '{region_name}' item {index} id must be a non-empty string"
+                )
+            })?;
+        if id.is_empty() || id.trim() != id {
+            return Err(format!(
+                "fan_out items_region '{region_name}' item {index} id must be a non-empty string without surrounding whitespace"
+            ));
+        }
+        if !ids.insert(id.to_string()) {
+            return Err(format!(
+                "fan_out items_region '{region_name}' contains duplicate id '{id}'"
+            ));
+        }
+        items.push(WorkItem {
+            id: id.to_string(),
+            context: object
+                .get("context")
+                .expect("validated above")
+                .clone(),
+        });
+    }
+    Ok(items)
+}
+
 /// How many agents one run may create, sub-agents included, or `0` for no limit.
 ///
 /// Read at every fan-out spawn. A run at its ceiling stops widening and finishes
@@ -477,19 +675,23 @@ pub(crate) fn config_for(request: &FanOutRequest, stage: Option<&FanOutConfig>) 
         max_workers: leviath_core::blueprint::DEFAULT_MAX_WORKERS,
         on_worker_failure: WorkerFailurePolicy::Continue,
         split_prompt: String::new(),
+        items_region: None,
         results_region: None,
         max_items: None,
         max_attempts: None,
     });
-    // A named agent wins over the blueprint's worker: an ordinary stage has no
-    // worker to inherit, and a fan-out stage that names one in the call meant it.
-    if let Some(agent) = &request.agent {
-        config.worker_agent = Some(agent.clone());
-        config.worker_stage = None;
-        config.worker_query = None;
-    }
-    if let Some(max_workers) = request.max_workers {
-        config.max_workers = max_workers;
+    // An authoritative items region makes the complete fan-out configuration
+    // blueprint-owned. Model arguments remain a trigger only and cannot swap
+    // the worker or concurrency cap beneath the region's inventory.
+    if config.items_region.is_none() {
+        if let Some(agent) = &request.agent {
+            config.worker_agent = Some(agent.clone());
+            config.worker_stage = None;
+            config.worker_query = None;
+        }
+        if let Some(max_workers) = request.max_workers {
+            config.max_workers = max_workers;
+        }
     }
     config
 }
@@ -559,6 +761,41 @@ pub(crate) fn start_pending_fan_outs(world: &mut World) {
             true => FanOutOrigin::Stage,
             false => FanOutOrigin::Tool { call_id },
         };
+        if let Some(stage_config) = stage_config.as_ref()
+            && let Some(region_name) = stage_config.items_region.as_deref()
+        {
+            // The model may request the deterministic split with `items = []`,
+            // but it cannot smuggle in a second inventory or replace the
+            // blueprint-owned worker/cap settings through tool arguments.
+            if !request.items.is_empty()
+                || request.agent.is_some()
+                || request.max_workers.is_some()
+            {
+                crate::pipeline::fail_stage_world(
+                    world,
+                    entity,
+                    "fan_out authoritative items_region forbids item, agent, and max_workers overrides"
+                        .to_string(),
+                );
+                continue;
+            }
+            let items = match authoritative_items(
+                world
+                    .get::<ContextWindow>(entity)
+                    .expect("fan-out parent has a context window"),
+                region_name,
+                stage_config.max_items,
+            ) {
+                Ok(items) => items,
+                Err(message) => {
+                    crate::pipeline::fail_stage_world(world, entity, message);
+                    continue;
+                }
+            };
+            let config = config_for(&request, Some(stage_config));
+            begin_fan_out(world, entity, config, items, origin);
+            continue;
+        }
         let mut config = config_for(&request, stage_config.as_ref());
         // A call through the tool comes from an ordinary stage, so it carries no
         // `max_items` and creates as many workers as the model named. Where the
@@ -1054,7 +1291,7 @@ mod tests {
     use crate::components::{InferenceConfig, ToolResultRoutingComponent};
     use crate::pipeline::{
         ProcessResponse, ReadyToInfer, StageInference, StageInferences, StageProgress, StageSetup,
-        StageSetups, VisitCounts,
+        StageSetups, ToolProgress, ToolService, VisitCounts,
     };
     use leviath_core::blueprint::{ModelConfig, Stage};
     use leviath_core::layout::{ContextLayout, RegionDefinition};
@@ -1065,6 +1302,19 @@ mod tests {
     /// in `fail`.
     struct TestSpawner {
         fail: HashSet<String>,
+    }
+
+    struct NoopToolService;
+
+    impl ToolService for NoopToolService {
+        fn exec_for(
+            &self,
+            _entity: Entity,
+            _calls: Vec<leviath_providers::ToolCall>,
+            _progress: ToolProgress,
+        ) -> crate::tool_bridge::BoxedToolExec {
+            Box::new(|| Box::pin(async { Vec::new() }))
+        }
     }
 
     impl TestSpawner {
@@ -1139,6 +1389,7 @@ mod tests {
             max_workers,
             on_worker_failure: policy,
             split_prompt: "split".to_string(),
+            items_region: None,
             results_region: None,
             max_items: None,
             max_attempts: None,
@@ -1502,6 +1753,76 @@ mod tests {
         assert_eq!(request.max_workers, None);
     }
 
+    #[test]
+    fn authoritative_items_are_strict_and_preserve_order() {
+        let mut window = window();
+        let mut items = Region::new("items".to_string(), RegionKind::Pinned, 10_000);
+        items
+            .add_entry(
+                r#"[{"id":"b","context":{"n":2}},{"id":"a","context":null}]"#
+                    .to_string(),
+                20,
+            )
+            .expect("fits");
+        window.add_region(items);
+
+        let parsed = authoritative_items(&window, "items", Some(2)).expect("strict array");
+        assert_eq!(
+            parsed
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b", "a"]
+        );
+        assert_eq!(parsed[0].context["n"], 2);
+    }
+
+    #[test]
+    fn authoritative_items_reject_duplicates_and_overrides() {
+        let mut window = window();
+        let mut items = Region::new("items".to_string(), RegionKind::Pinned, 10_000);
+        items
+            .add_entry(
+                r#"[{"id":"same","context":1},{"id":"same","context":2}]"#
+                    .to_string(),
+                20,
+            )
+            .expect("fits");
+        window.add_region(items);
+        let error = authoritative_items(&window, "items", Some(2)).unwrap_err();
+        assert!(error.contains("duplicate id"), "{error}");
+    }
+
+    #[test]
+    fn authoritative_items_reject_unknown_fields_and_over_cap() {
+        let mut window = window();
+        let mut items = Region::new("items".to_string(), RegionKind::Pinned, 10_000);
+        items
+            .add_entry(
+                r#"[{"id":"a","context":{},"extra":true}]"#.to_string(),
+                20,
+            )
+            .expect("fits");
+        window.add_region(items);
+        let error = authoritative_items(&window, "items", Some(1)).unwrap_err();
+        assert!(error.contains("exactly id and context"), "{error}");
+    }
+
+    #[test]
+    fn authoritative_items_reject_surrounding_id_whitespace() {
+        let mut window = window();
+        let mut items = Region::new("items".to_string(), RegionKind::Pinned, 10_000);
+        items
+            .add_entry(
+                r#"[{"id":" a ","context":{}}]"#.to_string(),
+                20,
+            )
+            .expect("fits");
+        window.add_region(items);
+        let error = authoritative_items(&window, "items", Some(1)).unwrap_err();
+        assert!(error.contains("surrounding whitespace"), "{error}");
+    }
+
     /// A blank agent is the same as none: a fan-out stage names its worker in
     /// the blueprint, and an empty string would otherwise override it with
     /// nothing.
@@ -1630,6 +1951,105 @@ mod tests {
             world.get::<PreviousWorkItems>(e),
             Some(&PreviousWorkItems(vec!["a".to_string(), "b".to_string()]))
         );
+    }
+
+    #[test]
+    fn authoritative_fanout_starts_without_provider_inference() {
+        let mut world = World::new();
+        let mut config = cfg(None, 2, WorkerFailurePolicy::Continue);
+        config.items_region = Some("items".to_string());
+        let mut blueprint = fanout_blueprint(config);
+        blueprint.stages[0]
+            .available_tools
+            .push(leviath_core::blueprint::FAN_OUT_TOOL.to_string());
+        let entity = spawn_parent(&mut world, blueprint, "");
+        world
+            .get_mut::<ContextWindow>(entity)
+            .expect("parent window")
+            .add_region(Region::new(
+                "items".to_string(),
+                RegionKind::Pinned,
+                10_000,
+            ));
+        world
+            .get_mut::<ContextWindow>(entity)
+            .expect("parent window")
+            .get_region_mut("items")
+            .expect("items region")
+            .add_entry(
+                r#"[{"id":"a","context":{"task":"read"}}]"#.to_string(),
+                20,
+            )
+            .expect("items fit");
+        world.entity_mut(entity).remove::<ProcessResponse>().insert((
+            AuthoritativeFanOutPending,
+            crate::pipeline::StageInference {
+                provider_name: "script".to_string(),
+                model: "m".to_string(),
+                tools: vec![leviath_providers::Tool {
+                    name: leviath_core::blueprint::FAN_OUT_TOOL.to_string(),
+                    description: String::new(),
+                    parameters: serde_json::json!({}),
+                }],
+                tool_filter: None,
+                fallbacks: Vec::new(),
+                output: None,
+            },
+        ));
+
+        start_authoritative_fanouts(&mut world);
+
+        assert!(world.get::<ReadyToInfer>(entity).is_none());
+        assert!(world.get::<AuthoritativeFanOutPending>(entity).is_none());
+        assert!(world.get::<FanOutWaiting>(entity).is_none());
+        assert!(matches!(status_of(&world, entity), AgentStatus::Active));
+        assert!(world.get::<ProcessResponse>(entity).is_none());
+        assert!(world.get::<crate::pipeline::ReadyForTools>(entity).is_some());
+        let result = world
+            .get::<InferenceResult>(entity)
+            .expect("synthetic tool result");
+        assert_eq!(result.response, "");
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].name, leviath_core::blueprint::FAN_OUT_TOOL);
+        assert_eq!(result.tool_calls[0].arguments, serde_json::json!({"items": []}));
+
+        // The synthetic call still has to pass the ordinary taint/consent
+        // gate. A denied call must not park the parent or launch workers.
+        world
+            .get_mut::<ContextWindow>(entity)
+            .expect("parent window")
+            .enable_taint_tracking();
+        world
+            .get_mut::<ContextWindow>(entity)
+            .expect("parent window")
+            .typed_write(
+                crate::components::WriteOrigin::System,
+                "conversation",
+                leviath_core::EntryKind::UserMessage,
+                "secret".to_string(),
+                5,
+                Some(leviath_core::TaintLevel::Internal),
+            )
+            .expect("tainted context write");
+        let (jobs, _jobs_rx) = tokio::sync::mpsc::unbounded_channel();
+        world.insert_resource(crate::pipeline::ToolServiceRes(Arc::new(NoopToolService)));
+        world.insert_resource(crate::pipeline::ToolStage::detached(jobs));
+        world.entity_mut(entity).insert(crate::taint::TaintGate::new(
+            leviath_core::SecurityConfig {
+                taint_tracking: true,
+            },
+        ));
+        let mut schedule = Schedule::default();
+        schedule.add_systems(crate::pipeline::dispatch_tools);
+        schedule.run(&mut world);
+        assert!(world.get::<FanOutWaiting>(entity).is_none());
+        assert!(world.get::<crate::pipeline::ReadyToInfer>(entity).is_some());
+        let expected_call_id = format!("authoritative-fan-out-{}", entity.to_bits());
+        assert!(world
+            .get::<crate::pipeline::ContextToolResults>(entity)
+            .is_some_and(|results| results.0.iter().any(|(id, text)| {
+                id == &expected_call_id && text.starts_with("[blocked]")
+            })));
     }
 
     /// `max_items` is a ceiling on the work, not just on concurrency.

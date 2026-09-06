@@ -87,6 +87,7 @@ pub(crate) async fn run_title_job(
         request,
         permit,
     } = job;
+    let mut request = request;
 
     // Mirrors `run_inference_job`'s loop, down to sharing `backoff_after`: a
     // capacity refusal gets the slow schedule or the provider's own
@@ -98,7 +99,8 @@ pub(crate) async fn run_title_job(
         // A title request is a few hundred tokens and almost never reaches the
         // counting line, but "almost" is not a property a lane gets to rely on:
         // the model is whatever `[title]` names, and its window is its own.
-        crate::inference_bridge::guard_context_window(provider.as_ref(), &request, None).await?;
+        crate::inference_bridge::guard_context_window(provider.as_ref(), &mut request, None)
+            .await?;
         let mut attempt = 1u32;
         let mut spent = std::time::Duration::ZERO;
         loop {

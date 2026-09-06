@@ -499,32 +499,6 @@ pub(crate) fn dispatch_tools(
                 context_results.push((c.tool_id.clone(), text));
                 continue;
             }
-            // Read inline, started after the loop. Like `submit_output` it needs
-            // world access the async lane does not have - it parks this agent on
-            // its workers - and like the context tools it is applied here rather
-            // than dispatched.
-            if crate::fanout::is_fan_out_tool(&c.name) {
-                let text = match crate::fanout::parse_fan_out_call(&c.arguments) {
-                    // One per batch. A second would need a second parked state
-                    // on one agent, and there is no work it could do that adding
-                    // its items to the first call would not: the engine paces
-                    // the concurrency either way.
-                    Ok(_) if fan_out.is_some() => Some(format!(
-                        "[error] only one {} call per turn - put all the work in \
-                         one call, the concurrency is paced for you",
-                        leviath_core::blueprint::FAN_OUT_TOOL
-                    )),
-                    Ok(request) => {
-                        fan_out = Some((c.tool_id.clone(), request));
-                        None
-                    }
-                    Err(e) => Some(format!("[error] {e}")),
-                };
-                if let Some(text) = text {
-                    context_results.push((c.tool_id.clone(), text));
-                }
-                continue;
-            }
             // A call the user already resolved in a prior prompt round. An
             // approved one skips the gate and lands where it would have
             // landed the first time: the lane, or the inline submission below.
@@ -581,6 +555,31 @@ pub(crate) fn dispatch_tools(
                         continue;
                     }
                 }
+            }
+            // Read inline, after the same offer/schema/taint/consent gates as
+            // every other tool. Starting workers before this point would let a
+            // fan-out call bypass a user's denial or a stage's taint policy.
+            if crate::fanout::is_fan_out_tool(&c.name) {
+                let text = match crate::fanout::parse_fan_out_call(&c.arguments) {
+                    // One per batch. A second would need a second parked state
+                    // on one agent, and there is no work it could do that adding
+                    // its items to the first call would not: the engine paces
+                    // the concurrency either way.
+                    Ok(_) if fan_out.is_some() => Some(format!(
+                        "[error] only one {} call per turn - put all the work in \
+                         one call, the concurrency is paced for you",
+                        leviath_core::blueprint::FAN_OUT_TOOL
+                    )),
+                    Ok(request) => {
+                        fan_out = Some((c.tool_id.clone(), request));
+                        None
+                    }
+                    Err(e) => Some(format!("[error] {e}")),
+                };
+                if let Some(text) = text {
+                    context_results.push((c.tool_id.clone(), text));
+                }
+                continue;
             }
             // Applied inline for the same reason the context tools are: it
             // writes the live window and an ECS component, neither of which the

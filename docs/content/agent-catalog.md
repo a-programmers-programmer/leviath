@@ -8,7 +8,7 @@ order: 4
 
 # Agent catalog
 
-Leviath ships with eight pre-built agents. `lev setup` installs them into `~/.leviath/agents/`
+Leviath ships with nine pre-built agents. `lev setup` installs them into `~/.leviath/agents/`
 (scripting it? pass `--install-agents`), one directory per agent, each holding an `agent.leviath`
 [blueprint](/docs/agents). Run any of them by name:
 
@@ -32,7 +32,19 @@ these. `lev validate <agent>` prints every one of them.
 >
 > `coder` aside, every agent that has more than one thing to cover
 > [fans out](/docs/sub-agents): `data-analyst`, `deep-researcher`, `log-analyzer`, `orchestrator`,
-> `reviewer`, and `wide-researcher` all work on several at once instead of one after another.
+> `reviewer`, `wide-researcher`, and `oracle` all work on several at once instead of one after another.
+
+## oracle (experimental)
+
+Keeps a high-tier model in a tool-free decision stage while cheaper readers,
+coders, and independent verifiers perform bounded repository work. The runtime
+dispatches exact work orders and accepts only the Oracle's decision on a verified
+snapshot. Requires Git, Python 3, and a POSIX shell. See the
+[workflow and configuration](https://github.com/a-programmers-programmer/leviath/blob/main/docs/design/oracle-workflow.md).
+
+```sh
+lev run oracle --task "Add request validation to the users endpoint"
+```
 
 ## coder
 

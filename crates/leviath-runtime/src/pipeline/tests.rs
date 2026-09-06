@@ -2826,6 +2826,7 @@ fn dispatch_persistence_serializes_fan_out_waiting() {
                 max_workers: 1,
                 on_worker_failure: WorkerFailurePolicy::Continue,
                 split_prompt: "s".to_string(),
+                items_region: None,
                 results_region: None,
                 max_items: None,
                 max_attempts: None,
@@ -8219,6 +8220,7 @@ fn stage_setup_from_folds_fanout_split_prompt() {
             max_workers: 4,
             on_worker_failure: WorkerFailurePolicy::Continue,
             split_prompt: split.to_string(),
+            items_region: None,
             results_region: None,
             max_items: None,
             max_attempts: None,
@@ -9132,6 +9134,7 @@ fn enforce_max_iterations_leaves_a_fan_out_stage_alone() {
             max_workers: 4,
             on_worker_failure: leviath_core::blueprint::WorkerFailurePolicy::Continue,
             split_prompt: "split".to_string(),
+            items_region: None,
             results_region: None,
             max_items: None,
             max_attempts: None,
@@ -13788,6 +13791,7 @@ fn fanning_bp_with(max_attempts: Option<usize>) -> AgentBlueprint {
             max_workers: 4,
             on_worker_failure: leviath_core::blueprint::WorkerFailurePolicy::Continue,
             split_prompt: "split it".to_string(),
+            items_region: None,
             results_region: None,
             max_items: None,
             max_attempts,
@@ -14731,6 +14735,7 @@ fn spawn_after(world: &mut World, src: &str) -> Entity {
         .spawn((
             stage_hooked(|h, p| h.after_inference = Some(p)),
             agent_state(),
+            conv_window(),
             StageCursor { index: 0 },
             ProcessResponse,
             crate::components::InferenceResult {
@@ -14920,6 +14925,46 @@ fn after_inference_sees_the_response_and_its_token_count() {
 }
 
 #[test]
+fn after_inference_sees_joined_regions_and_truncation_metadata() {
+    let mut world = World::new();
+    let e = spawn_after(
+        &mut world,
+        r#"fn after_inference(ctx) {
+             if ctx.truncated {
+                 #{ action: "modify", value: ctx.regions.conversation + "/" + ctx.cut_off_at }
+             } else { false }
+           }"#,
+    );
+    world
+        .get_mut::<ContextWindow>(e)
+        .expect("window")
+        .get_region_mut("conversation")
+        .expect("conversation")
+        .add_entry("first".to_string(), 1)
+        .expect("fits");
+    world
+        .get_mut::<ContextWindow>(e)
+        .expect("window")
+        .get_region_mut("conversation")
+        .expect("conversation")
+        .add_entry("second".to_string(), 1)
+        .expect("fits");
+    world
+        .get_mut::<crate::components::InferenceResult>(e)
+        .expect("result")
+        .cut_off_at = Some(13);
+
+    run_after_hooks(&mut world);
+    assert_eq!(
+        world
+            .get::<crate::components::InferenceResult>(e)
+            .expect("result")
+            .response,
+        "first\nsecond/13"
+    );
+}
+
+#[test]
 fn after_inference_can_reject_the_response() {
     let mut world = World::new();
     let e = spawn_after(
@@ -15004,6 +15049,7 @@ fn after_inference_sees_tool_call_names_but_cannot_change_them() {
         .spawn((
             stage_hooked(|h, p| h.after_inference = Some(p)),
             agent_state(),
+            conv_window(),
             StageCursor { index: 0 },
             ProcessResponse,
             crate::components::InferenceResult {
@@ -15045,6 +15091,7 @@ fn after_inference_skips_an_out_of_range_stage() {
         .spawn((
             stage_hooked(|h, p| h.after_inference = Some(p)),
             agent_state(),
+            conv_window(),
             StageCursor { index: 99 },
             ProcessResponse,
             crate::components::InferenceResult {
@@ -15075,6 +15122,7 @@ fn after_inference_skips_a_stage_that_declared_none() {
         .spawn((
             AgentBlueprint(blueprint(vec![stage])),
             agent_state(),
+            conv_window(),
             StageCursor { index: 0 },
             ProcessResponse,
             crate::components::InferenceResult {
@@ -15114,6 +15162,26 @@ fn an_inference_hook_refusing_without_a_reason_still_says_what_it_refused() {
     assert!(msg.contains("no reason given"), "{msg}");
 }
 
+#[test]
+fn after_inference_refusal_removes_processing_markers() {
+    let mut world = World::new();
+    let e = spawn_after(
+        &mut world,
+        r#"fn after_inference(ctx) { #{ action: "cancel", reason: "bad response" } }"#,
+    );
+    world
+        .entity_mut(e)
+        .insert((ReadyForTools, ReadyForTransition, ResolveTransition));
+
+    run_after_hooks(&mut world);
+
+    assert!(status_message(&world, e).expect("errored").contains("bad response"));
+    assert!(world.get::<ProcessResponse>(e).is_none());
+    assert!(world.get::<ReadyForTools>(e).is_none());
+    assert!(world.get::<ReadyForTransition>(e).is_none());
+    assert!(world.get::<ResolveTransition>(e).is_none());
+}
+
 // ─── on_tool_call ────────────────────────────────────────────────────────────
 
 fn call(name: &str, args: serde_json::Value) -> crate::components::ToolCall {
@@ -15134,6 +15202,7 @@ fn spawn_tool_hooked(
         .spawn((
             stage_hooked(|h, p| h.on_tool_call = Some(p)),
             agent_state(),
+            conv_window(),
             StageCursor { index: 0 },
             ReadyForTools,
             crate::components::InferenceResult {
@@ -15181,6 +15250,30 @@ fn on_tool_call_sees_the_calls_and_their_arguments() {
     assert_eq!(got[0].arguments["command"], "ls");
 }
 
+#[test]
+fn on_tool_call_sees_joined_context_regions() {
+    let mut world = World::new();
+    let e = spawn_tool_hooked(
+        &mut world,
+        r#"fn on_tool_call(ctx) {
+             #{ action: "modify",
+                value: [#{ name: "seen", arguments: #{ text: ctx.regions.conversation } }] }
+           }"#,
+        vec![call("shell", serde_json::json!({}))],
+    );
+    world
+        .get_mut::<ContextWindow>(e)
+        .expect("window")
+        .get_region_mut("conversation")
+        .expect("conversation")
+        .add_entry("context seen by hook".to_string(), 1)
+        .expect("fits");
+
+    run_tool_hooks(&mut world);
+    assert_eq!(calls_of(&world, e)[0].name, "seen");
+    assert_eq!(calls_of(&world, e)[0].arguments["text"], "context seen by hook");
+}
+
 /// Narrowing is the point: a hook can rewrite a call into something tamer.
 #[test]
 fn on_tool_call_can_rewrite_arguments() {
@@ -15195,6 +15288,24 @@ fn on_tool_call_can_rewrite_arguments() {
     );
     run_tool_hooks(&mut world);
     assert_eq!(calls_of(&world, e)[0].arguments["command"], "ls -la");
+}
+
+#[test]
+fn repeated_tool_call_rewrites_get_distinct_ids() {
+    let mut world = World::new();
+    let e = spawn_tool_hooked(
+        &mut world,
+        r#"fn on_tool_call(ctx) {
+             #{ action: "modify",
+                value: [#{ name: "shell", arguments: #{ command: "ls" } }] }
+           }"#,
+        vec![call("shell", serde_json::json!({}))],
+    );
+    run_tool_hooks(&mut world);
+    let first = calls_of(&world, e)[0].tool_id.clone();
+    run_tool_hooks(&mut world);
+    let second = calls_of(&world, e)[0].tool_id.clone();
+    assert_ne!(first, second, "rewritten calls must not reuse provider IDs");
 }
 
 #[test]
@@ -15220,6 +15331,7 @@ fn on_tool_call_cannot_mark_its_own_calls_approved() {
         .spawn((
             stage_hooked(|h, p| h.on_tool_call = Some(p)),
             agent_state(),
+            conv_window(),
             StageCursor { index: 0 },
             ReadyForTools,
             crate::components::InferenceResult {
@@ -15421,6 +15533,7 @@ fn on_tool_call_skips_an_out_of_range_stage_and_a_stage_that_declared_none() {
         .spawn((
             stage_hooked(|h, p| h.on_tool_call = Some(p)),
             agent_state(),
+            conv_window(),
             StageCursor { index: 99 },
             ReadyForTools,
             crate::components::InferenceResult {
@@ -15444,6 +15557,7 @@ fn on_tool_call_skips_an_out_of_range_stage_and_a_stage_that_declared_none() {
         .spawn((
             AgentBlueprint(blueprint(vec![stage])),
             agent_state(),
+            conv_window(),
             StageCursor { index: 0 },
             ReadyForTools,
             crate::components::InferenceResult {
@@ -15832,6 +15946,10 @@ fn on_stage_exit_can_refuse_and_the_run_stops() {
     let msg = status_message(&world, e).expect("errored");
     assert!(msg.contains("refused to leave stage 'main'"), "{msg}");
     assert!(msg.contains("work unfinished"), "{msg}");
+    assert!(
+        world.get::<ResolveTransition>(e).is_none(),
+        "a refused stage exit must not be routed after the hook"
+    );
 }
 
 #[test]
