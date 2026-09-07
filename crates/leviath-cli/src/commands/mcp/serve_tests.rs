@@ -320,7 +320,12 @@ async fn the_handshake_ping_and_tool_list_need_no_daemon() {
             "list_runs",
             "list_agents",
             "install_tool",
-            "list_tools"
+            "list_tools",
+            "ps",
+            "pause",
+            "resume",
+            "daemon_status",
+            "validate"
         ]
     );
     for tool in tools {
@@ -333,6 +338,9 @@ async fn the_handshake_ping_and_tool_list_need_no_daemon() {
             "list_agents",
             "list_tools",
             "wait",
+            "ps",
+            "daemon_status",
+            "validate",
         ]
         .contains(&name);
         assert_eq!(ann["readOnlyHint"], read_only, "{name}");
