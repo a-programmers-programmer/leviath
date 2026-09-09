@@ -1,0 +1,18 @@
+{
+  "name": "lifeops",
+  "version": "0.1.0",
+  "description": "Connect LifeOps Desk and Leviath through a Google-authenticated MCP adapter.",
+  "author": {
+    "name": "LifeOps"
+  },
+  "interface": {
+    "displayName": "LifeOps",
+    "shortDescription": "Inspect work and supervise Leviath workers.",
+    "longDescription": "Read Desk tasks and worker results, then dispatch allowlisted Leviath workers when enabled by the operator.",
+    "developerName": "LifeOps",
+    "category": "Productivity",
+    "capabilities": ["Read", "Write"],
+    "defaultPrompt": ["Show my LifeOps tasks and current Leviath runs."]
+  },
+  "mcpServers": "./.mcp.json"
+}
