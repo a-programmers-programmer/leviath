@@ -738,6 +738,58 @@ async fn run_spawns_waits_reports_progress_and_returns_the_answer() {
     .await;
 }
 
+/// A `run` call that names no model must not invent one: the spawn carries
+/// `model: None`, so the daemon resolves every stage from the blueprint - which
+/// is where a stage-model pin lives. A host-dispatched run is the path with no
+/// `--model` on it, so anything this layer filled in would silently override
+/// every stage's pin at once, and the run's recorded model would be somebody
+/// else's choice.
+#[tokio::test]
+async fn run_with_no_model_argument_leaves_the_model_to_the_blueprint() {
+    let machine = Machine::new();
+    let manifest = machine.install_agent(
+        "pinned",
+        "\n[stages.pinned.model]\nmodels = [ { provider = \"openrouter\", model = \
+         \"deepseek/deepseek-v4.1-flash\" } ]\n",
+    );
+    temp_env::async_with_vars(isolation(&machine), async {
+        let daemon = ScriptedDaemon::new(
+            vec![StreamScript::Hold(vec![status_event(), completed("complete")])],
+            spawn_ok,
+        );
+        let mut h = Harness::usual(&daemon, &machine);
+        h.call(
+            1,
+            "run",
+            json!({
+                "task": "t",
+                "agent": manifest.to_string_lossy(),
+                "workdir": machine.project().to_string_lossy(),
+            }),
+        )
+        .await;
+        let (_notifications, msg) = h.response(1).await;
+        let (is_error, text, _) = result_parts(&msg);
+        assert!(!is_error, "{text}");
+
+        let requests = daemon.requests();
+        let ControlRequest::Spawn { args } = &requests[0] else {
+            panic!("{requests:?}");
+        };
+        assert_eq!(
+            args.model, None,
+            "the attended path names no model of its own; the blueprint's pin is \
+             what resolves"
+        );
+        let pin = std::fs::read_to_string(&manifest).unwrap();
+        assert!(
+            pin.contains("deepseek-v4.1-flash"),
+            "the blueprint the daemon was handed still carries the pin: {pin}"
+        );
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn run_without_a_token_emits_no_progress_and_a_null_token_counts_as_none() {
     let machine = Machine::new();

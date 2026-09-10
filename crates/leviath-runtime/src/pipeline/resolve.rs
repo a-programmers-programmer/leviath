@@ -330,14 +330,25 @@ pub(crate) fn resolve_stage_candidates(
             }
         }
         // Only promote the user's default_model to the front when the current
-        // head is NOT an explicit stage pin. A pinned provider+model pair is
-        // the stage author's deliberate choice and must win over the global
-        // default.
+        // head is NOT a model the stage itself declared. A model the author
+        // named is a deliberate choice and must win over the global default,
+        // however the entry was written: a `provider/model` pair pins the
+        // route as well, while a bare model name leaves the route open and
+        // lets the machine pick the provider that serves it. Both mean "this
+        // stage runs on this model", so the comparison is by model key.
+        //
+        // Comparing the provider instead - the shape this check had - let the
+        // open-route form through: the head's provider was the user's own
+        // default provider, which no entry named, so the check said "not a
+        // pin" and the user's default_model took the head, and a stage that
+        // had named its model silently ran another one (the MCP/host dispatch
+        // path, where no `--model` override is in play, is exactly where that
+        // reached a run).
         let head_is_stage_pin = candidates.first().is_some_and(|head| {
-            !head.provider.is_empty()
-                && model_cfg.models.iter().any(|e| {
-                    e.provider == head.provider && !e.provider.is_empty()
-                })
+            model_cfg
+                .models
+                .iter()
+                .any(|e| model_key(&e.model) == model_key(&head.model))
         });
         if let Some(dm) = default_model
             && let Some(at) = order.iter().position(|k| k == model_key(dm))
@@ -682,6 +693,68 @@ pub fn providers_tried(
     names.join(", ")
 }
 
+/// The `provider/model` a stage pinned and did not get, when `head` is a
+/// substitute for it.
+///
+/// `Some` means: the stage listed at least one full `provider/model` pair (a
+/// pin), none of those entries could be honoured, and `head` - the model the
+/// run would actually use - is not one of the models the stage named. The value
+/// is the pinned pair, as the blueprint wrote it.
+///
+/// An entry with an empty provider is a model and leaves the route open: the
+/// machine's own provider answers for it, so a substitute is not a
+/// contradiction of anything the author wrote and this stays `None`. An entry
+/// the registry *has* is not a substitution either, even when it is behind the
+/// head: the runtime fails over to it deliberately and reports that on the
+/// stage's own fallback list.
+fn unhonoured_pin(
+    model_cfg: &ModelConfig,
+    head: &ModelEntry,
+    defaults: &ModelDefaults,
+    registry: &ProviderRegistry,
+) -> Option<String> {
+    // A substitute can only come from outside the stage's list, so a head the
+    // stage did name rules this out immediately.
+    if model_cfg
+        .models
+        .iter()
+        .any(|e| model_key(&e.model) == model_key(&head.model))
+    {
+        return None;
+    }
+    // Nothing the stage pinned, nothing to report: the stage is open route(s),
+    // and the head is what the machine's providers answered for them. Only the
+    // user's own default is a *substitution* here, never a default the stage
+    // cannot use anyway.
+    let pins: Vec<&ModelEntry> = model_cfg
+        .models
+        .iter()
+        .filter(|e| !e.provider.is_empty() && !e.model.is_empty())
+        .collect();
+    let pinned_any = pins.iter().any(|e| !registry.has(&e.provider));
+    if pins.is_empty() || !pinned_any {
+        return None;
+    }
+    // An embedder with no default configured cannot be substituting one, and a
+    // stage that forbids the user default has already been refused above.
+    let default_named = defaults
+        .model
+        .as_ref()
+        .is_some_and(|m| model_key(m) == model_key(&head.model));
+    let chain_named = defaults
+        .fallback_order
+        .iter()
+        .any(|f| model_key(&f.model) == model_key(&head.model));
+    if !default_named && !chain_named {
+        return None;
+    }
+    // The first pin with no registered provider is the one to name: it is the
+    // entry the resolver skipped on its way to `head`.
+    pins.iter()
+        .find(|e| !registry.has(&e.provider))
+        .map(|e| format!("{}/{}", e.provider, e.model))
+}
+
 /// Resolve every stage's provider/model + effective tool set from the
 /// blueprint, or report the first stage that has no usable provider.
 ///
@@ -717,6 +790,28 @@ pub fn resolve_stages(
             let mut candidates =
                 resolve_stage_candidates(&stage.model, model_override, defaults, registry);
             let head = candidates.remove(0);
+            // A stage that named its own model and had no registered route to
+            // it inherits whatever the user's config supplies next - the user's
+            // default model, or the host-wide chain - and runs a model its
+            // author never named. That is the silent half of this resolver: the
+            // run's declared model and its actual model disagree, and nothing
+            // says so. Report it instead, naming the stage, the pin and why the
+            // pin cannot be honoured.
+            //
+            // Not when the caller gave a `--model` override: that names a model
+            // deliberately, for this whole run, and is not a substitution.
+            if model_override.is_none()
+                && let Some(pin) = unhonoured_pin(&stage.model, &head, defaults, registry)
+            {
+                return Err(format!(
+                    "stage '{}' pins {}, but no provider configured here reaches it, so the \
+                     stage would have run {}/{} instead. Refusing: a stage never silently runs \
+                     a model its author did not name. Configure '{}' (`lev setup`, then the next \
+                     run picks it up), or name a model this machine can reach in the stage's \
+                     models list.",
+                    stage.name, pin, head.provider, head.model, head.provider,
+                ));
+            }
             // `registry.has` also consults the script layer, so a `.rhai`
             // provider sitting on disk counts as usable and is never
             // false-rejected here.
@@ -1659,31 +1754,30 @@ mod tests {
         };
         let registry = registry_with(&["openrouter", "anthropic", "openai"]);
         let got = resolve_stage_candidates(&cfg, None, &defaults, &registry);
-        // The user default heads the list (it is on `default_provider`), the
-        // stage's own entry follows, and the host-wide chain is last - which is
-        // the ordering this test exists to pin.
+        // The stage's own model heads the list (it named `deepseek`, and a
+        // stage that named a model runs it), the user default is the first
+        // failover behind it, and the host-wide chain is last - which is the
+        // ordering this test exists to pin.
         assert_eq!(
             pairs(&got),
             vec![
-                ("anthropic", "sonnet"),
                 ("openrouter", "deepseek"),
+                ("anthropic", "sonnet"),
                 ("openai", "gpt"),
             ]
         );
     }
 
     /// Every bundled blueprint lists Ollama as `qwen3.5:9b`. A user who set
-    /// `default_model = "qwen3.8:latest"` was still sent to the blueprint's
-    /// model, so the named default leads.
+    /// `default_model = "qwen3.8:latest"` used to be sent to the user's model
+    /// instead, and that is the bug this rule exists to stop: a stage that
+    /// named a model runs *that* model, and the user's default is the first
+    /// failover behind it.
     ///
-    /// What it does NOT do is drag the rest of that provider's entries with it.
-    /// `default_model` is a statement about a model and moves that model;
-    /// `default_provider` is a statement about a route and reorders routes
-    /// within a model. So the blueprint's own first model stays ahead of the
-    /// blueprint's later ones, and only falls through when nothing registered
-    /// can serve it.
+    /// `default_provider` is still a statement about routes - it reorders them
+    /// within a model - so it cannot drag a different model to the head either.
     #[test]
-    fn the_users_default_model_leads_the_blueprints_entry_on_the_same_provider() {
+    fn the_users_default_model_follows_the_blueprints_entry_on_the_same_provider() {
         let cfg = model_cfg(vec![
             ("anthropic", "claude-sonnet-5"),
             ("ollama", "qwen3.5:9b"),
@@ -1696,20 +1790,21 @@ mod tests {
         };
         let registry = registry_with(&["anthropic", "ollama"]);
         let got = resolve_stage_candidates(&cfg, None, &defaults, &registry);
+        // The blueprint's first model heads the list; the user's model is
+        // added behind the blueprint's own entries, which keep their order.
         assert_eq!(
             pairs(&got),
             vec![
-                ("ollama", "qwen3.8:latest"),
                 ("anthropic", "claude-sonnet-5"),
                 ("ollama", "qwen3.5:9b"),
                 ("ollama", "qwen3.6:27b"),
+                ("ollama", "qwen3.8:latest"),
             ],
         );
 
-        // A default that repeats the blueprint's own entry moves that model to
-        // the head and is listed once. The models behind it keep the
-        // blueprint's order rather than the provider's: `default_provider`
-        // reorders the routes to a model, not the models themselves.
+        // A default that repeats the blueprint's own entry is listed once, in
+        // the blueprint's place: `default_provider` reorders the routes to a
+        // model, not the models themselves.
         let repeated = ModelDefaults {
             provider: "ollama".to_string(),
             model: Some("qwen3.6:27b".to_string()),
@@ -1719,19 +1814,21 @@ mod tests {
         assert_eq!(
             pairs(&got),
             vec![
-                ("ollama", "qwen3.6:27b"),
                 ("anthropic", "claude-sonnet-5"),
                 ("ollama", "qwen3.5:9b"),
+                ("ollama", "qwen3.6:27b"),
             ],
         );
     }
 
+    /// The user's default provider does not put its model in front of a model
+    /// the stage named. It decides which *route* answers for a model - the
+    /// bundled blueprints all name `anthropic/openai/ollama`, and ollama
+    /// registers with no key, so an install that set
+    /// `default_provider = "openrouter"` must not be dragged to a localhost
+    /// server that is not running by a `default_model` it also set.
     #[test]
-    fn the_default_provider_outranks_the_stages_own_list() {
-        // Why it has to: the bundled blueprints all name
-        // anthropic/openai/ollama, and ollama registers with no key, so an
-        // OpenRouter-only install would otherwise dispatch every stage at a
-        // localhost server that is not running.
+    fn the_users_default_provider_does_not_outrank_the_stages_own_model() {
         let cfg = model_cfg(vec![
             ("anthropic", "claude-sonnet-5"),
             ("ollama", "qwen3.5:9b"),
@@ -1746,11 +1843,25 @@ mod tests {
         assert_eq!(
             pairs(&got),
             vec![
-                ("openrouter", "openai/gpt-4o-mini"),
                 ("ollama", "qwen3.5:9b"),
+                ("openrouter", "openai/gpt-4o-mini"),
             ],
-            "the user's default provider heads the list; the registered stage \
-             entry stays behind it as a fallback"
+            "the stage's own registered model heads the list; the user's \
+             default model follows it as the first failover"
+        );
+
+        // A stage that names no model of its own is where `default_provider`
+        // and `default_model` decide where the run goes: the open route takes
+        // the machine's answer.
+        let open = model_cfg_open(vec!["qwen3.8:latest"]);
+        let serving = registry_serving(&[("openrouter", &["qwen3.8:latest"][..])]);
+        let got = resolve_stage_candidates(&open, None, &defaults, &serving);
+        assert_eq!(
+            pairs(&got),
+            vec![
+                ("openrouter", "qwen3.8:latest"),
+                ("openrouter", "openai/gpt-4o-mini"),
+            ]
         );
     }
 
