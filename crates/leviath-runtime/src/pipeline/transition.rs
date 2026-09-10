@@ -511,6 +511,20 @@ pub(crate) fn resolve_transition(
                         }
                     })
             }
+            Some(StageOutcome::SoftCapHandoff(soft)) => {
+                // Soft cap (Josh directive): the agent recorded its progress and
+                // hands off to a fresh agent rather than hard-stopping. We note
+                // the cut-off for the handoff stage, then continue down the
+                // normal (or max_iterations) edge so the graph proceeds instead
+                // of ending. The handoff stage's prompt reads the note and picks
+                // up from the recorded progress.
+                note_max_iterations(&mut window, &stage.name, *soft);
+                find_conditioned_edge(&bp.0, stage, &visits.0, TransitionCondition::MaxIterations)
+                    .map(|(i, t)| StageResolution::Next(i, t, None))
+                    .unwrap_or_else(|| {
+                        resolve_transition_sync(&bp.0, stage, cursor.index, &visits.0)
+                    })
+            }
             Some(StageOutcome::Stuck(_)) => {
                 // A stuck interrupt is mid-stage, not a stage end. If the escape
                 // hatch went away between detection and here (its target spent

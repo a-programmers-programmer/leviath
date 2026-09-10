@@ -93,16 +93,16 @@ fn on_stage_exit(ctx) {
 
 fn on_tool_call(ctx) {
     if ctx.tool_calls.len() != 1 { throw "Use exactly one tool call per turn"; }
-    let call = ctx.tool_calls[0];
+    let tool_call = ctx.tool_calls[0];
     if ctx.stage == "report" {
-        if call.name != "submit_output" || ctx.regions.report.trim() == "" {
+        if tool_call.name != "submit_output" || ctx.regions.report.trim() == "" {
             throw "Only the recorded final report may be submitted";
         }
         return #{ action: "modify", value: [#{
             name: "submit_output", arguments: #{ content: ctx.regions.report }
         }] };
     }
-    if call.name != "oracle_workspace" { throw "Tool is outside this work order"; }
+    if tool_call.name != "oracle_workspace" { throw "Tool is outside this work order"; }
     let request = #{};
     if is_controller(ctx.stage) {
         if ctx.regions.control_result.trim() != "" {
@@ -128,7 +128,7 @@ fn on_tool_call(ctx) {
         let parts = ctx.regions.task.split("\nContext: ");
         if parts.len() != 2 { throw "Missing canonical worker context"; }
         let authority = require_json(parts[1], "Worker context");
-        request = call.arguments.request;
+        request = tool_call.arguments.request;
         if request == () { throw "Missing workspace action request"; }
         let actions = ["inspect", "read", "check", "patch", "seal"];
         if !actions.contains(request.action) { throw "Unknown worker action"; }

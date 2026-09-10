@@ -18,7 +18,7 @@ run at the same time, each with a clean context, and the parent gets the results
 Seven bundled agents work this way: `data-analyst` gathers one slice of a subject per worker,
 `reviewer` takes a file or hunk group each, `log-analyzer` a log file or time window,
 `orchestrator` hands each work item to a whole `coder` run, `deep-researcher` and
-`wide-researcher` hand each sub-question to a whole `researcher` run, and `oracle`
+`wide-researcher` hand each sub-question to a whole `researcher` run, and `oracle-workflow`
 executes bounded reader, coder, and verifier workers. See the
 [agent catalog](/docs/agent-catalog) for all seven.
 

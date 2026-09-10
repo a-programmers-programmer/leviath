@@ -621,6 +621,9 @@ pub(crate) enum StageOutcome {
     Errored(String),
     /// The stage hit its `max_iterations` cap.
     MaxIterations,
+    /// The stage hit its soft iteration cap: record progress and hand off to a
+    /// fresh agent via the `handoff` edge (carries which cap was reached).
+    SoftCapHandoff(usize),
     /// A `stuck` edge tripped mid-stage; carries the human-readable reason.
     Stuck(String),
 }

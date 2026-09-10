@@ -1226,6 +1226,52 @@ fn start_worker(
     Ok(child)
 }
 
+/// The one way a finished child's answer is read out of the world.
+///
+/// Precedence, unchanged since this was inline in [`worker_terminal_result`]:
+/// the child's explicit `submit_output` ([`FinalOutput`](crate::persistence::FinalOutput))
+/// always wins; failing that, its last non-empty `conversation` entry (a real
+/// assistant/analysis message on tool-call-ending runs); failing that, its last
+/// [`InferenceResult`]'s response. `None` only when the child holds none of the
+/// three.
+///
+/// Shared with the host's sub-agent `Check` op so a child run answers its parent
+/// the same way however it was started. That divergence was the bug: the fan-out
+/// collector resolved this chain while the host read `FinalOutput` alone, so a
+/// `spawn_agent` child that did its work in text - or whose submission never
+/// landed as a component - handed its parent nothing at all, and the parent
+/// reported an empty result over a child that had in fact finished.
+///
+/// Deliberately status-agnostic: callers decide whether a child is finished
+/// enough to be read (`worker_terminal_result` only asks on `Complete`).
+pub(crate) fn child_output_content(world: &World, child: Entity) -> Option<String> {
+    // Explicit submit_output always wins.
+    if let Some(content) = world
+        .get::<crate::persistence::FinalOutput>(child)
+        .map(|o| o.0.content.clone())
+    {
+        return Some(content);
+    }
+
+    // No explicit submit_output: fall back to the child's last non-empty
+    // conversation text (a real assistant/analysis message on tool-call-ending
+    // runs), then to InferenceResult.response.
+    world
+        .get::<ContextWindow>(child)
+        .and_then(|w| w.get_region("conversation"))
+        .and_then(|region| {
+            region.content.iter().rev().find_map(|entry| {
+                let text = entry.content.trim();
+                (!text.is_empty()).then(|| text.to_owned())
+            })
+        })
+        .or_else(|| {
+            world
+                .get::<InferenceResult>(child)
+                .map(|r| r.response.clone())
+        })
+}
+
 /// A worker's terminal result: `Some(Ok(deliverable))` if complete,
 /// `Some(Err(reason))` if it errored/was cancelled/vanished, `None` if still
 /// running.
@@ -1252,19 +1298,23 @@ fn worker_terminal_result(world: &World, worker: Entity) -> Option<Result<String
     match agent_status(world, worker) {
         None => Some(Err("worker vanished".to_string())),
         Some(AgentStatus::Complete) => {
-            match world
-                .get::<crate::persistence::FinalOutput>(worker)
-                .map(|o| o.0.content.clone())
-            {
-                Some(content) => Some(Ok(content)),
-                None if worker_requires_output(world, worker) => Some(Err(
+            // The shared resolution: submit_output, else last conversation text,
+            // else the last inference response.
+            let fallback = child_output_content(world, worker).unwrap_or_default();
+
+            // If the stage requires an output and even the fallback is empty,
+            // that is a real failure: the worker had nothing to say.  But a
+            // worker that produced real content (just never called
+            // submit_output) still relays it — the require_output guard catches
+            // genuinely-empty workers, not workers that used the wrong delivery
+            // channel.
+            if worker_requires_output(world, worker) && fallback.is_empty() {
+                return Some(Err(
                     "worker finished without the final output its stage requires".to_string(),
-                )),
-                None => Some(Ok(world
-                    .get::<InferenceResult>(worker)
-                    .map(|r| r.response.clone())
-                    .unwrap_or_default())),
+                ));
             }
+
+            Some(Ok(fallback))
         }
         Some(AgentStatus::Error { message }) => Some(Err(message)),
         Some(AgentStatus::Cancelled) => Some(Err("worker cancelled".to_string())),

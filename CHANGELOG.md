@@ -15,7 +15,7 @@ same list.
 
 ### Added
 
-- An experimental bundled `oracle` blueprint for repository work. It uses
+- An experimental bundled `oracle-workflow` blueprint for repository work. It uses
   tool-free JSON decisions, deterministic reader/coder/verifier fan-out, and a
   workspace kernel with bounded orders, receipts, snapshots, and path-scoped
   compare-and-swap patches. See [the Oracle workflow design](docs/design/oracle-workflow.md).

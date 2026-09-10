@@ -1388,7 +1388,121 @@ system = { kind = "pinned", max_tokens = 1000 }
         }
     }
 
+    /// The regression test for the reported bug: a blueprint whose entry stage
+    /// pins `openrouter/deepseek/deepseek-v4.1-flash`, dispatched with
+    /// `default_model = "deepseek/deepseek-v4-pro"` configured on that same
+    /// provider - which is what `config.toml` carried when two host-dispatched
+    /// runs recorded the *default* model in their `meta.json`.
+    ///
+    /// `build_agent` is the spawn every path goes through - `lev run` and the
+    /// MCP `run` tool alike - and `RunMetadata::model` is the field those runs
+    /// recorded. The stage pin has to survive it: the user's `default_model` is
+    /// the first *failover* behind the blueprint's own model, never its
+    /// replacement.
+    #[tokio::test]
+    async fn build_agent_keeps_a_pinned_stage_model_over_the_users_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("agent.leviath");
+        std::fs::write(&manifest, pinned_entry_manifest()).unwrap();
+        let (mut world, cli) = world_with(&["openrouter"]);
+        let config = Config {
+            default_provider: "openrouter".to_string(),
+            default_model: Some("deepseek/deepseek-v4-pro".to_string()),
+            ..Config::default()
+        };
+        let entity = build_agent(
+            world.world_mut(),
+            SpawnDeps {
+                tool_service: cli.as_ref(),
+                config: &config,
+                shared_mcp: Arc::new(Mutex::new(leviath_mcp::ToolExecutor::new())),
+                mcp_tool_defs: &[],
+                mcp_tool_owners: &Default::default(),
+                hub: &InteractionHub::new(),
+                now_secs: 100,
+                subagent_tx: sub_tx(),
+            },
+            &spawn_args(&manifest.to_string_lossy()),
+        )
+        .expect("a stage whose pinned provider is registered spawns");
+
+        let meta = world
+            .world()
+            .get::<RunMetadata>(entity)
+            .expect("run metadata attached");
+        assert_eq!(
+            meta.model.as_deref(),
+            Some("openrouter/deepseek/deepseek-v4.1-flash"),
+            "the run's recorded model is the blueprint's pin, not default_model"
+        );
+    }
+
+    /// A pin that this machine cannot honour is a named error, not a run on
+    /// somebody else's model. The stage names a provider the registry does not
+    /// have while `default_model` offers a substitute on a provider it does:
+    /// before this check the substitution was silent, and the run's declared
+    /// model and the model it actually used disagreed with nothing said.
+    #[tokio::test]
+    async fn build_agent_refuses_to_substitute_a_model_for_an_unreachable_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("agent.leviath");
+        std::fs::write(&manifest, pinned_entry_manifest()).unwrap();
+        // `openrouter` is the stage's pin and is not registered here.
+        let (mut world, cli) = world_with(&["anthropic"]);
+        let config = Config {
+            default_provider: "anthropic".to_string(),
+            default_model: Some("claude-sonnet-5".to_string()),
+            ..Config::default()
+        };
+        let err = build_agent(
+            world.world_mut(),
+            SpawnDeps {
+                tool_service: cli.as_ref(),
+                config: &config,
+                shared_mcp: Arc::new(Mutex::new(leviath_mcp::ToolExecutor::new())),
+                mcp_tool_defs: &[],
+                mcp_tool_owners: &Default::default(),
+                hub: &InteractionHub::new(),
+                now_secs: 100,
+                subagent_tx: sub_tx(),
+            },
+            &spawn_args(&manifest.to_string_lossy()),
+        )
+        .expect_err("the pin cannot be honoured, so the spawn fails");
+
+        assert!(err.contains("stage 'execute'"), "{err}");
+        assert!(
+            err.contains("openrouter/deepseek/deepseek-v4.1-flash"),
+            "the error names the pinned model: {err}"
+        );
+        assert!(
+            err.contains("deepseek-v4-pro") || err.contains("claude-sonnet-5"),
+            "the error names the substitute it refused: {err}"
+        );
+    }
+
     // ─── resolve_region_scripts ──────────────────────────────────────────
+
+    /// A manifest shaped like the one the reported runs used: the entry stage
+    /// pins a model on the provider the user's `default_model` also names.
+    fn pinned_entry_manifest() -> &'static str {
+        "[agent]\nname = \"pinned\"\nversion = \"0.1.0\"\ndescription = \"d\"\n\n\
+         [stages.execute]\nmodel = { models = [ { provider = \"openrouter\", \
+         model = \"deepseek/deepseek-v4.1-flash\" } ] }\n"
+    }
+
+    fn world_with(providers: &[&str]) -> (PipelineWorld, Arc<CliToolService>) {
+        let cli = Arc::new(CliToolService::new());
+        let world = PipelineWorld::new(
+            registry_with(providers),
+            cli.clone(),
+            InferencePoolConfig::new(),
+            1,
+            None,
+            Handle::current(),
+        );
+        (world, cli)
+    }
 
     /// Manifest with a global custom region and a per-stage one, both
     /// pointing into `hooks/` next to the manifest.

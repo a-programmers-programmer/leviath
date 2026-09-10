@@ -527,6 +527,15 @@ pub struct Stage {
     /// Maximum iterations for this stage
     pub max_iterations: Option<usize>,
 
+    /// Soft iteration cap: when the stage's iteration count reaches this value
+    /// (and `max_iterations`, if set, is higher), the run does NOT hard-stop —
+    /// it records its progress and routes to the `handoff` edge so a fresh agent
+    /// can continue the work. Conceptually a "nudge, then pass off" boundary
+    /// instead of a hard wall. Ignored when `>= max_iterations` (the hard cap wins)
+    /// or when the stage declares no `handoff` transition.
+    #[serde(default)]
+    pub soft_iteration_cap: Option<usize>,
+
     /// Interaction mode (autonomous or interactive)
     #[serde(default)]
     pub mode: StageMode,
@@ -705,6 +714,7 @@ impl Stage {
             available_connectors: Vec::new(),
             required_tools: Vec::new(),
             max_iterations: None,
+            soft_iteration_cap: None,
             mode: StageMode::Autonomous,
             context_layout: None,
             context_hide: Vec::new(),

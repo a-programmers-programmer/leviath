@@ -1,5 +1,5 @@
 [agent]
-name = "oracle"
+name = "oracle-workflow"
 version = "0.1.0"
 description = "A bounded evidence workflow that lets an oracle authorize, repair, and report repository changes"
 entry_stage = "bootstrap"

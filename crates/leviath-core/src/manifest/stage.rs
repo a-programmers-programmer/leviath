@@ -25,6 +25,7 @@ pub(super) const STAGE_KEYS: &[&str] = &[
     "max_attempts",
     "max_items",
     "max_iterations",
+    "soft_iteration_cap",
     "max_revisits",
     "max_workers",
     "merge_stage",
@@ -273,6 +274,9 @@ pub(super) fn parse_stage(stage_name: &str, stage_value: &toml::Value) -> Result
     let where_ = format!("stage '{stage_name}'");
     if let Some(max_iter) = count_of(stage_value, &where_, "max_iterations")? {
         stage.max_iterations = Some(max_iter);
+    }
+    if let Some(soft_iter) = count_of(stage_value, &where_, "soft_iteration_cap")? {
+        stage.soft_iteration_cap = Some(soft_iter);
     }
 
     if let Some(tools_arr) = array_of(stage_value, "available_tools") {
