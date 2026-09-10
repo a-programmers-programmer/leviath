@@ -1,0 +1,60 @@
+"""Task board read operations scoped to an authenticated workspace."""
+type Query {
+  """Read a task; returns null for absent or inaccessible tasks."""
+  task("""Workspace whose membership is checked.""" workspaceId: ID!, """Stable task identity.""" id: ID!): Task
+  """Browse visible tasks ordered by stable task identity."""
+  tasks("""Workspace whose membership is checked.""" workspaceId: ID!, """Page size between 1 and 100; defaults to 20.""" first: Int = 20, """Opaque cursor bound to workspace and ordering.""" after: String): TaskConnection!
+}
+"""Intent-based operations on tasks."""
+type Mutation {
+  """Complete an open task atomically, with revision and retry protection."""
+  completeTask("""Identity, concurrency and retry parameters.""" input: CompleteTaskInput!): CompleteTaskResult!
+}
+"""A task visible to the authenticated workspace member."""
+type Task {
+  """Stable opaque task identity.""" id: ID!
+  """User-visible task title.""" title: String!
+  """Current business lifecycle state.""" status: TaskStatus!
+  """Monotonically increasing revision used for compare-and-swap.""" revision: Int!
+}
+"""Supported task lifecycle states."""
+enum TaskStatus {
+  """The task still needs completion.""" OPEN
+  """The task has been completed.""" COMPLETED
+}
+"""One bounded page of visible tasks."""
+type TaskConnection {
+  """At most the requested page size, in stable ID order.""" edges: [TaskEdge!]!
+  """Information needed to fetch the next page.""" pageInfo: PageInfo!
+}
+"""A task together with its position in this connection."""
+type TaskEdge {
+  """Cursor scoped to workspace, order and task identity.""" cursor: String!
+  """Task visible to this workspace member.""" node: Task!
+}
+"""Forward pagination metadata, including empty pages."""
+type PageInfo {
+  """Whether another page contains visible tasks.""" hasNextPage: Boolean!
+  """Last edge cursor, or null when the page is empty.""" endCursor: String
+}
+"""A command to complete exactly one task."""
+input CompleteTaskInput {
+  """Workspace in which the command is authorized.""" workspaceId: ID!
+  """Stable identity of the task to complete.""" taskId: ID!
+  """Revision observed by the client before this command.""" expectedRevision: Int!
+  """Caller-generated retry key, unique for a command payload.""" idempotencyKey: ID!
+}
+"""Expected completion outcomes; unexpected faults use masked GraphQL errors."""
+union CompleteTaskResult = TaskCompleted | TaskConflict | TaskUnavailable
+"""The completion succeeded, or an identical command was replayed."""
+type TaskCompleted {
+  """Task after the committed state transition.""" task: Task!
+}
+"""An authorized task exists but its revision or state conflicts."""
+type TaskConflict {
+  """Current revision for a fresh client read; never exposed before authorization.""" currentRevision: Int!
+}
+"""Task absent or inaccessible; both cases deliberately share this outcome."""
+type TaskUnavailable {
+  """Safe user-facing explanation without object-existence disclosure.""" message: String!
+}

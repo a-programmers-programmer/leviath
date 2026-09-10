@@ -1,0 +1,175 @@
+{
+  "version": 1,
+  "mode": "new",
+  "assumptions": [
+    "Illustrative new task-board API; identity and workspace membership already exist."
+  ],
+  "open_questions": [],
+  "requirements": [
+    {
+      "id": "R-browse",
+      "description": "Workspace member pages through visible tasks in stable order.",
+      "operations": [
+        "BrowseTasks"
+      ],
+      "coordinates": [
+        "Query.tasks",
+        "Task.id",
+        "PageInfo.endCursor"
+      ]
+    },
+    {
+      "id": "R-read",
+      "description": "Workspace member reads one visible task or receives null.",
+      "operations": [
+        "GetTask"
+      ],
+      "coordinates": [
+        "Query.task",
+        "Task.status"
+      ]
+    },
+    {
+      "id": "R-complete",
+      "description": "Editor completes an open task with revision and retry protection.",
+      "operations": [
+        "CompleteTask"
+      ],
+      "coordinates": [
+        "Mutation.completeTask",
+        "TaskConflict.currentRevision",
+        "TaskUnavailable.message"
+      ]
+    }
+  ],
+  "fields": {
+    "Query.task": {
+      "authorization": "Only data already scoped to an authenticated workspace member; completion outcomes require editor rights.",
+      "nullability": "Returns null for missing or inaccessible tasks; unexpected faults also report a masked error.",
+      "source": "Scoped task repository or the authorized parent result; see design.md for transaction and paging semantics.",
+      "batching": "Read from the loaded parent or one bounded repository query; no per-row remote calls. Cache keys include principal and workspace."
+    },
+    "Query.tasks": {
+      "authorization": "Only data already scoped to an authenticated workspace member; completion outcomes require editor rights.",
+      "nullability": "Persisted or computed local value guaranteed after authorization; failure bubbles to its nearest nullable ancestor.",
+      "source": "Workspace-filtered SELECT ordered by binary task ID; fetch page size plus one to calculate hasNextPage.",
+      "batching": "Read from the loaded parent or one bounded repository query; no per-row remote calls. Cache keys include principal and workspace."
+    },
+    "Mutation.completeTask": {
+      "authorization": "Require editor membership before lookup or idempotency replay. Absence and denied access both produce TaskUnavailable.",
+      "nullability": "Persisted or computed local value guaranteed after authorization; failure bubbles to its nearest nullable ancestor.",
+      "source": "Atomic state/revision compare-and-swap and idempotency receipt, as specified in design.md.",
+      "batching": "Read from the loaded parent or one bounded repository query; no per-row remote calls. Cache keys include principal and workspace."
+    },
+    "Task.id": {
+      "authorization": "Only data already scoped to an authenticated workspace member; completion outcomes require editor rights.",
+      "nullability": "Persisted or computed local value guaranteed after authorization; failure bubbles to its nearest nullable ancestor.",
+      "source": "Scoped task repository or the authorized parent result; see design.md for transaction and paging semantics.",
+      "batching": "Read from the loaded parent or one bounded repository query; no per-row remote calls. Cache keys include principal and workspace."
+    },
+    "Task.title": {
+      "authorization": "Only data already scoped to an authenticated workspace member; completion outcomes require editor rights.",
+      "nullability": "Persisted or computed local value guaranteed after authorization; failure bubbles to its nearest nullable ancestor.",
+      "source": "Scoped task repository or the authorized parent result; see design.md for transaction and paging semantics.",
+      "batching": "Read from the loaded parent or one bounded repository query; no per-row remote calls. Cache keys include principal and workspace."
+    },
+    "Task.status": {
+      "authorization": "Only data already scoped to an authenticated workspace member; completion outcomes require editor rights.",
+      "nullability": "Persisted or computed local value guaranteed after authorization; failure bubbles to its nearest nullable ancestor.",
+      "source": "Scoped task repository or the authorized parent result; see design.md for transaction and paging semantics.",
+      "batching": "Read from the loaded parent or one bounded repository query; no per-row remote calls. Cache keys include principal and workspace."
+    },
+    "Task.revision": {
+      "authorization": "Only data already scoped to an authenticated workspace member; completion outcomes require editor rights.",
+      "nullability": "Persisted or computed local value guaranteed after authorization; failure bubbles to its nearest nullable ancestor.",
+      "source": "Scoped task repository or the authorized parent result; see design.md for transaction and paging semantics.",
+      "batching": "Read from the loaded parent or one bounded repository query; no per-row remote calls. Cache keys include principal and workspace."
+    },
+    "TaskConnection.edges": {
+      "authorization": "Only data already scoped to an authenticated workspace member; completion outcomes require editor rights.",
+      "nullability": "Persisted or computed local value guaranteed after authorization; failure bubbles to its nearest nullable ancestor.",
+      "source": "Scoped task repository or the authorized parent result; see design.md for transaction and paging semantics.",
+      "batching": "Read from the loaded parent or one bounded repository query; no per-row remote calls. Cache keys include principal and workspace."
+    },
+    "TaskConnection.pageInfo": {
+      "authorization": "Only data already scoped to an authenticated workspace member; completion outcomes require editor rights.",
+      "nullability": "Persisted or computed local value guaranteed after authorization; failure bubbles to its nearest nullable ancestor.",
+      "source": "Scoped task repository or the authorized parent result; see design.md for transaction and paging semantics.",
+      "batching": "Read from the loaded parent or one bounded repository query; no per-row remote calls. Cache keys include principal and workspace."
+    },
+    "TaskEdge.cursor": {
+      "authorization": "Only data already scoped to an authenticated workspace member; completion outcomes require editor rights.",
+      "nullability": "Persisted or computed local value guaranteed after authorization; failure bubbles to its nearest nullable ancestor.",
+      "source": "Scoped task repository or the authorized parent result; see design.md for transaction and paging semantics.",
+      "batching": "Read from the loaded parent or one bounded repository query; no per-row remote calls. Cache keys include principal and workspace."
+    },
+    "TaskEdge.node": {
+      "authorization": "Only data already scoped to an authenticated workspace member; completion outcomes require editor rights.",
+      "nullability": "Persisted or computed local value guaranteed after authorization; failure bubbles to its nearest nullable ancestor.",
+      "source": "Scoped task repository or the authorized parent result; see design.md for transaction and paging semantics.",
+      "batching": "Read from the loaded parent or one bounded repository query; no per-row remote calls. Cache keys include principal and workspace."
+    },
+    "PageInfo.hasNextPage": {
+      "authorization": "Only data already scoped to an authenticated workspace member; completion outcomes require editor rights.",
+      "nullability": "Persisted or computed local value guaranteed after authorization; failure bubbles to its nearest nullable ancestor.",
+      "source": "Scoped task repository or the authorized parent result; see design.md for transaction and paging semantics.",
+      "batching": "Read from the loaded parent or one bounded repository query; no per-row remote calls. Cache keys include principal and workspace."
+    },
+    "PageInfo.endCursor": {
+      "authorization": "Only data already scoped to an authenticated workspace member; completion outcomes require editor rights.",
+      "nullability": "Null on an empty page; otherwise the last edge cursor is guaranteed.",
+      "source": "Scoped task repository or the authorized parent result; see design.md for transaction and paging semantics.",
+      "batching": "Read from the loaded parent or one bounded repository query; no per-row remote calls. Cache keys include principal and workspace."
+    },
+    "TaskCompleted.task": {
+      "authorization": "Only data already scoped to an authenticated workspace member; completion outcomes require editor rights.",
+      "nullability": "Persisted or computed local value guaranteed after authorization; failure bubbles to its nearest nullable ancestor.",
+      "source": "Scoped task repository or the authorized parent result; see design.md for transaction and paging semantics.",
+      "batching": "Read from the loaded parent or one bounded repository query; no per-row remote calls. Cache keys include principal and workspace."
+    },
+    "TaskConflict.currentRevision": {
+      "authorization": "Only data already scoped to an authenticated workspace member; completion outcomes require editor rights.",
+      "nullability": "Persisted or computed local value guaranteed after authorization; failure bubbles to its nearest nullable ancestor.",
+      "source": "Scoped task repository or the authorized parent result; see design.md for transaction and paging semantics.",
+      "batching": "Read from the loaded parent or one bounded repository query; no per-row remote calls. Cache keys include principal and workspace."
+    },
+    "TaskUnavailable.message": {
+      "authorization": "Only data already scoped to an authenticated workspace member; completion outcomes require editor rights.",
+      "nullability": "Persisted or computed local value guaranteed after authorization; failure bubbles to its nearest nullable ancestor.",
+      "source": "Scoped task repository or the authorized parent result; see design.md for transaction and paging semantics.",
+      "batching": "Read from the loaded parent or one bounded repository query; no per-row remote calls. Cache keys include principal and workspace."
+    }
+  },
+  "collections": {
+    "Query.tasks": {
+      "kind": "cursor",
+      "max_items": 100,
+      "enforcement": "Resolver defaults omitted/null first to 20; rejects outside 1..100. Database query uses LIMIT first+1.",
+      "order": "Ascending immutable task ID using binary comparison.",
+      "tie_breaker": "Task ID is unique and is its own final tie-breaker.",
+      "cursor_scope": "Signed opaque cursor binds workspace ID, ordering version, and last task ID; wrong scope is rejected."
+    },
+    "TaskConnection.edges": {
+      "kind": "bounded",
+      "max_items": 100,
+      "enforcement": "Construct only from the bounded parent query after membership filtering."
+    }
+  },
+  "mutations": {
+    "Mutation.completeTask": {
+      "intent": "Transition OPEN to COMPLETED exactly once for the observed revision.",
+      "idempotency": "24-hour key scoped to principal/workspace; record payload hash and committed outcome atomically; reject changed-payload key reuse.",
+      "concurrency": "Compare expectedRevision and OPEN state atomically; increment revision on successful transition.",
+      "errors": "TaskConflict only for authorized editors; TaskUnavailable masks absence/denial; unexpected faults use masked GraphQL errors."
+    }
+  },
+  "scalars": {},
+  "runtime": {
+    "demand_control": "Enforce first<=100, depth<=8, aliases<=20, batch<=5, multiplicative list cost<=1000; calibrate using traffic.",
+    "tenant_isolation": "Principal membership scopes every read, mutation, cursor and request-local cache; client workspaceId is never authority.",
+    "authorization_tests": "Test absent/unauthorized equivalence, cross-tenant IDs, forged cursors and revoked membership, including idempotent replay.",
+    "performance_tests": "Measure constant query count for 1 vs 100 tasks and enforce the cost limits; inspect query plan for cursor index usage.",
+    "schema_codegen": "Generate client operation types from exact SDL/documents, compile clients and validate their mocks before application acceptance.",
+    "subscriptions": "No real-time requirement in this example; no subscription root or event guarantees are offered."
+  }
+}

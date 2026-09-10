@@ -1,0 +1,18 @@
+query BrowseTasks($workspace: ID!, $first: Int, $after: String) {
+  tasks(workspaceId: $workspace, first: $first, after: $after) {
+    edges { cursor node { ...TaskSummary } }
+    pageInfo { hasNextPage endCursor }
+  }
+}
+query GetTask($workspace: ID!, $id: ID!) {
+  task(workspaceId: $workspace, id: $id) { ...TaskSummary }
+}
+mutation CompleteTask($input: CompleteTaskInput!) {
+  completeTask(input: $input) {
+    __typename
+    ... on TaskCompleted { task { ...TaskSummary } }
+    ... on TaskConflict { currentRevision }
+    ... on TaskUnavailable { message }
+  }
+}
+fragment TaskSummary on Task { id title status revision }
