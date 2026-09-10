@@ -1,0 +1,43 @@
+[
+  {
+    "operation": "BrowseTasks",
+    "variables": {
+      "workspace": "w1",
+      "first": 20,
+      "after": null
+    },
+    "expected": "valid"
+  },
+  {
+    "operation": "GetTask",
+    "variables": {
+      "workspace": "w1",
+      "id": "t1"
+    },
+    "expected": "valid"
+  },
+  {
+    "operation": "CompleteTask",
+    "variables": {
+      "input": {
+        "workspaceId": "w1",
+        "taskId": "t1",
+        "expectedRevision": 1,
+        "idempotencyKey": "retry-1"
+      }
+    },
+    "expected": "valid"
+  },
+  {
+    "operation": "CompleteTask",
+    "variables": {
+      "input": {
+        "workspaceId": "w1",
+        "taskId": "t1",
+        "expectedRevision": "bad",
+        "idempotencyKey": "retry-1"
+      }
+    },
+    "expected": "invalid"
+  }
+]

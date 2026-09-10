@@ -1,6 +1,6 @@
 ---
 title: Agent catalog
-description: The eight pre-built agents Leviath ships, what each is for, how to install them, and the lev run command for each.
+description: The pre-built agents Leviath ships, what each is for, how to install them, and the lev run command for each.
 group: Get started
 group_order: 1
 order: 4
@@ -8,7 +8,7 @@ order: 4
 
 # Agent catalog
 
-Leviath ships with nine pre-built agents. `lev setup` installs them into `~/.leviath/agents/`
+Leviath ships with a set of pre-built agents. `lev setup` installs them into `~/.leviath/agents/`
 (scripting it? pass `--install-agents`), one directory per agent, each holding an `agent.leviath`
 [blueprint](/docs/agents). Run any of them by name:
 
@@ -45,6 +45,23 @@ snapshot. Requires Git, Python 3, and a POSIX shell. See the
 ```sh
 lev run oracle-workflow --task "Add request validation to the users endpoint"
 ```
+
+## graphql-schema
+
+Design a GraphQL contract before implementing an application: discover client journeys,
+model the domain, draft SDL and real operations, run deterministic checks, then obtain
+an independent design review. A bounded repair loop rechecks changed artifacts.
+Acceptance includes a file fingerprint that backend and frontend workers can verify.
+
+```sh
+lev run graphql-schema --task ./application-brief.md --wait
+```
+
+Requires Python 3 with `graphql-core==3.2.6`. For parent pipelines, use the packaged
+`scripts/run_stage.py` entrypoint so blocked outcomes and stale receipts stop downstream
+work. See [GraphQL schema workflow](https://github.com/zephyyrrr/leviath/blob/main/docs/design/graphql-schema-workflow.md)
+for installation, contract files and integration. Runtime resolver behavior is verified
+later by the application pipeline.
 
 ## coder
 
