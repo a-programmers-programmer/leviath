@@ -188,7 +188,7 @@ fn human_lines(dir_label: &str, report: &ToolsReport) -> Vec<String> {
         if !meta.required_caps.is_empty() {
             lines.push(format!("      requires: {}", meta.required_caps.join(", ")));
         }
-if !meta.accepts.is_empty() {
+        if !meta.accepts.is_empty() {
             lines.push(format!("      accepts: {}", meta.accepts.join(", ")));
         }
         if !meta.produces.is_empty() {

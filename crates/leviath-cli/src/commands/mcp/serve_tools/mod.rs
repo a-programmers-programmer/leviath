@@ -417,25 +417,6 @@ fn output_location(shared: &Shared, run_id: &str) -> String {
         .to_string()
 }
 
-/// Send a request whose answer is a boolean: `Ok(applied)` on `ok: true`,
-/// `Err` with `refused` on `ok: false`, and the daemon's own words otherwise.
-async fn bool_request(
-    shared: &Shared,
-    request: ControlRequest,
-    applied: &str,
-    refused: &str,
-) -> Result<String, String> {
-    if let Err(e) = shared.daemon_ready().await {
-        return Err(format!("the leviath daemon is not available: {e}"));
-    }
-    match shared.control.request(&request).await {
-        Ok(ControlResponse::Ok { ok: true }) => Ok(applied.to_string()),
-        Ok(ControlResponse::Ok { ok: false }) => Err(refused.to_string()),
-        Ok(other) => Err(format!("unexpected daemon response: {other:?}")),
-        Err(e) => Err(format!("the leviath daemon is not reachable ({e})")),
-    }
-}
-
 // The tools themselves, by concern. Each takes the shared helpers above
 // through `use super::*`.
 mod control;

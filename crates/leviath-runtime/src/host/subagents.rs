@@ -83,7 +83,7 @@ impl WorldHost {
     ///
     /// Resolution is [`child_output_content`](crate::fanout::child_output_content)
     /// - the fan-out collector's own chain, not a copy of it: `FinalOutput` →
-    /// last non-empty `conversation` entry → `InferenceResult.response`.
+    ///   last non-empty `conversation` entry → `InferenceResult.response`.
     ///
     /// Scoped to a `Complete` child, exactly as the collector scopes it: an
     /// errored or cancelled child reports its failure through `status`, and

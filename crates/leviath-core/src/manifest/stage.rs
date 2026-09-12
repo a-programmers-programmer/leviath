@@ -269,8 +269,7 @@ pub(super) fn parse_stage(stage_name: &str, stage_value: &toml::Value) -> Result
     let mut stage = Stage::new(stage_name.to_string(), model_config);
 
     stage = apply_stage_mode(stage, stage_name, stage_value)?;
-    if stage_value.get("items_region").is_some()
-        && !matches!(stage.mode, StageMode::FanOut { .. })
+    if stage_value.get("items_region").is_some() && !matches!(stage.mode, StageMode::FanOut { .. })
     {
         return Err(Error::Other(format!(
             "stage '{stage_name}': items_region is only valid with mode = \"fan_out\""

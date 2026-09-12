@@ -304,7 +304,11 @@ pub(crate) async fn daemon_status(shared: &Shared) -> CallOutcome {
             let request = ControlRequest::List;
             match shared.control.request(&request).await {
                 Ok(ControlResponse::List { runs, finished, .. }) => {
-                    format!("daemon online, {} active runs, {} recently finished", runs.len(), finished.len())
+                    format!(
+                        "daemon online, {} active runs, {} recently finished",
+                        runs.len(),
+                        finished.len()
+                    )
                 }
                 Ok(other) => format!("daemon online (response: {other:?})"),
                 Err(e) => format!("daemon unreachable: {e}"),

@@ -754,7 +754,10 @@ async fn run_with_no_model_argument_leaves_the_model_to_the_blueprint() {
     );
     temp_env::async_with_vars(isolation(&machine), async {
         let daemon = ScriptedDaemon::new(
-            vec![StreamScript::Hold(vec![status_event(), completed("complete")])],
+            vec![StreamScript::Hold(vec![
+                status_event(),
+                completed("complete"),
+            ])],
             spawn_ok,
         );
         let mut h = Harness::usual(&daemon, &machine);

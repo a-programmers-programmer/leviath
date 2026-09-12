@@ -21,8 +21,8 @@
 use super::*;
 use crate::components::StageHookScripts;
 use leviath_scripting::stage_hook::{HookOutcome, run};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Hook-generated tool calls do not carry a provider ID. Keep their IDs unique
@@ -319,8 +319,14 @@ pub(crate) fn run_after_inference_hooks(
             "response".to_string(),
             serde_json::Value::String(result.response.clone()),
         );
-        object.insert("tokens_used".to_string(), serde_json::json!(result.tokens_used));
-        object.insert("cut_off_at".to_string(), serde_json::json!(result.cut_off_at));
+        object.insert(
+            "tokens_used".to_string(),
+            serde_json::json!(result.tokens_used),
+        );
+        object.insert(
+            "cut_off_at".to_string(),
+            serde_json::json!(result.cut_off_at),
+        );
         object.insert(
             "truncated".to_string(),
             serde_json::Value::Bool(result.cut_off_at.is_some()),

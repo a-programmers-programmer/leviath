@@ -456,7 +456,7 @@ impl Blueprint {
             if let Some(region) = stage.transition_region.as_deref().map(str::trim) {
                 if region.is_empty() {
                     return Err(bad(
-                        "transition_region must be a non-empty region name".to_string(),
+                        "transition_region must be a non-empty region name".to_string()
                     ));
                 }
                 if !known.contains(region) {

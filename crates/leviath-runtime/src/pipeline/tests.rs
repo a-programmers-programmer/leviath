@@ -15615,7 +15615,11 @@ fn after_inference_refusal_removes_processing_markers() {
 
     run_after_hooks(&mut world);
 
-    assert!(status_message(&world, e).expect("errored").contains("bad response"));
+    assert!(
+        status_message(&world, e)
+            .expect("errored")
+            .contains("bad response")
+    );
     assert!(world.get::<ProcessResponse>(e).is_none());
     assert!(world.get::<ReadyForTools>(e).is_none());
     assert!(world.get::<ReadyForTransition>(e).is_none());
@@ -15712,7 +15716,10 @@ fn on_tool_call_sees_joined_context_regions() {
 
     run_tool_hooks(&mut world);
     assert_eq!(calls_of(&world, e)[0].name, "seen");
-    assert_eq!(calls_of(&world, e)[0].arguments["text"], "context seen by hook");
+    assert_eq!(
+        calls_of(&world, e)[0].arguments["text"],
+        "context seen by hook"
+    );
 }
 
 /// Narrowing is the point: a hook can rewrite a call into something tamer.

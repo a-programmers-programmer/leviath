@@ -363,9 +363,7 @@ pub async fn guard_context_window(
 /// value is rejected. The value is consumed even when the context-window
 /// provider has no reported maximum, so it can never leak as an unknown
 /// provider parameter. The request is never logged or included in the error.
-fn consume_input_budget(
-    request: &mut InferenceRequest,
-) -> Result<Option<usize>, ProviderError> {
+fn consume_input_budget(request: &mut InferenceRequest) -> Result<Option<usize>, ProviderError> {
     let Some(extra) = request.extra.as_object_mut() else {
         return Ok(None);
     };
@@ -1153,17 +1151,16 @@ mod tests {
             serde_json::json!("1"),
         ] {
             let mut request = test_request();
-            request.extra = serde_json::Map::from_iter([(
-                MAX_INPUT_TOKENS_PARAM.to_string(),
-                value,
-            )])
-            .into();
+            request.extra =
+                serde_json::Map::from_iter([(MAX_INPUT_TOKENS_PARAM.to_string(), value)]).into();
             let error = guard_context_window(provider.as_ref(), &mut request, None)
                 .await
                 .expect_err("invalid budget must refuse before dispatch");
-            assert!(error
-                .to_string()
-                .contains("leviath_max_input_tokens must be a positive integer"));
+            assert!(
+                error
+                    .to_string()
+                    .contains("leviath_max_input_tokens must be a positive integer")
+            );
             assert_eq!(request.extra, serde_json::Value::Object(Default::default()));
         }
     }

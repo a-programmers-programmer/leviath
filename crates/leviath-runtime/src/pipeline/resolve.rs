@@ -418,13 +418,14 @@ fn resolve_candidates_in_order(
                 .iter()
                 .any(|e| model_key(&e.model) == model_key(&head.model))
         });
+        // One condition, not two nested ones. The merge produced the nested
+        // shape; clippy's `collapsible_if` is right that it reads as one test.
         if let Some(dm) = override_model
             && let Some(at) = order.iter().position(|k| k == model_key(dm))
+            && (!head_is_stage_pin || at == 0)
         {
-            if !head_is_stage_pin || at == 0 {
-                let key = order.remove(at);
-                order.insert(0, key);
-            }
+            let key = order.remove(at);
+            order.insert(0, key);
         }
         let mut grouped: Vec<ModelEntry> = Vec::with_capacity(candidates.len());
         for key in order {

@@ -241,10 +241,7 @@ pub(crate) async fn respond(shared: &Shared, args: &Args) -> CallOutcome {
                     ok(text, json!({ "interactions": interactions }), None)
                 }
             }
-            Ok(other) => fail(
-                format!("unexpected daemon response: {other:?}"),
-                json!({}),
-            ),
+            Ok(other) => fail(format!("unexpected daemon response: {other:?}"), json!({})),
             Err(e) => fail(
                 format!("control error: {e}"),
                 json!({ "error": e.to_string() }),

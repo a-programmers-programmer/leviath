@@ -217,6 +217,19 @@ pub(crate) fn resolve_transition_sync(
     }
 }
 
+/// What a `[stages.X.transitions]` edge resolves to: which stage to move to,
+/// the transform to apply to the context on the way, and an optional gate that
+/// must pass first.
+///
+/// Named rather than written inline because the tuple appears in the return type
+/// and clippy's `type_complexity` is right that an unnamed triple of this shape
+/// reads poorly at a signature.
+type ResolvedTransition = (
+    usize,
+    leviath_core::blueprint::EdgeTransform,
+    Option<Box<leviath_core::blueprint::TransitionGate>>,
+);
+
 /// Resolve a stage's optional authoritative transition destination.
 ///
 /// A transition region is a control-plane input prepared by deterministic
@@ -229,7 +242,7 @@ fn resolve_transition_from_region(
     stage: &leviath_core::Stage,
     window: &ContextWindow,
     visits: &std::collections::HashMap<String, usize>,
-) -> Result<Option<(usize, leviath_core::blueprint::EdgeTransform, Option<Box<leviath_core::blueprint::TransitionGate>>)>, String> {
+) -> Result<Option<ResolvedTransition>, String> {
     let Some(region_name) = stage.transition_region.as_deref() else {
         return Ok(None);
     };
@@ -269,9 +282,7 @@ fn resolve_transition_from_region(
         ));
     }
     let target_stage = blueprint.find_stage(target).ok_or_else(|| {
-        format!(
-            "transition_region '{region_name}' selected unknown stage '{target}'"
-        )
+        format!("transition_region '{region_name}' selected unknown stage '{target}'")
     })?;
     if target_stage
         .max_revisits
@@ -493,23 +504,20 @@ pub(crate) fn resolve_transition(
                 note_max_iterations(&mut window, &stage.name, stage.max_iterations.unwrap_or(0));
                 find_conditioned_edge(&bp.0, stage, &visits.0, TransitionCondition::MaxIterations)
                     .map(|(i, t)| StageResolution::Next(i, t, None))
-                    .unwrap_or_else(|| match resolve_transition_from_region(
-                        &bp.0,
-                        stage,
-                        &window,
-                        &visits.0,
-                    ) {
-                        Ok(Some((idx, transform, gate))) => {
-                            StageResolution::Next(idx, transform, gate)
-                        }
-                        Ok(None) => {
-                            resolve_transition_sync(&bp.0, stage, cursor.index, &visits.0)
-                        }
-                        Err(message) => {
-                            state.status = AgentStatus::Error {
-                                message: message.clone(),
-                            };
-                            StageResolution::TerminalError
+                    .unwrap_or_else(|| {
+                        match resolve_transition_from_region(&bp.0, stage, &window, &visits.0) {
+                            Ok(Some((idx, transform, gate))) => {
+                                StageResolution::Next(idx, transform, gate)
+                            }
+                            Ok(None) => {
+                                resolve_transition_sync(&bp.0, stage, cursor.index, &visits.0)
+                            }
+                            Err(message) => {
+                                state.status = AgentStatus::Error {
+                                    message: message.clone(),
+                                };
+                                StageResolution::TerminalError
+                            }
                         }
                     })
             }

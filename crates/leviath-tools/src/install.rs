@@ -86,7 +86,7 @@ impl InstalledTool {
             ));
         }
         out.push_str(
-"\nEvery agent on this machine can call it from its next spawn. A stage that sets \
+            "\nEvery agent on this machine can call it from its next spawn. A stage that sets \
              `available_global_tools = true`, or whose `available_tools` names it or includes \
              `@scripts`, advertises it; a `dynamic_tools` agent already running sees it on its \
              next turn.",
@@ -408,7 +408,7 @@ mod tests {
         assert!(text.contains("Installed tool 'upper'"), "{text}");
         assert!(text.contains("text:string! (input to transform)"), "{text}");
         assert!(!text.contains("replaced"), "{text}");
-assert!(text.contains("available_global_tools"), "{text}");
+        assert!(text.contains("available_global_tools"), "{text}");
         assert!(text.contains("@scripts"), "{text}");
     }
 
