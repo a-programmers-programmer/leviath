@@ -1,5 +1,6 @@
 [agent]
 name = "bake-merge"
+version = "0.1.0"
 description = "HarnessQL merge-level decision lane: given a COMPACT schema diff, emit per-type merge decisions. No full-schema production."
 entry_stage = "decide"
 

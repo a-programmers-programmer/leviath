@@ -1,5 +1,6 @@
 [agent]
 name = "bake-off"
+version = "0.1.0"
 description = "HarnessQL flash bake-off lane: iterate a GraphQL schema per Composition Guide, reason-backed cost/benefit."
 entry_stage = "bake"
 
