@@ -320,7 +320,12 @@ async fn the_handshake_ping_and_tool_list_need_no_daemon() {
             "list_runs",
             "list_agents",
             "install_tool",
-            "list_tools"
+            "list_tools",
+            "ps",
+            "pause",
+            "resume",
+            "daemon_status",
+            "validate"
         ]
     );
     for tool in tools {
@@ -333,6 +338,9 @@ async fn the_handshake_ping_and_tool_list_need_no_daemon() {
             "list_agents",
             "list_tools",
             "wait",
+            "ps",
+            "daemon_status",
+            "validate",
         ]
         .contains(&name);
         assert_eq!(ann["readOnlyHint"], read_only, "{name}");
@@ -725,6 +733,61 @@ async fn run_spawns_waits_reports_progress_and_returns_the_answer() {
         assert_eq!(
             args.output.as_ref().unwrap().schema.as_ref().unwrap()["required"],
             json!(["summary"])
+        );
+    })
+    .await;
+}
+
+/// A `run` call that names no model must not invent one: the spawn carries
+/// `model: None`, so the daemon resolves every stage from the blueprint - which
+/// is where a stage-model pin lives. A host-dispatched run is the path with no
+/// `--model` on it, so anything this layer filled in would silently override
+/// every stage's pin at once, and the run's recorded model would be somebody
+/// else's choice.
+#[tokio::test]
+async fn run_with_no_model_argument_leaves_the_model_to_the_blueprint() {
+    let machine = Machine::new();
+    let manifest = machine.install_agent(
+        "pinned",
+        "\n[stages.pinned.model]\nmodels = [ { provider = \"openrouter\", model = \
+         \"deepseek/deepseek-v4.1-flash\" } ]\n",
+    );
+    temp_env::async_with_vars(isolation(&machine), async {
+        let daemon = ScriptedDaemon::new(
+            vec![StreamScript::Hold(vec![
+                status_event(),
+                completed("complete"),
+            ])],
+            spawn_ok,
+        );
+        let mut h = Harness::usual(&daemon, &machine);
+        h.call(
+            1,
+            "run",
+            json!({
+                "task": "t",
+                "agent": manifest.to_string_lossy(),
+                "workdir": machine.project().to_string_lossy(),
+            }),
+        )
+        .await;
+        let (_notifications, msg) = h.response(1).await;
+        let (is_error, text, _) = result_parts(&msg);
+        assert!(!is_error, "{text}");
+
+        let requests = daemon.requests();
+        let ControlRequest::Spawn { args } = &requests[0] else {
+            panic!("{requests:?}");
+        };
+        assert_eq!(
+            args.model, None,
+            "the attended path names no model of its own; the blueprint's pin is \
+             what resolves"
+        );
+        let pin = std::fs::read_to_string(&manifest).unwrap();
+        assert!(
+            pin.contains("deepseek-v4.1-flash"),
+            "the blueprint the daemon was handed still carries the pin: {pin}"
         );
     })
     .await;
@@ -2124,6 +2187,10 @@ async fn list_runs_merges_the_daemons_view_with_the_records_on_disk() {
         started_at: Some(started_at),
         active: None,
         unattended: true,
+        // `--yolo=<name>` profile. Upstream added this field and the sync merge
+        // dropped it from this test fixture. The fixture is an unattended run
+        // with no named profile.
+        yolo_profile: None,
         empty_output: false,
         splits_degraded: 0,
         broken_scripts: vec![],

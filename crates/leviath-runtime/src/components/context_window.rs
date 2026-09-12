@@ -13,6 +13,9 @@ use super::block_cache::{
 use super::*;
 
 mod eviction;
+/// Typed parts as provider content blocks: stand-ins, mime blocks, and the
+/// lifted message a system region's stored parts ride in.
+mod mime;
 
 /// Result of an eviction attempt, including tokens freed and regions needing LLM compaction.
 #[derive(Debug, Clone)]
@@ -57,6 +60,9 @@ pub(crate) struct InferenceConfig {
     /// `[stages.<name>.model] request_timeout_secs`. When `Some`, it overrides the
     /// default inference job timeout at dispatch; when `None`, the default applies.
     pub request_timeout_secs: Option<u64>,
+    /// Mime type patterns whose parts reach this stage's model as text
+    /// whatever the model takes: `[stages.<name>.input] as_text`.
+    pub as_text: Vec<String>,
 }
 
 /// Per-entity tool result routing configuration.
@@ -510,7 +516,27 @@ impl ContextWindow {
         tokens: usize,
         reasoning: Option<String>,
     ) -> leviath_core::Result<()> {
-        self.typed_write(
+        self.add_assistant_turn_content(
+            region_name,
+            kind,
+            leviath_core::region::EntryContent::text(content),
+            tokens,
+            reasoning,
+        )
+    }
+
+    /// [`add_assistant_turn`](Self::add_assistant_turn) for a turn that
+    /// carries parts beside its text: what a model that draws or speaks
+    /// handed back.
+    pub(crate) fn add_assistant_turn_content(
+        &mut self,
+        region_name: &str,
+        kind: leviath_core::EntryKind,
+        content: leviath_core::region::EntryContent,
+        tokens: usize,
+        reasoning: Option<String>,
+    ) -> leviath_core::Result<()> {
+        self.typed_write_content(
             WriteOrigin::System,
             region_name,
             kind,
@@ -542,25 +568,8 @@ impl ContextWindow {
         tokens: usize,
         taint: Option<leviath_core::TaintLevel>,
     ) -> leviath_core::Result<()> {
-        let (content, tokens, key_override) = match origin {
-            WriteOrigin::Agent => self.on_write_agent(region_name, content, tokens, &kind, None)?,
-            WriteOrigin::System => self.on_write_system(region_name, content, tokens, &kind, None),
-        };
-        self.write_to_region(region_name, tokens, &mut |region, tokens| {
-            match taint {
-                Some(level) => {
-                    region.add_typed_tainted_entry(content.clone(), tokens, kind.clone(), level)?;
-                }
-                None => region.add_typed_entry(content.clone(), tokens, kind.clone())?,
-            }
-            // A key override from the hook names the entry just pushed.
-            if let Some(key) = key_override.as_deref()
-                && let Some(entry) = region.content.last_mut()
-            {
-                entry.key = Some(key.to_string());
-            }
-            Ok(())
-        })
+        let content = leviath_core::region::EntryContent::text(content);
+        self.typed_write_content(origin, region_name, kind, content, tokens, taint)
     }
 
     /// Shared tail of every region write: run the insert, give a custom
@@ -639,6 +648,10 @@ impl ContextWindow {
         // the newest entry timestamp of the region that produced it. Feeds the
         // cache-breakpoint split after the sort.
         let mut volatile_recency: Vec<i64> = Vec::new();
+        // The stored parts of every region that renders into the system
+        // prompt, which is text. They travel in one user message ahead of the
+        // conversation instead; see `mime::lifted_blocks`.
+        let mut lifted: Vec<leviath_providers::ContentBlock> = Vec::new();
 
         for region in &self.regions {
             // A region this stage does not attend to is held but not shown.
@@ -653,6 +666,9 @@ impl ContextWindow {
             if region.content.is_empty() && !is_custom {
                 continue;
             }
+            if !matches!(region.kind, leviath_core::RegionKind::SlidingWindow { .. }) {
+                lifted.extend(mime::lifted_blocks(region));
+            }
 
             // Where this region's system blocks begin, so the recency mapping
             // below covers exactly the blocks this region adds.
@@ -664,7 +680,7 @@ impl ContextWindow {
                     let body = region
                         .content
                         .iter()
-                        .map(|e| e.content.clone())
+                        .map(|e| e.content.to_string())
                         .collect::<Vec<_>>();
                     push_chunked(&mut system_blocks, region, &body, CacheHint::Always);
                 }
@@ -688,7 +704,7 @@ impl ContextWindow {
                     let body = region
                         .content
                         .iter()
-                        .map(|e| e.content.clone())
+                        .map(|e| e.content.to_string())
                         .collect::<Vec<_>>();
                     push_chunked(&mut system_blocks, region, &body, CacheHint::Always);
                 }
@@ -719,26 +735,31 @@ impl ContextWindow {
                             EntryKind::UserMessage => {
                                 messages.push(leviath_providers::Message {
                                     role: "user".to_string(),
-                                    content: entry.content.clone().into(),
+                                    content: mime::message_content(&entry.content),
                                     cache_breakpoint: false,
                                     reasoning: None,
                                 });
                             }
                             EntryKind::AssistantTurn { tool_calls } => {
+                                // Media a stage produced (an image a model drew)
+                                // cannot ride the assistant turn that made it: a
+                                // provider rejects an image inside an assistant
+                                // turn (Anthropic answers 400), so a later stage
+                                // that should see it never would. The assistant
+                                // turn keeps its text and the stand-ins that name
+                                // the media; the bytes follow in a user turn.
+                                let lifted_media = mime::mime_blocks(&entry.content);
                                 if tool_calls.is_empty() {
                                     messages.push(leviath_providers::Message {
                                         role: "assistant".to_string(),
-                                        content: entry.content.clone().into(),
+                                        content: leviath_providers::MessageContent::Text(
+                                            entry.content.to_string(),
+                                        ),
                                         cache_breakpoint: false,
                                         reasoning: entry.reasoning.clone(),
                                     });
                                 } else {
-                                    let mut blocks = Vec::new();
-                                    if !entry.content.is_empty() {
-                                        blocks.push(leviath_providers::ContentBlock::Text {
-                                            text: entry.content.clone(),
-                                        });
-                                    }
+                                    let mut blocks = mime::text_blocks(&entry.content);
                                     for tc in tool_calls {
                                         blocks.push(leviath_providers::ContentBlock::ToolUse {
                                             id: tc.id.clone(),
@@ -754,6 +775,21 @@ impl ContextWindow {
                                         reasoning: entry.reasoning.clone(),
                                     });
                                 }
+                                // Only when the turn has no tool calls: inserting
+                                // a user turn between a tool_use and its
+                                // tool_result would break the pairing a provider
+                                // requires, and that rare turn's media stays a
+                                // stand-in rather than risk it.
+                                if tool_calls.is_empty() && !lifted_media.is_empty() {
+                                    messages.push(leviath_providers::Message {
+                                        role: "user".to_string(),
+                                        content: leviath_providers::MessageContent::Blocks(
+                                            lifted_media,
+                                        ),
+                                        cache_breakpoint: false,
+                                        reasoning: None,
+                                    });
+                                }
                             }
                             EntryKind::ToolResult {
                                 tool_call_id,
@@ -764,10 +800,14 @@ impl ContextWindow {
                                 pending_tool_results.push(
                                     leviath_providers::ContentBlock::ToolResult {
                                         tool_use_id: tool_call_id.clone(),
-                                        content: entry.content.clone(),
+                                        content: entry.content.to_string(),
                                         is_error: *is_error,
                                     },
                                 );
+                                // A tool result is text on every wire; the
+                                // parts it produced follow it in the same user
+                                // turn, after every result block.
+                                pending_tool_results.extend(mime::mime_blocks(&entry.content));
                             }
                             EntryKind::Text => {
                                 let trimmed = entry.content.trim();
@@ -788,7 +828,7 @@ impl ContextWindow {
                                 } else {
                                     messages.push(leviath_providers::Message {
                                         role: "user".to_string(),
-                                        content: entry.content.clone().into(),
+                                        content: mime::message_content(&entry.content),
                                         cache_breakpoint: false,
                                         reasoning: None,
                                     });
@@ -855,7 +895,7 @@ impl ContextWindow {
                             if let Some(key) = &e.key {
                                 format!("### [{}]\n{}", key, e.content)
                             } else {
-                                e.content.clone()
+                                e.content.to_string()
                             }
                         })
                         .collect::<Vec<_>>()
@@ -906,6 +946,20 @@ impl ContextWindow {
         if !preamble.is_empty() {
             let conversation = std::mem::replace(&mut messages, preamble);
             messages.extend(conversation);
+        }
+        // The stored parts of the system regions come first of all: they
+        // belong to the reference material, and a leading message that holds
+        // still is one a provider can cache.
+        if !lifted.is_empty() {
+            messages.insert(
+                0,
+                leviath_providers::Message {
+                    role: "user".to_string(),
+                    content: leviath_providers::MessageContent::Blocks(lifted),
+                    cache_breakpoint: false,
+                    reasoning: None,
+                },
+            );
         }
 
         // ── Sort system blocks for optimal prefix caching ────────────────

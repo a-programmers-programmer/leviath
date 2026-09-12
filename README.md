@@ -138,7 +138,7 @@ once instead of one after another. `coder` is the largest:
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/agents/coder-dark.svg">
+    <source mime="(prefers-color-scheme: dark)" srcset="docs/assets/agents/coder-dark.svg">
     <img src="docs/assets/agents/coder.svg" alt="The coder agent's workflow graph" width="560">
   </picture>
 </p>

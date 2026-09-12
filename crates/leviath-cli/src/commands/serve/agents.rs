@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use axum::response::Json;
+use leviath_core::mime::MimeRegistry;
 use leviath_runtime::control_socket::{ControlRequest, ControlResponse};
 use leviath_runtime::host::SpawnArgs;
 
@@ -25,7 +26,7 @@ use crate::runstate::{self, ContextSnapshot, RunMeta};
 /// (leaving whatever the blueprint declares).
 ///
 /// `output_format` is carried through as an opaque label and never checked
-/// against a known set, which is what lets a client ask for a2ui, a media type,
+/// against a known set, which is what lets a client ask for a2ui, a mime type,
 /// or a house format without any server-side support. `output_schema` is the
 /// one field with meaning here, and only because the runtime will check it.
 fn output_request(body: &SpawnAgentReq) -> Option<leviath_core::output::OutputSpec> {
@@ -42,6 +43,7 @@ fn output_request(body: &SpawnAgentReq) -> Option<leviath_core::output::OutputSp
         schema: body.output_schema.clone(),
         validator: None,
         on_validator_error: None,
+        artifacts: Vec::new(),
     })
 }
 
@@ -71,8 +73,11 @@ fn spawn_warnings(
 
 pub(super) async fn spawn_agent(
     State(state): State<AppState>,
-    Json(body): Json<SpawnAgentReq>,
+    request: axum::extract::Request,
 ) -> Result<Json<SpawnAgentResp>, ApiError> {
+    let max_upload = state.limits.request_limits.max_upload_bytes;
+    let (mut body, mut parts): (SpawnAgentReq, _) =
+        super::upload::json_or_multipart(&state, request, max_upload).await?;
     let blueprints = discover_blueprints(&state.current_config());
     let bp_info = blueprints
         .iter()
@@ -101,9 +106,11 @@ pub(super) async fn spawn_agent(
     // running on the host, from a request - as did `{"allow": ["*"]}`, which
     // reaches the same wildcard override by another name. `--no-remote-yolo`
     // refuses both.
+    // A named profile is a kind of yolo, so it is refused with it.
+    let yolo = body.yolo || body.yolo_profile.is_some();
     state
         .limits
-        .check_launch_overrides(body.yolo, &body.allow)
+        .check_launch_overrides(yolo, &body.allow)
         .map_err(|e| err(StatusCode::FORBIDDEN, e))?;
     // And a completion webhook is a request the daemon makes on the caller's
     // behalf, so it goes through the same SSRF policy as any model-supplied URL.
@@ -112,6 +119,24 @@ pub(super) async fn spawn_agent(
             .limits
             .check_callback_url(callback)
             .map_err(|e| err(StatusCode::FORBIDDEN, e))?;
+    }
+    // Files the request names inside the workdir, then the ones the task and
+    // each region's text mention with `@path`. The text keeps the token so
+    // the model reads the same name the part carries.
+    let workdir_path = std::path::Path::new(&workdir);
+    parts.extend(super::upload::json_parts(
+        &body.parts,
+        workdir_path,
+        max_upload,
+    )?);
+    let (task, named) = super::upload::inline_parts(&body.task, None, workdir_path, max_upload)?;
+    body.task = task;
+    parts.extend(named);
+    for (region, text) in body.regions.iter_mut() {
+        let (kept, named) =
+            super::upload::inline_parts(text, Some(region), workdir_path, max_upload)?;
+        *text = kept;
+        parts.extend(named);
     }
     let run_id = runstate::new_run_id(&body.blueprint);
     let args = SpawnArgs {
@@ -124,7 +149,8 @@ pub(super) async fn spawn_agent(
         metadata: body.metadata.clone(),
         callback_url: body.callback_url.clone(),
         callback_secret: body.callback_secret.clone(),
-        yolo: body.yolo,
+        yolo,
+        yolo_profile: body.yolo_profile.clone(),
         // Either side may refuse: the caller for this run, or the operator
         // for every run that comes in this way.
         no_seed_commands: body.no_seed_commands || state.limits.no_remote_seed_commands,
@@ -133,6 +159,7 @@ pub(super) async fn spawn_agent(
         max_depth: body.max_depth,
         // Serve spawns are top-level runs.
         parent_run_id: None,
+        parts,
     };
     let warnings = spawn_warnings(&manifest_path, args.output.as_ref());
 
@@ -426,6 +453,7 @@ pub(super) const MAX_FILE_READ_BYTES: u64 = 1024 * 1024;
 /// Purely a filesystem read: it works with the daemon down, like the other
 /// read endpoints.
 pub(super) async fn agent_file(
+    State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
     Query(query): Query<FileQuery>,
 ) -> Result<Json<FileOrListing>, ApiError> {
@@ -436,9 +464,13 @@ pub(super) async fn agent_file(
         .file_source()
         .map_err(|message| err(StatusCode::BAD_REQUEST, message))?;
 
+    // A listing types each row by name with the same registry `/files/raw`
+    // types the bytes with, so a console gets the run's answer, not its own.
+    let registry = state.current_config().mime_registry_or_defaults();
+
     // No path means "what is there", which is a listing rather than a read.
     let Some(ref requested_path) = query.path else {
-        return list_run_files(&meta, source, None, query.hidden).map(Json);
+        return list_run_files(&meta, source, None, query.hidden, &registry).map(Json);
     };
 
     let workdir = PathBuf::from(&meta.workdir);
@@ -459,8 +491,14 @@ pub(super) async fn agent_file(
         // folder picker already answers that shape, so it lists instead of
         // refusing.
         Ok(m) if m.is_dir() => {
-            return list_run_files(&meta, FileSource::Workdir, Some(&resolved), query.hidden)
-                .map(Json);
+            return list_run_files(
+                &meta,
+                FileSource::Workdir,
+                Some(&resolved),
+                query.hidden,
+                &registry,
+            )
+            .map(Json);
         }
         Ok(m) => m.len(),
         Err(_) => {
@@ -575,17 +613,31 @@ fn list_run_files(
     source: FileSource,
     dir: Option<&std::path::Path>,
     hidden: bool,
+    registry: &MimeRegistry,
 ) -> Result<FileOrListing, ApiError> {
     let workdir = PathBuf::from(&meta.workdir);
     let listing = match source {
-        FileSource::Modified => modified_listing(meta, &workdir),
-        FileSource::Workdir => workdir_listing(meta, &workdir, dir, hidden)?,
+        FileSource::Modified => modified_listing(meta, &workdir, registry),
+        FileSource::Workdir => workdir_listing(meta, &workdir, dir, hidden, registry)?,
     };
     Ok(FileOrListing::Listing(Box::new(listing)))
 }
 
+/// The type the registry gives a listing row from its name alone, empty for a
+/// directory. By extension, not sniffed - a listing must not read every file.
+fn entry_mime(name: &str, is_dir: bool, registry: &MimeRegistry) -> String {
+    match is_dir {
+        true => String::new(),
+        false => registry.resolve(None, Some(name), &[]).to_string(),
+    }
+}
+
 /// The paths the run recorded modifying, stat-ed against the workdir.
-fn modified_listing(meta: &RunMeta, workdir: &std::path::Path) -> RunFileListing {
+fn modified_listing(
+    meta: &RunMeta,
+    workdir: &std::path::Path,
+    registry: &MimeRegistry,
+) -> RunFileListing {
     let entries = meta
         .flags
         .modified_files
@@ -597,13 +649,16 @@ fn modified_listing(meta: &RunMeta, workdir: &std::path::Path) -> RunFileListing
                 workdir.join(rel)
             };
             let stat = std::fs::metadata(&resolved).ok();
+            let name = std::path::Path::new(rel)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| rel.clone());
+            let is_dir = stat.as_ref().is_some_and(|m| m.is_dir());
             RunFileEntry {
-                name: std::path::Path::new(rel)
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| rel.clone()),
+                mime_type: entry_mime(&name, is_dir, registry),
+                name,
                 path: rel.clone(),
-                is_dir: stat.as_ref().is_some_and(|m| m.is_dir()),
+                is_dir,
                 size: stat.as_ref().map(|m| m.len()),
                 // A recorded path can name a file since deleted, or - for a
                 // tool given an absolute path - one outside the workdir.
@@ -637,6 +692,7 @@ fn workdir_listing(
     workdir: &std::path::Path,
     dir: Option<&std::path::Path>,
     hidden: bool,
+    registry: &MimeRegistry,
 ) -> Result<RunFileListing, ApiError> {
     let target = dir
         .map(PathBuf::from)
@@ -672,14 +728,16 @@ fn workdir_listing(
             continue;
         }
         let stat = child.metadata().ok();
+        let is_dir = stat.as_ref().is_some_and(|m| m.is_dir());
         entries.push(RunFileEntry {
             path: path
                 .strip_prefix(workdir)
                 .unwrap_or(&path)
                 .to_string_lossy()
                 .into_owned(),
+            mime_type: entry_mime(&name, is_dir, registry),
             name,
-            is_dir: stat.as_ref().is_some_and(|m| m.is_dir()),
+            is_dir,
             size: stat.as_ref().map(|m| m.len()),
             exists: true,
             outside_workdir: false,
@@ -853,6 +911,17 @@ mod tests {
         ))
     }
 
+    /// A JSON `POST /api/agents` request carrying `req`, for calling the
+    /// handler directly.
+    fn spawn_request(req: &SpawnAgentReq) -> axum::extract::Request {
+        Request::builder()
+            .method("POST")
+            .uri("/api/agents")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(req).unwrap()))
+            .unwrap()
+    }
+
     fn test_state() -> AppState {
         let (tx, _) = broadcast::channel(64);
         AppState {
@@ -907,7 +976,7 @@ mod tests {
         // Outside `--workdir-root`.
         let err = spawn_agent(
             State(state.clone()),
-            Json(SpawnAgentReq {
+            spawn_request(&SpawnAgentReq {
                 blueprint: "probe".to_string(),
                 task: "t".to_string(),
                 workdir: Some("/".to_string()),
@@ -928,7 +997,7 @@ mod tests {
         // behalf, from inside the trust boundary.
         let err = spawn_agent(
             State(state.clone()),
-            Json(SpawnAgentReq {
+            spawn_request(&SpawnAgentReq {
                 blueprint: "probe".to_string(),
                 task: "t".to_string(),
                 workdir: Some(root.path().to_string_lossy().to_string()),
@@ -966,10 +1035,19 @@ mod tests {
                     ..Default::default()
                 },
             ),
+            // A profile is a kind of yolo, however narrow, and is refused
+            // with it; the operator's flag says nothing about which one.
+            (
+                "a yolo profile",
+                SpawnAgentReq {
+                    yolo_profile: Some("careful".to_string()),
+                    ..Default::default()
+                },
+            ),
         ] {
             let err = spawn_agent(
                 State(state.clone()),
-                Json(SpawnAgentReq {
+                spawn_request(&SpawnAgentReq {
                     blueprint: "probe".to_string(),
                     task: "t".to_string(),
                     workdir: Some(root.path().to_string_lossy().to_string()),
@@ -1210,6 +1288,137 @@ system_prompt = "Plan the work"
             .body(Body::from(body.to_string()))
             .unwrap();
         app.oneshot(req).await.unwrap().status()
+    }
+
+    /// A spawn with files: what the daemon receives on the wire.
+    async fn spawn_parts_seen(
+        content_type: &str,
+        body: Vec<u8>,
+    ) -> (StatusCode, Option<serde_json::Value>) {
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let sink = Arc::clone(&captured);
+        let (control, _dir, _srv) = fake_daemon(move |req| {
+            let wire = serde_json::to_value(&req).unwrap();
+            *sink.lock().unwrap() = Some(wire["args"].clone());
+            ControlResponse::Spawned {
+                run_id: "run-1".to_string(),
+            }
+        });
+        let (app, _agents) = spawn_app(control);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/agents")
+            .header("content-type", content_type)
+            .body(Body::from(body))
+            .unwrap();
+        let status = app.oneshot(req).await.unwrap().status();
+        let args = captured.lock().unwrap().take();
+        (status, args)
+    }
+
+    #[tokio::test]
+    async fn a_multipart_spawn_carries_its_files_to_the_daemon() {
+        let workdir = tempfile::tempdir().unwrap();
+        let boundary = "levboundary";
+        let mut body = Vec::new();
+        // Through the JSON encoder, not a raw interpolation: a Windows workdir
+        // carries backslashes, which a bare `"{}"` turns into invalid escapes.
+        let request = format!(
+            "{{\"blueprint\":\"spawnable\",\"task\":\"cut it\",\"workdir\":{}}}",
+            serde_json::to_string(&*workdir.path().to_string_lossy()).unwrap()
+        );
+        body.extend(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"request\"\r\n\r\n{request}\r\n").as_bytes());
+        body.extend(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"part:storyboard\"; filename=\"frame1.png\"\r\nContent-Type: image/png\r\n\r\n").as_bytes());
+        body.extend(b"\x89PNG\r\n\x1a\nframe");
+        body.extend(format!("\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"part\"; filename=\"notes.txt\"\r\n\r\nsome notes\r\n--{boundary}--\r\n").as_bytes());
+        let (status, args) =
+            spawn_parts_seen(&format!("multipart/form-data; boundary={boundary}"), body).await;
+        assert_eq!(status, StatusCode::OK);
+        let args = args.expect("the daemon saw a spawn");
+        assert_eq!(args["task"], "cut it");
+        let parts = args["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["name"], "frame1.png");
+        assert_eq!(parts[0]["region"], "storyboard");
+        assert_eq!(parts[0]["mime_type"], "image/png");
+        assert_eq!(parts[1]["name"], "notes.txt");
+        assert!(parts[1].get("region").is_none());
+        assert!(parts[1].get("mime_type").is_none());
+
+        // A body with no `request` field, an unexpected field, and an empty
+        // file are each refused.
+        for tail in [
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"part\"; filename=\"a.png\"\r\n\r\nxx\r\n--{boundary}--\r\n"
+            ),
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"request\"\r\n\r\n{request}\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"other\"\r\n\r\nx\r\n--{boundary}--\r\n"
+            ),
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"request\"\r\n\r\n{request}\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"part\"; filename=\"a.png\"\r\n\r\n\r\n--{boundary}--\r\n"
+            ),
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"request\"\r\n\r\nnot json\r\n--{boundary}--\r\n"
+            ),
+        ] {
+            let (status, _) = spawn_parts_seen(
+                &format!("multipart/form-data; boundary={boundary}"),
+                tail.clone().into_bytes(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{tail}");
+        }
+        // A body that says multipart and is nothing of the kind.
+        let (status, _) = spawn_parts_seen("multipart/form-data", b"garbage".to_vec()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn a_json_spawn_reads_named_and_mentioned_files_from_the_workdir() {
+        let workdir = tempfile::tempdir().unwrap();
+        std::fs::write(workdir.path().join("hero.png"), b"\x89PNG\r\n\x1a\nhero").unwrap();
+        std::fs::write(workdir.path().join("brief.md"), "# brief").unwrap();
+        // Encoded, so a Windows path's backslashes survive as JSON.
+        let wd = serde_json::to_string(&*workdir.path().to_string_lossy()).unwrap();
+        let body = format!(
+            "{{\"blueprint\":\"spawnable\",\"task\":\"edit @hero.png please\",\"workdir\":{wd},\
+             \"regions\":{{\"brief\":\"read @brief.md and @nothing.md\"}},\
+             \"parts\":[{{\"path\":\"brief.md\",\"region\":\"notes\",\"caption\":\"c\"}}]}}"
+        );
+        let (status, args) = spawn_parts_seen("application/json", body.into_bytes()).await;
+        assert_eq!(status, StatusCode::OK);
+        let args = args.expect("the daemon saw a spawn");
+        assert_eq!(args["task"], "edit @hero.png please");
+        assert_eq!(args["regions"]["brief"], "read @brief.md and @nothing.md");
+        let parts = args["parts"].as_array().unwrap();
+        let names: Vec<&str> = parts.iter().map(|p| p["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["brief.md", "hero.png", "brief.md"]);
+        assert_eq!(parts[0]["region"], "notes");
+        assert_eq!(parts[0]["caption"], "c");
+        assert!(parts[1].get("region").is_none());
+        assert_eq!(parts[2]["region"], "brief");
+
+        let body = format!(
+            "{{\"blueprint\":\"spawnable\",\"task\":\"t\",\"workdir\":{wd},\
+             \"parts\":[{{\"path\":\"../outside.png\"}}]}}"
+        );
+        let (status, _) = spawn_parts_seen("application/json", body.into_bytes()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        // A mentioned file the workdir holds but the API cannot take (empty,
+        // here) fails the spawn, whether the task or a region named it.
+        std::fs::write(workdir.path().join("empty.png"), b"").unwrap();
+        for body in [
+            format!("{{\"blueprint\":\"spawnable\",\"task\":\"see @empty.png\",\"workdir\":{wd}}}"),
+            format!(
+                "{{\"blueprint\":\"spawnable\",\"task\":\"t\",\"workdir\":{wd},\
+                 \"regions\":{{\"brief\":\"see @empty.png\"}}}}"
+            ),
+        ] {
+            let (status, _) = spawn_parts_seen("application/json", body.into_bytes()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+        let (status, _) = spawn_parts_seen("application/json", b"{\"blueprint\":5}".to_vec()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -2340,6 +2549,35 @@ system_prompt = "Plan the work"
 
             let (_, listing) = list_files(&run_id, "").await;
             assert_eq!(listing["modified_files_truncated"], true);
+
+            let _ = std::fs::remove_dir_all(runstate::run_dir(&run_id));
+        })
+        .await;
+    }
+
+    /// Every listing entry is typed by the registry from its name: a file gets
+    /// its mime type, a directory gets none.
+    #[tokio::test]
+    async fn a_listing_types_each_entry_by_name() {
+        crate::runstate::with_isolated_runs_dir_async("agent_files_mime", |_d| async move {
+            let workdir = tempfile::tempdir().unwrap();
+            std::fs::write(workdir.path().join("hero.png"), "x").unwrap();
+            std::fs::create_dir(workdir.path().join("assets")).unwrap();
+            let run_id = unique_run_id("files-mime");
+            create_run_in(&run_id, workdir.path());
+
+            let (status, listing) = list_files(&run_id, "?source=workdir").await;
+            assert_eq!(status, StatusCode::OK);
+            let by_name: std::collections::HashMap<&str, &serde_json::Value> = listing["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| (e["name"].as_str().unwrap(), e))
+                .collect();
+            // Typed by extension, not sniffed: the bytes above are not a PNG.
+            assert_eq!(by_name["hero.png"]["mime_type"], "image/png");
+            // A directory carries no type.
+            assert_eq!(by_name["assets"]["mime_type"], "");
 
             let _ = std::fs::remove_dir_all(runstate::run_dir(&run_id));
         })

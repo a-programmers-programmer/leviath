@@ -73,6 +73,9 @@ pub struct SpawnSpec {
     /// [`schema`](leviath_core::output::OutputSpec::schema) is the one thing
     /// that makes the runtime check the answer.
     pub output: Option<leviath_core::output::OutputSpec>,
+    /// Files to put in the run's regions as typed parts: on the task region
+    /// unless a part names another. Built with [`SpawnSpec::attach`].
+    pub parts: Vec<leviath_core::mime::InboundPart>,
 }
 
 impl SpawnSpec {
@@ -90,12 +93,21 @@ impl SpawnSpec {
             regions: HashMap::new(),
             metadata: HashMap::new(),
             output: None,
+            parts: Vec::new(),
         }
+    }
+
+    /// Attach a file to the run: bytes with a name, typed by the run's
+    /// registry unless the part declares a type, landing in the task region
+    /// unless the part names another.
+    pub fn attach(mut self, part: leviath_core::mime::InboundPart) -> Self {
+        self.parts.push(part);
+        self
     }
 
     /// Ask for the final output in `format`, with optional guidance.
     ///
-    /// `format` is carried through untouched: `"markdown"`, `"a2ui"`, a media
+    /// `format` is carried through untouched: `"markdown"`, `"a2ui"`, a mime
     /// type, or a shape invented for this program are all equally valid.
     pub fn output(mut self, format: impl Into<String>, instructions: Option<String>) -> Self {
         self.output = Some(leviath_core::output::OutputSpec {
@@ -105,6 +117,7 @@ impl SpawnSpec {
             schema: None,
             validator: None,
             on_validator_error: None,
+            artifacts: Vec::new(),
         });
         self
     }
@@ -168,21 +181,38 @@ impl AgentWorldBuilder {
         self
     }
 
-    /// The user-default provider/model, the fallback when none of a stage's
-    /// listed models has a registered provider.
-    pub fn default_model(mut self, provider: impl Into<String>, model: impl Into<String>) -> Self {
+    /// The provider bare model names route to, and the model every stage
+    /// that allows a user default starts on while this is set - ahead of the
+    /// models its blueprint names. The embedded form of `override_model`.
+    pub fn override_model(mut self, provider: impl Into<String>, model: impl Into<String>) -> Self {
         self.defaults.provider = provider.into();
-        self.defaults.model = Some(model.into());
+        self.defaults.override_model = Some(model.into());
+        self
+    }
+
+    /// The provider bare model names route to, with no override: each stage
+    /// keeps its blueprint's choice and open routes are asked of this
+    /// provider first. The embedded form of `default_provider` on its own.
+    pub fn default_provider(mut self, provider: impl Into<String>) -> Self {
+        self.defaults.provider = provider.into();
+        self
+    }
+
+    /// A model on the default provider tried after every model a stage names
+    /// and before any [`fallback_route`](Self::fallback_route), never ahead
+    /// of the blueprint's own choices. The embedded form of `fallback_model`.
+    pub fn fallback_model(mut self, model: impl Into<String>) -> Self {
+        self.defaults.fallback_model = Some(model.into());
         self
     }
 
     /// Append a host-wide failover target, tried after a stage's own entries
-    /// and the default model when the provider in use stops answering.
+    /// and the user's models when the provider in use stops answering.
     ///
     /// Call it once per target, best first. This is what keeps a blueprint
     /// that names exactly one model running when that provider runs out of
     /// credits.
-    pub fn fallback_model(mut self, provider: impl Into<String>, model: impl Into<String>) -> Self {
+    pub fn fallback_route(mut self, provider: impl Into<String>, model: impl Into<String>) -> Self {
         self.defaults
             .fallback_order
             .push(leviath_core::blueprint::ModelEntry::new(
@@ -392,6 +422,7 @@ impl AgentWorld {
             workdir: spec.workdir.to_string_lossy().into_owned(),
             metadata: spec.metadata,
             output: spec.output,
+            parts: spec.parts,
             ..Default::default()
         };
         let run_id = self
@@ -440,10 +471,23 @@ impl AgentWorld {
     /// Deliver a message into a running agent's inbox. `false` when the
     /// world can no longer accept messages (shut down or shutting down).
     pub async fn send_message(&self, id: &RunId, content: &str) -> bool {
+        self.send_message_with(id, content, Vec::new()).await
+    }
+
+    /// [`send_message`](Self::send_message) with files: the text and every
+    /// part bound for its region land as one entry, and a part naming
+    /// another region lands there on its own.
+    pub async fn send_message_with(
+        &self,
+        id: &RunId,
+        content: &str,
+        parts: Vec<leviath_core::mime::InboundPart>,
+    ) -> bool {
         self.ask(|reply| ControlOp::Message {
             agent_id: id.0.clone(),
             content: content.to_string(),
             target_region: None,
+            parts,
             reply,
         })
         .await
@@ -546,6 +590,7 @@ mod tests {
 
     fn text(content: &str) -> InferenceResponse {
         InferenceResponse {
+            parts: Vec::new(),
             content: content.to_string(),
             tool_calls: vec![],
             tokens_used: TokenUsage {
@@ -702,6 +747,29 @@ conversation = { kind = "sliding_window", max_items = 40, max_tokens = 20000 }
         assert!(requested.schema.is_none());
         assert!(requested.validator.is_none());
         assert!(requested.example.is_none());
+    }
+
+    /// Files attach to a spec one at a time and ride the spawn as inbound
+    /// parts, bound for the task region unless one names another.
+    #[test]
+    fn a_spawn_spec_carries_attached_files() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let spec = SpawnSpec::new(
+            BlueprintSource::Toml("[agent]\nname = \"x\"".to_string()),
+            "edit @hero.png",
+            dir.path(),
+        )
+        .attach(leviath_core::mime::InboundPart::from_bytes(
+            "hero.png",
+            vec![1, 2, 3],
+        ))
+        .attach(
+            leviath_core::mime::InboundPart::from_bytes("notes.md", b"# n".to_vec())
+                .in_region("brief"),
+        );
+        assert_eq!(spec.parts.len(), 2);
+        assert!(spec.parts[0].region.is_none());
+        assert_eq!(spec.parts[1].region.as_deref(), Some("brief"));
     }
 
     /// A spec that never asked for one requests nothing, so a blueprint's own
@@ -861,6 +929,18 @@ conversation = { kind = "sliding_window", max_items = 40, max_tokens = 20000 }
         // the pause/resume round-trip.)
         assert!(!world.pause(&run_id).await);
         assert!(world.send_message(&run_id, "prefer something boring").await);
+        assert!(
+            world
+                .send_message_with(
+                    &run_id,
+                    "and see @sketch.png",
+                    vec![leviath_core::mime::InboundPart::from_bytes(
+                        "sketch.png",
+                        b"\x89PNG\r\n\x1a\nsketch".to_vec()
+                    )],
+                )
+                .await
+        );
 
         // Answering resumes the run to completion.
         assert!(
@@ -1045,14 +1125,28 @@ conversation = { kind = "sliding_window", max_items = 40, max_tokens = 20000 }
             _progress: crate::pipeline::ToolProgress,
         ) -> crate::tool_bridge::BoxedToolExec {
             Box::new(move || {
-                Box::pin(async move {
-                    calls
-                        .into_iter()
-                        .map(|c| (c.id, "canned".to_string()))
-                        .collect()
-                })
+                Box::pin(
+                    async move { calls.into_iter().map(|c| (c.id, "canned".into())).collect() },
+                )
             })
         }
+    }
+
+    /// `default_provider` names the route for bare model names and nothing
+    /// else; `fallback_model` is the model behind every stage's own list.
+    /// Neither touches the override, so each stage keeps its blueprint's
+    /// choice.
+    #[test]
+    fn a_default_provider_and_a_fallback_model_leave_the_override_unset() {
+        let builder = AgentWorldBuilder::new()
+            .default_provider("openrouter")
+            .fallback_model("deepseek-v4-flash");
+        assert_eq!(builder.defaults.provider, "openrouter");
+        assert_eq!(builder.defaults.override_model, None);
+        assert_eq!(
+            builder.defaults.fallback_model.as_deref(),
+            Some("deepseek-v4-flash")
+        );
     }
 
     /// The failover chain is ordered and additive, and setting a default model
@@ -1060,11 +1154,11 @@ conversation = { kind = "sliding_window", max_items = 40, max_tokens = 20000 }
     #[test]
     fn fallback_models_accumulate_in_order_beside_the_default() {
         let builder = AgentWorldBuilder::new()
-            .fallback_model("anthropic", "sonnet")
-            .fallback_model("openai", "gpt")
-            .default_model("openrouter", "deepseek");
+            .fallback_route("anthropic", "sonnet")
+            .fallback_route("openai", "gpt")
+            .override_model("openrouter", "deepseek");
         assert_eq!(builder.defaults.provider, "openrouter");
-        assert_eq!(builder.defaults.model.as_deref(), Some("deepseek"));
+        assert_eq!(builder.defaults.override_model.as_deref(), Some("deepseek"));
         assert_eq!(
             builder
                 .defaults
@@ -1096,11 +1190,11 @@ conversation = { kind = "sliding_window", max_items = 40, max_tokens = 20000 }
                     ),
                 }),
             )
-            .default_model("mock", "m")
+            .override_model("mock", "m")
             // Repeated on purpose: the chain is ordered, so it must accumulate
             // rather than replace, and it must not disturb the default model.
-            .fallback_model("ollama", "llama")
-            .fallback_model("mock", "spare")
+            .fallback_route("ollama", "llama")
+            .fallback_route("mock", "spare")
             .state_dir(state.path())
             .inference_pool(InferencePoolConfig::new())
             .tool_concurrency(2)

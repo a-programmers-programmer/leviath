@@ -1,0 +1,29 @@
+Types only in A: Node, PageConnection, PageEdge, ProposalNotFound, ProposalResource
+Types only in B: ResourceKind, ResourceNotFound
+Identical types: 38
+
+Divergent types (24):
+  Agent: implements-removed=['Node']
+  ApprovalReview: fields-removed=['reviewer']; fields-added=['reviewerBinding']; implements-removed=['Node']
+  ChoiceGate: implements-removed=['Node']
+  ConfirmationGate: implements-removed=['Node']
+  DecisionOption: implements-removed=['Node']
+  Human: implements-removed=['Node']
+  Proposal: implements-removed=['Node']
+  ProposalChange: union-members-added=['ResourceNotFound']; union-members-removed=['ProposalNotFound']
+  ProposalConnection: implements-removed=['PageConnection']
+  ProposalEdge: implements-removed=['PageEdge']
+  ProposalRevision: fields-removed=['revisionNumber']; fields-added=['number']; implements-removed=['Node']
+  ProposalRevisionConnection: implements-removed=['PageConnection']
+  ProposalRevisionEdge: implements-removed=['PageEdge']
+  RejectionReview: fields-removed=['reviewer']; fields-added=['reviewerBinding']; implements-removed=['Node']
+  Review: fields-removed=['reviewer']; fields-added=['reviewerBinding']
+  ReviewDecision: union-members-added=['ResourceNotFound']; union-members-removed=['ProposalNotFound']
+  ReviewRound: fields-removed=['roundNumber']; fields-added=['number']; implements-removed=['Node']
+  ReviewRoundConnection: implements-removed=['PageConnection']
+  ReviewRoundEdge: implements-removed=['PageEdge']
+  ReviewerBinding: implements-removed=['Node']
+  ReviewerBindingChange: union-members-added=['ResourceNotFound']; union-members-removed=['ProposalNotFound']
+  ReviewerBindingConnection: implements-removed=['PageConnection']
+  ReviewerBindingEdge: implements-removed=['PageEdge']
+  RevisionRequestReview: fields-removed=['reviewer']; fields-added=['reviewerBinding']; implements-removed=['Node']

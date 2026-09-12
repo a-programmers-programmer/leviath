@@ -219,6 +219,52 @@ pub(super) fn tool_table() -> Vec<ServerTool> {
             object(json!({}), &[]),
             ToolAnnotations::READ_ONLY,
         ),
+        tool(
+            "ps",
+            "List active runs",
+            "Alias for list_runs with default parameters. Lists Leviath runs, newest first.",
+            object(
+                json!({
+                    "limit": integer("At most this many runs (default 20)."),
+                    "include_finished_on_disk": boolean("Include runs the daemon no longer holds (default true)."),
+                }),
+                &[],
+            ),
+            ToolAnnotations::READ_ONLY,
+        ),
+        tool(
+            "pause",
+            "Pause a run",
+            "Pause an active Leviath run.",
+            object(json!({ "run_id": run_id() }), &["run_id"]),
+            ToolAnnotations::MUTATING,
+        ),
+        tool(
+            "resume",
+            "Resume a run",
+            "Resume a paused Leviath run.",
+            object(json!({ "run_id": run_id() }), &["run_id"]),
+            ToolAnnotations::MUTATING,
+        ),
+        tool(
+            "daemon_status",
+            "Daemon health status",
+            "Check Leviath daemon connectivity and get active run counts.",
+            object(json!({}), &[]),
+            ToolAnnotations::READ_ONLY,
+        ),
+        tool(
+            "validate",
+            "Validate a blueprint",
+            "Validate an agent.leviath blueprint file schema and stages without running it.",
+            object(
+                json!({
+                    "path": string("Path to the agent.leviath file or agent directory."),
+                }),
+                &["path"],
+            ),
+            ToolAnnotations::READ_ONLY,
+        ),
     ]
 }
 
@@ -256,8 +302,13 @@ pub(super) async fn call_tool(
         "message" => control::message(shared, &args).await,
         "respond" => control::respond(shared, &args).await,
         "list_runs" => inspect::list_runs(shared, &args).await,
+        "ps" => inspect::list_runs(shared, &args).await,
         "list_agents" => inspect::list_agents(shared),
         "install_tool" => scripts::install_tool(shared, &args),
+        "pause" => control::pause(shared, &args).await,
+        "resume" => control::resume(shared, &args).await,
+        "daemon_status" => inspect::daemon_status(shared).await,
+        "validate" => inspect::validate_blueprint(&args),
         // The table and this match are held together by a test; the
         // fallback is for the type, not for a tool.
         _ => scripts::list_tools(shared),
@@ -364,25 +415,6 @@ fn output_location(shared: &Shared, run_id: &str) -> String {
         .join(leviath_core::FINAL_OUTPUT_FILE)
         .display()
         .to_string()
-}
-
-/// Send a request whose answer is a boolean: `Ok(applied)` on `ok: true`,
-/// `Err` with `refused` on `ok: false`, and the daemon's own words otherwise.
-async fn bool_request(
-    shared: &Shared,
-    request: ControlRequest,
-    applied: &str,
-    refused: &str,
-) -> Result<String, String> {
-    if let Err(e) = shared.daemon_ready().await {
-        return Err(format!("the leviath daemon is not available: {e}"));
-    }
-    match shared.control.request(&request).await {
-        Ok(ControlResponse::Ok { ok: true }) => Ok(applied.to_string()),
-        Ok(ControlResponse::Ok { ok: false }) => Err(refused.to_string()),
-        Ok(other) => Err(format!("unexpected daemon response: {other:?}")),
-        Err(e) => Err(format!("the leviath daemon is not reachable ({e})")),
-    }
 }
 
 // The tools themselves, by concern. Each takes the shared helpers above

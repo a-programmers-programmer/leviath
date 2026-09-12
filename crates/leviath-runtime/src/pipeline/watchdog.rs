@@ -126,6 +126,21 @@ pub(crate) fn enforce_max_iterations(
                 .remove::<ReadyToInfer>()
                 .insert(ResolveTransition)
                 .insert(StageOutcome::MaxIterations);
+        } else if let Some(soft) = stage.soft_iteration_cap {
+            // Soft cap (Josh directive): at the soft threshold we do NOT hard-
+            // stop. We record progress to the abnormal-ending/handoff note and
+            // route to the `handoff` edge so a fresh agent continues the work.
+            if progress.iterations >= soft {
+                // Record the cut-off on the run (handled fully in the transition
+                // resolver, which writes the abnormal-ending handoff note and
+                // routes the `handoff` edge). Here we just set the outcome so a
+                // fresh agent continues rather than a hard stop.
+                commands
+                    .entity(entity)
+                    .remove::<ReadyToInfer>()
+                    .insert(ResolveTransition)
+                    .insert(StageOutcome::SoftCapHandoff(soft));
+            }
         }
     }
 }

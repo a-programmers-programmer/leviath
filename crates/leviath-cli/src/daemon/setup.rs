@@ -270,6 +270,19 @@ fn make_resumer(
     })
 }
 
+/// The hook the host runs on every safety re-drive: the config as it stands
+/// on disk now, applied to the world where it differs from what is in it.
+/// One stat of `config.toml` and one read of `mime_types.toml` when nothing
+/// changed. Factored out so the closure body is unit-testable.
+fn make_housekeeper(
+    reloader: Arc<crate::daemon::config_reload::ConfigReloader>,
+    live_limits: Arc<crate::daemon::live_limits::LiveLimits>,
+) -> leviath_runtime::host::Housekeeper {
+    Box::new(move |world| {
+        live_limits.apply(&reloader.current(), world);
+    })
+}
+
 /// Everything the daemon hands its world host at construction.
 ///
 /// A struct rather than eight positional parameters because these are not
@@ -527,6 +540,13 @@ pub fn build_host(parts: HostParts) -> WorldHost {
     // no way out but a cancel, since its permissions were resolved at spawn and
     // an unanswered prompt waits for ever by default.
     host.set_resumer(make_resumer(tool_service.clone(), reloader.clone()));
+
+    // Housekeeping: on the host's own timer, whether or not a spawn comes
+    // along, re-read the config layers that reach runs already under way.
+    // This is what makes an edit to `mime_types.toml` (or a `[limits]` key)
+    // land in a live run within one re-drive interval rather than waiting
+    // for the next `lev run` to walk the spawn path.
+    host.set_housekeeper(make_housekeeper(reloader.clone(), live_limits.clone()));
 
     // Preprocessor: before the sync spawner runs, connect the blueprint's declared
     // MCP servers into the shared pool (lazy, deduped) so they're warm to advertise -
@@ -865,6 +885,60 @@ mod tests {
     /// it. Both arms in one test: an entity with no tool state (a fan-out
     /// parent paged back in before its workers register) is a no-op, and one
     /// with state has its config layers re-read.
+    /// The housekeeper applies the config as it stands on disk, so an edit
+    /// to `mime_types.toml` reaches the world on the next pass with no
+    /// spawn to carry it.
+    #[tokio::test]
+    async fn make_housekeeper_applies_the_files_on_disk() {
+        crate::config::with_isolated_config_path_async("housekeeper", |dir| async move {
+            let world_config = Config::default();
+            let mut world = PipelineWorld::new(
+                ProviderRegistry::new(),
+                Arc::new(CliToolService::new()),
+                leviath_runtime::inference_pool::InferencePoolConfig::new(),
+                1,
+                None,
+                Handle::current(),
+            );
+            let config_path = dir.join("config.toml");
+            std::fs::write(&config_path, toml::to_string(&world_config).unwrap()).unwrap();
+            let reloader = Arc::new(crate::daemon::config_reload::ConfigReloader::new(
+                config_path,
+                world_config,
+            ));
+            let live = crate::daemon::live_limits::for_daemon(
+                InteractionHub::new(),
+                leviath_runtime::host::HostSettings::default(),
+            );
+            let mut housekeeper = make_housekeeper(reloader, live);
+            let obj: leviath_core::mime::MimeType = "model/obj".parse().unwrap();
+            let family = |world: &PipelineWorld| {
+                world
+                    .world()
+                    .get_resource::<leviath_runtime::blob_store::MimeRegistryHandle>()
+                    .expect("the first pass installs the registry")
+                    .0
+                    .info(&obj)
+                    .family
+                    .clone()
+            };
+            housekeeper(&mut world);
+            assert_eq!(family(&world), "model");
+            std::fs::write(
+                dir.join("mime_types.toml"),
+                "[\"model/obj\"]\nfamily = \"scene\"\n",
+            )
+            .unwrap();
+            housekeeper(&mut world);
+            assert_eq!(
+                family(&world),
+                "scene",
+                "the file edit landed with no spawn"
+            );
+        })
+        .await;
+    }
+
     #[tokio::test]
     async fn make_resumer_rereads_the_config_of_a_registered_agent() {
         let tool_service = Arc::new(CliToolService::new());
@@ -959,6 +1033,7 @@ mod tests {
             title: None,
             title_error: None,
             unattended: false,
+            yolo_profile: None,
             read_paths: None,
             output_request: None,
             model_override: None,
@@ -1026,11 +1101,13 @@ mod tests {
                 callback_url: None,
                 callback_secret: None,
                 yolo: false,
+                yolo_profile: None,
                 no_seed_commands: false,
                 allow: Vec::new(),
                 max_depth: None,
                 parent_run_id: None,
                 output: None,
+                parts: Vec::new(),
             }),
             reply,
         });
@@ -1744,11 +1821,13 @@ system_prompt = "x"
                     callback_url: None,
                     callback_secret: None,
                     yolo: false,
+                    yolo_profile: None,
                     no_seed_commands: false,
                     allow: Vec::new(),
                     max_depth: None,
                     parent_run_id: None,
                     output: None,
+                    parts: Vec::new(),
                 }),
                 reply,
             })
@@ -1763,7 +1842,7 @@ system_prompt = "x"
     fn config_naming(path: &std::path::Path, providers: &[(&str, &str)], default: &str) -> Config {
         let mut config = Config {
             default_provider: default.to_string(),
-            default_model: Some("m".to_string()),
+            override_model: Some("m".to_string()),
             ..Config::default()
         };
         for (name, url) in providers {
@@ -1830,11 +1909,13 @@ task = {{ kind = "pinned", max_tokens = 200, seed = {{ caller = "task" }} }}
                 callback_url: None,
                 callback_secret: None,
                 yolo: false,
+                yolo_profile: None,
                 no_seed_commands: false,
                 allow: Vec::new(),
                 max_depth: None,
                 parent_run_id: None,
                 output: None,
+                parts: Vec::new(),
             }),
             reply,
         };
@@ -1972,11 +2053,13 @@ task = {{ kind = "pinned", max_tokens = 200, seed = {{ caller = "task" }} }}
                 callback_url: None,
                 callback_secret: None,
                 yolo: false,
+                yolo_profile: None,
                 no_seed_commands: false,
                 allow: Vec::new(),
                 max_depth: None,
                 parent_run_id: None,
                 output: None,
+                parts: Vec::new(),
             }),
             reply,
         });
@@ -2040,6 +2123,7 @@ task = {{ kind = "pinned", max_tokens = 200, seed = {{ caller = "task" }} }}
             max_child_depth: 0,
             flags: Default::default(),
             yolo: false,
+            yolo_profile: None,
             read_paths: None,
             final_output: None,
             waiting_on: None,
@@ -2153,6 +2237,7 @@ task = {{ kind = "pinned", max_tokens = 200, seed = {{ caller = "task" }} }}
             max_child_depth: 0,
             flags: Default::default(),
             yolo: false,
+            yolo_profile: None,
             read_paths: None,
             final_output: None,
             waiting_on: None,

@@ -542,6 +542,24 @@ impl AnthropicProvider {
 
     /// Build the request body for the Anthropic API.
     fn build_request_body(&self, request: &InferenceRequest) -> serde_json::Value {
+        // A message's content as the API takes it: a string for plain text,
+        // else the blocks, with each stored part written as Anthropic's own
+        // `image` or `document` block and every other block as it serialises.
+        fn anthropic_content(content: &crate::MessageContent) -> serde_json::Value {
+            match content {
+                crate::MessageContent::Text(text) => serde_json::Value::String(text.clone()),
+                crate::MessageContent::Blocks(blocks) => serde_json::Value::Array(
+                    blocks
+                        .iter()
+                        .map(|block| {
+                            crate::mime::anthropic_block(block).unwrap_or_else(|| {
+                                serde_json::to_value(block).unwrap_or(serde_json::Value::Null)
+                            })
+                        })
+                        .collect(),
+                ),
+            }
+        }
         // Anthropic allows at most 4 `cache_control` blocks per request, counted
         // across BOTH system blocks and message content. System blocks get first
         // claim on that budget (they're the most stable, most valuable prefix to
@@ -632,7 +650,7 @@ impl AnthropicProvider {
                         // time.
                         let mut message = serde_json::json!({
                             "role": msg.role,
-                            "content": msg.content,
+                            "content": anthropic_content(&msg.content),
                         });
                         // Nothing to mark leaves the message unannotated; it
                         // is still sent.
@@ -648,7 +666,7 @@ impl AnthropicProvider {
             } else {
                 messages.push(serde_json::json!({
                     "role": msg.role,
-                    "content": msg.content,
+                    "content": anthropic_content(&msg.content),
                 }));
             }
         }
@@ -796,6 +814,7 @@ impl AnthropicProvider {
             ),
             finish_reason: Self::parse_stop_reason(stop_reason),
             reasoning: None,
+            parts: Vec::new(),
         })
     }
 }
@@ -935,6 +954,16 @@ impl Provider for AnthropicProvider {
         }
     }
 
+    fn mime(&self, model: &str) -> crate::capabilities::ModelMime {
+        let base = self
+            .learned
+            .mime_corrected(model, crate::mime_tables::anthropic(model));
+        match self.capability_overrides.get(model) {
+            Some(o) => o.apply_mime(base),
+            None => base,
+        }
+    }
+
     /// Every id the listing named, once primed.
     ///
     /// `GET /v1/models` carries chat models only, so unlike OpenAI's there is
@@ -1041,6 +1070,9 @@ impl AnthropicProvider {
         })
     }
 }
+
+#[cfg(test)]
+mod mime_tests;
 
 #[cfg(test)]
 mod tests {

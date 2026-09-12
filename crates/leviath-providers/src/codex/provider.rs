@@ -385,6 +385,14 @@ impl Provider for CodexProvider {
         }
     }
 
+    fn mime(&self, model: &str) -> crate::capabilities::ModelMime {
+        let base = crate::mime_tables::codex(model);
+        match self.capability_overrides.get(model) {
+            Some(over) => over.apply_mime(base),
+            None => base,
+        }
+    }
+
     async fn prime_capabilities(&self) -> Result<()> {
         // The plan tier is already in the stored id token, so this costs no
         // network at all in the common case. Only an unreadable token sends us

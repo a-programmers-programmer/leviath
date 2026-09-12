@@ -2,6 +2,7 @@
 //!
 //! Provides file system and shell tools sandboxed to a working directory.
 
+use leviath_core::region::EntryContent;
 use leviath_core::resolves_within;
 use leviath_providers::Tool;
 use serde_json::{Value, json};
@@ -20,10 +21,15 @@ mod exec;
 pub use exec::is_null_device;
 pub use exec::resolve_within;
 mod install;
+pub mod mime;
+pub use mime::ToolMime;
 mod platform;
 pub mod validate;
 pub use context::*;
-pub use defs::{SUBAGENT_TOOLS, is_subagent_tool, submit_output_description};
+pub use defs::{
+    BUILTIN_TOOL_NAMES, STAGE_CONTROL_TOOLS, SUBAGENT_TOOLS, is_builtin_tool, is_subagent_tool,
+    submit_output_description,
+};
 pub use install::{
     InstallProbes, InstalledTool, MAX_TOOL_SOURCE_BYTES, install_script_tool,
     install_script_tool_with,
@@ -191,6 +197,24 @@ mod tests {
         assert!(!is_subagent_tool("read_file"));
     }
 
+    /// The static list is the catalog `tool_defs` ships, one name per def:
+    /// a built-in added to one and not the other would make `@builtin` miss it.
+    #[test]
+    fn builtin_name_list_matches_the_catalog() {
+        let tools = make_tools(&std::env::temp_dir());
+        let defs: Vec<String> = tools.tool_defs().into_iter().map(|d| d.name).collect();
+        for name in BUILTIN_TOOL_NAMES {
+            assert!(defs.contains(&name.to_string()), "{name} has no def");
+            assert!(is_builtin_tool(name));
+        }
+        assert_eq!(defs.len(), BUILTIN_TOOL_NAMES.len());
+        assert!(!is_builtin_tool("bash"), "an alias is not a canonical name");
+        assert!(!is_builtin_tool("spawn_agent"));
+        for name in STAGE_CONTROL_TOOLS {
+            assert!(is_builtin_tool(name));
+        }
+    }
+
     // ── Tool definitions ──────────────────────────────────────────────────
 
     #[test]
@@ -198,7 +222,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let tools = make_tools(&dir);
         let defs = tools.tool_defs();
-        assert_eq!(defs.len(), 28);
+        assert_eq!(defs.len(), 30);
     }
 
     #[test]
@@ -496,7 +520,7 @@ mod tests {
     fn names_returns_every_tool_and_alias() {
         let dir = std::env::temp_dir();
         let tools = make_tools(&dir);
-        assert_eq!(tools.names().len(), 29);
+        assert_eq!(tools.names().len(), 31);
     }
 
     /// The taint gate's fallback arm is the third-party default: outbound,
@@ -2263,7 +2287,7 @@ mod tests {
         let names: Vec<String> = tools.tool_defs().iter().map(|t| t.name.clone()).collect();
         assert!(!names.contains(&"shell".to_string()));
         // The rest remain, `install_tool` included: mobile has a filesystem.
-        assert_eq!(tools.tool_defs().len(), 27);
+        assert_eq!(tools.tool_defs().len(), 29);
         assert!(names.contains(&"read_file".to_string()));
         assert!(names.contains(&"install_tool".to_string()));
         assert!(names.contains(&"context_write".to_string()));
@@ -2447,5 +2471,73 @@ mod tests {
             result.contains("inside the workspace"),
             "says what to do instead: {result}"
         );
+    }
+}
+
+#[cfg(test)]
+mod binary_read_tests {
+    use super::*;
+    use leviath_core::mime::{BlobStore, MemoryBlobStore};
+    use serde_json::json;
+    use std::sync::Arc;
+
+    fn png_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("hero.png"), b"\x89PNG\r\n\x1a\n\xff\xfe").unwrap();
+        std::fs::write(dir.path().join("big.bin"), vec![0xff; 40]).unwrap();
+        dir
+    }
+
+    fn mime(store: Arc<MemoryBlobStore>, max: u64) -> Arc<ToolMime> {
+        Arc::new(ToolMime {
+            store,
+            registry: Arc::new(leviath_core::mime::RegistryCell::default()),
+            run_id: "run-1".to_string(),
+            max_part_bytes: max,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_binary_file_becomes_a_stored_part() {
+        let dir = png_dir();
+        let store = Arc::new(MemoryBlobStore::new());
+        let tools = BuiltinTools::new(
+            ToolContext::new(dir.path().to_path_buf()).with_mime(mime(store.clone(), 16)),
+        );
+        assert!(tools.mime().is_some());
+        let out = tools
+            .execute("read_file", json!({"path": "hero.png"}))
+            .await;
+        assert!(out.has_stored(), "{out}");
+        assert!(out.as_str().starts_with("'hero.png' is not text."), "{out}");
+        assert!(out.as_str().contains("[image/png, 10 B] hero.png"), "{out}");
+        let sha = &out.stored().next().unwrap().blob().unwrap().sha256;
+        assert!(store.has("run-1", sha));
+
+        // Over the ceiling: refused by name.
+        let out = tools.execute("read_file", json!({"path": "big.bin"})).await;
+        assert!(
+            out.as_str()
+                .starts_with("[error] 'big.bin' is 40 bytes, over the 16 byte ceiling"),
+            "{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_a_store_the_model_is_told() {
+        let dir = png_dir();
+        let tools = BuiltinTools::new(ToolContext::new(dir.path().to_path_buf()));
+        assert!(tools.mime().is_none());
+        let out = tools
+            .execute("read_file", json!({"path": "hero.png"}))
+            .await;
+        assert_eq!(
+            out.as_str(),
+            "[error] 'hero.png' is not a text file (10 B), and this run has no blob store to hold it as a part"
+        );
+        // Text files read as they always did.
+        std::fs::write(dir.path().join("a.txt"), "hello").unwrap();
+        let out = tools.execute("read_file", json!({"path": "a.txt"})).await;
+        assert_eq!(out, "hello");
     }
 }

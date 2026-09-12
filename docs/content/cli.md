@@ -38,7 +38,7 @@ Spawn an agent into the daemon. `PATH` is an installed agent name, a blueprint d
 | `-t`, `--task <TEXT\|FILE>` | The task prompt, or the path of a file holding it. Left off, your editor opens |
 | `-m`, `--model <MODEL>` | Model override for the whole run, as `provider/model` or a bare model name. Fan-out workers and sub-agents inherit it |
 | `--workdir <DIR>` | Working directory for the run, defaulting to where you ran the command. See below |
-| `--yolo` | Run unattended. See below |
+| `--yolo[=PROFILE]` | Run unattended, or under a named profile from `yolo.toml`. The equals sign is required. See below |
 | `--allow <TOOL>` | Allow one tool outright. Repeatable |
 | `--max-depth <N>` | Override the blueprint's maximum sub-agent tree depth |
 | `--no-seed-commands` | Refuse the blueprint's `seed = { command = "..." }` regions for this run |
@@ -48,6 +48,7 @@ Spawn an agent into the daemon. `PATH` is an installed agent name, a blueprint d
 | `--output-format <LABEL>` | Ask for the final output in this shape. A label that differs from what the blueprint declares retires its Rhai validator and JSON schema, with a warning on stderr. See [Final outputs](/docs/outputs) |
 | `--output-instructions <TEXT>` | Extra guidance about that shape |
 | `--output-schema <JSON\|@FILE>` | A JSON Schema the final output must satisfy |
+| `--attach <PATH[:REGION][:TYPE][:text|native|stand_in]>` | Put a file in a region as a typed part. Repeatable. See below |
 | `--<region> <TEXT\|@FILE>` | Seed a named context region. See below |
 
 **`--workdir`** decides more than where commands run. File tools are confined to it, and relative
@@ -76,6 +77,15 @@ before the run starts, and `lev validate` reports it as `holds-under-yolo`.
 
 `--yolo` can turn an `ask` into an `allow`, but it can never lift a `deny`.
 
+**`--yolo=<profile>`** is `--yolo` taken apart. A profile in [`yolo.toml`](/docs/configuration#yolotoml)
+says which tool calls and shell commands run unprompted, which still go through the ordinary
+approval prompt, and which are refused, and whether the model's questions, the stage checkpoints
+and the taint gate still come to you. The equals sign is required: `lev run --yolo coder` keeps
+meaning "run coder, plain yolo". A name the file does not have stops the run before the daemon is
+asked, and lists the names it does have. Before a profiled run starts, `lev run` prints what the
+profile keeps for you, above the blueprint's own held checkpoints. `lev yolo list` shows the
+profiles you have.
+
 Region seed flags are dynamic, because region names come from the blueprint. Any `--<name>` that is
 not one of the flags above is read as a seed for the region called `<name>`, and a value starting
 with `@` is read from that file:
@@ -89,6 +99,28 @@ A region only accepts a seed if the blueprint declares it as caller input: a str
 key implicitly. A table seed (`seed = { glob = ... }`, `{ command = ... }`, and so on) fills the
 region from somewhere else and takes no caller input. A `--<name>` naming any other region is
 dropped.
+
+A `@file` that is not text (an image, a recording, a PDF) is attached to the region as a typed
+[part](/docs/mime) instead of being read as its seed text, and a required region counts as
+provided by it. `--attach` does the same for any region the blueprint declares, caller input or
+not, and says more about the file when the name alone does not:
+
+```bash
+lev run storyteller --task "a 30 second trailer" \
+  --attach voice.wav:voice_samples --attach frame1.png:storyboard
+lev run modeller --attach scene.bin:props:model/gltf-binary
+lev run reviewer --task "does @mockup.png match the brief?"
+```
+
+The segments after the path are told apart by shape: `type/subtype` declares the mime type when
+the registry cannot tell from the bytes or the extension, `text`, `native` or `stand_in` chooses how
+the part reaches the model, and anything else names the region. Left off, the region is the one
+the task lands in. A `@path` inside the task text or a region's text attaches that file to the
+same entry, and the text keeps the `@path` as written so the model reads the same name the part
+carries. Paths resolve from where you ran the command. Write `\@` for a literal `@`; a token that
+names no file is left as text, and `lev run` warns when it looked like a path. A part bound for a
+region the blueprint does not declare, or whose declared type the region's `accepts` excludes, is
+refused before the daemon is dialled.
 
 > [!NOTE]
 > `--task` fills the caller-input key `task`. A blueprint receives it only if some region asks for
@@ -231,7 +263,8 @@ that was looked for.
 | error | `unknown-tool` | A name in `available_tools` matches nothing. See below |
 | error | `unparseable-safe-command` | A `[safe_commands] shell` entry no call can ever match. See below |
 | error | `output-missing-submit-tool` | A stage must produce an output and has no way to submit one. See below |
-| error | `orphan-stage-permission` | A `[stages.X.tool_permissions]` key names a tool the stage never granted. It reads as a grant and is not one. |
+| error | `orphan-stage-permission` | A `[stages.X.tool_permissions]` key names a tool the stage never granted, by name or through a group. It reads as a grant and is not one. |
+| error | `required-tool-not-granted` | A `required_tools` entry that no name and no group in `available_tools` reaches, so the model never sees it. Only checked when a group is in play; without one the load itself refuses the manifest. |
 | error | `unserved-model` | A stage names a model the provider that would run it does not carry. See below |
 | warning | `stage-missing-model` | No `[stages.X.model]` block, so the stage runs on whatever your `default_provider` is. |
 | warning | `stage-missing-mode` | No `mode`, so the stage runs as `autonomous`. |
@@ -240,6 +273,7 @@ that was looked for.
 | warning | `region-seed-not-understood` | A region's `seed` is not a recognized form, so the region starts empty. See below |
 | warning | `blocking-tool-in-autonomous-stage` | An autonomous stage grants a tool that waits for a person. See below |
 | warning | `implicit-shell-policy` | A shell grant with no policy behind it. See below |
+| warning | `blueprint-permission-clamped` | A `tool_permissions` entry that sets a granted tool more permissively than its built-in default, which a blueprint cannot do on its own. The runtime clamps it back, so the tool still asks. See below |
 | warning | `unknown-model` | A model this build has not heard of. See below |
 | warning | `catalog-unchecked` | A script provider that will not say which models it serves, so a name against it went unchecked. See below |
 | warning | `no-reachable-provider` | Nothing in the stage's models list can run here, so it falls through to your default model. See below |
@@ -253,7 +287,7 @@ that was looked for.
 | note | `safe-commands-declared` | The blueprint declares `[safe_commands]`. Declaring is not granting. See below |
 | note | `command-seed`, `read-paths-declared` | Things worth knowing before you run the blueprint. See below |
 
-Fifteen of those findings need more than a phrase.
+Sixteen of those findings need more than a phrase.
 
 **`unknown-tool`** means the name matches no built-in, no sub-agent tool, and no `tools/*.rhai`
 file. The stage then advertises one tool fewer, so the model is told a tool it was meant to have
@@ -271,10 +305,21 @@ ever match it. Write a program, optionally with the subcommand that narrows it: 
 
 **`blocking-tool-in-autonomous-stage`** fires when an autonomous stage grants `ask_user_*`,
 `present_for_review` or `edit_document`. With nobody attached, the run parks there until it is
-killed. Set `allow_blocking_tools = true` on the stage to say you meant it.
+killed. Set `allow_blocking_tools = true` on the stage to say you meant it. A stage granting
+`@builtin` or `@all` reaches all of them at once and gets one warning naming the group.
 
 **`implicit-shell-policy`** matters because the default is `ask`. An unattended run waits on that
-prompt rather than being denied.
+prompt rather than being denied. The shell arrives with `@builtin` as surely as by name, so a group
+grant with no `shell` policy is reported too.
+
+**`blueprint-permission-clamped`** is the other side of that. Setting `shell = "allow"` (or
+`write_file`, `edit_file`, `install_tool`) silences `implicit-shell-policy`, but a downloaded
+blueprint is not allowed to grant itself write or shell access: the runtime clamps the policy back
+to the stricter of it and the built-in default, so the tool still asks. The line looks like a
+decision and is not one. Run the agent with `--yolo`, set `[security] allow_blueprint_permissions
+= true` in your own `config.toml`, or set the tool there yourself; otherwise drop the line. Tools a
+blueprint may pre-approve (`web_search`, `web_fetch`) are exempt, and a policy no looser than the
+default (`ask`, `deny`) is fine.
 
 **`unserved-model`** is the one model finding that fails the command, because it is the one that can
 be proved. The provider is configured here, it published the full list of what it carries, and the
@@ -395,7 +440,7 @@ includes those checks, so a broken script is caught without spending anything.
 
 | Command | Flags |
 |---|---|
-| `lev models list` | `-p/--provider <NAME>`, `--offline` (this build's table only, no network), `-a/--all` (include providers with no credential here), `--json`. `-r/--remote` is accepted and changes nothing: asking the providers is the default |
+| `lev models list` | `-p/--provider <NAME>`, `--offline` (this build's table only, no network), `-a/--all` (include providers with no credential here), `--accepts <MIME_TYPE>` (only models that take `image/png`, `audio/*` and so on), `--json`. `-r/--remote` is accepted and changes nothing: asking the providers is the default. The `MIME` column says what a model takes beyond text (`img,pdf`) and, after an arrow, what it hands back beyond text (`->img`) |
 | `lev models show <MODEL>` | `-p/--provider <NAME>` (ask only this provider), `--offline`. `-r/--remote` is accepted and changes nothing, as above |
 
 Both ask every configured provider for its own listing by default, waiting up to five seconds each,
@@ -416,6 +461,28 @@ provider, no row in the built-in table, no script of that name that loads - **ex
 rather than printing an empty table, since there is nothing an empty table could be reporting.
 A provider the built-in table knows but this install has no credential for is still an empty table
 and still exits 0.
+
+### `lev mime`
+
+The mime registry as this install sees it, and what a file resolves to under it. See
+[Mime](/docs/mime) for what a row means.
+
+| Command | Flags |
+|---|---|
+| `lev mime list` | `--json`. Every type the registry knows with its family, whether its bytes are text, its extensions, which layer the row came from (`builtin`, `config`, `mime_types.toml`) and the [check](/docs/rhai-mime-checks) its bytes must pass |
+| `lev mime show <TYPE>` | `--json`. One type as the registry resolves it: every field, the token rule spelled out, the check and whether it loaded, and the source of the most specific row |
+| `lev mime check <FILE>` | `--type <MIME_TYPE>` (take the file as this type, as a sender declaring it would), `--json`. The type the file resolves to and where that row came from, its family, size, dimensions or duration when the header says, the token estimate, the stand-in a model that cannot take it would see, how it reaches a model: as text to any model, or natively to one that lists the type (`lev models list --accepts <type>` names those) and as its stand-in to the rest, and the verdict of the type's check over the file's bytes when a row names one |
+| `lev mime init` | `--force`. Write a commented example [`mime_types.toml`](/docs/configuration#mime_typestoml) beside your config |
+| `lev mime add <TYPE>` | `--family <NAME>`, `--text` or `--binary`, `--tokens <RULE>` (`per_byte=0.25`, `per_pixel=750,max=1600`, `per_second=32`, `fixed=1000`), `--extensions a,b`, `--magic <HEX>`, `--stand-in <TEMPLATE>`, `--check <PATH>` or `--no-check`. Add a row to `mime_types.toml`, or set the fields given on a row that is there; `<TYPE>` may be `type/*` for a whole family. The file is checked before it is written, a `--check` script compiled included, so a flag that would leave it unloadable is refused with the reason |
+| `lev mime remove <TYPE>` | Take a row out of `mime_types.toml` |
+
+`init` is optional. The registry works with no file at all, `add` creates the file when it has
+to, and the example `init` writes is a starting point for editing by hand, every field
+commented. The three readers use the registry as the daemon builds it and refuse to run on a row
+that does not load, the same fault `lev doctor` reports; `add` and `remove` edit the file in
+place and leave every other row, comment and blank line as you wrote them. An edit reaches the
+next run at once and every run already under way within the daemon's housekeeping interval of
+thirty seconds.
 
 ### `lev agent-client`
 
@@ -451,18 +518,22 @@ config grants.
 |---|---|---|
 | `lev ps` | `--json`, `--all` | List runs in the daemon with their status. `--all` also reads the runs dir. See [below](#reading-lev-ps) |
 | `lev dash` | | Full-screen TUI [dashboard](/docs/dashboard) |
-| `lev msg <AGENT_ID> <CONTENT>` | | Deliver a message into a running agent's context |
+| `lev msg <AGENT_ID> <CONTENT>` | `--attach` | Deliver a message into a running agent's context. `--attach` and a `@path` in the text send files with it, as on `lev run` |
 | `lev pause <RUN_ID>` | | Pause a run. It finishes its in-flight step, then holds |
 | `lev resume <RUN_ID>` | | Un-pause a run |
 | `lev cancel <RUN_ID>` | `--force` | Cancel a run. Also aliased as `lev kill` |
 | `lev context <RUN_ID>` | `--json`, `--full` | Show a run's context-window history from its `run.lvr` archive |
-| `lev result <RUN_ID>` | `--json`, `--raw` | Print what the agent handed back. See [below](#lev-result) |
+| `lev result <RUN_ID>` | `--json`, `--raw`, `--artifact`, `--out`, `--open` | Print what the agent handed back, or hand out the files it produced. See [below](#lev-result) |
+| `lev blobs <RUN_ID> [PART]` | `--json`, `--out`, `--open` | List the files a run holds as stored parts, or fetch one. See [below](#lev-blobs-run-id-part) |
 
 `lev cancel --force` writes the run's on-disk state terminal without asking the daemon, for when
 the daemon is gone or unresponsive. Without it, the daemon is asked first, since it can stop the
 work rather than only record the outcome, and the on-disk write is the fallback.
 
-`lev context --full` includes each region's entry contents instead of per-region summaries.
+`lev context --full` includes each region's entry contents instead of per-region summaries. An
+entry that carries files shows each as its own row: the stand-in the model would see, the hash,
+the token estimate, and a delivery override when the entry has one. The summary counts a region's
+stored parts beside its entries, and `--json` carries every part as it was recorded.
 
 ### `lev result`
 
@@ -478,11 +549,42 @@ lev result agent-abc123 --json   # the answer plus its shape and stage
 A run that produced no answer exits non-zero rather than printing nothing. So
 `lev result <id> > answer.txt` in a script cannot quietly write an empty file.
 
-Files the run produced are listed under the answer. Fetch one however you normally would; the paths
-are relative to the run's working directory.
+Files the run produced are listed under the answer, with their type, size and hash. Three flags
+hand them out without a trip to the working directory:
+
+```bash
+lev result agent-abc123 --artifact final > trailer.mp4   # one file's bytes, by the name the stage gave it
+lev result agent-abc123 --out ./delivered                # every file into a directory, each path printed
+lev result agent-abc123 --artifact final --out ./here    # just that one, into a directory
+lev result agent-abc123 --open final                     # hand one to whatever the OS opens it with
+```
+
+The bytes come from the run's own store when the answer recorded a hash, so they are what the
+stage submitted even if the working directory has moved on; a file the store does not hold is read
+from the working directory instead. `--open` writes the file under the system temp directory
+first, so it has a name and an extension the opener can type it by. Nothing in `lev` plays or
+draws a file.
 
 Only an agent that calls `submit_output` has an answer to show. See
 [Final outputs](/docs/outputs) for how a blueprint asks for one.
+
+### `lev blobs <RUN-ID> [PART]`
+
+Every file a run holds as a stored part, whatever put it there: an attachment on `lev run`, a
+`read_file` on an image, an MCP server's audio block, a `context_attach`, a submitted artifact.
+Read from the run's `context.json` and its `blobs/` directory, so it needs no daemon.
+
+```bash
+lev blobs agent-abc123                       # name, type, size, shape, tokens, hash, and the regions holding each
+lev blobs agent-abc123 --json
+lev blobs agent-abc123 hero.png > hero.png   # one part's bytes, by name
+lev blobs agent-abc123 ab12cdef --out ./     # by a hash prefix (six characters or more), into a directory
+lev blobs agent-abc123 hero.png --out x.png  # to a path
+lev blobs agent-abc123 hero.png --open       # hand it to the OS
+```
+
+A part the context names but the store no longer holds is listed with a note and cannot be
+fetched. A part with no name exports as its short hash plus the extension its type implies.
 
 ### `lev respond [REQUEST_ID] [VALUE]`
 
@@ -496,6 +598,7 @@ Answer an interaction the daemon is holding. With no `REQUEST_ID`, lists the ope
 | `--feedback <TEXT>` | With `--deny`, what the model should do instead. It reads the text inside the refused call's tool result. An error with anything but `--deny` |
 | `--stage` | With `--approve`, allow what this call runs until the run leaves the current stage |
 | `--session` | With `--approve`, allow what this call runs for the rest of the run (alias `--run`) |
+| `--attach <PATH[:REGION][:TYPE][:text|native|stand_in]>` | Attach a file to a text answer, as on `lev run --attach`. Repeatable. A `@path` inside the answer attaches that file too. Refused on a choice or an approval |
 
 See [Human-in-the-loop](/docs/interaction) for what raises these.
 
@@ -758,7 +861,8 @@ nothing about what gets written.
 
 The Defaults screen leads with **Provider priority** - the order a bare model name prefers, whose
 head is your default provider. Enter opens a modal to arrange it: drag a row by its `⠿` grip, or
-move the one under the cursor with `Shift+↑`/`Shift+↓`. It writes the same
+move the one under the cursor with `Shift+↑`/`Shift+↓`, or with `K`/`J` on a terminal that keeps
+Shift+arrows for itself (Apple Terminal does). It writes the same
 [`provider_order`](/docs/configuration#provider-preference-order) that `lev providers order` and
 `PUT /api/config` set, so putting a subscription like Codex first there is how you route bare model
 names onto your plan.
@@ -769,7 +873,8 @@ names onto your plan.
 | `--no-verify` | Skip checking credentials against the provider APIs |
 | `--anthropic-key`, `--openai-key`, `--google-key`, `--openrouter-key <KEY>` | Provider API keys |
 | `--ollama-url <URL>` | Ollama base URL |
-| `--default-model <MODEL>` | Default model override |
+| `--override-model <MODEL>` | One model every stage starts on, ahead of what its blueprint names; unset lets each blueprint decide |
+| `--fallback-model <MODEL>` | The model a stage falls back to when none of the models it names is configured here |
 | `--claude-code <true\|false>` | Enable the Claude Code CLI transport. Off unless set, and the wizard does not ask about it: this flag is the way to turn it on |
 | `--claude-code-effort <LEVEL>` | `low`, `medium`, `high`, `xhigh`, or `max` |
 | `--codex <true\|false>` | Enable the Codex transport, which bills a ChatGPT subscription. Flips the switch only: interactive `lev setup` signs in from its own screen, and a non-interactive run has nobody watching a browser, so sign in with `lev auth login codex` on that path |
@@ -1033,6 +1138,31 @@ Manage [taint tracking](/docs/security#taint-tracking-experimental) policy rules
 | `lev policy list` | | List current rules, static and scripted |
 | `lev policy add <TOOL>` | `--target <PATTERN>`, `--max-sensitivity <public\|internal\|private>` (default `internal`) | Add an allowlist rule |
 | `lev policy test <TOOL>` | `--target <PATTERN>`, `--taint <public\|internal\|private>` (default `private`) | Check whether a call would be gated |
+
+### `lev yolo`
+
+The profiles behind [`--yolo=<name>`](/docs/configuration#yolotoml): what you have, what one
+says, and what it would decide. Every subcommand reads `yolo.toml` as it stands, the same way a
+spawn does, so what it prints is what the next run gets.
+
+| Command | Flags | Purpose |
+|---|---|---|
+| `lev yolo list` | `--json` | One line per profile: its default, the three human knobs, and how many rules of each kind it has |
+| `lev yolo show <NAME>` | `--json` | The profile in full, as TOML, with what it keeps for a person |
+| `lev yolo test <NAME> --tool <TOOL>` | `--command <LINE>`, `--args <JSON>`, `--workdir <DIR>`, `--configured <allow\|ask\|deny>`, `--kind <builtin\|subagent\|script\|mcp>`, `--allowed`, `--json` | What the profile would decide for one call, and which rule decided it |
+| `lev yolo init` | `--force` | Write a commented example `yolo.toml` beside your config |
+
+`test` is the same code path a run takes, so its answer is the run's answer. `--configured`
+stands in for what the config layers resolve the tool to; left off, that is read from your
+`config.toml`. `--allowed` decides as if `--allow <tool>` had been passed. A shell line is judged
+with `--command`; any other tool takes its arguments as `--args '{"url": "..."}'`.
+
+```bash
+lev yolo init
+lev yolo test careful --tool shell --command "rm -r target/debug"
+lev yolo test careful --tool shell --command "cargo test && curl https://x" --json
+lev run coder --yolo=careful -t "tidy the build"
+```
 
 ## Environment
 

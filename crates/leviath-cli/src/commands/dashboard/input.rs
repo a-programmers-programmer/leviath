@@ -363,11 +363,12 @@ impl Dashboard {
     /// Keys in the long-form response box and on the Send button under it.
     ///
     /// Enter breaks the line, the way it does in the new-run task and every
-    /// other text box, and Ctrl+Enter sends. Ctrl+Enter reaches the program
-    /// only under the kitty keyboard protocol; elsewhere it arrives as a plain
-    /// Enter, which is a newline here, and the Send button (Tab, then Enter
-    /// or Space, or a click) is how such a terminal sends. `/quit` on its own
-    /// line still ends the conversation when sent.
+    /// other text box, and Ctrl+S or Ctrl+Enter sends. Ctrl+Enter reaches the
+    /// program only under the kitty keyboard protocol; elsewhere it arrives
+    /// as a plain Enter, which is a newline here, so Ctrl+S - an ordinary
+    /// control byte every terminal delivers - is the chord that always works,
+    /// with the Send button (Tab, then Enter or Space, or a click) for the
+    /// mouse. `/quit` on its own line still ends the conversation when sent.
     fn handle_response_box_key(&mut self, key: crossterm::event::KeyEvent) {
         use crossterm::event::KeyModifiers;
         if self.response_focus_send {
@@ -381,6 +382,9 @@ impl Dashboard {
         }
         match key.code {
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.submit_input();
+            }
+            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.submit_input();
             }
             KeyCode::Tab => self.response_focus_send = true,
@@ -425,7 +429,8 @@ impl Dashboard {
                     self.context_tree.expanded_entries.insert(key);
                 }
             }
-            None => {}
+            // A part folds nothing; `v` and `w` are its keys.
+            Some(TreeRow::Part { .. }) | None => {}
         }
         self.context_tree.follow_cursor = true;
         // Kept per run, so reopening this one finds it the way it was left.
@@ -587,6 +592,10 @@ impl Dashboard {
             // Jump between region headers.
             KeyCode::Char('[') if in_context => self.jump_context_region(false),
             KeyCode::Char(']') if in_context => self.jump_context_region(true),
+            // The stored part under the cursor: open it with the OS, or
+            // write it into the run's working directory.
+            KeyCode::Char('v') if in_context => self.open_context_part(),
+            KeyCode::Char('w') if in_context => self.write_context_part(),
             // The full-screen stage explorer.
             KeyCode::Char('g') => {
                 self.open_stage_explorer();
@@ -1014,8 +1023,8 @@ impl Dashboard {
     pub(super) fn submit_input(&mut self) {
         use interaction::{ApprovalScope, InteractionKind, InteractionResponse};
 
-        let (agent_id, req) = match self.selected_agent() {
-            Some(a) => (a.id.clone(), a.pending_request.clone()),
+        let (agent_id, req, workdir) = match self.selected_agent() {
+            Some(a) => (a.id.clone(), a.pending_request.clone(), a.workdir.clone()),
             None => return,
         };
 
@@ -1028,12 +1037,16 @@ impl Dashboard {
                     } else {
                         raw
                     };
+                    let (input, parts) = self.answer_parts(&input, &workdir);
                     let d = if input.is_empty() {
                         "(end)".to_string()
                     } else {
                         truncate(&input, 40)
                     };
-                    (InteractionResponse::text(&r.id, &input), d)
+                    (
+                        InteractionResponse::text(&r.id, &input).with_parts(parts),
+                        d,
+                    )
                 }
                 InteractionKind::EditText => {
                     // Preserve indentation / internal newlines - only trim the
@@ -1083,6 +1096,7 @@ impl Dashboard {
                 } else {
                     raw
                 };
+                let (input, parts) = self.answer_parts(&input, &workdir);
                 let d = if input.is_empty() {
                     "(end)".to_string()
                 } else {
@@ -1096,6 +1110,7 @@ impl Dashboard {
                         approved: None,
                         scope: None,
                         feedback: None,
+                        parts,
                     },
                     d,
                 )
@@ -1133,10 +1148,11 @@ impl Dashboard {
             let _ = self.cmd_tx.send(DaemonCommand::Answer { response: resp });
             self.add_log(format!("Sent: {}", display));
         } else {
-            let content = resp.value.clone().unwrap_or_default();
+            let content = resp.value.unwrap_or_default();
             let _ = self.cmd_tx.send(DaemonCommand::Message {
                 agent_id: agent_id.clone(),
                 content,
+                parts: resp.parts,
             });
             self.add_log(format!("💬 User: \"{}\"", display));
         }
@@ -2523,7 +2539,7 @@ mod tests {
     fn context_agent(id: &str) -> DashboardAgent {
         let mut agent = make_test_agent(id, AgentDisplayStatus::Active);
         let entry = |content: &str| leviath_core::run_meta::RegionEntrySnapshot {
-            content: content.to_string(),
+            content: content.to_string().into(),
             tokens: 5,
             kind: Default::default(),
             metadata: None,
@@ -2964,6 +2980,88 @@ mod tests {
         assert!(dash.agents[0].pending_request.is_none());
         assert!(dash.agents[0].waiting_prompt.is_none());
         assert_eq!(dash.agents[0].status, AgentDisplayStatus::Active);
+    }
+
+    /// A `@path` in a typed answer attaches that file from the run's
+    /// workdir, and the same in a message with no question open.
+    #[test]
+    fn an_answer_and_a_message_attach_the_files_they_name() {
+        let workdir = tempfile::tempdir().unwrap();
+        std::fs::write(workdir.path().join("mark.png"), b"\x89PNG\r\n\x1a\nmark").unwrap();
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let mut dash = Dashboard::new(cmd_tx);
+        let mut agent = make_test_agent("run-1", AgentDisplayStatus::Waiting);
+        agent.workdir = workdir.path().to_string_lossy().to_string();
+        agent.pending_request = Some(leviath_core::interaction::InteractionRequest::free_text(
+            "ft1", "What?", "main", true,
+        ));
+        dash.agents.push(agent);
+        dash.update_display_indices();
+        dash.detail_view = true;
+        dash.input_mode = true;
+        dash.input_textarea
+            .area_mut()
+            .insert_str("the arm is wrong, see @mark.png and @gone.png");
+        dash.submit_input();
+        let mark = || {
+            leviath_core::mime::InboundPart::from_bytes(
+                "mark.png",
+                b"\x89PNG\r\n\x1a\nmark".to_vec(),
+            )
+        };
+        assert_eq!(
+            cmd_rx.try_recv().expect("an answer was sent"),
+            DaemonCommand::Answer {
+                response: interaction::InteractionResponse::text(
+                    "ft1",
+                    "the arm is wrong, see @mark.png and @gone.png"
+                )
+                .with_parts(vec![mark()]),
+            }
+        );
+        let toasts = dash.toast_messages_for_test();
+        assert!(
+            toasts
+                .iter()
+                .any(|t| t.contains("'@gone.png' names no file")),
+            "{toasts:?}"
+        );
+
+        // No question open: a message, with its files.
+        dash.agents[0].status = AgentDisplayStatus::Active;
+        dash.input_mode = true;
+        dash.input_textarea.area_mut().insert_str("also @mark.png");
+        dash.submit_input();
+        assert_eq!(
+            cmd_rx.try_recv().expect("a message was sent"),
+            DaemonCommand::Message {
+                agent_id: "run-1".to_string(),
+                content: "also @mark.png".to_string(),
+                parts: vec![mark()],
+            }
+        );
+
+        // A file that cannot be attached (empty, here) keeps the words and
+        // says why.
+        std::fs::write(workdir.path().join("empty.png"), b"").unwrap();
+        dash.input_mode = true;
+        dash.input_textarea.area_mut().insert_str("see @empty.png");
+        dash.submit_input();
+        assert_eq!(
+            cmd_rx.try_recv().expect("a message was sent"),
+            DaemonCommand::Message {
+                agent_id: "run-1".to_string(),
+                content: "see @empty.png".to_string(),
+                parts: Vec::new(),
+            }
+        );
+        let toasts = dash.toast_messages_for_test();
+        assert!(
+            toasts
+                .iter()
+                .any(|t| t.starts_with("Could not attach a file")),
+            "{toasts:?}"
+        );
     }
 
     // ─── submit_input for FreeText with /quit ─────────────────────────────
@@ -3435,6 +3533,21 @@ mod tests {
 
         dash.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
         assert!(!dash.input_mode, "Ctrl+Enter sent");
+        assert!(dash.agents[0].pending_request.is_none());
+    }
+
+    /// Ctrl+S sends too - the chord for terminals where Ctrl+Enter never
+    /// arrives - while a bare `s` is just a letter in the answer.
+    #[test]
+    fn response_box_ctrl_s_sends_and_a_plain_s_is_text() {
+        let mut dash = dash_answering_free_text();
+
+        dash.handle_key(key(KeyCode::Char('s')));
+        assert!(dash.input_mode, "a bare s did not send");
+        assert_eq!(dash.input_textarea.text(), "answers");
+
+        dash.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert!(!dash.input_mode, "Ctrl+S sent");
         assert!(dash.agents[0].pending_request.is_none());
     }
 

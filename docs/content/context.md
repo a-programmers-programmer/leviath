@@ -168,6 +168,7 @@ and pass on the first attempt, which looks exactly like a stage that finished it
 | `describe_in_prompt` | `false` | Also show the `description` to the model, above the region's contents. See [what the model sees](#what-the-model-sees) |
 | `volatility` | `"rewritten"` | How much the region's contents move between requests, which decides where it sits in the prompt. See [what caching costs](#what-caching-costs) |
 | `admission` | `"evict"` | What happens when a write does not fit. `"reject"` refuses it instead of dropping something. See [letting the agent decide what to forget](#letting-the-agent-decide-what-to-forget) |
+| `accepts` | unset | Mime types the region takes, as `type/subtype` or `type/*`. Unset takes anything. A write carrying another type is refused with this list. See [typed mime](/docs/mime) |
 | `required_message` | generated | What the model is told when a required region is empty. Supports `{region}` |
 
 **Resolved budget** is the phrase used for the number a region actually gets, once the percentage
@@ -391,6 +392,23 @@ Empty regions contribute nothing - no heading, no blank block - so a blueprint
 can declare the regions it might need without paying for the ones it has not
 filled yet.
 
+### Stored parts in the prompt
+
+An entry can hold more than text: an image, a clip, a document, any
+[typed mime](/docs/mime) part. In a region that renders into the system prompt
+the part appears as its one-line stand-in, `[image/png 1024x768, 240 KB] hero.png`,
+and the bytes travel in one user message placed before the conversation, each
+after a pointer naming the region, the key and the part. In the conversation the
+part sits in its own turn, after the text it came with. A tool result's parts
+follow the result in the same turn.
+
+Whether the model gets the bytes is decided when the request is built, not
+when the entry is written. A model whose input types cover the part gets it as
+that provider's native block; a part whose bytes are text reaches any model as
+text; anything else is the stand-in alone, which still names the part so the
+model can hand it to a tool. The journal and `context.json` carry references,
+never the bytes.
+
 ## What caching costs
 
 A provider caches the prompt by **prefix**: it stores everything up to a marker, and next
@@ -535,6 +553,12 @@ flowchart TD
   T -->|clearable / temporary| CL["Trimmed or cleared under budget pressure"]
 ```
 
+A summary is text. When a compacting region's entries carried stored [parts](/docs/mime) (an
+attached image, a file a tool stored), the summary is written from their stand-ins and the parts
+leave the window with the entries they sat on. The bytes stay in the run's store, `lev blobs`
+still lists them, and the run log names which ones a compaction dropped. Pin a region whose files
+a later stage needs, or have the stage put them somewhere pinned with `context_attach`.
+
 ## Letting the agent decide what to forget
 
 Everything above is reactive: a region crosses a threshold and the runtime makes room. That is the
@@ -645,6 +669,56 @@ skipped.
 result when it applies. Without one, a large file went into its region whole and was either
 truncated or dropped as `[result omitted]` depending on how full the region already was. That is a
 cliff rather than a limit.
+
+## Routing produced parts
+
+`tool_routing` moves *tool results*. A model can also **produce parts of its own** - a picture from
+an image model, audio from a speech model, a document a generator returns - and those default to the
+conversation, riding the assistant turn like its text. `output_routing` sends them somewhere else,
+**by mime type**, so a produced file lands in a region a later stage reads instead of in the running
+transcript:
+
+```toml
+[context.regions]
+artwork      = { kind = "pinned", accepts = ["image/*"], max_stored = 4 }
+conversation = { kind = "sliding_window", budget = "50%" }
+
+[stages.draw.output_routing]
+"image/*"         = "artwork"
+"application/pdf" = "handouts"
+```
+
+Each key is a mime pattern (`image/png`, `image/*`, `*/*`) and each value a region. A reply that
+mixes text and other parts is split part by part: every part goes to the region of the **most
+specific** matching pattern (`image/png` beats `image/*` beats `*/*`), and the reply's text, plus
+any part no rule matched, stays in `conversation` as before. Nothing here names a family in code -
+it is mime types all the way down, so the same table routes audio, video, 3D models or any type you
+register the same way it routes images.
+
+Unlike `tool_routing`, the target need not be a region *this* stage reads back - the whole point is
+usually to hand a produced file forward - so it is checked against every region the blueprint
+declares, not just the ones the producing stage can see. A target no layout declares is refused by
+`lev validate`.
+
+A pinned target lifts its stored parts into the leading user turn, and a sliding window renders them
+as a user message, so the next stage's model sees the bytes either way (subject to that model taking
+the type; otherwise it sees the stand-in, as anywhere else).
+
+### A clean slate for the next stage
+
+Routing the produced part out of the conversation is half of handing it on; the other half is the
+receiving stage not inheriting the producing stage's transcript. `conversation` cannot be hidden -
+the model's own turns live there - but a stage can **empty** a region as it is entered:
+
+```toml
+[stages.describe.context]
+reset = ["conversation"]
+```
+
+`reset` clears the named regions on entry (the content is gone, not merely hidden from this stage),
+so the stage starts on a clean conversation with only what its visible regions hold - the routed
+image in `artwork`, say. A re-entered stage clears them again each visit. Unlike `hide`, `reset` may
+name `conversation`; like `hide`, a name no layout declares is refused.
 
 ## Requests are measured before they are sent
 

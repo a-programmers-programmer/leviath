@@ -312,14 +312,14 @@ pub fn restore_pending_batch(
             thought_signature: c.thought_signature.clone(),
         })
         .collect();
-    let merged: Vec<(String, String)> = batch
+    let merged: Vec<crate::tool_bridge::ToolResult> = batch
         .calls
         .iter()
         .map(|c| {
             let result = c
                 .result
                 .clone()
-                .unwrap_or_else(|| interrupted_result(&c.name, children));
+                .unwrap_or_else(|| interrupted_result(&c.name, children).into());
             (c.id.clone(), result)
         })
         .collect();
@@ -367,11 +367,13 @@ mod tests {
                 batch_tool_hint: false,
                 shell_hint: false,
                 request_timeout_secs: None,
+                as_text: Vec::new(),
             },
             routing: None,
             accepts_messages: true,
             context_layout: None,
             context_hide: Vec::new(),
+            context_reset: Vec::new(),
             system_prompt: None,
         }
     }
@@ -435,7 +437,7 @@ mod tests {
                     max_tokens: 10_000,
                     entries: vec![
                         RegionEntrySnapshot {
-                            content: "prior user turn".to_string(),
+                            content: "prior user turn".into(),
                             tokens: 5,
                             kind: EntryKind::UserMessage,
                             metadata: None,
@@ -444,7 +446,7 @@ mod tests {
                             reasoning: None,
                         },
                         RegionEntrySnapshot {
-                            content: "prior assistant".to_string(),
+                            content: "prior assistant".into(),
                             tokens: 3,
                             kind: EntryKind::AssistantTurn { tool_calls: vec![] },
                             metadata: None,
@@ -462,7 +464,7 @@ mod tests {
                     current_tokens: 1,
                     max_tokens: 10,
                     entries: vec![RegionEntrySnapshot {
-                        content: "orphan".to_string(),
+                        content: "orphan".into(),
                         tokens: 1,
                         kind: EntryKind::Text,
                         metadata: None,
@@ -677,7 +679,7 @@ mod tests {
             id: id.to_string(),
             name: name.to_string(),
             arguments: r#"{"path":"x.txt"}"#.to_string(),
-            result: result.map(str::to_string),
+            result: result.map(Into::into),
             thought_signature: None,
         }
     }

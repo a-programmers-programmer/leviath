@@ -1,6 +1,6 @@
 ---
 title: Agent catalog
-description: The eight pre-built agents Leviath ships, what each is for, how to install them, and the lev run command for each.
+description: The pre-built agents Leviath ships, what each is for, how to install them, and the lev run command for each.
 group: Get started
 group_order: 1
 order: 4
@@ -8,7 +8,7 @@ order: 4
 
 # Agent catalog
 
-Leviath ships with nine pre-built agents. `lev setup` installs them into `~/.leviath/agents/`
+Leviath ships with a set of pre-built agents. `lev setup` installs them into `~/.leviath/agents/`
 (scripting it? pass `--install-agents`), one directory per agent, each holding an `agent.leviath`
 [blueprint](/docs/agents). Run any of them by name:
 
@@ -32,9 +32,9 @@ these. `lev validate <agent>` prints every one of them.
 >
 > `coder` aside, every agent that has more than one thing to cover
 > [fans out](/docs/sub-agents): `data-analyst`, `deep-researcher`, `log-analyzer`, `orchestrator`,
-> `reviewer`, `wide-researcher`, and `oracle` all work on several at once instead of one after another.
+> `reviewer`, `wide-researcher`, and `oracle-workflow` all work on several at once instead of one after another.
 
-## oracle (experimental)
+## oracle-workflow (experimental)
 
 Keeps a high-tier model in a tool-free decision stage while cheaper readers,
 coders, and independent verifiers perform bounded repository work. The runtime
@@ -43,8 +43,25 @@ snapshot. Requires Git, Python 3, and a POSIX shell. See the
 [workflow and configuration](https://github.com/a-programmers-programmer/leviath/blob/main/docs/design/oracle-workflow.md).
 
 ```sh
-lev run oracle --task "Add request validation to the users endpoint"
+lev run oracle-workflow --task "Add request validation to the users endpoint"
 ```
+
+## graphql-schema
+
+Design a GraphQL contract before implementing an application: discover client journeys,
+model the domain, draft SDL and real operations, run deterministic checks, then obtain
+an independent design review. A bounded repair loop rechecks changed artifacts.
+Acceptance includes a file fingerprint that backend and frontend workers can verify.
+
+```sh
+lev run graphql-schema --task ./application-brief.md --wait
+```
+
+Requires Python 3 with `graphql-core==3.2.6`. For parent pipelines, use the packaged
+`scripts/run_stage.py` entrypoint so blocked outcomes and stale receipts stop downstream
+work. See [GraphQL schema workflow](https://github.com/zephyyrrr/leviath/blob/main/docs/design/graphql-schema-workflow.md)
+for installation, contract files and integration. Runtime resolver behavior is verified
+later by the application pipeline.
 
 ## coder
 
@@ -164,7 +181,13 @@ flowchart LR
 
 ```bash
 lev run reviewer --task "Review the changes on the feature/auth branch"
+lev run reviewer --diff @change.patch --criteria "does the code produce what after.png shows?" \
+  --attach before.png:screenshots --attach after.png:screenshots
 ```
+
+Screenshots are a typed input: the `screenshots` region accepts `image/*` and holds six, so a
+mockup or a before-and-after reaches a model that can see images as pixels and any other as a
+line naming the file; a `@path` in `--criteria` attaches the same way. See [Mime](/docs/mime).
 
 The two-pass split is deliberate: `scan` runs on Sonnet to flag areas, then the review itself
 escalates to Opus to scrutinize only what was flagged, which keeps the expensive model focused.

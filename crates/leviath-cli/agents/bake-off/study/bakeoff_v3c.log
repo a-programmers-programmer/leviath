@@ -1,0 +1,6 @@
+[L0] lane0 complete iters=4 -> /data/work/leviath/study/bakeoff/v0_L0L0.graphql (42593B)
+[L0] lane1 complete iters=4 -> /data/work/leviath/study/bakeoff/v0_L0L1.graphql (45218B)
+[L0] lane0 42587B vs lane1 45204B -> DIFFERENT-recurse
+[L1] lane0 error iters=60 -> /data/work/leviath/study/bakeoff/v1_L0L0.graphql (0B)
+[L1] lane1 error iters=60 -> /data/work/leviath/study/bakeoff/v1_L0L1.graphql (0B)
+[L1] ABORT: missing output

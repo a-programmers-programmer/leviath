@@ -99,6 +99,13 @@ keeps meaning that however your `config.toml` is ordered.
 Calls route back to the owning server under the tool's original name, so the server never sees the
 qualified form.
 
+A result's text blocks reach the model as text. Its `image` and `audio` blocks, and an embedded
+`resource` carrying a `blob`, are decoded and stored as typed [parts](/docs/mime) on the same
+result, typed by the server's `mimeType` (corrected by the registry when that does not parse) and
+named after the resource URI or, for a bare block, after the tool. A `resource_link` is described
+in the text with its URI and type, since its bytes were never sent. A part the run cannot hold
+(over `[mime] max_part_bytes`) is described in the text instead of dropped.
+
 Tools used to be advertised bare, with the server prefixed only on a clash, so a blueprint written
 against that naming grants `create_issue` where the tool is now `github__create_issue`. Such a grant
 still resolves, **as long as exactly one server offers a tool by that name**. Two do and the name is
@@ -156,11 +163,14 @@ through the same `tool_permissions`, the same taint gate, and the same approval 
 you named by hand.
 
 > [!NOTE]
-> There is no wildcard form of `available_tools`, and a connector grant is not sugar for one.
-> Names are server-qualified, so `github__*` would *usually* work - but not reliably enough to
-> build on: a server named `my.tools` sanitizes to `my_tools`, and a name collision appends `_2`,
-> so matching the string is a guess where the connector grant is a fact. `available_connectors`
-> asks Leviath which tools a server owns rather than inferring it from how they are spelled.
+> A connector grant is per server. To grant every connected server at once, put `@mcp` in
+> `available_tools` instead (see [tool groups](/docs/tools#tool-groups)); `@mcp` and
+> `available_connectors` compose, so `["@builtin", "@mcp"]` with no connector list is the
+> "all built-ins and every MCP tool" shape in one line. There is no pattern form such as
+> `github__*`: a server named `my.tools` sanitizes to `my_tools`, and a name collision appends
+> `_2`, so matching the string would be a guess where the connector grant is a fact.
+> `available_connectors` asks Leviath which tools a server owns rather than inferring it from how
+> they are spelled.
 
 ## OAuth, safely
 

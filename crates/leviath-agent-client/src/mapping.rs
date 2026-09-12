@@ -4,7 +4,9 @@
 //! async - so the stdio server in `leviath-cli` is left with only sequencing to
 //! do, and every mapping decision is unit-testable in isolation.
 
+use base64::Engine;
 use leviath_core::interaction::{InteractionKind, InteractionRequest};
+use leviath_core::mime::{InboundPart, MimeRegistry, MimeType};
 use leviath_core::run_meta::RunStatus;
 
 use crate::protocol::{
@@ -24,15 +26,24 @@ pub const OPTION_REJECT_ONCE: &str = "reject-once";
 ///
 /// `text` blocks contribute their text. `resource` blocks (the `embeddedContext`
 /// capability) contribute their inlined text under a `--- <uri> ---` header, so
-/// the model can tell attached context from the instruction itself. Every other
-/// block kind - `image`, `audio`, `resource_link` - is dropped: we advertise no
-/// support for them, and silently ignoring one block is far better than failing
-/// the whole prompt.
+/// the model can tell attached context from the instruction itself, and a
+/// `resource_link` contributes its target under the same header, marked as
+/// not fetched. `image` and `audio` blocks, and a `resource` carrying bytes,
+/// put nothing here: their bytes go through [`prompt_parts`] instead, and
+/// silently skipping a block is far better than failing the whole prompt.
 ///
-/// Blocks are joined with a blank line and the result is trimmed, so a prompt of
-/// only unsupported blocks yields `""` (which the caller treats as an error
-/// rather than spawning an agent with an empty task).
+/// Blocks are joined with a blank line and the result is trimmed, so a prompt
+/// of only unsupported blocks yields `""`.
 pub fn flatten_prompt(blocks: &[ContentBlock]) -> String {
+    flatten_prompt_with(blocks, &[])
+}
+
+/// [`flatten_prompt`], told which `resource_link` URIs the caller read
+/// itself: those are marked as attached rather than not fetched, so the
+/// model knows the file is beside the words. Reading is the caller's job
+/// (this crate does no I/O); the stdio server follows `file://` links inside
+/// the session's working directory.
+pub fn flatten_prompt_with(blocks: &[ContentBlock], attached: &[String]) -> String {
     let mut parts: Vec<String> = Vec::new();
     for block in blocks {
         match block.kind.as_str() {
@@ -53,10 +64,80 @@ pub fn flatten_prompt(blocks: &[ContentBlock]) -> String {
                     parts.push(format!("--- {} ---\n{}", resource.uri, text));
                 }
             }
+            "resource_link" => {
+                if let Some(uri) = block.uri.as_deref() {
+                    let kind = block
+                        .mime_type
+                        .as_deref()
+                        .map(|m| format!(" ({m})"))
+                        .unwrap_or_default();
+                    let fate = if attached.iter().any(|a| a == uri) {
+                        "attached"
+                    } else {
+                        "not fetched"
+                    };
+                    parts.push(format!("--- {uri} ---\n[a linked resource{kind}; {fate}]"));
+                }
+            }
             _ => {}
         }
     }
     parts.join("\n\n").trim().to_string()
+}
+
+/// The bytes a prompt carries, as parts bound for the task region: every
+/// `image` and `audio` block with `data`, and every `resource` block with a
+/// `blob`. A block whose bytes do not decode, or decode to nothing, is
+/// skipped the way an unknown block kind is.
+///
+/// An image or audio block has no name in the protocol, so it gets one
+/// from its kind and position plus the extension its type implies; a
+/// resource is named after the last segment of its URI. The declared type
+/// travels with the part; the daemon's registry corrects one it cannot
+/// parse.
+pub fn prompt_parts(blocks: &[ContentBlock]) -> Vec<InboundPart> {
+    let registry = MimeRegistry::builtin();
+    let mut parts: Vec<InboundPart> = Vec::new();
+    for block in blocks {
+        let (data, mime, uri) = match block.kind.as_str() {
+            "image" | "audio" => (block.data.as_deref(), block.mime_type.as_deref(), None),
+            "resource" => match &block.resource {
+                Some(r) => (
+                    r.blob.as_deref(),
+                    r.mime_type.as_deref(),
+                    Some(r.uri.as_str()),
+                ),
+                None => (None, None, None),
+            },
+            _ => (None, None, None),
+        };
+        let bytes = data
+            .and_then(|d| base64::engine::general_purpose::STANDARD.decode(d).ok())
+            .filter(|b| !b.is_empty());
+        let Some(bytes) = bytes else {
+            continue;
+        };
+        let mime_type = mime.and_then(|m| MimeType::parse(m).ok());
+        let name = match uri {
+            Some(uri) => uri
+                .rsplit('/')
+                .find(|s| !s.is_empty())
+                .unwrap_or("resource")
+                .to_string(),
+            None => {
+                let ext = mime_type
+                    .as_ref()
+                    .and_then(|t| registry.info(t).extensions.first().cloned())
+                    .map(|e| format!(".{e}"))
+                    .unwrap_or_default();
+                format!("{}-{}{ext}", block.kind, parts.len() + 1)
+            }
+        };
+        let mut part = InboundPart::from_bytes(name, bytes);
+        part.mime_type = mime_type;
+        parts.push(part);
+    }
+    parts
 }
 
 /// Parse `---region:<name>---` markers out of a flattened prompt into a
@@ -279,7 +360,12 @@ mod tests {
                 uri: uri.to_string(),
                 mime_type: None,
                 text: text.map(str::to_string),
+                blob: None,
             }),
+            data: None,
+            mime_type: None,
+            uri: None,
+            name: None,
         }
     }
 
@@ -383,6 +469,10 @@ this trailing text is ignored";
             kind: "text".to_string(),
             text: None,
             resource: None,
+            data: None,
+            mime_type: None,
+            uri: None,
+            name: None,
         };
         assert_eq!(flatten_prompt(&[block, text_block("kept")]), "kept");
     }
@@ -412,8 +502,113 @@ this trailing text is ignored";
             kind: "resource".to_string(),
             text: None,
             resource: None,
+            data: None,
+            mime_type: None,
+            uri: None,
+            name: None,
         };
         assert_eq!(flatten_prompt(&[block, text_block("kept")]), "kept");
+    }
+
+    /// The bytes a prompt carries become parts, named and typed; what does
+    /// not decode is skipped, and the text sees none of it.
+    #[test]
+    fn prompt_bytes_become_named_typed_parts() {
+        let png = base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\nhero");
+        let image = ContentBlock {
+            data: Some(png.clone()),
+            mime_type: Some("image/png".to_string()),
+            ..ContentBlock::text("")
+        };
+        let mut image = image;
+        image.kind = "image".to_string();
+        image.text = None;
+        let mut audio = image.clone();
+        audio.kind = "audio".to_string();
+        audio.mime_type = Some("not a type".to_string());
+        let resource = ContentBlock {
+            kind: "resource".to_string(),
+            resource: Some(EmbeddedResource {
+                uri: "file:///work/sketch/".to_string(),
+                mime_type: Some("image/webp".to_string()),
+                text: None,
+                blob: Some(png.clone()),
+            }),
+            ..ContentBlock::text("")
+        };
+        let mut resource = resource;
+        resource.text = None;
+        let mut empty = image.clone();
+        empty.data = Some(String::new());
+        let mut garbage = image.clone();
+        garbage.data = Some("!!".to_string());
+        let mut bare = image.clone();
+        bare.data = None;
+        let no_resource = ContentBlock {
+            kind: "resource".to_string(),
+            ..ContentBlock::text("")
+        };
+        let blocks = vec![
+            text_block("edit this"),
+            image,
+            audio,
+            resource,
+            empty,
+            garbage,
+            bare,
+            no_resource,
+        ];
+        let parts = prompt_parts(&blocks);
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0].name, "image-1.png");
+        assert_eq!(parts[0].mime_type.as_ref().unwrap().as_str(), "image/png");
+        assert_eq!(parts[1].name, "audio-2");
+        assert!(
+            parts[1].mime_type.is_none(),
+            "a type that is not one is left to the registry"
+        );
+        assert_eq!(parts[2].name, "sketch");
+        assert_eq!(parts[2].mime_type.as_ref().unwrap().as_str(), "image/webp");
+        assert!(parts.iter().all(|p| p.region.is_none()));
+        assert_eq!(flatten_prompt(&blocks), "edit this");
+
+        // A resource whose URI has no segments is named for what it is.
+        let mut odd = ContentBlock::text("");
+        odd.kind = "resource".to_string();
+        odd.text = None;
+        odd.resource = Some(EmbeddedResource {
+            uri: "///".to_string(),
+            mime_type: None,
+            text: None,
+            blob: Some(png),
+        });
+        assert_eq!(prompt_parts(&[odd])[0].name, "resource");
+    }
+
+    /// A linked resource is named in the text so the model knows it exists,
+    /// and marked as not fetched so it does not pretend to have read it,
+    /// unless the caller says it read the file, in which case it is marked
+    /// as attached.
+    #[test]
+    fn a_resource_link_is_described_not_followed() {
+        let link =
+            ContentBlock::resource_link("file:///work/plan.pdf", "plan.pdf", "application/pdf");
+        assert_eq!(
+            flatten_prompt(&[text_block("read it"), link.clone()]),
+            "read it\n\n--- file:///work/plan.pdf ---\n[a linked resource (application/pdf); not fetched]"
+        );
+        assert_eq!(
+            flatten_prompt_with(&[link], &["file:///work/plan.pdf".to_string()]),
+            "--- file:///work/plan.pdf ---\n[a linked resource (application/pdf); attached]"
+        );
+        let mut untyped = ContentBlock::resource_link("file:///x", "x", "");
+        untyped.mime_type = None;
+        assert!(flatten_prompt(&[untyped]).ends_with("[a linked resource; not fetched]"));
+        let mut no_uri = ContentBlock::resource_link("", "x", "");
+        no_uri.uri = None;
+        assert_eq!(flatten_prompt(&[no_uri]), "");
+        let json = serde_json::to_string(&ContentBlock::resource_link("u", "n", "m")).unwrap();
+        assert!(json.contains("\"mimeType\":\"m\""), "{json}");
     }
 
     #[test]
@@ -422,6 +617,10 @@ this trailing text is ignored";
             kind: "image".to_string(),
             text: Some("ignored".to_string()),
             resource: None,
+            data: None,
+            mime_type: None,
+            uri: None,
+            name: None,
         };
         assert_eq!(flatten_prompt(&[image, text_block("kept")]), "kept");
     }
@@ -433,6 +632,10 @@ this trailing text is ignored";
             kind: "audio".to_string(),
             text: None,
             resource: None,
+            data: None,
+            mime_type: None,
+            uri: None,
+            name: None,
         };
         assert_eq!(flatten_prompt(&[audio]), "");
     }

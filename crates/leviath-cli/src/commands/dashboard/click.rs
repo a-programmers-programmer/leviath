@@ -158,6 +158,7 @@ impl Dashboard {
                 self.toggle_context_row();
             }
             ClickTarget::NewRunStart => self.submit_new_run(),
+            ClickTarget::NewRunInput(index) => self.click_new_run_input(index),
             ClickTarget::ResponseSend => self.submit_input(),
         }
         true
@@ -423,7 +424,7 @@ mod tests {
                 current_tokens: 10,
                 max_tokens: 50,
                 entries: vec![leviath_core::run_meta::RegionEntrySnapshot {
-                    content: "hello".to_string(),
+                    content: "hello".to_string().into(),
                     tokens: 5,
                     kind: Default::default(),
                     metadata: None,

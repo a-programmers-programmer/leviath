@@ -460,6 +460,16 @@ impl Provider for OpenAIProvider {
         caps
     }
 
+    fn mime(&self, model: &str) -> crate::capabilities::ModelMime {
+        // The listing says nothing about mime either, so the table answers
+        // and the operator's entry corrects it.
+        let base = crate::mime_tables::openai(model);
+        match self.capability_overrides.get(model) {
+            Some(o) => o.apply_mime(base),
+            None => base,
+        }
+    }
+
     /// The chat and reasoning models the listing named, once primed.
     ///
     /// Filtered through `is_chat_model_id` because `GET /v1/models` also
@@ -567,6 +577,9 @@ impl OpenAIProvider {
         crate::provider::decode_json(response).await
     }
 }
+
+#[cfg(test)]
+mod mime_tests;
 
 #[cfg(test)]
 mod tests {

@@ -11,7 +11,7 @@
 //! whole path is synchronous - which lets it run straight from the host's
 //! control loop.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex as StdMutex};
 
@@ -206,6 +206,54 @@ fn load_blueprint(
     Ok((content, blueprint))
 }
 
+/// The registry this run types its bytes by: the world's rows (the
+/// operator's, kept current by the config reload) with the blueprint's own
+/// `[mime_types]` layered on top, and the blueprint's checks compiled
+/// beside its other scripts. A world without a registry (a test's) starts
+/// from the compiled defaults.
+///
+/// Cannot fail here: the manifest parser layered these rows once already,
+/// and a row that layers over nothing layers over anything, since one row
+/// never constrains another; `checks` is keyed by the registry's own keys.
+fn run_mime_registry(
+    world: &World,
+    blueprint: &Blueprint,
+    checks: BTreeMap<String, Arc<dyn leviath_core::mime::MimeCheck>>,
+) -> leviath_runtime::blob_store::RunMimeRegistry {
+    let base = world
+        .get_resource::<leviath_runtime::blob_store::MimeRegistryHandle>()
+        .map(|r| r.0.clone())
+        .unwrap_or_default();
+    leviath_runtime::blob_store::RunMimeRegistry::new(&base, blueprint.mime_types.clone(), checks)
+        .expect("the manifest parser accepted these rows")
+}
+
+/// The run's blob store as the tools see it: the world's store and the
+/// run's registry, keyed by this run, under the operator's size ceiling.
+fn tool_mime(
+    world: &World,
+    run_id: &str,
+    registry: &leviath_runtime::blob_store::RunMimeRegistry,
+) -> leviath_tools::ToolMime {
+    let store = world
+        .get_resource::<leviath_runtime::blob_store::BlobStoreHandle>()
+        .map(|s| s.0.clone())
+        .unwrap_or_else(|| Arc::new(leviath_core::mime::MemoryBlobStore::new()));
+    let registry = registry.cell();
+    let max_part_bytes = world
+        .get_resource::<leviath_runtime::blob_store::MimeLimits>()
+        .map_or(
+            leviath_runtime::blob_store::MimeLimits::default().max_part_bytes,
+            |l| l.max_part_bytes,
+        );
+    leviath_tools::ToolMime {
+        store,
+        registry,
+        run_id: run_id.to_string(),
+        max_part_bytes,
+    }
+}
+
 /// Everything phase 7 attaches that is not already on the entity.
 ///
 /// A struct because these are one thing - the durable record of a run - rather
@@ -231,6 +279,13 @@ struct RunRecordParts {
     tool_sensitivities: Option<HashMap<String, leviath_core::TaintLevel>>,
     security: leviath_core::taint::SecurityConfig,
     mcp_overrides: std::collections::HashMap<String, leviath_core::policy::McpToolOverride>,
+    /// The yolo profile's answer to the two spawn-time markers: whether
+    /// stage-boundary checkpoints approve themselves, and whether the taint
+    /// gate does. Both false for an attended run.
+    auto_checkpoints: bool,
+    auto_gate: bool,
+    /// The profile's name when `--yolo=<name>` named one.
+    yolo_profile: Option<String>,
 }
 
 /// Record the run on its entity: metadata, counters, and the markers that
@@ -258,6 +313,7 @@ fn attach_run_record(
         title: None,
         title_error: None,
         unattended: args.yolo,
+        yolo_profile: parts.yolo_profile,
         read_paths: parts.read_path_counts,
         output_request: args.output.clone(),
         model_override: args.model.clone(),
@@ -302,9 +358,11 @@ fn attach_run_record(
             });
         // `--yolo` means run unattended, so a blueprint's stage-boundary
         // checkpoints are approved rather than parked on a deps.hub nobody is
-        // watching. (`.then_some(..).into_iter()` keeps the non-yolo path
+        // watching - unless the yolo profile keeps them (`checkpoints =
+        // "ask"`). (`.then_some(..).into_iter()` keeps the non-yolo path
         // branch-free, matching the taint-gate marker below.)
-        args.yolo
+        parts
+            .auto_checkpoints
             .then_some(leviath_runtime::components::InteractionAutoApprove)
             .into_iter()
             .for_each(|marker| {
@@ -329,9 +387,10 @@ fn attach_run_record(
                     leviath_runtime::pipeline::ToolSensitivities(sensitivities),
                 ));
                 // `--yolo` means run unattended: waive taint-gate prompts (the
-                // tool-policy wildcard below doesn't cover them), so a headless run
-                // never blocks on a gate no one can answer.
-                if args.yolo {
+                // tool policy doesn't cover them), so a headless run never
+                // blocks on a gate no one can answer - unless the profile keeps
+                // them (`gate = "ask"`).
+                if parts.auto_gate {
                     entity_mut.insert(leviath_runtime::components::GateAutoApprove);
                 }
                 // `Option`'s iterator enables tracking without a dead "no window" arm
@@ -465,6 +524,20 @@ fn build_agent_inner(
 ) -> Result<Entity, String> {
     // 0. Everything that can be judged from the request alone.
     check_spawn_request(args)?;
+    // The yolo profile, read from `yolo.toml` as it stands now: `None` for an
+    // attended run, the built-in default for bare `--yolo`. A name the file
+    // does not have fails the spawn here, before anything is on disk but the
+    // placeholder - the person asked for a specific set of rules.
+    let profile = crate::yolo::resolve_for_spawn(args.yolo, args.yolo_profile.as_deref())
+        .map_err(|e| e.to_string())?;
+    // Whether the human tools are cut and auto-answered: yolo, under a
+    // profile that does not keep the model's questions for a person.
+    let unattended_tools = profile.as_ref().is_some_and(|p| p.spec.questions.is_auto());
+    let yolo_profile_name = args
+        .yolo
+        .then(|| args.yolo_profile.clone())
+        .flatten()
+        .filter(|name| !name.is_empty());
 
     // 1. Load the blueprint (the client resolves the manifest path). Mutable
     // because step 2d writes each stage's global tool grants into it before the
@@ -526,9 +599,16 @@ fn build_agent_inner(
     // that a live run is up but blind to paths its author designed it around.
     let read_path_counts =
         read_path_grant_counts(&blueprint, deps.config, std::path::Path::new(&args.workdir));
+    // The run's mime registry, before the tools are built over it: the
+    // blueprint's checks are compiled here, with the same fence its other
+    // scripts get, and a broken one is a spawn error.
+    let mime_checks = resolve_mime_checks(&blueprint, &args.blueprint_path)?;
+    let run_registry = run_mime_registry(world, &blueprint, mime_checks);
+    let mime = Arc::new(tool_mime(world, &args.run_id, &run_registry));
     let tool_ctx = leviath_tools::ToolContext::new(std::path::PathBuf::from(&args.workdir))
         .with_read_paths(read_path_policy)
-        .with_shell_env(shell_env_policy(deps.config));
+        .with_shell_env(shell_env_policy(deps.config))
+        .with_mime(mime.clone());
     let mut builtins = leviath_tools::BuiltinTools::new(tool_ctx);
     if let Some(mgr) = &sandbox {
         builtins =
@@ -612,7 +692,7 @@ fn build_agent_inner(
                 defs: &all_tool_defs,
                 owners: deps.mcp_tool_owners,
             },
-            args.yolo,
+            unattended_tools,
             args.output.as_ref(),
         )?
     };
@@ -695,6 +775,23 @@ fn build_agent_inner(
                 .collect()
         })
         .collect();
+    // What each stage lets each tool be handed, canonicalised the same way,
+    // so a limit written against an alias still meets the call.
+    let stage_tool_accepts_by_index: Vec<HashMap<String, Vec<String>>> = blueprint
+        .stages
+        .iter()
+        .map(|s| {
+            s.tool_accepts
+                .iter()
+                .map(|(tool, list)| {
+                    (
+                        leviath_tools::canonical_tool_name(tool).to_string(),
+                        list.clone(),
+                    )
+                })
+                .collect()
+        })
+        .collect();
     let model_label = stages
         .first()
         .map(|s| format!("{}/{}", s.provider_name, s.model));
@@ -712,15 +809,18 @@ fn build_agent_inner(
     // `seed = { tools = [...] }` needs them: a seeded call answers to the
     // same policy a mid-run call does, and a seeded *script* tool needs the
     // host it would run under. Everything they read is already bound.
-    // Launch overrides: `--yolo` allows every tool (`*` wildcard); `--allow X`
-    // allows tool `X` outright.
+    // Launch overrides: `--allow X` allows tool `X` outright. `--yolo` is not
+    // an override any more but a profile (`profile` above), applied after the
+    // config layers by `crate::yolo::apply_profile`; bare `--yolo` is the
+    // profile that allows everything the config does not deny, which is the
+    // wildcard it used to write here.
     let mut launch_overrides: HashMap<String, crate::config::ToolPolicy> = HashMap::new();
-    if args.yolo {
-        launch_overrides.insert("*".to_string(), crate::config::ToolPolicy::Allow);
-    }
     for tool in &args.allow {
         launch_overrides.insert(tool.clone(), crate::config::ToolPolicy::Allow);
     }
+    let workdir_path = std::path::PathBuf::from(&args.workdir);
+    // The files no run may change, for the seeds now and the tool lane after.
+    let protected = crate::tools::permission_files(deps.config);
     // Rhai script-tool host (Layer 3): resolve `[tool_script_permissions]` once,
     // with `read_file`/`shell` `inherit` deferring to the agent's own resolved
     // policy for that built-in (evaluated against the entry stage).
@@ -742,7 +842,7 @@ fn build_agent_inner(
     let script_allow = crate::daemon::script_host::resolve_script_permissions(
         &effective_script_perms,
         &|builtin| {
-            crate::tools::resolve_policy(
+            let configured = crate::tools::resolve_policy(
                 builtin,
                 true,
                 &launch_overrides,
@@ -750,6 +850,17 @@ fn build_agent_inner(
                 &agent_perms,
                 &agent_scoped_perms,
                 deps.config.security.allow_blueprint_permissions,
+            );
+            // A script's `inherit` answers to the profile as the tool lane
+            // does, by name: there is no call here to read arguments from.
+            crate::yolo::apply_profile(
+                profile.as_deref(),
+                builtin,
+                &serde_json::Value::Null,
+                configured,
+                crate::tools::launch_allows(&launch_overrides, builtin),
+                crate::yolo::ToolKind::Builtin,
+                &workdir_path,
             )
         },
     );
@@ -759,12 +870,15 @@ fn build_agent_inner(
     let writes = Arc::new(crate::daemon::tool_service::WriteBudget::new(
         deps.config.limits.write_limits(),
     ));
+    let offered_parts = Arc::new(std::sync::Mutex::new(Vec::new()));
     let script_host: Arc<dyn leviath_scripting::ScriptHost> = Arc::new(
         crate::daemon::script_host::DaemonScriptHost::new(
             script_allow,
             std::path::PathBuf::from(&args.workdir),
         )
         .with_write_budget(writes.clone())
+        // The run's parts, by name, and somewhere to put new ones.
+        .with_mime(mime.clone(), offered_parts.clone())
         // Route a script `shell()` through the agent's per-stage sandbox (so a
         // script can't escape the isolation the stage declared) and cap it at the
         // configured wall-clock timeout.
@@ -814,6 +928,10 @@ fn build_agent_inner(
         let seed_agent = agent_perms.clone();
         let seed_global = agent_scoped_perms.clone();
         let seed_may_loosen = deps.config.security.allow_blueprint_permissions;
+        let seed_profile = profile.clone();
+        let seed_workdir = workdir_path.clone();
+        let seed_builtins = builtin_names.clone();
+        let seed_scripts = script_tool_names.clone();
         let tool_policy = crate::daemon::seed_tool::SeedToolPolicy::new(
             crate::daemon::seed_tool::production_runner(
                 crate::daemon::seed_tool::SeedToolContext {
@@ -823,17 +941,37 @@ fn build_agent_inner(
                     script_host: script_host.clone(),
                     mcp: deps.shared_mcp.clone(),
                     writes: writes.clone(),
+                    protected: protected.clone(),
                 },
-                Arc::new(move |name: &str, is_builtin: bool| {
-                    crate::daemon::seed_tool::SeedToolPermissions {
-                        launch: &seed_launch,
-                        stage: &seed_stage,
-                        agent: &seed_agent,
-                        global: &seed_global,
-                        may_loosen: seed_may_loosen,
-                    }
-                    .resolve(name, is_builtin)
-                }),
+                Arc::new(
+                    move |name: &str, is_builtin: bool, arguments: &serde_json::Value| {
+                        let configured = crate::daemon::seed_tool::SeedToolPermissions {
+                            launch: &seed_launch,
+                            stage: &seed_stage,
+                            agent: &seed_agent,
+                            global: &seed_global,
+                            may_loosen: seed_may_loosen,
+                        }
+                        .resolve(name, is_builtin);
+                        // The profile has the same say over a seed as over a
+                        // mid-run call. Under bare `--yolo` that is what lets a
+                        // seeded `shell` run at all: a seed refuses `ask`, and the
+                        // profile is what turns it into `allow`.
+                        crate::yolo::apply_profile(
+                            seed_profile.as_deref(),
+                            name,
+                            arguments,
+                            configured,
+                            crate::tools::launch_allows(&seed_launch, name),
+                            crate::yolo::ToolKind::classify(
+                                name,
+                                seed_builtins.contains(name),
+                                seed_scripts.contains(name),
+                            ),
+                            &seed_workdir,
+                        )
+                    },
+                ),
             ),
         );
         resolve_seeds(
@@ -881,6 +1019,7 @@ fn build_agent_inner(
             agent_id: args.run_id.clone(),
             blueprint,
             seeds,
+            parts: args.parts.clone(),
             stages,
             global_hints: leviath_core::config::PromptHints {
                 batch_tool: deps.config.batch_tool_hint,
@@ -888,6 +1027,7 @@ fn build_agent_inner(
             },
             global_nudge: deps.config.nudge.clone(),
             region_scripts,
+            mime_registry: Some(run_registry),
         },
     )?;
 
@@ -941,6 +1081,11 @@ fn build_agent_inner(
             tool_sensitivities,
             security: security.clone(),
             mcp_overrides,
+            auto_checkpoints: profile
+                .as_ref()
+                .is_some_and(|p| p.spec.checkpoints.is_auto()),
+            auto_gate: profile.as_ref().is_some_and(|p| p.spec.gate.is_auto()),
+            yolo_profile: yolo_profile_name.clone(),
         },
     );
 
@@ -952,7 +1097,10 @@ fn build_agent_inner(
         max_depth: max_child_depth,
         no_seed_commands: args.no_seed_commands,
         unattended: args.yolo,
+        yolo_profile: yolo_profile_name.clone(),
         model_override: args.model.clone(),
+        offered_parts: offered_parts.clone(),
+        mime: Some(mime.clone()),
     };
     // Build the dynamic-tools re-resolution context and tag the entity
     // `DynamicTools` so the runtime polls it for mid-run re-scans.
@@ -964,11 +1112,14 @@ fn build_agent_inner(
             scan_dirs: script_scan_dirs(&args.blueprint_path, workdir_tools_dir),
             reserved_names: reserved_tool_names(&builtin_names, deps.mcp_tool_defs),
             static_defs: static_tool_defs,
+            mcp_owners: deps.mcp_tool_owners.clone(),
             stage_available,
             stage_required,
             stage_global,
             tools_dir: global_tools_dir,
-            unattended: args.yolo,
+            // Upstream refines `unattended` to the profile's own
+            // `questions` mode; the fork's global-grant fields ride alongside.
+            unattended: unattended_tools,
             dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     });
@@ -984,6 +1135,7 @@ fn build_agent_inner(
         entry_index,
         stage_perms_by_index,
         stage_required_by_index,
+        stage_tool_accepts_by_index,
         agent_perms,
         agent_name: &agent_name,
         launch_overrides,
@@ -992,8 +1144,12 @@ fn build_agent_inner(
         script_tools,
         script_tool_names,
         script_host,
+        offered_parts,
         dynamic,
-        unattended: args.yolo,
+        unattended: unattended_tools,
+        yolo: profile,
+        yolo_profile: yolo_profile_name,
+        protected,
         blueprint_safe: blueprint_safe.as_ref(),
         blueprint_read_paths: blueprint_read_paths.as_ref(),
         workdir: std::path::PathBuf::from(&args.workdir),
@@ -1129,13 +1285,15 @@ system = { kind = "pinned", max_tokens = 1000 }
     fn model_defaults_carries_the_fallback_chain_from_config() {
         let mut config = Config {
             default_provider: "openrouter".to_string(),
-            default_model: Some("deepseek".to_string()),
+            override_model: Some("deepseek".to_string()),
+            fallback_model: Some("flash".to_string()),
             ..Default::default()
         };
         config.providers.fallback_order = vec!["anthropic/claude-sonnet-5".to_string()];
         let defaults = model_defaults(&config);
         assert_eq!(defaults.provider, "openrouter");
-        assert_eq!(defaults.model.as_deref(), Some("deepseek"));
+        assert_eq!(defaults.override_model.as_deref(), Some("deepseek"));
+        assert_eq!(defaults.fallback_model.as_deref(), Some("flash"));
         assert_eq!(defaults.fallback_order.len(), 1);
         assert_eq!(defaults.fallback_order[0].provider, "anthropic");
     }
@@ -1380,15 +1538,138 @@ system = { kind = "pinned", max_tokens = 1000 }
             callback_url: None,
             callback_secret: None,
             yolo: false,
+            yolo_profile: None,
             no_seed_commands: false,
             allow: Vec::new(),
             max_depth: None,
             parent_run_id: None,
             output: None,
+            parts: Vec::new(),
         }
     }
 
+    /// The regression test for the reported bug: a blueprint whose entry stage
+    /// pins `openrouter/deepseek/deepseek-v4.1-flash`, dispatched with
+    /// `default_model = "deepseek/deepseek-v4-pro"` configured on that same
+    /// provider - which is what `config.toml` carried when two host-dispatched
+    /// runs recorded the *default* model in their `meta.json`.
+    ///
+    /// `build_agent` is the spawn every path goes through - `lev run` and the
+    /// MCP `run` tool alike - and `RunMetadata::model` is the field those runs
+    /// recorded. The stage pin has to survive it: the user's `default_model` is
+    /// the first *failover* behind the blueprint's own model, never its
+    /// replacement.
+    #[tokio::test]
+    async fn build_agent_keeps_a_pinned_stage_model_over_the_users_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("agent.leviath");
+        std::fs::write(&manifest, pinned_entry_manifest()).unwrap();
+        let (mut world, cli) = world_with(&["openrouter"]);
+        let config = Config {
+            default_provider: "openrouter".to_string(),
+            // Upstream renamed `Config::default_model` to `Config::override_model`
+            // ("one model every stage that allows a user default starts on").
+            // Same field, same role in `model_defaults`; the sync merge kept the
+            // old name in this fork-only test. The rename is the whole fix and
+            // the assertion below is unchanged, because a pinned stage does not
+            // allow a user default, so the override cannot displace it.
+            override_model: Some("deepseek/deepseek-v4-pro".to_string()),
+            ..Config::default()
+        };
+        let entity = build_agent(
+            world.world_mut(),
+            SpawnDeps {
+                tool_service: cli.as_ref(),
+                config: &config,
+                shared_mcp: Arc::new(Mutex::new(leviath_mcp::ToolExecutor::new())),
+                mcp_tool_defs: &[],
+                mcp_tool_owners: &Default::default(),
+                hub: &InteractionHub::new(),
+                now_secs: 100,
+                subagent_tx: sub_tx(),
+            },
+            &spawn_args(&manifest.to_string_lossy()),
+        )
+        .expect("a stage whose pinned provider is registered spawns");
+
+        let meta = world
+            .world()
+            .get::<RunMetadata>(entity)
+            .expect("run metadata attached");
+        assert_eq!(
+            meta.model.as_deref(),
+            Some("openrouter/deepseek/deepseek-v4.1-flash"),
+            "the run's recorded model is the blueprint's pin, not default_model"
+        );
+    }
+
+    /// A pin that this machine cannot honour is a named error, not a run on
+    /// somebody else's model. The stage names a provider the registry does not
+    /// have while `default_model` offers a substitute on a provider it does:
+    /// before this check the substitution was silent, and the run's declared
+    /// model and the model it actually used disagreed with nothing said.
+    #[tokio::test]
+    async fn build_agent_refuses_to_substitute_a_model_for_an_unreachable_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("agent.leviath");
+        std::fs::write(&manifest, pinned_entry_manifest()).unwrap();
+        // `openrouter` is the stage's pin and is not registered here.
+        let (mut world, cli) = world_with(&["anthropic"]);
+        let config = Config {
+            default_provider: "anthropic".to_string(),
+            // Same rename as above: `default_model` is now `override_model`.
+            override_model: Some("claude-sonnet-5".to_string()),
+            ..Config::default()
+        };
+        let err = build_agent(
+            world.world_mut(),
+            SpawnDeps {
+                tool_service: cli.as_ref(),
+                config: &config,
+                shared_mcp: Arc::new(Mutex::new(leviath_mcp::ToolExecutor::new())),
+                mcp_tool_defs: &[],
+                mcp_tool_owners: &Default::default(),
+                hub: &InteractionHub::new(),
+                now_secs: 100,
+                subagent_tx: sub_tx(),
+            },
+            &spawn_args(&manifest.to_string_lossy()),
+        )
+        .expect_err("the pin cannot be honoured, so the spawn fails");
+
+        assert!(err.contains("stage 'execute'"), "{err}");
+        assert!(
+            err.contains("openrouter/deepseek/deepseek-v4.1-flash"),
+            "the error names the pinned model: {err}"
+        );
+        assert!(
+            err.contains("deepseek-v4-pro") || err.contains("claude-sonnet-5"),
+            "the error names the substitute it refused: {err}"
+        );
+    }
+
     // ─── resolve_region_scripts ──────────────────────────────────────────
+
+    /// A manifest shaped like the one the reported runs used: the entry stage
+    /// pins a model on the provider the user's `default_model` also names.
+    fn pinned_entry_manifest() -> &'static str {
+        "[agent]\nname = \"pinned\"\nversion = \"0.1.0\"\ndescription = \"d\"\n\n\
+         [stages.execute]\nmodel = { models = [ { provider = \"openrouter\", \
+         model = \"deepseek/deepseek-v4.1-flash\" } ] }\n"
+    }
+
+    fn world_with(providers: &[&str]) -> (PipelineWorld, Arc<CliToolService>) {
+        let cli = Arc::new(CliToolService::new());
+        let world = PipelineWorld::new(
+            registry_with(providers),
+            cli.clone(),
+            InferencePoolConfig::new(),
+            1,
+            None,
+            Handle::current(),
+        );
+        (world, cli)
+    }
 
     /// Manifest with a global custom region and a per-stage one, both
     /// pointing into `hooks/` next to the manifest.
@@ -1724,6 +2005,42 @@ system = { kind = "pinned", max_tokens = 1000 }
         assert!(err.contains("hooks/brain.rhai"), "got: {err}");
     }
 
+    /// A blueprint's mime check that cannot be loaded stops the spawn, the
+    /// way its other scripts do, before any tokens are spent.
+    #[tokio::test]
+    async fn build_agent_fails_fast_on_a_mime_check_it_cannot_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("agent.leviath");
+        std::fs::write(
+            &manifest,
+            "[agent]\nname = \"v\"\nversion = \"0.1.0\"\ndescription = \"d\"\n\n\
+             [stages.main]\nmodel = { provider = \"anthropic\", model = \"m\" }\n\n\
+             [mime_types.\"application/x-acme-scene\"]\ncheck = \"checks/gone.rhai\"\n",
+        )
+        .unwrap();
+        let (mut world, cli) = test_world();
+        let hub = InteractionHub::new();
+        let mcp = Arc::new(Mutex::new(leviath_mcp::ToolExecutor::new()));
+        let args = spawn_args(&manifest.to_string_lossy());
+        let err = build_agent(
+            world.world_mut(),
+            SpawnDeps {
+                tool_service: cli.as_ref(),
+                config: &Config::default(),
+                shared_mcp: mcp,
+                mcp_tool_defs: &[],
+                mcp_tool_owners: &Default::default(),
+                hub: &hub,
+                now_secs: 100,
+                subagent_tx: sub_tx(),
+            },
+            &args,
+        )
+        .unwrap_err();
+        assert!(err.contains("cannot read mime check"), "got: {err}");
+        assert!(err.contains("gone.rhai"), "got: {err}");
+    }
+
     /// The run id becomes a directory name and everything a run writes lands
     /// under it. The persistence lane joins it to the runs directory without
     /// checking, so the check belongs at the boundary that accepts the request.
@@ -1731,6 +2048,98 @@ system = { kind = "pinned", max_tokens = 1000 }
     /// The blueprint path here points at nothing, which is the point: the error
     /// must be about the run id, proving the guard runs before anything is read
     /// off disk.
+    #[test]
+    fn tool_mime_reads_the_worlds_store_or_falls_back_to_memory() {
+        let bare = World::new();
+        let bp = validator_blueprint(None, None);
+        let registry = run_mime_registry(&bare, &bp, BTreeMap::new());
+        let m = tool_mime(&bare, "run-x", &registry);
+        assert_eq!(m.run_id, "run-x");
+        assert_eq!(
+            m.max_part_bytes,
+            leviath_runtime::blob_store::MimeLimits::default().max_part_bytes
+        );
+        let mut world = World::new();
+        world.insert_resource(leviath_runtime::blob_store::BlobStoreHandle(Arc::new(
+            leviath_core::mime::MemoryBlobStore::new(),
+        )));
+        world.insert_resource(leviath_runtime::blob_store::MimeRegistryHandle::default());
+        world.insert_resource(leviath_runtime::blob_store::MimeLimits {
+            max_part_bytes: 7,
+            ..Default::default()
+        });
+        assert_eq!(tool_mime(&world, "r", &registry).max_part_bytes, 7);
+        // The tools read the run's registry through the cell the runtime
+        // swaps a reload into, so the two never disagree about a type.
+        let obj = leviath_core::mime::MimeType::parse("model/obj").unwrap();
+        assert_eq!(m.name_for("a", &obj), "a.obj");
+        let rows: toml::Table = toml::from_str("[\"model/obj\"]\nextensions = [\"o\"]\n").unwrap();
+        registry
+            .rebuild(
+                &leviath_core::mime::MimeRegistry::builtin()
+                    .layered(&rows, "e")
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(m.name_for("a", &obj), "a.o");
+    }
+
+    /// A blueprint's `[mime_types]` checks are compiled beside its other
+    /// scripts, fenced to its directory, and refuse bytes on the run.
+    #[test]
+    fn resolve_mime_checks_compiles_the_rows_scripts() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("agent.leviath");
+        std::fs::create_dir_all(dir.path().join("checks")).unwrap();
+        std::fs::write(
+            dir.path().join("checks/scene.rhai"),
+            "fn check(bytes, mime_type) { if bytes.len() < 4 { return \"too short\"; } () }",
+        )
+        .unwrap();
+        let mut bp = validator_blueprint(None, None);
+        bp.mime_types = toml::from_str(
+            "[\"application/x-acme-scene\"]\nfamily = \"model\"\ncheck = \"checks/scene.rhai\"\n\
+             [\"model/obj\"]\ntext = true\n",
+        )
+        .unwrap();
+        let checks = resolve_mime_checks(&bp, &manifest.to_string_lossy()).expect("compiles");
+        assert_eq!(checks.len(), 1);
+        let scene = leviath_core::mime::MimeType::parse("application/x-acme-scene").unwrap();
+        assert_eq!(
+            checks["application/x-acme-scene"].check(&scene, b"ab"),
+            Err("too short".to_string())
+        );
+        // On the run: the store refuses what the check refuses.
+        let registry = run_mime_registry(&World::new(), &bp, checks);
+        let mime = tool_mime(&World::new(), "run-c", &registry);
+        let short = leviath_core::mime::Blob::new(scene.clone(), b"ab".to_vec()).named("a.scene");
+        let err = mime.store(short).unwrap_err();
+        assert!(err.contains("too short"), "{err}");
+        let fine = leviath_core::mime::Blob::new(scene, b"ACME1".to_vec()).named("b.scene");
+        assert!(mime.store(fine).is_ok());
+
+        // Missing, escaping and broken scripts are each named.
+        bp.mime_types = toml::from_str("[\"x/y\"]\ncheck = \"checks/gone.rhai\"\n").unwrap();
+        let err = resolve_mime_checks(&bp, &manifest.to_string_lossy()).unwrap_err();
+        assert!(err.contains("cannot read mime check"), "{err}");
+        bp.mime_types = toml::from_str("[\"x/y\"]\ncheck = \"../escape.rhai\"\n").unwrap();
+        let err = resolve_mime_checks(&bp, &manifest.to_string_lossy()).unwrap_err();
+        assert!(
+            err.contains("mime check '../escape.rhai' resolves outside"),
+            "{err}"
+        );
+        std::fs::write(dir.path().join("checks/broken.rhai"), "fn check(a) { () }").unwrap();
+        bp.mime_types = toml::from_str("[\"x/y\"]\ncheck = \"checks/broken.rhai\"\n").unwrap();
+        let err = resolve_mime_checks(&bp, &manifest.to_string_lossy()).unwrap_err();
+        assert!(
+            err.contains("mime check for x/y failed to compile"),
+            "{err}"
+        );
+        bp.mime_types = toml::from_str("[png]\ncheck = \"checks/scene.rhai\"\n").unwrap();
+        let err = resolve_mime_checks(&bp, &manifest.to_string_lossy()).unwrap_err();
+        assert!(err.starts_with("[mime_types]:"), "{err}");
+    }
+
     #[tokio::test]
     async fn build_agent_rejects_a_run_id_that_is_not_a_directory_name() {
         for bad in ["../escape", "a/b", "..", ".", ""] {
@@ -2725,7 +3134,8 @@ system = { kind = "pinned", max_tokens = 1000 }
             "[agent]\nname = \"asks\"\nversion = \"0.1.0\"\ndescription = \"d\"\n\n\
              [stages.main]\nmodel = { provider = \"anthropic\", model = \"m\" }\n\
              available_tools = [\"read_file\", \"ask_user_text\"]\n\
-             required_tools = [\"ask_user_text\"]\n",
+             required_tools = [\"ask_user_text\"]\n\
+             [stages.main.tool_accepts]\nread_file = [\"text/*\"]\n",
         )
         .unwrap();
         let (mut world, cli) = test_world();
@@ -2756,6 +3166,12 @@ system = { kind = "pinned", max_tokens = 1000 }
                 .contains("ask_user_text")
         );
         assert_eq!(state.stage_required_by_index.len(), 1);
+        // And what the stage lets each tool be handed, by canonical name.
+        assert_eq!(
+            state.stage_tool_accepts.lock().unwrap().get("read_file"),
+            Some(&vec!["text/*".to_string()])
+        );
+        assert_eq!(state.stage_tool_accepts_by_index.len(), 1);
     }
 
     #[tokio::test]
@@ -3918,11 +4334,13 @@ conversation = {{ kind = "sliding_window", max_items = 20, max_tokens = 10000 }}
             callback_url: None,
             callback_secret: None,
             yolo: false,
+            yolo_profile: None,
             no_seed_commands: false,
             allow: Vec::new(),
             max_depth: None,
             parent_run_id: None,
             output: None,
+            parts: Vec::new(),
         }
     }
 
@@ -4011,6 +4429,38 @@ criteria = { kind = "pinned", max_tokens = 2000, seed = "input" }"#,
         )
         .unwrap_err();
         assert!(err.contains("spec"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_seeds_required_caller_input_is_satisfied_by_a_part() {
+        let bp =
+            bp(r#"spec = { kind = "pinned", max_tokens = 2000, seed = "input", required = true }"#);
+        let mut args = args_with("t", HashMap::new(), "/tmp");
+        args.parts =
+            vec![leviath_core::mime::InboundPart::from_bytes("m.png", vec![1]).in_region("spec")];
+        let seeds = resolve_seeds(
+            &bp,
+            &args,
+            "/tmp",
+            &seed_policy(),
+            &no_seed_tools(),
+            &no_read_paths(),
+        )
+        .unwrap();
+        assert!(!seeds.contains_key("spec"));
+        // A part bound elsewhere does not satisfy it.
+        args.parts[0].region = Some("other".to_string());
+        assert!(
+            resolve_seeds(
+                &bp,
+                &args,
+                "/tmp",
+                &seed_policy(),
+                &no_seed_tools(),
+                &no_read_paths(),
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -5294,5 +5744,191 @@ conversation = {{ kind = "sliding_window", max_items = 20, max_tokens = 10000 }}
                 "{name} tells the user to pass --task but declares no region to hold one"
             );
         }
+    }
+
+    const PROFILES_TOML: &str = "[careful]\ndefault = \"ask\"\nquestions = \"ask\"\n\
+        checkpoints = \"ask\"\ngate = \"ask\"\n\n[loose]\ndefault = \"allow\"\n";
+
+    /// A profile that keeps the human mechanisms leaves every marker off: the
+    /// run is still yolo (its tool calls answer to the profile), but a
+    /// checkpoint opens, the gate asks, and the model's questions are offered.
+    /// One that keeps nothing is bare `--yolo` with a name on it.
+    #[tokio::test]
+    async fn build_agent_under_a_profile_keeps_what_the_profile_keeps() {
+        crate::config::with_isolated_config_path_async("spawn_profile_keeps", |cfg| async move {
+            std::fs::write(cfg.join("yolo.toml"), PROFILES_TOML).unwrap();
+            for (name, auto) in [("careful", false), ("loose", true)] {
+                let dir = tempfile::tempdir().unwrap();
+                let manifest = dir.path().join("agent.leviath");
+                std::fs::write(
+                    &manifest,
+                    "[agent]\nname = \"sec\"\nversion = \"0.1.0\"\ndescription = \"d\"\n\n\
+                     [security]\ntaint_tracking = true\n\n\
+                     [stages.main]\nmodel = { provider = \"anthropic\", model = \"m\" }\n",
+                )
+                .unwrap();
+                let (mut world, cli) = test_world();
+                let hub = InteractionHub::new();
+                let mut args = spawn_args(&manifest.to_string_lossy());
+                args.yolo = true;
+                args.yolo_profile = Some(name.to_string());
+                let entity = build_agent(
+                    world.world_mut(),
+                    SpawnDeps {
+                        tool_service: cli.as_ref(),
+                        config: &Config::default(),
+                        shared_mcp: Arc::new(Mutex::new(leviath_mcp::ToolExecutor::new())),
+                        mcp_tool_defs: &[],
+                        mcp_tool_owners: &Default::default(),
+                        hub: &hub,
+                        now_secs: 100,
+                        subagent_tx: sub_tx(),
+                    },
+                    &args,
+                )
+                .expect("spawn succeeds");
+                assert_eq!(
+                    world
+                        .world()
+                        .get::<leviath_runtime::components::GateAutoApprove>(entity)
+                        .is_some(),
+                    auto,
+                    "{name}: gate marker"
+                );
+                assert_eq!(
+                    world
+                        .world()
+                        .get::<leviath_runtime::components::InteractionAutoApprove>(entity)
+                        .is_some(),
+                    auto,
+                    "{name}: checkpoint marker"
+                );
+                let meta = world
+                    .world()
+                    .get::<RunMetadata>(entity)
+                    .expect("run metadata attached");
+                assert!(meta.unattended, "{name}: still a yolo run");
+                assert_eq!(meta.yolo_profile.as_deref(), Some(name));
+                let state = cli.take(entity).expect("tool state registered");
+                assert_eq!(state.unattended, auto, "{name}: questions routing");
+                let profile = state.yolo.get();
+                assert_eq!(
+                    profile.as_ref().as_ref().map(|p| p.name.as_str()),
+                    Some(name)
+                );
+                let handle = state.subagent.as_ref().expect("a sub-agent handle");
+                assert!(handle.unattended);
+                assert_eq!(handle.yolo_profile.as_deref(), Some(name));
+            }
+        })
+        .await;
+    }
+
+    /// A name the file does not have stops the spawn and lists what it does
+    /// have. Without `yolo`, a stray name is not even looked up.
+    #[tokio::test]
+    async fn build_agent_refuses_a_profile_the_file_does_not_have() {
+        crate::config::with_isolated_config_path_async("spawn_profile_unknown", |cfg| async move {
+            std::fs::write(cfg.join("yolo.toml"), PROFILES_TOML).unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let manifest = dir.path().join("agent.leviath");
+            std::fs::write(
+                &manifest,
+                "[agent]\nname = \"a\"\nversion = \"0.1.0\"\ndescription = \"d\"\n\n\
+                 [stages.main]\nmodel = { provider = \"anthropic\", model = \"m\" }\n",
+            )
+            .unwrap();
+            let (mut world, cli) = test_world();
+            let config = Config::default();
+            let hub = InteractionHub::new();
+            let owners = Default::default();
+            let deps = || SpawnDeps {
+                tool_service: cli.as_ref(),
+                config: &config,
+                shared_mcp: Arc::new(Mutex::new(leviath_mcp::ToolExecutor::new())),
+                mcp_tool_defs: &[],
+                mcp_tool_owners: &owners,
+                hub: &hub,
+                now_secs: 100,
+                subagent_tx: sub_tx(),
+            };
+            let mut args = spawn_args(&manifest.to_string_lossy());
+            args.yolo = true;
+            args.yolo_profile = Some("nope".to_string());
+            let err = build_agent(world.world_mut(), deps(), &args).expect_err("unknown profile");
+            assert!(err.contains("no yolo profile named \"nope\""), "{err}");
+            assert!(err.contains("careful, loose"), "{err}");
+
+            std::fs::remove_file(cfg.join("yolo.toml")).unwrap();
+            args.yolo = false;
+            let entity = build_agent(world.world_mut(), deps(), &args)
+                .expect("an attended run ignores the name");
+            let meta = world.world().get::<RunMetadata>(entity).expect("metadata");
+            assert!(!meta.unattended);
+            assert!(meta.yolo_profile.is_none());
+            assert!(cli.take(entity).expect("state").yolo.get().is_none());
+        })
+        .await;
+    }
+
+    /// A seed answers to the profile as a mid-run call does. Bare `--yolo`
+    /// is what lets a seeded `shell` run at all - a seed refuses `ask` - and a
+    /// profile whose default asks leaves the region empty rather than running
+    /// it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tool_seed_answers_to_the_yolo_profile() {
+        crate::config::with_isolated_config_path_async("spawn_profile_seed", |cfg| async move {
+            std::fs::write(cfg.join("yolo.toml"), PROFILES_TOML).unwrap();
+            for (profile, expect_ran) in [(None, true), (Some("careful"), false), (Some("loose"), true)] {
+                let dir = tempfile::tempdir().unwrap();
+                let manifest = dir.path().join("agent.leviath");
+                std::fs::write(
+                    &manifest,
+                    "[agent]\nname = \"seeded\"\nversion = \"0.1.0\"\ndescription = \"d\"\n\n\
+                     [stages.main]\nmodel = { provider = \"anthropic\", model = \"m\" }\n\n\
+                     [context.regions]\n\
+                     task = { kind = \"pinned\", max_tokens = 4000, seed = \"task_input\" }\n\
+                     environment = { kind = \"pinned\", max_tokens = 1000, \
+                     seed = { tools = [{ name = \"shell\", args = { command = \"echo seeded\" } }] } }\n",
+                )
+                .unwrap();
+                let (mut world, cli) = test_world();
+                let mut args = spawn_args(&manifest.to_string_lossy());
+                args.workdir = dir.path().to_string_lossy().to_string();
+                args.yolo = true;
+                args.yolo_profile = profile.map(str::to_string);
+                let entity = build_agent(
+                    world.world_mut(),
+                    SpawnDeps {
+                        tool_service: cli.as_ref(),
+                        config: &Config::default(),
+                        shared_mcp: Arc::new(Mutex::new(leviath_mcp::ToolExecutor::new())),
+                        mcp_tool_defs: &[],
+                        mcp_tool_owners: &Default::default(),
+                        hub: &InteractionHub::new(),
+                        now_secs: 100,
+                        subagent_tx: sub_tx(),
+                    },
+                    &args,
+                )
+                .expect("spawn succeeds");
+                let window = world
+                    .world()
+                    .get::<leviath_runtime::components::ContextWindow>(entity)
+                    .expect("the agent has a window");
+                let content: String = window
+                    .regions
+                    .iter()
+                    .find(|r| r.name == "environment")
+                    .expect("the seeded region exists")
+                    .content
+                    .iter()
+                    .map(|e| e.content.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert_eq!(content.contains("seeded"), expect_ran, "{profile:?}: {content}");
+            }
+        })
+        .await;
     }
 }

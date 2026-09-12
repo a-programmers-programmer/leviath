@@ -182,7 +182,7 @@ impl Dashboard {
         // in place rather than in the bottom input bar.
         if self.editing_document() {
             let view = MdEditView::new(
-                " ✎ Editing this document - your changes replace it  ·  [^Enter] save  \
+                " ✎ Editing this document - your changes replace it  ·  [^S] save  \
                  [Enter] newline  [Tab] Save button  [Esc] cancel ",
                 C_SUCCESS,
                 !self.response_focus_send,
@@ -885,6 +885,42 @@ fn final_output_lines(answer: &leviath_core::FinalOutput, width: u16) -> Vec<Lin
         Line::from(""),
     ];
     lines.extend(crate::render::markdown_to_text(&answer.content, width).lines);
+    if !answer.artifacts.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!(" Files produced ({}):", answer.artifacts.len()),
+            Style::default().fg(C_DIM).add_modifier(Modifier::BOLD),
+        )));
+        for artifact in &answer.artifacts {
+            let sha = match artifact.sha256.is_empty() {
+                true => String::new(),
+                false => format!(
+                    "  sha256:{}",
+                    artifact.sha256.chars().take(12).collect::<String>()
+                ),
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("   {}", artifact.name),
+                    Style::default().fg(C_WHITE),
+                ),
+                Span::styled(
+                    format!(
+                        "  {}  {}  {}{sha}",
+                        artifact.path,
+                        artifact.mime_type,
+                        leviath_core::mime::human_size(artifact.size)
+                    ),
+                    Style::default().fg(C_DIM),
+                ),
+            ]));
+        }
+        lines.push(Line::from(Span::styled(
+            " lev result <run> --artifact <name> fetches one; in the Context view, v opens a \
+             final_output part and w writes it into the workdir.",
+            Style::default().fg(C_MUTED),
+        )));
+    }
     lines
 }
 
@@ -1552,6 +1588,28 @@ mod tests {
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
         assert!(body.contains("body"), "{body}");
+
+        // The files the run produced, under the answer, hashed when stored.
+        answer.artifacts = vec![
+            leviath_core::output::Artifact::from_path("out/notes.md"),
+            leviath_core::output::Artifact {
+                name: "final".to_string(),
+                path: "out/final.mp4".to_string(),
+                mime_type: leviath_core::mime::MimeType::parse("video/mp4").unwrap(),
+                size: 3 * 1024 * 1024,
+                sha256: "abcdef0123456789".repeat(4),
+            },
+        ];
+        let body: String = final_output_lines(&answer, 80)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(body.contains("Files produced (2):"), "{body}");
+        assert!(body.contains("   notes.md  out/notes.md"), "{body}");
+        assert!(
+            body.contains("   final  out/final.mp4  video/mp4  3.0 MB  sha256:abcdef012345"),
+            "{body}"
+        );
     }
 
     /// A minimal stage record carrying just the name the final-output fallback
@@ -2041,7 +2099,7 @@ condition = "error"
                 current_tokens: 2000,
                 max_tokens: 4000,
                 entries: vec![runstate::RegionEntrySnapshot {
-                    content: "Hello world".to_string(),
+                    content: "Hello world".to_string().into(),
                     tokens: 5,
                     kind: Default::default(),
                     metadata: None,
@@ -2341,7 +2399,7 @@ transform = "clear"
                 current_tokens: 2000,
                 max_tokens: 4000,
                 entries: vec![runstate::RegionEntrySnapshot {
-                    content: "hello token world".to_string(),
+                    content: "hello token world".to_string().into(),
                     tokens: 5,
                     kind: Default::default(),
                     metadata: None,
@@ -2435,7 +2493,7 @@ transform = "clear"
         // Make snapshot with many entries to exceed screen height
         let entries: Vec<runstate::RegionEntrySnapshot> = (0..50)
             .map(|i| runstate::RegionEntrySnapshot {
-                content: format!("content line {}", i),
+                content: format!("content line {}", i).into(),
                 tokens: 10,
                 kind: Default::default(),
                 metadata: None,
@@ -2785,7 +2843,7 @@ transform = "clear"
     /// A context window with more rows than a short pane can show.
     fn tall_context_agent(id: &str) -> DashboardAgent {
         let entry = |text: &str| runstate::RegionEntrySnapshot {
-            content: text.to_string(),
+            content: text.to_string().into(),
             tokens: 5,
             kind: Default::default(),
             metadata: None,

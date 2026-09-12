@@ -48,6 +48,9 @@ pub enum Commands {
     /// List and inspect available models
     Models(commands::models::ModelsArgs),
 
+    /// Show the mime registry, and what a file resolves to under it
+    Mime(commands::mime::MimeArgs),
+
     /// Inspect and move the secrets Leviath holds
     Auth(commands::auth::AuthArgs),
 
@@ -59,6 +62,9 @@ pub enum Commands {
 
     /// Manage taint tracking policy rules
     Policy(commands::policy::PolicyArgs),
+
+    /// List, inspect and try the profiles behind `--yolo=<name>`
+    Yolo(commands::yolo::YoloArgs),
 
     /// Update Leviath, then everything that shipped with it
     #[command(long_about = commands::update::UPDATE_LONG_ABOUT)]
@@ -127,6 +133,9 @@ pub enum Commands {
     /// Show a run's context-window history (from its run.lvr archive)
     Context(commands::context::ContextArgs),
 
+    /// List the files a run holds as stored parts, and fetch one
+    Blobs(commands::blobs::BlobsArgs),
+
     /// Show a run's per-stage token ledger, where a staged agent's cost lives
     Stages(commands::stages::StagesArgs),
 
@@ -170,10 +179,12 @@ Setup and configuration:
   providers     Show configured providers and set their priority order
   doctor        Check that provider wiring works, end to end
   models        List and inspect available models
+  mime         Show the mime registry, and what a file resolves to under it
   auth          Inspect and move the secrets Leviath holds
   mcp           Manage MCP tool servers, or serve Leviath itself as one
   approvals     Show what runs without an approval prompt, and why
   policy        Manage taint tracking policy rules
+  yolo          List, inspect and try the profiles behind `--yolo=<name>`
   update        Update Leviath, then everything that shipped with it
   integrate     Register Leviath as an MCP server in Claude Code, Grok, Codex, Gemini or Hermes
 
@@ -200,6 +211,7 @@ Running agents:
 Inspecting runs:
   result        Print what an agent handed back when a run finished
   context       Show a run's context-window history (from its run.lvr archive)
+  blobs         List the files a run holds as stored parts, and fetch one
   stages        Show a run's per-stage token ledger, where a staged agent's cost lives
   timeline      Show where a run's wall-clock time went: model calls, tools, waiting on children
 
@@ -360,14 +372,17 @@ pub async fn dispatch(command: Commands, ex: &impl RiskyExecutors) -> anyhow::Re
         Commands::Pack(args) => commands::pack::execute(args).await,
         Commands::Dashboard(args) => ex.dashboard(args).await,
         Commands::Models(args) => commands::models::execute(args).await,
+        Commands::Mime(args) => commands::mime::execute(args).await,
         Commands::Validate(args) => commands::validate::execute(args).await,
         Commands::Tools(args) => commands::tools::execute(args).await,
         Commands::Approvals(args) => commands::approvals::execute(args).await,
         Commands::Policy(args) => commands::policy::execute(args).await,
+        Commands::Yolo(args) => commands::yolo::execute(args).await,
         Commands::Serve(args) => ex.serve(args).await,
         Commands::AgentClient(args) => ex.agent_client(args).await,
         Commands::Daemon(args) => ex.daemon(args).await,
         Commands::Context(args) => commands::context::execute(args).await,
+        Commands::Blobs(args) => commands::blobs::execute(args).await,
         Commands::Stages(args) => commands::stages::execute(args).await,
         Commands::Timeline(args) => commands::timeline::execute(args).await,
         Commands::Result(args) => commands::result::execute(args).await,
@@ -527,7 +542,8 @@ mod tests {
             google_key: None,
             openrouter_key: None,
             ollama_url: None,
-            default_model: None,
+            override_model: None,
+            fallback_model: None,
             claude_code: None,
             claude_code_effort: None,
             codex: None,
@@ -548,6 +564,7 @@ mod tests {
         let args = commands::ctl::MsgArgs {
             agent_id: "a".to_string(),
             content: "c".to_string(),
+            attach: Vec::new(),
         };
         assert!(dispatch(Commands::Msg(args), &MockRisky).await.is_ok());
     }
@@ -564,6 +581,7 @@ mod tests {
             session: false,
             stage: false,
             json: false,
+            attach: Vec::new(),
         };
         assert!(dispatch(Commands::Respond(args), &MockRisky).await.is_ok());
     }
@@ -784,6 +802,7 @@ mod tests {
                     offline: false,
                     all: false,
                     json: false,
+                    accepts: None,
                 }),
             };
             let result = dispatch(Commands::Models(args), &MockRisky).await;
@@ -885,9 +904,38 @@ mod tests {
             run_id: "no-such-run-xyzzy".to_string(),
             json: false,
             raw: false,
+            artifact: None,
+            out: None,
+            open: None,
         };
         let result = dispatch(Commands::Result(args), &MockRisky).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn dispatch_blobs_and_mime_variants_are_routed() {
+        // A run that is not there errors, which shows the routing reached it.
+        let blobs = commands::blobs::BlobsArgs {
+            run_id: "no-such-run-xyzzy".to_string(),
+            part: None,
+            out: None,
+            open: false,
+            json: false,
+        };
+        assert!(dispatch(Commands::Blobs(blobs), &MockRisky).await.is_err());
+        // A file that is not there errors the same way, before any config is
+        // consulted for anything the test would have to isolate.
+        crate::config::with_isolated_config_path_async("dispatch-mime", |_dir| async move {
+            let mime = commands::mime::MimeArgs {
+                command: commands::mime::MimeCommand::Check(commands::mime::CheckArgs {
+                    file: std::path::PathBuf::from("/no/such/file.png"),
+                    mime_type: None,
+                    json: false,
+                }),
+            };
+            assert!(dispatch(Commands::Mime(mime), &MockRisky).await.is_err());
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -954,6 +1002,21 @@ mod tests {
             command: commands::policy::PolicyCommand::List(commands::policy::PolicyListArgs {}),
         };
         let result = dispatch(Commands::Policy(args), &MockRisky).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dispatch_yolo_variant_is_routed() {
+        let result = crate::config::with_isolated_config_path_async("dispatch-yolo", |_| async {
+            dispatch(
+                Commands::Yolo(commands::yolo::YoloArgs {
+                    command: commands::yolo::YoloCommand::List(commands::yolo::ListArgs::default()),
+                }),
+                &MockRisky,
+            )
+            .await
+        })
+        .await;
         assert!(result.is_ok());
     }
 

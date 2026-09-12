@@ -32,21 +32,36 @@ impl Dashboard {
         self.draw_new_run_agents(frame, panes[0]);
         // The selected blueprint's stage graph sits above the task editor,
         // when the pane has the rows for both; the editor keeps its minimum.
+        // Between them, the Inputs pane, when the blueprint has slots and the
+        // column has the rows for it.
+        self.sync_new_run_inputs();
         let preview_h = super::super::new_run_preview::preview_height(panes[1].height);
-        let task_area = if preview_h > 0 {
-            let right = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Length(preview_h), Constraint::Min(1)])
-                .split(panes[1]);
-            self.draw_new_run_preview(frame, right[0]);
-            right[1]
-        } else {
-            panes[1]
+        let inputs_h = self.new_run_inputs_height();
+        let inputs_h = match panes[1].height.saturating_sub(preview_h) > inputs_h + 8 {
+            true => inputs_h,
+            false => 0,
         };
+        let right = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(preview_h),
+                Constraint::Length(inputs_h),
+                Constraint::Min(1),
+            ])
+            .split(panes[1]);
+        if preview_h > 0 {
+            self.draw_new_run_preview(frame, right[0]);
+        }
+        if inputs_h > 0 {
+            self.draw_new_run_inputs(frame, right[1]);
+        }
+        let task_area = right[2];
         self.draw_new_run_task(frame, task_area);
         // The completion floats over the task pane, so it is drawn after it.
         self.draw_file_ref_popup(frame, task_area);
         self.draw_new_run_help_bar(frame, rows[1]);
+        // The file picker floats over the whole screen, so it is drawn last.
+        self.draw_new_run_picker(frame, area);
     }
 
     fn draw_new_run_agents(&self, frame: &mut Frame, area: Rect) {
@@ -161,6 +176,7 @@ impl Dashboard {
                     ),
                     false => Span::styled("", Style::default()),
                 },
+                Self::attached_chip(&self.new_run_attached_names()),
             ]),
             focus_colour(focused),
             focused,
@@ -225,26 +241,49 @@ impl Dashboard {
         );
     }
 
+    /// The title chip naming the files the task attaches, or nothing.
+    fn attached_chip(names: &[String]) -> Span<'static> {
+        match names.is_empty() {
+            true => Span::styled("", Style::default()),
+            false => Span::styled(
+                format!("[{} attached: {}] ", names.len(), names.join(", ")),
+                Style::default().fg(C_SUCCESS).add_modifier(Modifier::BOLD),
+            ),
+        }
+    }
+
     /// The help bar's text for the current focus. Names the unattended
     /// setting's state, not only its key: the title chip appears only when
     /// it is on, so with it off nothing on the screen said so, and a warning
     /// dialog declined by an Enter meant as "yes" left a person believing
     /// the opposite of what the next run would do.
     pub(in crate::commands::dashboard) fn new_run_help_bar_text(&self) -> String {
-        let unattended = match self.new_run_yolo {
-            true => "unattended: on",
-            false => "unattended: off",
+        let unattended = match (self.new_run_yolo, &self.new_run_yolo_profile) {
+            (true, Some(profile)) => format!("unattended: on ({profile})"),
+            (true, None) => "unattended: on".to_string(),
+            (false, _) => "unattended: off".to_string(),
         };
+        if self.new_run_picker_open() {
+            return " ↑↓ move · Space select · Enter done · Esc cancel · type to filter "
+                .to_string();
+        }
         match (self.new_run_file_ref, self.new_run_focus) {
             (true, _) => " ↑↓ choose · Enter/Tab insert · Esc dismiss ".to_string(),
             (false, NewRunPane::Agents) => format!(
-                " ↑↓ select · type to filter · Tab write task · ^Y {unattended} · F1 help · Esc back "
+                " ↑↓ select · type to filter · Tab {} · ^Y {unattended} · F1 help · Esc back ",
+                match self.new_run_has_inputs() {
+                    true => "inputs",
+                    false => "write task",
+                }
+            ),
+            (false, NewRunPane::Inputs) => format!(
+                " ↑↓ slot · Enter/^O choose files · type for text · Tab write task · Shift+Tab agents · ^Y {unattended} · F1 help "
             ),
             // The formatting chord is named on the pane that has the toolbar,
             // and only there: on the picker it would be a key that does
             // nothing.
             (false, NewRunPane::Task) => format!(
-                " ^Enter start · Enter newline · Tab Start button · @ file · {} bold · {MODE_CHORD} preview · ^Y {unattended} · F1 help · Esc back ",
+                " ^S start · Enter newline · Tab Start button · @ file · {} bold · {MODE_CHORD} preview · ^Y {unattended} · F1 help · Esc back ",
                 chord_label(MdAction::Bold)
             ),
             (false, NewRunPane::Start) => format!(
@@ -330,6 +369,20 @@ mod tests {
         dash
     }
 
+    /// A `@path` the workdir holds shows on the task box's title as you type.
+    #[test]
+    fn the_title_names_the_files_the_task_attaches() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("hero.png"), b"png").unwrap();
+        let mut dash = screen();
+        dash.new_run_ctx.workdir = dir.path().to_path_buf();
+        dash.new_run_task
+            .area_mut()
+            .insert_str("edit @hero.png and @nothing.png");
+        let out = rendered(&mut dash);
+        assert!(out.contains("[1 attached: hero.png]"), "{out}");
+    }
+
     #[test]
     fn the_screen_lists_agents_with_their_source() {
         let mut dash = screen();
@@ -385,7 +438,7 @@ mod tests {
         let mut dash = screen();
         dash.new_run_focus = NewRunPane::Task;
         let out = rendered(&mut dash);
-        assert!(out.contains("^Enter start"), "{out}");
+        assert!(out.contains("^S start"), "{out}");
         assert!(out.contains("Enter newline"), "{out}");
         assert!(out.contains("@ file"), "{out}");
     }

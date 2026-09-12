@@ -8,6 +8,8 @@ use ratatui::text::Line;
 
 use super::super::state::Dashboard;
 use super::super::types::*;
+use super::McpCatalog;
+use super::choices::{ToolChoice, mime_type_options, tool_choices};
 use super::inspector::{self, Field, FieldId, FieldValue, Panel, StageTab};
 use crate::blueprint_edit::check::{Problems, check};
 use crate::blueprint_edit::{
@@ -45,7 +47,27 @@ pub(in crate::commands::dashboard) enum PickerFor {
     RoutingTool,
     /// Where a tool's results land.
     RoutingRegion(String),
+    /// The mime types of a field: what a region or a stage takes, what a
+    /// tool may be handed, a declared file's type.
+    MimeTypes(FieldId),
 }
+
+/// The panel a window was opened over, kept while the window is up: the
+/// inspector goes on showing it, and Esc brings it back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::commands::dashboard) struct ModalBase {
+    /// The panel under the window.
+    pub(in crate::commands::dashboard) panel: Panel,
+    /// Its cursor.
+    pub(in crate::commands::dashboard) cursor: usize,
+    /// The canvas selection the window was opened from: it stays up while
+    /// that holds.
+    pub(in crate::commands::dashboard) anchor: Selection,
+}
+
+/// The chooser row that means "type one in": a mime type the list does
+/// not have.
+pub(in crate::commands::dashboard) const TYPE_ANOTHER: &str = "another…";
 
 /// A full-screen overlay over the editor.
 #[derive(Debug, Clone)]
@@ -102,9 +124,16 @@ pub(in crate::commands::dashboard) struct Editor {
     pub(in crate::commands::dashboard) add_stage: Option<LineEdit>,
     /// The name of a region about to be added.
     pub(in crate::commands::dashboard) add_region: Option<LineEdit>,
-    /// The canvas selection a pushed panel (a region, a stage's loop back
-    /// to itself) was opened from: the panel stays while it holds.
-    pub(in crate::commands::dashboard) panel_anchor: Option<Selection>,
+    /// The name of an artifact about to be declared.
+    pub(in crate::commands::dashboard) add_artifact: Option<LineEdit>,
+    /// The panel a window (a region, a declared file, a stage's loop back
+    /// to itself) was opened over, while one is up. `panel` and `cursor`
+    /// are then the window's.
+    pub(in crate::commands::dashboard) modal: Option<ModalBase>,
+    /// Where the last frame put the window's rows, for the mouse.
+    pub(in crate::commands::dashboard) modal_hit: InspectorHits,
+    /// The mime types the choosers offer.
+    pub(in crate::commands::dashboard) mime_types: Vec<String>,
     pub(in crate::commands::dashboard) overlay: Option<Overlay>,
     /// The right-click menu, while one is open.
     pub(in crate::commands::dashboard) menu: Option<super::context_menu::ContextMenu>,
@@ -120,8 +149,9 @@ pub(in crate::commands::dashboard) struct Editor {
     pub(in crate::commands::dashboard) message: Option<String>,
     /// `provider/model` ids the model chooser offers.
     pub(in crate::commands::dashboard) models: Vec<String>,
-    /// Tool names the tools chooser offers.
-    pub(in crate::commands::dashboard) tools: Vec<String>,
+    /// What the tools chooser offers: the five group tokens first, then
+    /// every tool by name.
+    pub(in crate::commands::dashboard) tools: Vec<ToolChoice>,
     /// Where the last frame put the inspector's rows: the screen row of
     /// each field, and the column span of each stage tab, so a click lands
     /// on the right one.
@@ -200,26 +230,51 @@ impl Editor {
         inspector::fields(&self.doc, &self.panel)
     }
 
+    /// Rebuild the tools chooser's rows over what the MCP servers have
+    /// said so far.
+    pub(in crate::commands::dashboard) fn rebuild_tools(&mut self, mcp: &McpCatalog) {
+        self.tools = tool_choices(&self.dir, &self.name, &self.doc, mcp);
+    }
+
     /// The row under the inspector cursor.
     pub(in crate::commands::dashboard) fn current_field(&self) -> Option<Field> {
         self.fields().into_iter().nth(self.cursor)
     }
 
+    /// The tab a stage panel is on; `None` on every other panel and under a
+    /// window.
+    pub(in crate::commands::dashboard) fn panel_tab(&self) -> Option<StageTab> {
+        match (&self.modal, &self.panel) {
+            (None, Panel::Stage { tab, .. }) => Some(*tab),
+            _ => None,
+        }
+    }
+
     /// Bring the panel in line with the canvas selection, keeping a stage
     /// panel's tab across stages.
     pub(in crate::commands::dashboard) fn sync_panel(&mut self) {
-        // A pushed panel (a region, a loop back to the same stage) stays
-        // while the selection that opened it holds and what it shows exists.
+        // A window (a region, a declared file, a loop back to the same
+        // stage) stays up while the selection that opened it holds and what
+        // it shows exists.
         let pushed = match &self.panel {
-            Panel::Region { scope, name, .. } => self.doc.region(scope.stage(), name).is_some(),
+            Panel::Region { scope, name } => self.doc.region(scope.stage(), name).is_some(),
+            Panel::Artifact { stage, index } => self.doc.artifacts(stage).len() > *index,
             Panel::Edge { from, to } if from == to => self.doc.edge(from, to).is_some(),
             _ => false,
         };
-        if pushed && self.panel_anchor.as_ref() == Some(&self.view.selection()) {
+        if pushed
+            && self
+                .modal
+                .as_ref()
+                .is_some_and(|m| m.anchor == self.view.selection())
+        {
             return;
         }
-        self.panel_anchor = None;
-        let tab = match &self.panel {
+        // The tab to keep is the one under the window, when one is up:
+        // a region deleted from its window lands back on the tab it was
+        // opened from.
+        let under = self.modal.take().map(|m| m.panel);
+        let tab = match under.as_ref().unwrap_or(&self.panel) {
             Panel::Stage { tab, .. } => *tab,
             _ => StageTab::Behaviour,
         };
@@ -394,16 +449,12 @@ impl Dashboard {
         );
         models.sort();
         models.dedup();
-        // The tools this install has: built in, plus scripts under the
-        // agent's directory and the ones the manifest already names.
-        let mut tools: Vec<String> =
-            crate::tool_inventory::ToolInventory::discover(Some(&dir), Some(&name))
-                .names()
-                .into_iter()
-                .collect();
-        tools.extend(doc.known_tools());
-        tools.sort();
-        tools.dedup();
+        let mcp = self.agents().mcp.clone();
+        let tools = tool_choices(&dir, &name, &doc, &mcp);
+        let mime_types = mime_type_options(&self.new_run_ctx.config_path, &doc);
+        // The agent's own servers join the config's in the chooser, asked
+        // for their tools the same way.
+        let own_servers = crate::daemon::mcp_pool::parse_blueprint_mcp_servers(text);
         let mut editor = Editor {
             name,
             is_new,
@@ -421,7 +472,10 @@ impl Dashboard {
             picker: None,
             add_stage: None,
             add_region: None,
-            panel_anchor: None,
+            add_artifact: None,
+            modal: None,
+            modal_hit: InspectorHits::default(),
+            mime_types,
             overlay: None,
             menu: None,
             place_next: None,
@@ -437,6 +491,7 @@ impl Dashboard {
         };
         editor.apply_flags();
         self.agents().editor = Some(editor);
+        self.ask_mcp_servers(&own_servers);
     }
 
     /// The open editor.
@@ -902,11 +957,6 @@ impl Dashboard {
     /// Enter on a button row.
     pub(in crate::commands::dashboard) fn editor_button(&mut self, id: &FieldId) {
         match id {
-            FieldId::MoveUp | FieldId::MoveDown => {
-                let stage = self.editor().panel_stage().expect("a stage field");
-                let up = *id == FieldId::MoveUp;
-                self.editor_mutate(|d| d.move_stage(&stage, up));
-            }
             FieldId::DeleteStage => {
                 let stage = self.editor().panel_stage().expect("a stage field");
                 self.editor_request_delete_stage(&stage);
@@ -1015,19 +1065,7 @@ impl Dashboard {
                 };
                 self.editor_set_number(id, value);
             }
-            FieldId::WorkerRef => {
-                let stage = self.editor().panel_stage().expect("a stage field");
-                let kind = self
-                    .editor()
-                    .doc
-                    .stage(&stage)
-                    .and_then(|s| s.fan_out.worker.map(|(k, _)| k))
-                    .unwrap_or(WorkerKind::Stage);
-                let worker = (!text.is_empty()).then_some((kind, text));
-                self.editor_mutate(|d| {
-                    d.set_fan_out(&stage, crate::blueprint_edit::FanOutField::Worker(worker))
-                });
-            }
+            FieldId::WorkerRef => self.editor_set_worker(&text),
             FieldId::EdgeHint => {
                 let (from, to) = self.editor().panel_edge().expect("a path field");
                 self.editor_mutate(|d| d.set_edge_hint(&from, &to, &text));

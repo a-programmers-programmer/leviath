@@ -856,7 +856,7 @@ mod tests {
                 max_tokens: 100,
                 entries: (0..entries)
                     .map(|i| leviath_core::run_meta::RegionEntrySnapshot {
-                        content: format!("line {i}"),
+                        content: format!("line {i}").into(),
                         tokens: 1,
                         kind: leviath_core::region::EntryKind::Text,
                         metadata: None,
@@ -1552,7 +1552,7 @@ mod tests {
             record: Box::new(leviath_core::run_archive::RunRecord::ToolCallDone {
                 iteration: 0,
                 call_id: "c1".to_string(),
-                result: "ran".to_string(),
+                result: "ran".to_string().into(),
                 at: 2,
             }),
             ack: None, // the fire-and-forget per-call path

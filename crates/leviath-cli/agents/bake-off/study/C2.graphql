@@ -1,0 +1,706 @@
+################################################################################
+# LABEL: C2   GROUP: CHANNEL
+#
+# NOTE ON SCOPE (read before the schema): the group-prompts.md file provided
+# alongside the Composition Guide defines exactly three groups — TASK, MEMORY,
+# and PROPOSAL. It does not define a fourth group named "CHANNEL". The word
+# "Channel" appears only inside the Composition Guide itself, as a recurring
+# *illustrative* example (ChannelMode as an enum example, channel.publish as
+# a verb-phrase field example, channel.retentionPolicy as a directive-vs-field
+# example). Rather than silently substituting one of the three defined groups
+# (which would misrepresent the assignment) or refusing to produce output,
+# this draft treats "CHANNEL" as its own domain concept — a communication /
+# messaging-channel abstraction for an agentic system — inferred from those
+# guide examples, and composes it with the same rigor the guide demands of
+# TASK, MEMORY, and PROPOSAL. This choice is made explicit here so a reviewer
+# can judge the draft on its own terms and flag the prompt/label mismatch
+# independently of the schema's quality. The schema below is self-contained
+# and does not depend on Task/Memory/Proposal types from the other groups,
+# consistent with "One Concept, One Type" and the group's own stated
+# boundaries in the guide ("distinct from workflow and task", by analogy).
+################################################################################
+
+schema {
+  query: Query
+  mutation: Mutation
+  subscription: Subscription
+}
+
+# ------------------------------------------------------------------------------
+# Custom scalars (Section 3, decision-tree step 4: domain-specific validation /
+# serialization semantics — not just a renamed String)
+# ------------------------------------------------------------------------------
+
+"ISO-8601 date-time, always UTC on the wire."
+scalar DateTime
+
+"ISO-8601 duration string (e.g. 'P30D', 'PT2H'). Used only for retention windows."
+scalar Duration
+
+"""
+Bounded, internal-system structured payload attached to SystemEventMessage only.
+Not a general-purpose escape hatch: every other structured value in this schema
+has an explicit type. Kept as JSON here because system event payloads vary by
+event type and are rendered as opaque debug/audit detail in clients, not acted
+upon programmatically.
+"""
+scalar JSON
+
+# ------------------------------------------------------------------------------
+# Shared interfaces (Section 3, decision-tree step 2: structural contract
+# meaningful across multiple implementors)
+# ------------------------------------------------------------------------------
+
+interface Node {
+  id: ID!
+}
+
+interface Temporal {
+  createdAt: DateTime!
+  updatedAt: DateTime!
+}
+
+# ------------------------------------------------------------------------------
+# Participant — minimal, generic identity reference. Channels are agent- and
+# human-facing; we do not duplicate a User/Agent type from another bounded
+# context here (One Concept, One Type says this type belongs to an identity
+# group, not to Channel) — Participant is the *thin* projection Channel needs
+# to render authorship, ownership, and membership. This is intentionally not
+# a bare ID (no ID-soup): it is a real type with the two fields every channel
+# client actually renders (who is this, what kind of actor is it).
+# ------------------------------------------------------------------------------
+
+enum ParticipantKind {
+  AGENT
+  HUMAN
+  SYSTEM
+}
+
+type Participant implements Node {
+  id: ID!
+  kind: ParticipantKind!
+  displayName: String!
+}
+
+# ------------------------------------------------------------------------------
+# 1. THE CHANNEL ITSELF — identity, typology, visibility, lifecycle
+# ------------------------------------------------------------------------------
+
+"""
+What kind of channel this is. Closed, finite, no associated data per value —
+a genuine enum (decision-tree step 1), not a type-with-a-field.
+"""
+enum ChannelKind {
+  AGENT_LOG
+  TEAM_CHAT
+  NOTIFICATION_FEED
+  DIRECT_MESSAGE
+  BROADCAST
+}
+
+"""
+Visibility / access mode. Closed set, no per-value metadata — enum.
+(This is the guide's own worked example: `ChannelMode`.)
+"""
+enum ChannelMode {
+  PUBLIC
+  PRIVATE
+  RESTRICTED
+}
+
+"""
+Gated-value pattern applied to channel lifecycle. A naive design would use
+`status: ChannelStatus!` plus nullable `archivedAt/archivedBy/reason` and
+`suspendedAt/suspendedBy/reason/reviewAt` fields on Channel — exactly the
+"implicit contract via nullability" anti-pattern the guide calls out. Instead,
+each lifecycle state that carries its own data is its own type, and the union
+makes it structurally impossible to read `archivedBy` on a channel that was
+never archived.
+"""
+union ChannelLifecycle = ChannelActive | ChannelArchived | ChannelSuspended
+
+type ChannelActive {
+  since: DateTime!
+}
+
+type ChannelArchived {
+  archivedAt: DateTime!
+  archivedBy: Participant!
+  reason: String
+}
+
+type ChannelSuspended {
+  suspendedAt: DateTime!
+  suspendedBy: Participant!
+  reason: String!
+  "When this suspension is next due for human review. Null = no scheduled review."
+  reviewAt: DateTime
+}
+
+"""
+Retention policy, also gated-value: the shape of "how long do messages live"
+genuinely differs by mode (a permanent channel has no expiry to query; an
+expiring channel has a duration and a computed next-delete time). Modeling
+this as one type with a nullable `duration: Duration` and a nullable
+`deleteAt: DateTime` would be a string-bag-adjacent "null means N/A" smell.
+"""
+union RetentionPolicy = PermanentRetention | ExpiringRetention | ArchivingRetention
+
+type PermanentRetention {
+  since: DateTime!
+}
+
+type ExpiringRetention {
+  "How long a message lives after being posted before hard deletion."
+  expiresAfter: Duration!
+  "Resolver-computed next deletion sweep time for the oldest live message, if any."
+  nextDeleteAt: DateTime
+}
+
+type ArchivingRetention {
+  "How long a message lives in the hot store before being moved to cold storage."
+  archiveAfter: Duration!
+  nextArchiveAt: DateTime
+}
+
+"""
+The channel. One canonical type — no ChannelSummary / ChannelDetail mirror.
+Field selection (e.g. omitting `messages`) is how callers get a "summary" view.
+"""
+type Channel implements Node & Temporal {
+  id: ID!
+  name: String!
+  description: String
+  kind: ChannelKind!
+  mode: ChannelMode!
+  lifecycle: ChannelLifecycle!
+  retention: RetentionPolicy!
+  owner: Participant!
+  createdAt: DateTime!
+  updatedAt: DateTime!
+
+  "Paginated membership roster. Edge-first: see ChannelMembership below."
+  membership(first: Int, after: String): ChannelMembershipConnection!
+
+  "Paginated message history for this channel, newest last."
+  messages(first: Int, after: String): ChannelMessageConnection!
+
+  "The requesting viewer's own membership in this channel, if any. Powers UI checks like 'can I post here?' without a separate permission-check field."
+  viewerMembership: ChannelMembership
+}
+
+# ------------------------------------------------------------------------------
+# 2. MEMBERSHIP / BINDING — who may publish or read, and their standing
+#
+# Promotion test (Section 6): does this relationship carry its own state,
+# lifecycle, or metadata that clients query independently of either endpoint?
+# Yes — role, standing (active/muted/banned), and join time are all queried
+# and changed independently of the Channel or the Participant. This is a
+# genuine edge-first type, not a simple field like `Channel.owner`.
+# ------------------------------------------------------------------------------
+
+"""
+Closed set of standing levels within a channel — enum, not a permissions
+string bag.
+"""
+enum ChannelRole {
+  OWNER
+  MODERATOR
+  PUBLISHER
+  SUBSCRIBER
+}
+
+"""
+Gated-value pattern for membership standing. A muted member has a `since`
+and optionally an `until` and a `reason`; a banned member has a mandatory
+reason and the moderator who banned them; an active member has neither.
+Collapsing these into nullable fields on one type would reintroduce the
+"null = who knows what" problem the guide specifically rejects.
+"""
+union MembershipState = ActiveMembership | MutedMembership | BannedMembership
+
+type ActiveMembership {
+  since: DateTime!
+}
+
+type MutedMembership {
+  since: DateTime!
+  "Null = muted indefinitely until explicitly unmuted."
+  until: DateTime
+  reason: String
+}
+
+type BannedMembership {
+  since: DateTime!
+  reason: String!
+  bannedBy: Participant!
+}
+
+"""
+The edge itself. Implements Node because memberships are independently
+addressable and mutated (mute/ban/role-change operate on a membership id,
+not on a (channel, participant) composite key).
+"""
+type ChannelMembership implements Node {
+  id: ID!
+  channel: Channel!
+  participant: Participant!
+  role: ChannelRole!
+  state: MembershipState!
+  joinedAt: DateTime!
+}
+
+type ChannelMembershipEdge {
+  cursor: String!
+  node: ChannelMembership!
+}
+
+type ChannelMembershipConnection {
+  edges: [ChannelMembershipEdge!]!
+  pageInfo: PageInfo!
+  totalCount: Int!
+}
+
+# ------------------------------------------------------------------------------
+# 3. MESSAGE TRAJECTORY — the run of messages posted to a channel, their
+# content, threading, and delivery outcome.
+# ------------------------------------------------------------------------------
+
+"""
+Structurally divergent message payloads (a union, not an interface, per
+decision-tree step 3 — there is no meaningful shared field across a plain
+text note, an artifact reference, and a system event beyond what Node/
+Temporal on the parent ChannelMessage already give us).
+"""
+union MessageContent = TextMessage | ArtifactMessage | SystemEventMessage
+
+type TextMessage {
+  text: String!
+}
+
+type ArtifactMessage {
+  "Opaque reference to an artifact stored outside this schema's domain (e.g. a run output). Intentionally a bare ID — this is the guide's sanctioned exception: an external-system reference, not an in-domain traversable relationship."
+  artifactRef: ID!
+  mimeType: String!
+  caption: String
+}
+
+enum SystemEventType {
+  MEMBER_JOINED
+  MEMBER_LEFT
+  CHANNEL_ARCHIVED
+  CHANNEL_RENAMED
+}
+
+type SystemEventMessage {
+  eventType: SystemEventType!
+  "Structured detail specific to eventType; rendered as audit/debug detail by clients, not required for the primary read path."
+  payload: JSON
+}
+
+"""
+Gated-value pattern for delivery outcome — mirrors the guide's canonical
+TaskOutcome example directly. A message that is still queued has no
+`deliveredAt`; a delivered message has no `error`; a failed message has no
+`deliveredTo`. Nullable fields on one flat type would hide exactly the
+"not yet computed vs. errored vs. not applicable" ambiguity the guide warns
+about.
+"""
+union MessageDelivery = MessagePending | MessageDelivered | MessageFailed
+
+type MessagePending {
+  queuedAt: DateTime!
+}
+
+type MessageDelivered {
+  deliveredAt: DateTime!
+  deliveredTo: [Participant!]!
+}
+
+enum DeliveryErrorCode {
+  RECIPIENT_UNREACHABLE
+  RATE_LIMITED
+  CHANNEL_ARCHIVED
+  UNKNOWN
+}
+
+type DeliveryError {
+  code: DeliveryErrorCode!
+  message: String!
+}
+
+type MessageFailed {
+  failedAt: DateTime!
+  error: DeliveryError!
+}
+
+"""
+One canonical Message type. Threading (`parent`) stays a plain field rather
+than its own edge type: a reply-to relationship here carries no state or
+lifecycle of its own beyond identity (no "reply status", no metadata a
+client queries independently of the message) — it fails the edge-first
+promotion test, so per "edge-first, not edge-only" it stays a field.
+"""
+type ChannelMessage implements Node & Temporal {
+  id: ID!
+  channel: Channel!
+  author: Participant!
+  content: MessageContent!
+  "The message this one replies to, if any."
+  parent: ChannelMessage
+  "Direct replies to this message, most recent first."
+  replies(first: Int, after: String): ChannelMessageConnection!
+  delivery: MessageDelivery!
+  createdAt: DateTime!
+  updatedAt: DateTime!
+}
+
+type ChannelMessageEdge {
+  cursor: String!
+  node: ChannelMessage!
+}
+
+type ChannelMessageConnection {
+  edges: [ChannelMessageEdge!]!
+  pageInfo: PageInfo!
+  totalCount: Int!
+}
+
+# ------------------------------------------------------------------------------
+# Shared pagination scaffolding
+# ------------------------------------------------------------------------------
+
+type PageInfo {
+  hasNextPage: Boolean!
+  hasPreviousPage: Boolean!
+  startCursor: String
+  endCursor: String
+}
+
+type ChannelEdge {
+  cursor: String!
+  node: Channel!
+}
+
+type ChannelConnection {
+  edges: [ChannelEdge!]!
+  pageInfo: PageInfo!
+  totalCount: Int!
+}
+
+# ------------------------------------------------------------------------------
+# Directives — execution-plane concerns kept off the data model (Section 8)
+# ------------------------------------------------------------------------------
+
+enum AuthRequirement {
+  PUBLIC
+  MEMBER
+  MODERATOR
+  OWNER
+}
+
+"""
+A single grouped policy directive rather than directive creep
+(`@authenticated`, `@rateLimited`, `@audited` scattered independently).
+`auth` states the minimum standing required to invoke the field; `rateLimit`,
+when present, is an informational hint to gateway middleware, not a value a
+client selects — hence a directive argument, not a field.
+"""
+directive @policy(auth: AuthRequirement!, rateLimit: String) on FIELD_DEFINITION
+
+# ------------------------------------------------------------------------------
+# Inputs — express intent, do not mirror output types (Section 4)
+# ------------------------------------------------------------------------------
+
+input CreateChannelInput {
+  name: String!
+  description: String
+  kind: ChannelKind!
+  mode: ChannelMode!
+  ownerId: ID!
+}
+
+"""
+Exactly one of `text`, `artifactRef`, or (eventType is server-set, never
+client-set — system events are never authored via this input) must be
+present. GraphQL's type system does not (yet, absent the experimental
+`@oneOf` input-object directive) let us express "this input is a union" the
+way MessageContent is expressed as an output union. This is therefore a
+documented *soft* invariant, enforced by the resolver, not the schema — the
+same asymmetry the guide flags between gated output values (hard, via union)
+and gated inputs (necessarily softer given current GraphQL input
+capabilities).
+"""
+input PublishMessageInput {
+  text: String
+  artifactRef: ID
+  mimeType: String
+  caption: String
+  parentId: ID
+}
+
+enum RetentionMode {
+  PERMANENT
+  EXPIRE_AFTER
+  ARCHIVE_AFTER
+}
+
+"""
+`duration` is required when mode is EXPIRE_AFTER or ARCHIVE_AFTER and must be
+absent/ignored when mode is PERMANENT. Soft invariant (resolver-enforced,
+"X must be Y when Z"), deliberately not hard-encoded as three separate input
+types per mode — that would reintroduce mirror-input proliferation for a
+three-field input.
+"""
+input RetentionPolicyInput {
+  mode: RetentionMode!
+  duration: Duration
+}
+
+# ------------------------------------------------------------------------------
+# Query
+# ------------------------------------------------------------------------------
+
+type Query {
+  channel(id: ID!): Channel
+  channels(kind: ChannelKind, mode: ChannelMode, first: Int, after: String): ChannelConnection!
+  channelMessage(id: ID!): ChannelMessage
+  channelMembership(id: ID!): ChannelMembership
+}
+
+# ------------------------------------------------------------------------------
+# Mutation — verb-phrase names; flat scalar args for small ops (≤3 fields),
+# a single non-mirroring Input type for larger ops (Section 4 & sniff test)
+# ------------------------------------------------------------------------------
+
+type Mutation {
+  createChannel(input: CreateChannelInput!): Channel!
+  renameChannel(channelId: ID!, name: String!): Channel!
+
+  archiveChannel(channelId: ID!, reason: String): Channel! @policy(auth: OWNER)
+  suspendChannel(channelId: ID!, reason: String!, reviewAt: DateTime): Channel! @policy(auth: MODERATOR)
+  reactivateChannel(channelId: ID!): Channel! @policy(auth: OWNER)
+
+  setRetentionPolicy(channelId: ID!, policy: RetentionPolicyInput!): Channel! @policy(auth: OWNER)
+
+  joinChannel(channelId: ID!): ChannelMembership!
+  leaveChannel(channelId: ID!): ChannelMembership!
+  setMemberRole(membershipId: ID!, role: ChannelRole!): ChannelMembership! @policy(auth: OWNER)
+  muteMember(membershipId: ID!, until: DateTime, reason: String): ChannelMembership! @policy(auth: MODERATOR)
+  unmuteMember(membershipId: ID!): ChannelMembership! @policy(auth: MODERATOR)
+  banMember(membershipId: ID!, reason: String!): ChannelMembership! @policy(auth: MODERATOR)
+
+  publishMessage(channelId: ID!, input: PublishMessageInput!): ChannelMessage! @policy(auth: MEMBER, rateLimit: "30/m")
+  deleteMessage(messageId: ID!): Boolean! @policy(auth: MODERATOR)
+}
+
+# ------------------------------------------------------------------------------
+# Subscription — real-time is a first-class client need for a chat/notification
+# primitive; passes the "would I query this" test directly (a channel UI must
+# live-update).
+# ------------------------------------------------------------------------------
+
+type Subscription {
+  messagePublished(channelId: ID!): ChannelMessage!
+  membershipChanged(channelId: ID!): ChannelMembership!
+  channelLifecycleChanged(channelId: ID!): Channel!
+}
+
+################################################################################
+# RATIONALE
+################################################################################
+#
+# 0. On the GROUP mismatch
+# -------------------------
+# The task string assigned GROUP=CHANNEL, but group-prompts.md defines only
+# TASK, MEMORY, and PROPOSAL. Rather than guess which of those three was
+# "really" meant, or fabricate a plausible-sounding but ungrounded prompt,
+# this draft names the mismatch explicitly (top-of-file comment) and treats
+# "Channel" as a fourth, genuinely distinct domain — a communication/
+# messaging-channel primitive for an agentic system — built from the only
+# textual anchor available: the Composition Guide's own recurring use of
+# "Channel" as its running example (ChannelMode, channel.publish,
+# channel.retentionPolicy). This keeps the exercise honest: every choice
+# below is justified against the guide the same way it would be for TASK,
+# MEMORY, or PROPOSAL, and a reviewer can independently judge whether the
+# domain inference was reasonable, separately from whether the guide was
+# applied well within that domain.
+#
+# 1. One Concept, One Type
+# -------------------------
+# Channel, ChannelMessage, ChannelMembership, and Participant each represent
+# exactly one queryable concept. There is no ChannelSummary / ChannelDetail
+# split, no MessagePreview beside Message — field selection and connections
+# cover every "lighter view" need. Participant is deliberately thin (id,
+# kind, displayName only) because it is a *reference* type borrowed by
+# Channel's bounded context, not the canonical identity type for agents/
+# humans (which would belong to its own group and would be a mirror-type
+# violation to redefine here in full).
+#
+# 2. Naming sniff test
+# ----------------------
+# Every type name is a domain noun a non-technical channel admin would
+# recognize: Channel, ChannelMembership, ChannelMessage, RetentionPolicy.
+# No `ChannelInputPayload`, no leaked storage/protocol vocabulary (no
+# `KafkaMessage`, no `MongoChannelDocument`). Action fields are verb phrases:
+# `publishMessage`, `archiveChannel`, `muteMember`, `joinChannel`. We avoided
+# the guide's flagged "contextual redundancy" anti-pattern by *not* prefixing
+# nested-only types with `Channel` where the parent already scopes them
+# (`PublishMessageInput`, not `ChannelPublishMessageInput`, since the input is
+# only ever passed to `publishMessage` and the channel context is established
+# by the sibling `channelId` argument) — but we *did* keep the `Channel`
+# prefix on `ChannelMembership` and `ChannelMessage` themselves, because
+# those types are referenced from Query root fields and Subscription fields
+# outside any nesting under Channel, where the disambiguating power is real
+# (per the guide: "keep the prefix only if the type is referenced outside
+# that shadow").
+#
+# 3. Decision tree (enum / interface / union / scalar)
+# -------------------------------------------------------
+# - Enums used only for genuinely closed, data-free sets: ChannelKind,
+#   ChannelMode, ChannelRole, ParticipantKind, SystemEventType,
+#   DeliveryErrorCode, RetentionMode.
+# - Interfaces (Node, Temporal) used for the flat, composable structural
+#   contracts shared by Channel, ChannelMessage, and (Node only) Participant
+#   and ChannelMembership — never a deep hierarchy.
+# - Unions used exactly where structural divergence is real and payload-
+#   bearing: ChannelLifecycle, RetentionPolicy, MembershipState,
+#   MessageContent, MessageDelivery. Each of these was a *candidate* enum
+#   that failed the "would I need to attach data to a value" test — e.g. a
+#   naive `ChannelStatus { ACTIVE, ARCHIVED, SUSPENDED }` enum immediately
+#   wants an `archivedBy`/`archivedAt` next to it, which is exactly the
+#   signal the guide says means "this is not an enum."
+# - Custom scalars limited to three, each independently justified:
+#   DateTime (serialization/comparison semantics), Duration (domain-specific
+#   parsing, used only for retention windows), and JSON (bounded, used only
+#   for the one genuinely-variable field, SystemEventMessage.payload, which
+#   is explicitly *not* meant as a general escape hatch — see its scalar
+#   doc comment).
+#
+# 4. No ID-soup, mirror types, or string bags
+# ----------------------------------------------
+# Every in-domain relationship (channel.owner, message.author,
+# membership.participant, message.parent, membership.channel) is a field
+# returning the related type, traversable in a single query — not a bare
+# `ownerId: ID!` sitting next to a bare `channelId: ID!`. The one deliberate
+# exception is `ArtifactMessage.artifactRef: ID!`, which is an intentionally
+# opaque external-system reference (an artifact produced by some other
+# subsystem, out of scope for this group) — exactly the sanctioned exception
+# the guide carves out for "intentionally opaque references." There are no
+# mirror output types, and the two multi-field inputs (CreateChannelInput,
+# PublishMessageInput) are intent-shaped, not field-for-field copies of
+# Channel/ChannelMessage — e.g. PublishMessageInput has no `id`, `delivery`,
+# or `createdAt`, because the caller does not supply those; they are computed.
+# Small mutations (rename, mute, ban, join, leave, unmute) take flat scalar
+# arguments per the guide's ≤3-field rule rather than wrapping them in inputs.
+# Nothing in this schema is an undifferentiated string bag: every "state"-
+# shaped concept (lifecycle, retention, membership standing, delivery) is
+# either an enum or a gated union, never a bare String.
+#
+# 5. Gated-value pattern
+# ------------------------
+# Applied four times, deliberately choosing the pattern even where the guide
+# only worked one canonical example (task outcome):
+#   - ChannelLifecycle (active/archived/suspended) — because archived and
+#     suspended each carry mandatory actor/reason/time metadata that active
+#     channels structurally cannot have.
+#   - RetentionPolicy (permanent/expiring/archiving) — because "when does
+#     this expire" is meaningless for a permanent channel; a nullable
+#     `duration` field would silently mean either "permanent" or "not yet
+#     configured," which is precisely the ambiguity the guide rejects.
+#   - MembershipState (active/muted/banned) — mute needs an optional
+#     `until`, ban needs a mandatory `reason` and `bannedBy`; active needs
+#     neither.
+#   - MessageDelivery (pending/delivered/failed) — a direct structural
+#     analogue of the guide's own TaskOutcome/TaskCompleted/TaskFailed/
+#     TaskPending example, applied to message delivery instead of task
+#     completion.
+# In every case, the union is the hard invariant (you cannot read
+# `bannedBy` off an ActiveMembership — the field doesn't exist there); the
+# predicate that decides which variant a given membership/message/channel
+# resolves to is a soft invariant living in resolver code.
+#
+# 6. Edge-first modeling
+# ------------------------
+# ChannelMembership is the schema's one genuine edge-first type: it has its
+# own id, is fetched and mutated independently (`channelMembership(id:)`,
+# `setMemberRole`, `muteMember` all operate on a membership id, not a
+# (channel, participant) pair), and carries state/lifecycle (role, standing,
+# joinedAt) that a client legitimately queries on its own — e.g. "show me
+# all muted members across channels" is a real query shape a moderation UI
+# would want, backed by `channelMembership(id:)` plus whatever moderation-
+# feed field a future iteration might add. By contrast, `ChannelMessage.
+# parent` was deliberately *not* promoted to a "ReplyEdge" type: a reply-to
+# link carries no state of its own beyond which message points at which —
+# no lifecycle, no independently-queried metadata — so per "edge-first, not
+# edge-only" it stays a plain field, with `replies` as the reverse
+# connection. This mirrors the guide's warning against creating edge types
+# for every relationship indiscriminately.
+#
+# 7. Soft vs hard invariants
+# -----------------------------
+# Hard (schema-enforced): every Node's `id`, every union field's non-null
+# resolution to exactly one variant, `BannedMembership.reason: String!`
+# (a ban without a reason is semantically incoherent — moderation UIs must
+# always be able to show why), `DeliveryError.code` and `.message` (a failure
+# without an error is incoherent). Soft (resolver-enforced, documented on the
+# relevant type/input): "publishMessage's input must set exactly one content
+# field" (PublishMessageInput doc comment), "RetentionPolicyInput.duration
+# is required unless mode is PERMANENT" (RetentionPolicyInput doc comment),
+# "a participant cannot ban themselves," "a channel's `mode` cannot be
+# loosened by a non-owner." None of these soft rules were hard-coded as
+# extra non-null fields or extra enum splits — doing so would have produced
+# the "can't evolve" failure mode the guide warns about (e.g. splitting
+# PublishMessageInput into three mirror input types per content kind, which
+# is exactly the mirror-input anti-pattern Section 4 rejects).
+#
+# 8. Directives vs fields
+# --------------------------
+# Authorization ("who may call this mutation") and rate limiting are
+# execution-plane concerns — no client ever *selects* `auth` or `rateLimit`
+# in a query, so they are directive arguments (`@policy(auth: ..., rateLimit:
+# ...)`), not fields. This single grouped directive is used everywhere
+# instead of directive creep (no separate `@authenticated`, `@moderatorOnly`,
+# `@rateLimited` scattered across the schema). Everything a client *does*
+# select — `role`, `state`, `lifecycle`, `delivery`, `retention` — stayed a
+# field, satisfying the redundancy test in both directions: there is no
+# `@status(ARCHIVED)` directive shadowing the `lifecycle` field, and no
+# field that exists purely to inform infrastructure (e.g. there is no
+# `cacheControl` field on Channel; if caching were ever needed it would be a
+# directive, not a field, on the same reasoning).
+#
+# 9. Do guided by prompt, do-not enforced by invariant
+# --------------------------------------------------------
+# Nullability was kept minimal and meaningful: `Channel.description`,
+# `MutedMembership.until/reason`, `ChannelArchived.reason`,
+# `ExpiringRetention.nextDeleteAt` are all nullable because "not set" or
+# "not yet computed" is a legitimate, documented state for each — not
+# defensive "maybe I'll need this" nullability. Every enum value reads as a
+# domain state (`SUSPENDED`, not `STATUS_3`), and every gated union's doc
+# comment explains, in plain language, why the shape differs by variant, so
+# a client author understands the contract without needing to read resolver
+# code.
+#
+# 10. Two-way schema/code authoring
+# -------------------------------------
+# `nextDeleteAt` and `nextArchiveAt` on the retention types are explicitly
+# documented as resolver-computed rather than stored, signaling to
+# implementers that these fields need a scheduler/sweep computation behind
+# them, not a database column — the schema *prompts* that piece of code to
+# exist. Conversely, if a future implementation reveals that channel
+# suspension always requires a scheduled review (never optional), that
+# would be a code-driven signal to tighten `ChannelSuspended.reviewAt` from
+# nullable to non-null — the schema is not assumed to be finished.
+#
+# 11. Would I query this?
+# ---------------------------
+# Every field earns its place against a real client scenario: a chat/log UI
+# rendering a channel list and message feed (`channels`, `channel.messages`,
+# `messagePublished` subscription), a moderation console (`channelMembership`,
+# `muteMember`, `banMember`, `membershipChanged` subscription), an admin
+# settings panel (`setRetentionPolicy`, `archiveChannel`, `suspendChannel`),
+# and a compose box that needs to know if the current user may post
+# (`Channel.viewerMembership`). Nothing here exists only to satisfy an
+# internal system need — there is no shard key, no queue name, no raw
+# storage timestamp exposed anywhere in the schema.
+################################################################################

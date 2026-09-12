@@ -1,0 +1,13 @@
+HarnessQL bake-off: seed=/data/work/leviath/study/B2.graphql max_levels=5
+[L0] lanes iterating on 1 seed(s): ['/data/work/leviath/study/B2.graphql']
+[2m2026-09-10T05:09:19.006840Z[0m [32m INFO[0m [2mlev[0m[2m:[0m Leviath CLI v0.5.0
+[2m2026-09-10T05:09:19.007245Z[0m [33m WARN[0m [2mleviath_cli::config[0m[2m:[0m config.toml has keys nothing reads; they are being ignored. `lev doctor` reports them too, if this scrolls past. [3mkeys[0m[2m=[0magent_read_paths.fixer.write_paths, agent_read_paths.oracle.write_paths
+[2m2026-09-10T05:09:19.007667Z[0m [33m WARN[0m [2mleviath_cli::config[0m[2m:[0m config.toml has keys nothing reads; they are being ignored. `lev doctor` reports them too, if this scrolls past. [3mkeys[0m[2m=[0magent_read_paths.fixer.write_paths, agent_read_paths.oracle.write_paths
+[2m2026-09-10T05:09:19.007786Z[0m [33m WARN[0m [2mleviath_cli::config[0m[2m:[0m config.toml has keys nothing reads; they are being ignored. `lev doctor` reports them too, if this scrolls past. [3mkeys[0m[2m=[0magent_read_paths.fixer.write_paths, agent_read_paths.oracle.write_paths
+spawned bake-off-1789016959-cbd0980afd65
+[2m2026-09-10T05:24:19.063235Z[0m [32m INFO[0m [2mlev[0m[2m:[0m Leviath CLI v0.5.0
+[2m2026-09-10T05:24:19.063630Z[0m [33m WARN[0m [2mleviath_cli::config[0m[2m:[0m config.toml has keys nothing reads; they are being ignored. `lev doctor` reports them too, if this scrolls past. [3mkeys[0m[2m=[0magent_read_paths.fixer.write_paths, agent_read_paths.oracle.write_paths
+[2m2026-09-10T05:24:19.064048Z[0m [33m WARN[0m [2mleviath_cli::config[0m[2m:[0m config.toml has keys nothing reads; they are being ignored. `lev doctor` reports them too, if this scrolls past. [3mkeys[0m[2m=[0magent_read_paths.fixer.write_paths, agent_read_paths.oracle.write_paths
+[2m2026-09-10T05:24:19.064159Z[0m [33m WARN[0m [2mleviath_cli::config[0m[2m:[0m config.toml has keys nothing reads; they are being ignored. `lev doctor` reports them too, if this scrolls past. [3mkeys[0m[2m=[0magent_read_paths.fixer.write_paths, agent_read_paths.oracle.write_paths
+spawned bake-off-1789017859-2f42f1df33b5
+[L0] one/both lanes missing output; abort. /data/work/leviath/study/bakeoff/v0_lane0.graphql=False /data/work/leviath/study/bakeoff/v0_lane1.graphql=True

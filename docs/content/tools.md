@@ -23,7 +23,7 @@ Read and modify files relative to the agent's working directory.
 
 | Tool | Purpose | Arguments |
 | --- | --- | --- |
-| `read_file` | Read one file, up to 256 KiB, with a note when the content is truncated. | `path` |
+| `read_file` | Read one file, up to 256 KiB, with a note when the content is truncated. A file that is not text (an image, a PDF, a model) is stored as a typed [part](/docs/mime) on the result instead, so a model that takes the type sees the bytes and one that does not sees a one-line stand-in. | `path` |
 | `read_files` | Read several files in one call, separated by path headers. | `paths` (array) |
 | `write_file` | Write content to a file, creating parent directories as needed. | `path`, `content` |
 | `edit_file` | Replace an exact string that occurs exactly once in a file. | `path`, `old_str`, `new_str` |
@@ -127,6 +127,8 @@ back into the system prompt on later turns.
 | `context_read` | Read a section, or a specific keyed entry within it. | `region`, `key` (optional) |
 | `context_delete` | Release an entry the agent is finished with, freeing its tokens. See [letting the agent decide what to forget](/docs/context#letting-the-agent-decide-what-to-forget). | `region`, and one of `key` / `index` / `oldest` |
 | `context_list` | List sections with their token counts and entry counts. | `region` (optional) |
+| `context_attach` | Put a file from the working directory into a section as a typed [part](/docs/mime): an image, a recording, a document. A `key` makes a newer version replace the older one; a `caption` is stored beside it. | `region`, `path`, `key`, `caption`, `type`, `deliver` (all but the first two optional) |
+| `context_export` | Write a stored part back into the working directory, by its file name or the start of its sha256, so a shell tool or a script can work on the bytes. | `name`, `path` (optional) |
 | `todo_add` | Add an open item to a [checklist region](/docs/context#tracking-work-with-a-checklist), returning its id. | `region`, `item` |
 | `todo_done` | Tick a checklist item off. | `region`, `id` |
 | `todo_note` | Record a note against an item without closing it. | `region`, `id`, `note` |
@@ -202,7 +204,7 @@ model but executed by the engine's tool registry, since they act on the shared a
 
 | Tool | Purpose | Arguments |
 | --- | --- | --- |
-| `spawn_agent` | Spawn a sub-agent from a blueprint; returns its ID (blocks and returns the result when `wait` is true). | `blueprint`, `task`, `wait` (default false), `seed_context` (optional), `max_child_depth` (optional), `output_format` (optional), `output_instructions` (optional) |
+| `spawn_agent` | Spawn a sub-agent from a blueprint; returns its ID (blocks and returns the result when `wait` is true). | `blueprint`, `task`, `wait` (default false), `seed_context` (optional), `parts` (optional: stored parts of this run to hand the child, by name or sha256 prefix), `max_child_depth` (optional), `output_format` (optional), `output_instructions` (optional) |
 | `check_agent` | Non-blocking status check; returns the child's answer once it is done. | `agent_id` |
 | `wait_for_agent` | Block until a sub-agent completes, then return its answer. | `agent_id` |
 | `send_to_agent` | Send a message into a running sub-agent's context. | `agent_id`, `message`, `target_region` (optional; defaults to the conversation) |
@@ -361,6 +363,43 @@ edit_file = "allow"    # apply edits without prompting
 > `available_tools` to be offered at all, and its `tool_permissions` value then decides whether a
 > call is allowed, prompted, or refused.
 
+### Tool groups
+
+Listing twenty-eight built-ins by hand to say "everything" is a chore, and a list written that way
+goes stale the day a tool is added. An `available_tools` entry that starts with `@` names a whole
+kind of tool instead of one:
+
+| Token | Grants |
+|---|---|
+| `@builtin` | every tool compiled into Leviath (this page's catalog) |
+| `@subagent` | `spawn_agent`, `check_agent`, `wait_for_agent`, `send_to_agent`, `kill_agent` |
+| `@scripts` | every [Rhai tool](/docs/rhai-tools), the agent's own and the global ones |
+| `@mcp` | every tool every connected [MCP server](/docs/mcp) advertises |
+| `@all` | all of the above |
+
+Groups and names mix freely, so the four shapes people actually want are each one line:
+
+```toml
+available_tools = ["read_file", "edit_file", "shell"]          # a hand-picked set
+available_tools = ["@builtin", "summarize", "github__search"]  # every built-in, plus a few others by name
+available_tools = ["@builtin", "@scripts", "github__search"]   # every built-in and script, one MCP tool
+available_tools = ["@all"]                                     # everything this install has
+```
+
+A group is resolved when the stage runs, not when the blueprint is written: a script dropped into
+`~/.leviath/tools/` or a server added with `lev mcp add` is offered to a stage granting `@scripts`
+or `@mcp` without touching the manifest. Two things a group never grants: `submit_output` and
+`fan_out`, which decide what a stage *is* rather than what it can do. Name those, or use the mode
+that carries them.
+
+A group is a grant of visibility and nothing more. Every tool it reaches still goes through
+`tool_permissions`, the taint gate, and the approval prompts exactly as a tool you named would, and
+the `@` prefix can never collide with a real tool, since tool names are limited to `[A-Za-z0-9_-]`.
+`lev validate` knows the groups: an entry like `@builtins` is refused as naming no group, a
+`required_tools` entry no group reaches is an error, and an autonomous stage granting `@builtin`
+gets one `blocking-tool-in-autonomous-stage` warning for the group rather than five for its
+members.
+
 ## Default permissions
 
 With nothing configured, tools fall back to these:
@@ -370,7 +409,7 @@ With nothing configured, tools fall back to these:
 | `read_file`, `read_files`, `list_dir` | `allow` |
 | `write_file`, `edit_file`, `shell` (and its `bash` alias) | `ask` |
 | `install_tool` | `ask` |
-| `context_read`, `context_write`, `context_append`, `context_delete`, `context_list` | `allow` |
+| `context_read`, `context_write`, `context_append`, `context_delete`, `context_list`, `context_attach`, `context_export` | `allow` |
 | `todo_add`, `todo_done`, `todo_note` | `allow` |
 | `ask_user_text`, `ask_user_choice`, `ask_user_confirm`, `edit_document` | `allow` |
 | `spawn_agent`, `check_agent`, `wait_for_agent`, `send_to_agent`, `kill_agent` | `allow` |

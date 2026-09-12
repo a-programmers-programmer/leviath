@@ -44,6 +44,8 @@ pub(crate) struct StageSetup {
     pub context_layout: Option<leviath_core::ContextLayout>,
     /// Regions this stage leaves out of its prompt (`[stages.<name>.context] hide`).
     pub context_hide: Vec<String>,
+    /// Regions this stage empties on entry (`[stages.<name>.context] reset`).
+    pub context_reset: Vec<String>,
     /// Optional stage instructions injected as pinned context on entry.
     pub system_prompt: Option<String>,
 }
@@ -215,6 +217,19 @@ pub(crate) fn resolve_transition_sync(
     }
 }
 
+/// What a `[stages.X.transitions]` edge resolves to: which stage to move to,
+/// the transform to apply to the context on the way, and an optional gate that
+/// must pass first.
+///
+/// Named rather than written inline because the tuple appears in the return type
+/// and clippy's `type_complexity` is right that an unnamed triple of this shape
+/// reads poorly at a signature.
+type ResolvedTransition = (
+    usize,
+    leviath_core::blueprint::EdgeTransform,
+    Option<Box<leviath_core::blueprint::TransitionGate>>,
+);
+
 /// Resolve a stage's optional authoritative transition destination.
 ///
 /// A transition region is a control-plane input prepared by deterministic
@@ -227,7 +242,7 @@ fn resolve_transition_from_region(
     stage: &leviath_core::Stage,
     window: &ContextWindow,
     visits: &std::collections::HashMap<String, usize>,
-) -> Result<Option<(usize, leviath_core::blueprint::EdgeTransform, Option<Box<leviath_core::blueprint::TransitionGate>>)>, String> {
+) -> Result<Option<ResolvedTransition>, String> {
     let Some(region_name) = stage.transition_region.as_deref() else {
         return Ok(None);
     };
@@ -267,9 +282,7 @@ fn resolve_transition_from_region(
         ));
     }
     let target_stage = blueprint.find_stage(target).ok_or_else(|| {
-        format!(
-            "transition_region '{region_name}' selected unknown stage '{target}'"
-        )
+        format!("transition_region '{region_name}' selected unknown stage '{target}'")
     })?;
     if target_stage
         .max_revisits
@@ -491,24 +504,35 @@ pub(crate) fn resolve_transition(
                 note_max_iterations(&mut window, &stage.name, stage.max_iterations.unwrap_or(0));
                 find_conditioned_edge(&bp.0, stage, &visits.0, TransitionCondition::MaxIterations)
                     .map(|(i, t)| StageResolution::Next(i, t, None))
-                    .unwrap_or_else(|| match resolve_transition_from_region(
-                        &bp.0,
-                        stage,
-                        &window,
-                        &visits.0,
-                    ) {
-                        Ok(Some((idx, transform, gate))) => {
-                            StageResolution::Next(idx, transform, gate)
+                    .unwrap_or_else(|| {
+                        match resolve_transition_from_region(&bp.0, stage, &window, &visits.0) {
+                            Ok(Some((idx, transform, gate))) => {
+                                StageResolution::Next(idx, transform, gate)
+                            }
+                            Ok(None) => {
+                                resolve_transition_sync(&bp.0, stage, cursor.index, &visits.0)
+                            }
+                            Err(message) => {
+                                state.status = AgentStatus::Error {
+                                    message: message.clone(),
+                                };
+                                StageResolution::TerminalError
+                            }
                         }
-                        Ok(None) => {
-                            resolve_transition_sync(&bp.0, stage, cursor.index, &visits.0)
-                        }
-                        Err(message) => {
-                            state.status = AgentStatus::Error {
-                                message: message.clone(),
-                            };
-                            StageResolution::TerminalError
-                        }
+                    })
+            }
+            Some(StageOutcome::SoftCapHandoff(soft)) => {
+                // Soft cap (Josh directive): the agent recorded its progress and
+                // hands off to a fresh agent rather than hard-stopping. We note
+                // the cut-off for the handoff stage, then continue down the
+                // normal (or max_iterations) edge so the graph proceeds instead
+                // of ending. The handoff stage's prompt reads the note and picks
+                // up from the recorded progress.
+                note_max_iterations(&mut window, &stage.name, *soft);
+                find_conditioned_edge(&bp.0, stage, &visits.0, TransitionCondition::MaxIterations)
+                    .map(|(i, t)| StageResolution::Next(i, t, None))
+                    .unwrap_or_else(|| {
+                        resolve_transition_sync(&bp.0, stage, cursor.index, &visits.0)
                     })
             }
             Some(StageOutcome::Stuck(_)) => {
@@ -888,6 +912,15 @@ pub(crate) fn apply_stage_context(
     for name in &setup.context_hide {
         if !leviath_core::blueprint::ALWAYS_VISIBLE_REGIONS.contains(&name.as_str()) {
             window.hidden.insert(name.clone());
+        }
+    }
+    // `reset` empties a region as the stage is entered, so it starts on a clean
+    // slate - a describe stage reading its image from a region of its own with
+    // none of the drawing stage's conversation carried in. Emptied, not
+    // hidden: a later stage sees the fresh region, not the old turns.
+    for name in &setup.context_reset {
+        if let Some(region) = window.regions.iter_mut().find(|r| &r.name == name) {
+            region.clear();
         }
     }
 

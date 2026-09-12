@@ -209,6 +209,13 @@ pub(crate) struct Dashboard {
     /// Workdir-relative file paths the `@` completion offers, walked once when
     /// the screen opens rather than per keystroke.
     pub(super) new_run_files: Vec<String>,
+    /// One slot per caller-input region of the selected blueprint.
+    pub(super) new_run_inputs: Vec<super::new_run_inputs::NewRunInput>,
+    /// The slot the Inputs pane's cursor is on.
+    pub(super) new_run_input_selected: usize,
+    /// The agent path the slots were built for, so a selection that has not
+    /// moved keeps what was typed.
+    pub(super) new_run_inputs_key: String,
     /// True while an `@` file reference is being typed, so the completion
     /// popup has the keys.
     pub(super) new_run_file_ref: bool,
@@ -217,6 +224,9 @@ pub(crate) struct Dashboard {
     pub(super) new_run_file_query: String,
     /// Highlighted row of the completion popup.
     pub(super) new_run_file_selected: usize,
+    /// The file picker modal over the Inputs pane, when one is open, so a file
+    /// reaches a region by being chosen rather than by a typed name.
+    pub(super) new_run_picker: Option<super::new_run_picker::FilePicker>,
     /// A run started from the new-run screen whose page to open once the
     /// daemon reports it, with the ticks left to wait for that.
     pub(super) pending_open_run: Option<(String, u32)>,
@@ -232,6 +242,13 @@ pub(crate) struct Dashboard {
     /// consequences, and a toggle that survives out of sight is one a user can
     /// leave on and forget.
     pub(super) new_run_yolo: bool,
+    /// The yolo profile runs started from this screen run under, when
+    /// unattended is on and `Ctrl-Y` has stepped past plain yolo. `None` with
+    /// `new_run_yolo` set is the bare flag.
+    pub(super) new_run_yolo_profile: Option<String>,
+    /// The profiles `yolo.toml` defined when the screen opened, in file
+    /// order, which `Ctrl-Y` steps through after plain yolo.
+    pub(super) new_run_profiles: Vec<std::sync::Arc<crate::yolo::YoloProfile>>,
     /// Paths the screen reads its agents and file candidates from.
     pub(super) new_run_ctx: NewRunContext,
     /// The Agents screen (`a`): catalog and editor. Boxed: it carries a

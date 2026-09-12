@@ -243,6 +243,9 @@ pub enum ControlRequest {
         /// Optional target region.
         #[serde(default)]
         target_region: Option<String>,
+        /// Files attached to the message, landing in the same entry.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        parts: Vec<leviath_core::mime::InboundPart>,
     },
     /// List open interactions awaiting an answer.
     ListInteractions,
@@ -509,12 +512,14 @@ async fn dispatch(req: ControlRequest, op_tx: &UnboundedSender<ControlOp>) -> Co
             agent_id,
             content,
             target_region,
+            parts,
         } => {
             let (reply, rx) = oneshot::channel();
             let _ = op_tx.send(ControlOp::Message {
                 agent_id,
                 content,
                 target_region,
+                parts,
                 reply,
             });
             ControlResponse::Ok {
@@ -912,6 +917,7 @@ mod tests {
             tool_calls: 7,
             last_progress_at: Some(1_000),
             unattended: false,
+            yolo_profile: None,
             empty_output: false,
             read_paths: None,
             has_final_output: false,
@@ -1134,6 +1140,10 @@ mod tests {
                 agent_id: "a".to_string(),
                 content: "hi".to_string(),
                 target_region: None,
+                parts: vec![leviath_core::mime::InboundPart::from_bytes(
+                    "a.png",
+                    vec![1, 2, 3],
+                )],
             },
             ControlRequest::AnswerInteraction {
                 response: InteractionResponse::text("q1", "yes"),
@@ -1160,11 +1170,13 @@ mod tests {
                 callback_url: None,
                 callback_secret: None,
                 yolo: false,
+                yolo_profile: None,
                 no_seed_commands: false,
                 allow: Vec::new(),
                 max_depth: None,
                 parent_run_id: None,
                 output: None,
+                parts: Vec::new(),
             }),
         })
         .await;
@@ -2362,6 +2374,7 @@ mod tests {
                 agent_id: run(),
                 content: run(),
                 target_region: None,
+                parts: Vec::new(),
             },
             ControlRequest::AnswerInteraction {
                 response: InteractionResponse {
@@ -2371,6 +2384,7 @@ mod tests {
                     approved: None,
                     scope: None,
                     feedback: None,
+                    parts: Vec::new(),
                 },
             },
             ControlRequest::CancelInteraction { request_id: run() },

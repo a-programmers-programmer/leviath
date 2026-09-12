@@ -227,6 +227,27 @@ fn completed_with_answer(content: &str, format: Option<&str>) -> WorldEvent {
     }
 }
 
+/// A completion whose answer produced files.
+fn completed_with_files(content: &str, paths: &[&str]) -> WorldEvent {
+    let mut event = completed_with_answer(content, None);
+    if let WorldEvent::Completed { final_output, .. } = &mut event
+        && let Some(output) = final_output
+    {
+        let registry = leviath_core::mime::MimeRegistry::builtin();
+        output.artifacts = paths
+            .iter()
+            .map(|p| {
+                let mut artifact = leviath_core::output::Artifact::from_path(p);
+                artifact.mime_type = registry
+                    .from_name(p)
+                    .unwrap_or_else(leviath_core::mime::octet_stream);
+                artifact
+            })
+            .collect();
+    }
+    event
+}
+
 fn status_event() -> WorldEvent {
     WorldEvent::Status {
         run_id: RUN_ID.to_string(),
@@ -328,7 +349,7 @@ system_prompt = "Do it"
     .unwrap();
     let args = AgentClientArgs {
         agent: Some(dir.to_string_lossy().to_string()),
-        yolo: false,
+        yolo: None,
         no_seed_commands: false,
         allow: vec![],
         max_depth: None,
@@ -1661,6 +1682,147 @@ async fn a_submitted_answer_arrives_as_the_turns_closing_message() {
         "got: {assembled}"
     );
     assert!(assembled.contains("final output (xml)"), "got: {assembled}");
+    h.close_input().await;
+}
+
+/// The files a run produced follow its answer as `resource_link` blocks,
+/// pointing into the session's working directory.
+#[tokio::test]
+async fn produced_files_follow_the_answer_as_links() {
+    let daemon = ScriptedDaemon::new(
+        vec![completed_with_files("done", &["out/final.mp4", "notes.md"])],
+        spawn_ok,
+    );
+    let (mut h, _bp) = opened_session(daemon, false).await;
+    h.send(r#"{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"prompt":[{"type":"text","text":"go"}]}}"#)
+        .await;
+    let mut links = Vec::new();
+    loop {
+        let msg = h.recv().await;
+        if is_result(&msg) {
+            break;
+        }
+        if let Some("agent_message_chunk") = update_kind(&msg).as_deref() {
+            let content = msg.params.unwrap()["update"]["content"].clone();
+            if content["type"] == "resource_link" {
+                links.push(content);
+            }
+        }
+    }
+    assert_eq!(links.len(), 2, "{links:?}");
+    assert_eq!(links[0]["name"], "final.mp4");
+    assert!(
+        links[0]["uri"]
+            .as_str()
+            .unwrap()
+            .ends_with("/tmp/out/final.mp4"),
+        "{links:?}"
+    );
+    assert_eq!(links[0]["mimeType"], "video/mp4");
+    assert_eq!(links[1]["name"], "notes.md");
+    h.close_input().await;
+}
+
+/// An image in the prompt reaches the daemon as a part on the spawn, and on
+/// a later prompt as a part on the message; a prompt that is only an image
+/// still gets words naming it.
+#[tokio::test]
+async fn prompt_files_reach_the_daemon_as_parts() {
+    let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let cap = captured.clone();
+    let daemon = ScriptedDaemon::new(vec![completed("complete")], move |req| match req {
+        ControlRequest::Spawn { args } => {
+            cap.lock()
+                .unwrap()
+                .push((args.task.clone(), args.parts.clone()));
+            ControlResponse::Spawned {
+                run_id: RUN_ID.to_string(),
+            }
+        }
+        ControlRequest::Message { content, parts, .. } => {
+            cap.lock().unwrap().push((content, parts));
+            ControlResponse::Ok { ok: true }
+        }
+        _ => ControlResponse::Ok { ok: true },
+    });
+    let (mut h, _bp) = opened_session(daemon, false).await;
+    // AQID is [1, 2, 3].
+    h.send(r#"{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"prompt":[{"type":"image","data":"AQID","mimeType":"image/png"}]}}"#)
+        .await;
+    let _ = h.recv_until(is_result).await;
+    h.send(r#"{"jsonrpc":"2.0","id":4,"method":"session/prompt","params":{"prompt":[{"type":"text","text":"and this"},{"type":"audio","data":"AQID","mimeType":"audio/wav"}]}}"#)
+        .await;
+    let _ = h.recv_until(is_result).await;
+    let seen = captured.lock().unwrap().clone();
+    assert_eq!(seen.len(), 2, "{seen:?}");
+    assert_eq!(seen[0].0, "Attached: image-1.png");
+    assert_eq!(seen[0].1.len(), 1);
+    assert_eq!(seen[0].1[0].name, "image-1.png");
+    assert_eq!(seen[1].0, "and this");
+    assert_eq!(seen[1].1[0].name, "audio-1.wav");
+    h.close_input().await;
+}
+
+/// A `resource_link` into the session's working directory is read and rides
+/// the prompt as a part, and the text says so; one pointing elsewhere stays
+/// a name, marked as not fetched.
+#[tokio::test]
+async fn linked_files_inside_the_working_directory_reach_the_daemon_as_parts() {
+    let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let cap = captured.clone();
+    let daemon = ScriptedDaemon::new(vec![completed("complete")], move |req| match req {
+        ControlRequest::Spawn { args } => {
+            cap.lock()
+                .unwrap()
+                .push((args.task.clone(), args.parts.clone()));
+            ControlResponse::Spawned {
+                run_id: RUN_ID.to_string(),
+            }
+        }
+        _ => ControlResponse::Ok { ok: true },
+    });
+    let (_bp, args) = blueprint_args();
+    let work = tempfile::tempdir().unwrap();
+    let inside = work.path().join("notes.md");
+    std::fs::write(&inside, b"# notes").unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let outside = elsewhere.path().join("secret.txt");
+    std::fs::write(&outside, b"no").unwrap();
+    let mut h = Harness::start(daemon, args);
+    h.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}"#)
+        .await;
+    let _ = h.recv().await;
+    let cwd = serde_json::to_string(&work.path().to_string_lossy()).unwrap();
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"session/new","params":{{"cwd":{cwd}}}}}"#
+    ))
+    .await;
+    let _ = h.recv().await;
+    let inside_url = crate::commands::result::export::file_url(&inside);
+    let outside_url = crate::commands::result::export::file_url(&outside);
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{{"prompt":[{{"type":"text","text":"read these"}},{{"type":"resource_link","uri":"{inside_url}","name":"notes.md","mimeType":"text/markdown"}},{{"type":"resource_link","uri":"{outside_url}","name":"secret.txt"}}]}}}}"#
+    ))
+    .await;
+    let _ = h.recv_until(is_result).await;
+    let seen = captured.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    let (task, parts) = &seen[0];
+    assert!(
+        task.contains(&format!(
+            "--- {inside_url} ---\n[a linked resource (text/markdown); attached]"
+        )),
+        "{task}"
+    );
+    assert!(
+        task.contains(&format!(
+            "--- {outside_url} ---\n[a linked resource; not fetched]"
+        )),
+        "{task}"
+    );
+    assert_eq!(parts.len(), 1, "{parts:?}");
+    assert_eq!(parts[0].name, "notes.md");
+    assert_eq!(parts[0].data, b"# notes");
     h.close_input().await;
 }
 

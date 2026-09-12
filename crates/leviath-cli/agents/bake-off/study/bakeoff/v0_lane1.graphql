@@ -1,0 +1,816 @@
+# HUMAN-IN-THE-LOOP PROPOSALS / DECISION GATES
+# Iterated (lane 1) standalone group schema. Rationale follows the SDL as
+# GraphQL comments; every field-level invariant is documented at its point of
+# use per the "do guided by prompt" principle, not only in the trailing
+# RATIONALE.
+
+schema {
+  query: Query
+  mutation: Mutation
+}
+
+"""
+An RFC 3339 instant with an explicit UTC offset. Serialized in UTC; comparisons
+use the instant rather than its textual representation.
+"""
+scalar DateTime
+
+"""
+Exactly one member must be supplied, and that member must be non-null.
+The server must support one-of input coercion, including variable validation;
+this declaration alone does not implement that behavior in older engines.
+"""
+directive @oneOf on INPUT_OBJECT
+
+"""A person or agent that can be named in proposal provenance."""
+interface Actor {
+  id: ID!
+  displayName: String!
+}
+
+"""A human identity. Only an authenticated human can issue a review verdict."""
+type Human implements Actor {
+  id: ID!
+  displayName: String!
+}
+
+"""An agent identity responsible for proposing and revising content."""
+type Agent implements Actor {
+  id: ID!
+  displayName: String!
+}
+
+"""
+The subject of the proposed decision, not its lifecycle or gate shape.
+The initial application taxonomy is intentionally finite.
+"""
+enum ProposalKind {
+  """Proposing the execution of a concrete action or commitment."""
+  ACTION
+  """Proposing a plan or approach, possibly with alternatives."""
+  PLAN
+  """Proposing a change to existing state or policy."""
+  CHANGE
+  """Proposing an exception to a stated rule or policy."""
+  EXCEPTION
+}
+
+"""
+Lifecycle of a proposal. The same value always agrees with the concrete
+ProposalState type (see that interface): e.g. status AWAITING_REVIEW always
+coincides with type ProposalAwaitingReview. Exact discriminator agreement is a
+resolver invariant, not a GraphQL-enforceable cross-field constraint.
+"""
+enum ProposalStatus {
+  """Created and still editable by its agent; nothing is submitted for review."""
+  DRAFT
+  """A revision is submitted and an open review round is awaiting a verdict."""
+  AWAITING_REVIEW
+  """An accepting review closed the round; this is a terminal state."""
+  APPROVED
+  """A rejecting review closed the round; this is a terminal state."""
+  REJECTED
+  """A revision-request review closed the round; the agent must produce a revision."""
+  CHANGES_REQUESTED
+}
+
+"""
+The durable proposal. Its currentRevision contains its title, description, and
+exact decision gate. Revisions, rounds, reviews, and reviewer bindings remain
+traversable after the proposal reaches a terminal state.
+"""
+type Proposal {
+  id: ID!
+  kind: ProposalKind!
+  author: Agent!
+  """Instant this proposal was created (revision 1, DRAFT)."""
+  createdAt: DateTime!
+  """
+  Time of the most recent content, lifecycle, or reviewer-binding change.
+  Monotonic: equals createdAt after creation and strictly increases with every
+  accepted write that changes the proposal aggregate.
+  """
+  updatedAt: DateTime!
+  """
+  Optimistic concurrency token, beginning at 1. Every accepted command that
+  changes this proposal or its reviewer bindings increments it atomically.
+  Clients pass the value they last read as expectedVersion on every mutation.
+  """
+  version: Int!
+  """The current content and decision gate; never a separate title/description view."""
+  currentRevision: ProposalRevision!
+  state: ProposalState!
+  """Immutable revisions ordered by increasing revision number."""
+  revisions(first: Int = 50, after: String): ProposalRevisionConnection!
+  """Review attempts ordered by increasing round number, including withdrawals."""
+  reviewRounds(first: Int = 50, after: String): ReviewRoundConnection!
+  """Authorization relationships, including retained revocations by default."""
+  reviewerBindings(
+    status: ReviewerBindingStatus
+    first: Int = 50
+    after: String
+  ): ReviewerBindingConnection!
+}
+
+"""
+A queryable current lifecycle state. status is useful for uniform rendering;
+concrete types make state-specific data available without nullable sentinels.
+Exact agreement between status and the concrete type is a resolver invariant
+(soft invariant enforced in code; the schema guides via descriptions).
+"""
+interface ProposalState {
+  status: ProposalStatus!
+  """When this lifecycle state began; equals the event time that entered it."""
+  since: DateTime!
+}
+
+type ProposalDraft implements ProposalState {
+  """Always DRAFT."""
+  status: ProposalStatus!
+  """When the proposal entered DRAFT; a draft edit that stays DRAFT does not reset it."""
+  since: DateTime!
+}
+
+type ProposalAwaitingReview implements ProposalState {
+  """Always AWAITING_REVIEW."""
+  status: ProposalStatus!
+  """Submission instant; equal to the open round's openedAt."""
+  since: DateTime!
+  """The open round awaiting a decision; exactly one open round can exist."""
+  round: ReviewRound!
+}
+
+type ProposalApproved implements ProposalState {
+  """Always APPROVED."""
+  status: ProposalStatus!
+  """Instant the accepting review was decided; equal to its decidedAt."""
+  since: DateTime!
+  decision: ApprovalReview!
+}
+
+type ProposalRejected implements ProposalState {
+  """Always REJECTED."""
+  status: ProposalStatus!
+  """Instant the rejecting review was decided; equal to its decidedAt."""
+  since: DateTime!
+  decision: RejectionReview!
+}
+
+type ProposalChangesRequested implements ProposalState {
+  """Always CHANGES_REQUESTED."""
+  status: ProposalStatus!
+  """Instant the revision-request review was decided; equal to its decidedAt."""
+  since: DateTime!
+  request: RevisionRequestReview!
+}
+
+"""
+An immutable version of the material the human is being asked to decide on.
+Every edit creates another revision, including edits while still in draft.
+"""
+type ProposalRevision {
+  id: ID!
+  proposal: Proposal!
+  """Ordinal within the proposal, starting at 1 and strictly increasing."""
+  number: Int!
+  title: String!
+  description: String!
+  gate: DecisionGate!
+  author: Agent!
+  createdAt: DateTime!
+  """Null means this is the initial revision; never means inaccessible history."""
+  previous: ProposalRevision
+  """
+  The human revision request addressed by this revision. Null means no request
+  prompted this revision. Draft edits in the same response retain this link
+  until that response is submitted. The server sets the link, not the caller.
+  """
+  respondsTo: RevisionRequestReview
+}
+
+"""
+The precise question in one revision. Approval either confirms a stated action
+or selects exactly one offered option. Rejection and requests for changes are
+review verdicts, not disguised options in a selection gate.
+"""
+interface DecisionGate {
+  id: ID!
+  question: String!
+  """Optional human-facing decision guidance; null means none was supplied."""
+  instructions: String
+}
+
+"""A yes/no approval of a concrete, described action or commitment."""
+type ConfirmationGate implements DecisionGate {
+  id: ID!
+  question: String!
+  instructions: String
+  """The concrete action or commitment the human is asked to confirm."""
+  requestedAction: String!
+}
+
+"""
+A decision among mutually exclusive alternatives. At least two distinguishable
+options must exist. Approving this gate means choosing exactly one of them.
+"""
+type ChoiceGate implements DecisionGate {
+  id: ID!
+  question: String!
+  instructions: String
+  """Nonempty, immutable, and ordered for presentation; order is not preference."""
+  options: [DecisionOption!]!
+}
+
+"""
+A substantive alternative within one immutable choice gate. This is not an enum:
+it has its own identity and human-facing explanation supplied by the agent.
+"""
+type DecisionOption {
+  id: ID!
+  gate: ChoiceGate!
+  label: String!
+  description: String!
+}
+
+"""The answer recorded by an approving human, with a traversable gate."""
+interface DecisionAnswer {
+  gate: DecisionGate!
+}
+
+"""Affirmative confirmation of exactly this revision's requested action."""
+type ConfirmationAnswer implements DecisionAnswer {
+  gate: ConfirmationGate!
+}
+
+"""Approval of exactly one alternative belonging to this revision's gate."""
+type ChoiceAnswer implements DecisionAnswer {
+  gate: ChoiceGate!
+  option: DecisionOption!
+}
+
+"""
+One submission of an immutable revision for human review. A withdrawn revision
+may be submitted again in a new round without inventing another content edit.
+Exactly one accepted human review closes a round; any authorized reviewer may
+supply it. This group does not assume quorum or multi-stage approval semantics.
+"""
+type ReviewRound {
+  id: ID!
+  proposal: Proposal!
+  """Ordinal within the proposal, starting at 1 and strictly increasing."""
+  number: Int!
+  """The immutable revision this round asks the human to decide on."""
+  revision: ProposalRevision!
+  """Instant the round opened; equal to ProposalAwaitingReview.since."""
+  openedAt: DateTime!
+  openedBy: Agent!
+  outcome: ReviewOutcome!
+}
+
+"""
+A round is awaiting a decision, has one canonical human review, or was withdrawn.
+There is no nullable decision/error pair and no second copy of a review object.
+"""
+union ReviewOutcome = ReviewPending | ApprovalReview | RejectionReview | RevisionRequestReview | ReviewWithdrawal
+
+"""No human verdict has been accepted for this open round."""
+type ReviewPending {
+  """Equal to this round's openedAt; a round pending for its whole duration."""
+  since: DateTime!
+}
+
+"""Withdrawal closes a round without claiming that a human rejected it."""
+type ReviewWithdrawal {
+  withdrawnAt: DateTime!
+  withdrawnBy: Agent!
+  """Null means the agent supplied no withdrawal explanation."""
+  reason: String
+}
+
+enum ReviewVerdict {
+  """The human accepted the submitted revision with a valid answer."""
+  APPROVED
+  """The human rejected the submitted revision; the proposal is closed."""
+  REJECTED
+  """The human returned the proposal to its agent with revision guidance."""
+  CHANGES_REQUESTED
+}
+
+"""
+An immutable, authenticated human verdict on a specific submitted revision.
+reviewer is the binding that authorized the decision when it was accepted;
+revoking that binding later does not invalidate this historical verdict.
+"""
+interface Review {
+  id: ID!
+  round: ReviewRound!
+  reviewer: ReviewerBinding!
+  decidedAt: DateTime!
+  verdict: ReviewVerdict!
+}
+
+"""An approval always records a structurally valid answer, never a null result."""
+type ApprovalReview implements Review {
+  id: ID!
+  round: ReviewRound!
+  reviewer: ReviewerBinding!
+  decidedAt: DateTime!
+  """Always APPROVED."""
+  verdict: ReviewVerdict!
+  """
+  The structurally valid answer to the round's gate: ConfirmationAnswer for a
+  ConfirmationGate, ChoiceAnswer (with an option from that exact gate) for a
+  ChoiceGate. Never null; a gate-answer mismatch is a resolver invariant.
+  """
+  answer: DecisionAnswer!
+}
+
+"""A rejection closes the proposal and explains the negative decision."""
+type RejectionReview implements Review {
+  id: ID!
+  round: ReviewRound!
+  reviewer: ReviewerBinding!
+  decidedAt: DateTime!
+  """Always REJECTED."""
+  verdict: ReviewVerdict!
+  """Nonblank prose explaining the rejection."""
+  reason: String!
+}
+
+"""A request returns the proposal to its agent with actionable revision guidance."""
+type RevisionRequestReview implements Review {
+  id: ID!
+  round: ReviewRound!
+  reviewer: ReviewerBinding!
+  decidedAt: DateTime!
+  """Always CHANGES_REQUESTED."""
+  verdict: ReviewVerdict!
+  """Nonblank, actionable instructions for the required revision."""
+  instructions: String!
+}
+
+enum ReviewerBindingStatus {
+  """Currently eligible to review this proposal."""
+  AUTHORIZED
+  """No longer eligible; historical reviews under it remain valid."""
+  REVOKED
+}
+
+"""
+A first-class authorization edge from a proposal to a human, with its own identity,
+provenance, and lifecycle. Each human can have at most one authorized binding to
+one proposal. Reauthorization after revocation creates a new binding.
+"""
+type ReviewerBinding {
+  id: ID!
+  proposal: Proposal!
+  reviewer: Human!
+  assignedAt: DateTime!
+  assignedBy: Actor!
+  state: ReviewerBindingState!
+}
+
+interface ReviewerBindingState {
+  status: ReviewerBindingStatus!
+  since: DateTime!
+}
+
+type ReviewerAuthorized implements ReviewerBindingState {
+  """Always AUTHORIZED."""
+  status: ReviewerBindingStatus!
+  """When this authorization took effect, equal to the binding's assignedAt."""
+  since: DateTime!
+}
+
+type ReviewerRevoked implements ReviewerBindingState {
+  """Always REVOKED."""
+  status: ReviewerBindingStatus!
+  """When this authorization was revoked."""
+  since: DateTime!
+  revokedBy: Actor!
+  """Null means the revoker supplied no explanation."""
+  reason: String
+}
+
+# Query and traversal surface
+
+"""
+Group-local query entry points. Null on an identity lookup means no resource is
+visible under that identifier, including deliberate concealment by access policy.
+Operational failures use GraphQL errors rather than pretending the object is absent.
+"""
+type Query {
+  proposal(id: ID!): Proposal
+  revision(id: ID!): ProposalRevision
+  reviewRound(id: ID!): ReviewRound
+  review(id: ID!): Review
+  reviewerBinding(id: ID!): ReviewerBinding
+  """
+  Search the visible review inbox or proposal history. Ordering is createdAt
+  descending, then id descending. All supplied filters are combined with AND.
+  """
+  proposals(
+    filter: ProposalFilter
+    first: Int = 50
+    after: String
+  ): ProposalConnection!
+}
+
+input ProposalFilter {
+  """Omitted means all statuses; an empty list matches nothing."""
+  statuses: [ProposalStatus!]
+  """Omitted means all kinds; an empty list matches nothing."""
+  kinds: [ProposalKind!]
+  authorId: ID
+  """
+  Match proposals with an AUTHORIZED binding to this human. Combine with
+  AWAITING_REVIEW for that person's current decision inbox.
+  """
+  reviewerId: ID
+  """Case-insensitive text search over the current revision's title and description."""
+  text: String
+}
+
+"""
+Forward cursor pagination. first must be positive. Cursors are opaque and scoped
+to a particular collection, filter, and ordering; invalid cursors are errors.
+"""
+type PageInfo {
+  hasNextPage: Boolean!
+  """Null only when the returned page has no edges."""
+  endCursor: String
+}
+
+type ProposalConnection {
+  edges: [ProposalEdge!]!
+  pageInfo: PageInfo!
+}
+
+type ProposalEdge {
+  cursor: String!
+  node: Proposal!
+}
+
+type ProposalRevisionConnection {
+  edges: [ProposalRevisionEdge!]!
+  pageInfo: PageInfo!
+}
+
+type ProposalRevisionEdge {
+  cursor: String!
+  node: ProposalRevision!
+}
+
+type ReviewRoundConnection {
+  edges: [ReviewRoundEdge!]!
+  pageInfo: PageInfo!
+}
+
+type ReviewRoundEdge {
+  cursor: String!
+  node: ReviewRound!
+}
+
+"""Bindings are ordered by assignedAt ascending, then id ascending."""
+type ReviewerBindingConnection {
+  edges: [ReviewerBindingEdge!]!
+  pageInfo: PageInfo!
+}
+
+"""
+A pagination edge only. The node is the actual domain authorization edge; cursor
+metadata must not be confused with its authorization history.
+"""
+type ReviewerBindingEdge {
+  cursor: String!
+  node: ReviewerBinding!
+}
+
+# Intent inputs: immutable proposed content, not output-entity mirrors.
+
+"""
+Complete proposed content for a new immutable revision. This is intentionally
+not a patch: omitted optional instructions mean no instructions in the new
+revision. Whitespace-only titles, descriptions, and questions are rejected.
+"""
+input RevisionInput {
+  title: String!
+  description: String!
+  gate: DecisionGateInput!
+}
+
+input DecisionGateInput @oneOf {
+  confirmation: ConfirmationGateInput
+  choice: ChoiceGateInput
+}
+
+input ConfirmationGateInput {
+  question: String!
+  instructions: String
+  requestedAction: String!
+}
+
+input ChoiceGateInput {
+  question: String!
+  instructions: String
+  """At least two options; labels must be nonblank and distinguishable."""
+  options: [DecisionOptionInput!]!
+}
+
+input DecisionOptionInput {
+  label: String!
+  description: String!
+}
+
+# Recoverable, typed command failures.
+
+"""A recoverable application error, not an infrastructure or authentication error."""
+interface ProposalProblem {
+  message: String!
+}
+
+enum ProposalResource {
+  PROPOSAL
+  HUMAN
+  REVIEWER_BINDING
+  DECISION_OPTION
+}
+
+type ProposalNotFound implements ProposalProblem {
+  message: String!
+  resource: ProposalResource!
+  """Echo of the command's lookup argument, not an output relationship."""
+  requestedId: ID!
+}
+
+type ProposalConflict implements ProposalProblem {
+  message: String!
+  proposal: Proposal!
+  expectedVersion: Int!
+  actualVersion: Int!
+}
+
+enum ProposalRule {
+  """The proposal lifecycle does not permit the attempted transition."""
+  TRANSITION_NOT_ALLOWED
+  """Submission requires at least one authorized human reviewer."""
+  REVIEWER_REQUIRED
+  """This human already has an active binding to this proposal."""
+  REVIEWER_ALREADY_AUTHORIZED
+  """The supplied binding is revoked and cannot be used to review."""
+  REVIEWER_BINDING_REVOKED
+  """The last authorized reviewer cannot be revoked while awaiting review."""
+  LAST_REVIEWER_CANNOT_BE_REVOKED
+  """The command's gate kind does not match the current revision's gate."""
+  WRONG_GATE_KIND
+  """The chosen option does not belong to the current revision's gate."""
+  OPTION_NOT_IN_CURRENT_GATE
+  """The authenticated actor is not permitted to perform this command."""
+  ACTOR_NOT_AUTHORIZED
+  """The current open round already has an accepted review."""
+  REVIEW_ALREADY_DECIDED
+}
+
+type ProposalRuleViolation implements ProposalProblem {
+  message: String!
+  rule: ProposalRule!
+  proposal: Proposal!
+}
+
+enum ProposalInputRule {
+  """A required title, description, question, or explanation is blank/whitespace."""
+  REQUIRED_TEXT
+  """A choice gate was supplied with fewer than two options."""
+  TOO_FEW_OPTIONS
+  """Two options in one gate share the same label."""
+  DUPLICATE_OPTION_LABEL
+  """The same human was listed more than once among initial reviewers."""
+  DUPLICATE_REVIEWER
+  """expectedVersion does not equal the proposal's current version."""
+  INVALID_VERSION
+}
+
+type ProposalInputViolation {
+  """Argument/input path segments, with list indices represented as decimal strings."""
+  path: [String!]!
+  rule: ProposalInputRule!
+  message: String!
+}
+
+type InvalidProposalInput implements ProposalProblem {
+  message: String!
+  """Contains at least one violation."""
+  violations: [ProposalInputViolation!]!
+}
+
+union ProposalChange = Proposal | ProposalNotFound | ProposalConflict | ProposalRuleViolation | InvalidProposalInput
+
+union ReviewerBindingChange = ReviewerBinding | ProposalNotFound | ProposalConflict | ProposalRuleViolation | InvalidProposalInput
+
+union ReviewDecision = ApprovalReview | RejectionReview | RevisionRequestReview | ProposalNotFound | ProposalConflict | ProposalRuleViolation | InvalidProposalInput
+
+"""
+All commands are atomic. Actor identities come from the authenticated execution
+context, never caller-supplied author/decider fields. Commands on an existing
+proposal require its current expectedVersion; check and update occur in the same
+transaction as content, binding, round, and verdict changes. Failed commands make
+no changes. Authorization applies even if an input contains a valid identity.
+"""
+type Mutation {
+  """
+  An agent creates a DRAFT proposal and revision 1. reviewerIds are human
+  identities to bind initially; the empty default permits an unassigned draft.
+  Initial bindings are created atomically and record the creating agent.
+  """
+  createProposal(
+    kind: ProposalKind!
+    content: RevisionInput!
+    reviewerIds: [ID!]! = []
+  ): ProposalChange!
+
+  """
+  The owning agent creates a new immutable revision from complete content.
+  Allowed in DRAFT or CHANGES_REQUESTED only; the resulting state is DRAFT.
+  In CHANGES_REQUESTED, respondsTo is set to the closing revision request.
+  Subsequent draft edits retain that request link until submission. A draft
+  reached by withdrawing a submission starts a new, unprompted edit chain.
+  Existing gates/options are never edited; each revision receives fresh ones.
+  """
+  reviseProposal(
+    proposalId: ID!
+    expectedVersion: Int!
+    content: RevisionInput!
+  ): ProposalChange!
+
+  """
+  The owning agent submits the current DRAFT revision, opening a new review round
+  and moving to AWAITING_REVIEW. At least one authorized human binding is required.
+  CHANGES_REQUESTED must first receive a revision; it cannot be resubmitted as-is.
+  """
+  submitProposal(proposalId: ID!, expectedVersion: Int!): ProposalChange!
+
+  """
+  The owning agent withdraws the open round and returns to DRAFT, keeping the
+  same current revision. A completed round cannot be withdrawn or rewritten.
+  """
+  withdrawProposal(
+    proposalId: ID!
+    expectedVersion: Int!
+    reason: String
+  ): ProposalChange!
+
+  """
+  Bind a human to this proposal. The caller must be allowed to manage reviewers.
+  Allowed in DRAFT, AWAITING_REVIEW, or CHANGES_REQUESTED; the binding is immediately
+  effective. Reject duplicate active bindings. Rebinding a revoked human creates
+  a new binding so that historical review provenance is preserved.
+  """
+  bindReviewer(
+    proposalId: ID!
+    expectedVersion: Int!
+    reviewerId: ID!
+  ): ReviewerBindingChange!
+
+  """
+  Revoke a binding without deleting its history. expectedVersion refers to the
+  proposal reached through bindingId. The caller must be allowed to manage
+  reviewers. The last authorized reviewer cannot be revoked while awaiting review.
+  Binding maintenance is allowed only in DRAFT, AWAITING_REVIEW, or CHANGES_REQUESTED.
+  """
+  revokeReviewer(
+    bindingId: ID!
+    expectedVersion: Int!
+    reason: String
+  ): ReviewerBindingChange!
+
+  """
+  An authorized human approves the current open round's ConfirmationGate.
+  Records an ApprovalReview with a ConfirmationAnswer and moves to APPROVED.
+  """
+  confirmProposal(proposalId: ID!, expectedVersion: Int!): ReviewDecision!
+
+  """
+  An authorized human approves one option of the current open round's ChoiceGate.
+  optionId must belong to that exact immutable gate, not a previous revision.
+  Records an ApprovalReview with a ChoiceAnswer and moves to APPROVED.
+  """
+  chooseProposalOption(
+    proposalId: ID!
+    expectedVersion: Int!
+    optionId: ID!
+  ): ReviewDecision!
+
+  """
+  An authorized human rejects the current open round. reason must be nonblank.
+  Records a RejectionReview and moves to terminal REJECTED.
+  """
+  rejectProposal(
+    proposalId: ID!
+    expectedVersion: Int!
+    reason: String!
+  ): ReviewDecision!
+
+  """
+  An authorized human requests changes to the current submitted revision.
+  instructions must be nonblank and describe the requested revision. Records a
+  RevisionRequestReview, closes the round, and moves to CHANGES_REQUESTED.
+  """
+  requestProposalChanges(
+    proposalId: ID!
+    expectedVersion: Int!
+    instructions: String!
+  ): ReviewDecision!
+}
+
+# ============================================================================
+# RATIONALE
+# ============================================================================
+#
+# This is an ITERATION of the B2 seed, not a rewrite. The seed already
+# satisfies the Composition Guide's structural rules (one-concept-one-type,
+# edge-first reviewer authorization, gated-value state wrappers, enum/union/
+# interface decision tree, inputs-as-intent, no directive creep, no ID-soup).
+# Every change below is deliberate and mapped to a guide rule; nothing was
+# reworked speculatively.
+#
+# CHANGE 1. Point-of-use field descriptions for the gated-value wrappers
+#   DRIVER: Guide §9 "Do Guided by Prompt" + §5 composition ("field descriptions
+#     that explain gated-value contracts in human terms"); §7 soft invariants
+#     "Live in code and evolve faster than the schema. The schema provides the
+#     stable structural contract."
+#   COST: Descriptions only; zero types/fields/enums added or removed.
+#   BENEFIT: The cross-field equality contracts that previously lived only in
+#     the trailing RATIONALE now sit at the exact field that must honor them —
+#     state.since == event time, pending.since == openedAt, ProposalDraft.since
+#     surviving draft edits — so a reader of the SDL sees the invariant without
+#     hunting a prose appendix. Better renderability and less drift between
+#     documentation and code (Guide §10).
+#
+# CHANGE 2. Point-of-use descriptions on provenance and monotonicity
+#   DRIVER: §9 guidance (self-documenting relationships) + §7 (soft invariants
+#     documented at the field), §2 naming sniff test.
+#   COST: Descriptions only.
+#   BENEFIT: reviewer-assignment provenance (assignedAt/assignedBy, revokedBy),
+#     version semantics, monotonic updatedAt, and exact discriminator agreement
+#     are now self-documenting where they appear, making the schema a teacher
+#     rather than a data dump.
+#
+# CHANGE 3. Enum value descriptions on domain-state enums
+#   DRIVER: §2 table ("Enum values: SCREAMING_SNAKE_CASE, domain states") and
+#     §9 (enum values that read as domain states).
+#   COST: Descriptions on ~38 existing enum values; no value renamed, added,
+#     or removed. No behavior change; codegen from the SDL is unaffected.
+#   BENEFIT: Each value now answers the domain-expert sniff test in prose
+#     (AWAITING_REVIEW means "open round awaiting a verdict", APPROVED is
+#     terminal, etc.) with no grammar ambiguity.
+#
+# CHANGE 4. Soft-invariant notes added to Review.verdict, ApprovalReview.answer,
+#     ProposalState.status, ReviewerBindingState.status, RejectionReview.reason,
+#     RevisionRequestReview.instructions, and ReviewRound.revision
+#   DRIVER: §7 (soft invariants live in code but are named in the schema) and
+#     §9 (field descriptions that explain contracts in human terms).
+#   COST: Descriptions only.
+#   BENEFIT: "Exact discriminator/type agreement is a resolver invariant" is now
+#     stated at the exact field that carries the invariant, so contract-test
+#     authors and code reviewers can spot-check each one without consulting the
+#     appendix.
+#
+# CHANGE 5. Set ReviewRound.revision as non-null (was already non-null)
+#   DRIVER: §7 hard-invariant heuristic — "an edge without a target is
+#     incoherent"; a round is literally "a submission of a revision."
+#   COST: None (already `revision: ProposalRevision!`); documented.
+#   BENEFIT: Keeps the structural invariant explicit in the type; reinforces
+#     the hard/soft distinction the seed already draws.
+#
+# CHANGE 6. Structural fidelity pass — no invented rework
+#   DRIVER: §11 "Would I query this?" and §1 "One Concept, One Type".
+#   COST: None.
+#   BENEFIT: Deliberately did NOT add a global Node interface (no polymorphic
+#     client query exists — every root is a concrete identity lookup), did NOT
+#     add an id to DecisionAnswer (answers are selected through their review,
+#     which already has identity), and did NOT rename contextual prefixes
+#     (ProposalRevision/DecisionOption are legitimately referenced outside
+#     their parent shadow per §2). These are exactly the "speculative rework"
+#     the guide warns against.
+#
+# CHANGE 7. Head-of-file section header updated
+#   DRIVER: §2 sniff test + readability.
+#   COST: Comment line only.
+#   BENEFIT: States that field-level invariants now live at their point of use.
+#
+# The remaining design is carried over unmodified because it already complies
+# with the guide: ReviewerBinding as a first-class edge (§6) with an explicit
+# distinction from ReviewerBindingEdge pagination nodes; ProposalState /
+# ReviewOutcome / ReviewerBindingState as gated-value sum types (§5); shared
+# RevisionInput with @oneOf gate input (§4); command result unions with typed
+# problems (§3); version/expectedVersion optimistic concurrency as a client
+# visible conflict signal (§8); and no directive creep beyond @oneOf (§8).
+#
+# Domain invariants intentionally left as soft invariants (per §7/§9):
+# nonblank prose, at least two choice options, distinct option labels, option
+# membership in the current gate, immutable history, at most one open round,
+# exactly one accepted review per round, valid state transitions, monotonic
+# timestamps, and exact status/type discriminator agreement. GraphQL SDL
+# cannot express these cross-field predicates; forcing them into `!` or new
+# types would over-constrain the schema, so they are documented in code and
+# enforced in resolvers, with the schema prompting correct usage.

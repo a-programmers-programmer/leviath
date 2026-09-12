@@ -41,6 +41,8 @@ pub(super) struct ToolStateParts<'a> {
     pub(super) stage_perms_by_index: Vec<HashMap<String, String>>,
     /// Per-stage required tools, indexed by stage.
     pub(super) stage_required_by_index: Vec<HashSet<String>>,
+    /// Per-stage `tool_accepts`, by canonical tool name, indexed by stage.
+    pub(super) stage_tool_accepts_by_index: Vec<HashMap<String, Vec<String>>>,
     /// Agent-wide tool policies from the blueprint.
     pub(super) agent_perms: HashMap<String, String>,
     /// The blueprint's name, for policy lookup and messages.
@@ -57,10 +59,22 @@ pub(super) struct ToolStateParts<'a> {
     pub(super) script_tool_names: HashSet<String>,
     /// The host those scripts call back into.
     pub(super) script_host: Arc<dyn leviath_scripting::ScriptHost>,
+    /// The parts handle that host reads, which the runtime's offers fill.
+    pub(super) offered_parts: Arc<std::sync::Mutex<Vec<leviath_core::mime::Part>>>,
     /// Re-resolution context, for a blueprint that rescans mid-run.
     pub(super) dynamic: Option<Arc<crate::daemon::tool_service::DynamicToolCtx>>,
-    /// Whether this run answers its own prompts (`--yolo`).
+    /// Whether this run answers its own prompts: `--yolo` under a profile
+    /// whose `questions` are `auto`.
     pub(super) unattended: bool,
+    /// The yolo profile this run decides tool calls under, if it is a yolo
+    /// run at all.
+    pub(super) yolo: Option<Arc<crate::yolo::YoloProfile>>,
+    /// The profile's name when `--yolo=<name>` named one, so a resume can read
+    /// it again. `None` for an attended run and for the bare flag.
+    pub(super) yolo_profile: Option<String>,
+    /// The files this run may not change, shared with the seeds that ran
+    /// before the tool lane existed.
+    pub(super) protected: Vec<crate::tools::ProtectedPath>,
     /// `[safe_commands]` the blueprint declares, if the user opted in.
     pub(super) blueprint_safe: Option<&'a leviath_core::blueprint::SafeCommandsConfig>,
     /// `[read_paths]` the blueprint declares, if any.
@@ -77,6 +91,11 @@ pub(super) fn build_tool_state(parts: ToolStateParts<'_>) -> Arc<AgentToolState>
         .unwrap_or_default();
     let entry_required = parts
         .stage_required_by_index
+        .get(parts.entry_index)
+        .cloned()
+        .unwrap_or_default();
+    let entry_limits = parts
+        .stage_tool_accepts_by_index
         .get(parts.entry_index)
         .cloned()
         .unwrap_or_default();
@@ -102,6 +121,8 @@ pub(super) fn build_tool_state(parts: ToolStateParts<'_>) -> Arc<AgentToolState>
         stage_perms_by_index: Arc::new(parts.stage_perms_by_index),
         stage_required: Arc::new(StdMutex::new(entry_required)),
         stage_required_by_index: Arc::new(parts.stage_required_by_index),
+        stage_tool_accepts: Arc::new(StdMutex::new(entry_limits)),
+        stage_tool_accepts_by_index: Arc::new(parts.stage_tool_accepts_by_index),
         agent_perms: Arc::new(parts.agent_perms),
         blueprint_may_loosen: Arc::new(std::sync::atomic::AtomicBool::new(
             parts.config.security.allow_blueprint_permissions,
@@ -115,12 +136,15 @@ pub(super) fn build_tool_state(parts: ToolStateParts<'_>) -> Arc<AgentToolState>
         ),
         interaction: parts.hub.backend_for(parts.run_id),
         unattended: parts.unattended,
+        yolo: crate::daemon::tool_service::Live::new(parts.yolo),
+        protected: crate::daemon::tool_service::Live::new(parts.protected),
         stage_name: Arc::new(StdMutex::new(parts.entry_stage.to_string())),
         subagent: parts.subagent,
         sandbox: parts.sandbox,
         script_tools: Arc::new(StdMutex::new(parts.script_tools)),
         script_tool_names: Arc::new(StdMutex::new(parts.script_tool_names)),
         script_host: parts.script_host,
+        offered_parts: parts.offered_parts,
         dynamic: parts.dynamic,
         // Everything a resume needs to redo this resolution against the config
         // as it stands then, rather than the copy this spawn read.
@@ -129,6 +153,7 @@ pub(super) fn build_tool_state(parts: ToolStateParts<'_>) -> Arc<AgentToolState>
             blueprint_safe: parts.blueprint_safe.cloned(),
             blueprint_read_paths: parts.blueprint_read_paths.cloned(),
             workdir: parts.workdir,
+            yolo_profile: parts.yolo_profile,
         }),
     })
 }

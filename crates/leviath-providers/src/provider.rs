@@ -379,10 +379,14 @@ pub struct ModelInfo {
     /// Whether this entry came from the provider's own listing rather than a
     /// table compiled into this build.
     pub learned: bool,
+
+    /// What mime the model takes and can hand back. See [`Provider::mime`].
+    pub mime: crate::capabilities::ModelMime,
 }
 
 impl ModelInfo {
-    /// An entry from a compiled table: nothing learned, nothing dated.
+    /// An entry from a compiled table: nothing learned, nothing dated, text
+    /// in and text out until [`Self::with_mime`] says otherwise.
     pub fn new(
         id: impl Into<String>,
         provider: impl Into<String>,
@@ -397,7 +401,14 @@ impl ModelInfo {
             retires: None,
             pricing: None,
             learned: false,
+            mime: crate::capabilities::ModelMime::text_only(),
         }
+    }
+
+    /// The same entry, with what the model takes and produces filled in.
+    pub fn with_mime(mut self, mime: crate::capabilities::ModelMime) -> Self {
+        self.mime = mime;
+        self
     }
 
     /// This entry with a display name.
@@ -451,6 +462,14 @@ impl From<String> for MessageContent {
 impl From<&str> for MessageContent {
     fn from(s: &str) -> Self {
         MessageContent::Text(s.to_string())
+    }
+}
+
+impl From<leviath_core::region::EntryContent> for MessageContent {
+    /// The text an entry reads as. Assembly turns an entry's stored parts
+    /// into mime blocks itself; this is the plain-text path.
+    fn from(c: leviath_core::region::EntryContent) -> Self {
+        MessageContent::Text(c.into_string())
     }
 }
 
@@ -521,6 +540,57 @@ pub enum ContentBlock {
         /// Whether the tool refused or failed.
         is_error: bool,
     },
+    /// A stored mime part: an image, a clip, a document, anything that is
+    /// not text.
+    ///
+    /// The neutral form. Assembly emits one per stored part with `data` empty;
+    /// hydration (`crate::mime::hydrate_request`) fills `data` with the base64
+    /// bytes when the model takes the type, or turns the block into text. A
+    /// built-in provider encodes a hydrated block into its own shape (an
+    /// Anthropic `image` block, an OpenAI `image_url` part); a block that
+    /// reaches a provider with `data` still empty is sent as its stand-in
+    /// text, so no lane has to hydrate to stay correct. A Rhai provider sees
+    /// this form as it is.
+    #[serde(rename = "mime")]
+    Mime {
+        /// What the part is: hash, type, size, dimensions, the stand-in text.
+        part: leviath_core::mime::BlobRef,
+        /// The bytes, base64, once hydrated. Empty until then.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        data: String,
+        /// The part's name, when it has one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        /// The part's delivery override, when it has one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        deliver: Option<leviath_core::mime::Delivery>,
+    },
+}
+
+impl ContentBlock {
+    /// A mime block for `part`, unhydrated.
+    pub fn mime(part: &leviath_core::mime::Part) -> Option<Self> {
+        let blob = part.blob()?;
+        Some(ContentBlock::Mime {
+            part: blob.clone(),
+            data: String::new(),
+            name: part.name.clone(),
+            deliver: part.deliver,
+        })
+    }
+
+    /// The stand-in text of a mime block, or `None` for any other block.
+    pub fn stand_in(&self) -> Option<&str> {
+        match self {
+            ContentBlock::Mime { part, .. } => Some(part.stand_in.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Whether this is a mime block carrying its bytes.
+    pub fn is_hydrated_mime(&self) -> bool {
+        matches!(self, ContentBlock::Mime { data, .. } if !data.is_empty())
+    }
 }
 
 /// A system prompt block, separated from conversation messages.
@@ -670,6 +740,13 @@ pub struct InferenceResponse {
     /// that produced it, never by another.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
+
+    /// Mime the model produced beside its text: an image from a model that
+    /// draws, audio from one that speaks. Bytes, not references, because the
+    /// provider has no store; the runtime stores them on the assistant turn.
+    /// Never serialised: a journal carries the stored reference instead.
+    #[serde(skip)]
+    pub parts: Vec<leviath_core::mime::Blob>,
 }
 
 // `TokenUsage` lives in `crate::pricing` alongside the rates it is priced
@@ -745,6 +822,9 @@ pub struct StreamChunk {
     /// See [`InferenceResponse::reasoning`]. Arrives on whichever chunk
     /// carries the provider's reasoning item, not necessarily the last.
     pub reasoning: Option<String>,
+
+    /// See [`InferenceResponse::parts`]: mime this chunk carried whole.
+    pub parts: Vec<leviath_core::mime::Blob>,
 }
 
 /// A partial tool call update from streaming.
@@ -829,6 +909,7 @@ pub trait Provider: Send + Sync {
             tokens: Some(response.tokens_used),
             finish_reason: Some(response.finish_reason),
             reasoning: None,
+            parts: Vec::new(),
         };
         Ok(Box::pin(stream_once::once(Ok(chunk))))
     }
@@ -852,6 +933,18 @@ pub trait Provider: Send + Sync {
 
     /// Get the capabilities of the given model.
     fn capabilities(&self, model: &str) -> ModelCapabilities;
+
+    /// What mime `model` takes and can hand back, as mime type patterns.
+    ///
+    /// Answered the way [`Self::capabilities`] is: the compiled table, then
+    /// the provider's own listing, then the operator's `[model_capabilities]`
+    /// row. A provider that knows nothing about mime answers text only,
+    /// which is the default here, so a stored part sent its way arrives as
+    /// text or as its stand-in rather than as bytes it would reject.
+    fn mime(&self, model: &str) -> crate::capabilities::ModelMime {
+        let _ = model;
+        crate::capabilities::ModelMime::text_only()
+    }
 
     /// Learn what this provider's own API says about its models, before any
     /// inference asks.
@@ -2015,6 +2108,7 @@ mod tests {
                 },
                 finish_reason: FinishReason::Complete,
                 reasoning: None,
+                parts: Vec::new(),
             })
         }
 

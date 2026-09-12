@@ -1,0 +1,100 @@
+MERGE DECISIONS (label=L1) — A is the base; result must be a SUPERSET of A and B.
+A-only types (Node, PageConnection, PageEdge, ProposalNotFound, ProposalResource) and
+B-only types (ResourceKind, ResourceNotFound) are not divergent; no TYPE block needed.
+No renames detected: no RENAME blocks.
+
+TYPE Agent: reconcile
+REASON: B only drops the Node interface and adds no field, so nothing is discarded by keeping it — A's base already covers both sides.
+FIELDS: implements Node (retained from A's base; B contributes no field)
+
+TYPE ApprovalReview: reconcile
+REASON: Both sides' reviewer relationships must survive — keep A's `reviewer` and add B's `reviewerBinding`, plus A's Node implementation; B's binding shape is kept as the normalized edge to ReviewerBinding.
+FIELDS: reviewer (A retained), reviewerBinding, implements Node
+
+TYPE ChoiceGate: reconcile
+REASON: B only drops the Node interface and adds no field; A's base is already the superset.
+FIELDS: implements Node (retained from A's base; B contributes no field)
+
+TYPE ConfirmationGate: reconcile
+REASON: B only drops the Node interface and adds no field; A's base is already the superset.
+FIELDS: implements Node (retained from A's base; B contributes no field)
+
+TYPE DecisionOption: reconcile
+REASON: B only drops the Node interface and adds no field; A's base is already the superset.
+FIELDS: implements Node (retained from A's base; B contributes no field)
+
+TYPE Human: reconcile
+REASON: B only drops the Node interface and adds no field; A's base is already the superset.
+FIELDS: implements Node (retained from A's base; B contributes no field)
+
+TYPE Proposal: reconcile
+REASON: B only drops the Node interface and adds no field; A's base is already the superset.
+FIELDS: implements Node (retained from A's base; B contributes no field)
+
+TYPE ProposalChange: reconcile
+REASON: The two error variant sets are not mutually exclusive — carry B's generic ResourceNotFound member alongside A's ProposalNotFound so no error can be lost.
+FIELDS: ResourceNotFound (union member added; ProposalNotFound retained from A)
+
+TYPE ProposalConnection: reconcile
+REASON: B drops the relay PageConnection contract without supplying a replacement, so keeping A's interface loses no B field.
+FIELDS: implements PageConnection (retained from A's base; B contributes no field)
+
+TYPE ProposalEdge: reconcile
+REASON: B drops the relay PageEdge contract without supplying a replacement, so keeping A's interface loses no B field.
+FIELDS: implements PageEdge (retained from A's base; B contributes no field)
+
+TYPE ProposalRevision: reconcile
+REASON: Keep A's `revisionNumber` as canonical and add B's `number` (same concept, B's naming), and retain A's Node implementation — combining neither side's fields is dropped.
+FIELDS: number, implements Node
+
+TYPE ProposalRevisionConnection: reconcile
+REASON: B drops the relay PageConnection contract without a replacement; A's interface loses no B field.
+FIELDS: implements PageConnection (retained from A's base; B contributes no field)
+
+TYPE ProposalRevisionEdge: reconcile
+REASON: B drops the relay PageEdge contract without a replacement; A's interface loses no B field.
+FIELDS: implements PageEdge (retained from A's base; B contributes no field)
+
+TYPE RejectionReview: reconcile
+REASON: Keep A's `reviewer` and add B's `reviewerBinding` (normalized edge to ReviewerBinding), retaining A's Node implementation.
+FIELDS: reviewer (A retained), reviewerBinding, implements Node
+
+TYPE Review: reconcile
+REASON: Keep A's `reviewer` and add B's `reviewerBinding`; no interface conflict, so both relationship shapes survive.
+FIELDS: reviewer (A retained), reviewerBinding
+
+TYPE ReviewDecision: reconcile
+REASON: The error variant sets are not mutually exclusive — carry B's ResourceNotFound member alongside A's ProposalNotFound.
+FIELDS: ResourceNotFound (union member added; ProposalNotFound retained from A)
+
+TYPE ReviewRound: reconcile
+REASON: Keep A's `roundNumber` as canonical and add B's `number`, retaining A's Node implementation; nothing from either side is dropped.
+FIELDS: number, implements Node
+
+TYPE ReviewRoundConnection: reconcile
+REASON: B drops the relay PageConnection contract without a replacement; A's interface loses no B field.
+FIELDS: implements PageConnection (retained from A's base; B contributes no field)
+
+TYPE ReviewRoundEdge: reconcile
+REASON: B drops the relay PageEdge contract without a replacement; A's interface loses no B field.
+FIELDS: implements PageEdge (retained from A's base; B contributes no field)
+
+TYPE ReviewerBinding: reconcile
+REASON: B only drops the Node interface and adds no field; A's base is already the superset.
+FIELDS: implements Node (retained from A's base; B contributes no field)
+
+TYPE ReviewerBindingChange: reconcile
+REASON: The error variant sets are not mutually exclusive — carry B's ResourceNotFound member alongside A's ProposalNotFound.
+FIELDS: ResourceNotFound (union member added; ProposalNotFound retained from A)
+
+TYPE ReviewerBindingConnection: reconcile
+REASON: B drops the relay PageConnection contract without a replacement; A's interface loses no B field.
+FIELDS: implements PageConnection (retained from A's base; B contributes no field)
+
+TYPE ReviewerBindingEdge: reconcile
+REASON: B drops the relay PageEdge contract without a replacement; A's interface loses no B field.
+FIELDS: implements PageEdge (retained from A's base; B contributes no field)
+
+TYPE RevisionRequestReview: reconcile
+REASON: Keep A's `reviewer` and add B's `reviewerBinding` (normalized edge to ReviewerBinding), retaining A's Node implementation.
+FIELDS: reviewer (A retained), reviewerBinding, implements Node
