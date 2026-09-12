@@ -2184,6 +2184,10 @@ async fn list_runs_merges_the_daemons_view_with_the_records_on_disk() {
         started_at: Some(started_at),
         active: None,
         unattended: true,
+        // `--yolo=<name>` profile. Upstream added this field and the sync merge
+        // dropped it from this test fixture. The fixture is an unattended run
+        // with no named profile.
+        yolo_profile: None,
         empty_output: false,
         splits_degraded: 0,
         broken_scripts: vec![],

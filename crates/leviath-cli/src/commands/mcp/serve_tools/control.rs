@@ -136,6 +136,10 @@ pub(crate) async fn message(shared: &Shared, args: &Args) -> CallOutcome {
         agent_id: run_id.clone(),
         content,
         target_region,
+        // Upstream added mime parts to a control message. A message sent through
+        // this MCP tool is plain text with no attachments, so it carries none.
+        // Dropped by the upstream sync merge; restored here.
+        parts: Vec::new(),
     };
     match shared.control.request(&request).await {
         Ok(ControlResponse::Ok { ok: true }) => ok(
@@ -181,6 +185,11 @@ pub(crate) fn build_interaction_response(
         approved,
         scope,
         feedback,
+        // Upstream added mime parts to an interaction answer. This MCP tool
+        // answers an interaction with a value, a choice, an approval or
+        // feedback, never with attached mime. Dropped by the upstream sync
+        // merge; restored here.
+        parts: Vec::new(),
     };
     if response.value.is_none()
         && response.choice_index.is_none()

@@ -1567,7 +1567,13 @@ system = { kind = "pinned", max_tokens = 1000 }
         let (mut world, cli) = world_with(&["openrouter"]);
         let config = Config {
             default_provider: "openrouter".to_string(),
-            default_model: Some("deepseek/deepseek-v4-pro".to_string()),
+            // Upstream renamed `Config::default_model` to `Config::override_model`
+            // ("one model every stage that allows a user default starts on").
+            // Same field, same role in `model_defaults`; the sync merge kept the
+            // old name in this fork-only test. The rename is the whole fix and
+            // the assertion below is unchanged, because a pinned stage does not
+            // allow a user default, so the override cannot displace it.
+            override_model: Some("deepseek/deepseek-v4-pro".to_string()),
             ..Config::default()
         };
         let entity = build_agent(
@@ -1611,7 +1617,8 @@ system = { kind = "pinned", max_tokens = 1000 }
         let (mut world, cli) = world_with(&["anthropic"]);
         let config = Config {
             default_provider: "anthropic".to_string(),
-            default_model: Some("claude-sonnet-5".to_string()),
+            // Same rename as above: `default_model` is now `override_model`.
+            override_model: Some("claude-sonnet-5".to_string()),
             ..Config::default()
         };
         let err = build_agent(

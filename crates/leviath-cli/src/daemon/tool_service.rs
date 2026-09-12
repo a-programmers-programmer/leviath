@@ -1792,6 +1792,10 @@ mod tests {
                 scan_dirs: vec![scan_dir],
                 reserved_names: HashSet::new(),
                 static_defs,
+                // Which MCP server owns each MCP def. Upstream added this field
+                // and the sync merge dropped it from this fixture. These tests
+                // build no MCP tools, so nothing owns anything here.
+                mcp_owners: leviath_runtime::pipeline::ToolOwners::new(),
                 stage_available,
                 stage_required,
                 stage_global: Vec::new(),
@@ -1814,6 +1818,10 @@ mod tests {
             scan_dirs,
             reserved_names: HashSet::new(),
             static_defs: vec![tool_def("read_file")],
+            // Which MCP server owns each MCP def. Upstream added this field and
+            // the sync merge dropped it from this fixture. This test builds one
+            // static def and no MCP tools, so nothing owns anything here.
+            mcp_owners: leviath_runtime::pipeline::ToolOwners::new(),
             stage_available: vec![vec!["read_file".to_string()]; stage_global.len()],
             stage_required: Vec::new(),
             stage_global,
