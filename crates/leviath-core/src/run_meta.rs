@@ -527,6 +527,13 @@ pub struct RunMeta {
     /// to attended, so nothing is escalated retroactively.
     #[serde(default)]
     pub yolo: bool,
+    /// The named yolo profile (`--yolo=<name>`) the run was launched under,
+    /// persisted with `yolo` for the same reason: a restart that dropped the
+    /// name would resume a carefully scoped run under bare `--yolo`, which is
+    /// the escalating direction. Absent for the bare flag and for runs written
+    /// before profiles existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yolo_profile: Option<String>,
     /// How much of the blueprint's `[read_paths]` the config granted, as
     /// resolved at spawn. `None` for a blueprint that declared none, and for
     /// runs written before this field existed.
@@ -746,6 +753,22 @@ impl RunFlags {
             self.modified_files.push(path.to_string());
         }
     }
+
+    /// Note a path that changed on disk without a modifying tool naming it -
+    /// a file a `shell` command created or rewrote, found by scanning the
+    /// working directory. It joins the list (deduped, capped) but does not
+    /// touch `modified_file_count`, which counts modifying *tool calls*: a
+    /// shell call is not one, and a scan that ran twice must not double-count
+    /// the same file. Returns whether the path was newly added.
+    pub fn note_modified_path(&mut self, path: &str) -> bool {
+        if self.modified_files.len() >= MAX_TRACKED_MODIFIED_FILES
+            || self.modified_files.iter().any(|p| p == path)
+        {
+            return false;
+        }
+        self.modified_files.push(path.to_string());
+        true
+    }
 }
 
 impl RunMeta {
@@ -828,6 +851,7 @@ impl RunMeta {
             model_override: None,
             flags: RunFlags::default(),
             yolo: false,
+            yolo_profile: None,
             read_paths: None,
         }
     }
@@ -883,8 +907,9 @@ impl RunMeta {
 /// One content entry within a region, captured at snapshot time.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RegionEntrySnapshot {
-    /// The entry's text, exactly as it sat in the live region.
-    pub content: String,
+    /// The entry's parts, exactly as they sat in the live region. Reads as
+    /// text; a plain string in an older snapshot loads as one text part.
+    pub content: crate::region::EntryContent,
     /// The entry's token cost as counted when it was added, carried through the
     /// snapshot so a reload does not have to re-tokenize to rebuild budgets.
     pub tokens: usize,
@@ -1596,7 +1621,7 @@ mod tests {
                 current_tokens: 10,
                 max_tokens: 50,
                 entries: vec![RegionEntrySnapshot {
-                    content: "hi".to_string(),
+                    content: "hi".into(),
                     tokens: 1,
                     kind: crate::region::EntryKind::UserMessage,
                     metadata: Some(serde_json::json!({"a": 1})),
@@ -1656,6 +1681,29 @@ mod tests {
         }
         assert_eq!(flags.modified_files.len(), MAX_TRACKED_MODIFIED_FILES);
         assert_eq!(flags.modified_file_count, 3 + MAX_TRACKED_MODIFIED_FILES);
+    }
+
+    #[test]
+    fn note_modified_path_joins_the_list_without_touching_the_call_count() {
+        let mut flags = RunFlags::default();
+        // A modifying tool call: counts and lists.
+        flags.record_modification("plot_chart.py");
+        // A shell creation, noted from a workdir scan: lists, but is not a
+        // modifying tool call, so the count stays 1 - and a second scan that
+        // finds it again neither re-adds nor re-counts.
+        assert!(flags.note_modified_path("chart.png"));
+        assert!(!flags.note_modified_path("chart.png"));
+        assert_eq!(flags.modified_file_count, 1);
+        assert_eq!(flags.modified_files, vec!["plot_chart.py", "chart.png"]);
+
+        // Past the cap it stops adding and says so.
+        let mut full = RunFlags::default();
+        for i in 0..MAX_TRACKED_MODIFIED_FILES {
+            assert!(full.note_modified_path(&format!("f{i}.png")));
+        }
+        assert!(!full.note_modified_path("one-too-many.png"));
+        assert_eq!(full.modified_files.len(), MAX_TRACKED_MODIFIED_FILES);
+        assert_eq!(full.modified_file_count, 0);
     }
 
     #[test]

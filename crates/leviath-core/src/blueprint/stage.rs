@@ -7,7 +7,7 @@
 //! it configures rather than in a flat bag on `Stage`.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::error::ValidationError;
 use crate::layout::ContextLayout;
@@ -483,7 +483,12 @@ pub struct Stage {
     /// Model to use for this stage
     pub model: ModelConfig,
 
-    /// Which tools are available in this stage
+    /// Which tools are available in this stage.
+    ///
+    /// Tool names, exact-match and alias-aware, plus any number of group
+    /// tokens (`@all`, `@builtin`, `@subagent`, `@scripts`, `@mcp`) that each
+    /// stand for a whole source and resolve at spawn against what the install
+    /// has then. See [`ToolGroup`](super::ToolGroup).
     pub available_tools: Vec<String>,
 
     /// Human-in-the-loop tools (`ask_user_*`, `present_for_review`,
@@ -499,28 +504,32 @@ pub struct Stage {
     /// Entries must also appear in `available_tools` - listing a tool the stage
     /// can't call in the first place is a validation error, not a silent no-op.
     /// Matched verbatim against `available_tools` (this crate has no alias
-    /// table), so write the name the same way in both.
+    /// table), so write the name the same way in both. A stage that grants a
+    /// group (`@builtin`, `@all`, ...) may require any tool the group could
+    /// cover; which tools those are is only known at spawn, so this crate
+    /// takes the author's word for it and the lint checks the name.
     #[serde(default)]
     pub required_tools: Vec<String>,
 
     /// MCP servers whose whole tool set this stage may use.
     ///
-    /// `available_tools` is an exact-match list, which makes a server's tools
-    /// the author's problem to enumerate - and a server's tool list is not the
-    /// author's to know. It is whatever that server advertises today. A tool
-    /// added to the server later is simply never offered, with nothing said,
-    /// so the stage quietly cannot do a thing its author believed it could.
+    /// A server's tool list is not the author's to know. It is whatever that
+    /// server advertises today; a tool added to the server later is simply
+    /// never offered, with nothing said, so a stage that enumerated the tools
+    /// quietly cannot do a thing its author believed it could.
     ///
     /// Naming the server instead defers the question to spawn, when the answer
     /// is known. Resolved against what the server actually advertises then,
     /// and merged with whatever `available_tools` names, so the two can be
     /// mixed freely.
     ///
-    /// Kept separate from `available_tools` rather than spelled as a wildcard
-    /// in it, for two reasons. That field's contract is exact-match and every
-    /// consumer reads it that way; and the advertised name of an MCP tool does
-    /// not reliably carry its server, so there is no prefix a wildcard could
-    /// match on (see `unique_advertised_name` in `leviath-mcp`).
+    /// This is the per-server form. `@mcp` in `available_tools` is the
+    /// every-server form; a connector grant is the one to reach for when a
+    /// stage should see one server's tools and not another's. Kept as a
+    /// separate field rather than a `github__*` pattern because the advertised
+    /// name of an MCP tool does not reliably carry its server (a server named
+    /// `my.tools` sanitizes to `my_tools`, and a collision appends `_2`), so
+    /// matching the string is a guess where naming the server is a fact.
     #[serde(default)]
     pub available_connectors: Vec<String>,
 
@@ -551,6 +560,17 @@ pub struct Stage {
     /// read, without re-declaring the whole layout for that stage.
     #[serde(default)]
     pub context_hide: Vec<String>,
+
+    /// Regions emptied when this stage is entered
+    /// (`[stages.<name>.context] reset = ["conversation"]`). Unlike
+    /// [`Self::context_hide`], which only stops a region being shown here, this
+    /// clears it, so the stage starts with a clean slate where a previous
+    /// stage's turns would otherwise carry forward - an image-describe stage
+    /// reading its picture from a region of its own, say, with none of the
+    /// drawing stage's scaffolding in the conversation. The content is gone,
+    /// not hidden, so a re-entered stage clears it again each visit.
+    #[serde(default)]
+    pub context_reset: Vec<String>,
 
     /// Custom configuration for this stage
     pub config: HashMap<String, serde_json::Value>,
@@ -675,6 +695,21 @@ pub struct Stage {
     #[serde(default)]
     pub tool_result_routing: Option<ToolResultRouting>,
 
+    /// Where the model's produced parts go, by mime type
+    /// (`[stages.<name>.output_routing]`: `"image/*" = "artwork"`). Keys are
+    /// mime patterns (`image/png`, `image/*`, `*/*`), values are region names.
+    ///
+    /// A reply that carries more than text is split part by part: each part
+    /// (an image the model drew, a `submit_output` artifact) whose mime type
+    /// matches goes to the region of the *most specific* matching pattern
+    /// (`image/png` beats `image/*` beats `*/*`), and text and any unmatched
+    /// part stay in `conversation` as before. The whole point is to hand a
+    /// produced file to a *later* stage or to the user, so unlike
+    /// [`Self::tool_result_routing`] the target need not be a region this
+    /// stage reads back - only one some layout in the blueprint declares.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub output_routing: BTreeMap<String, String>,
+
     /// What shape this stage's final output should take, narrowing the
     /// agent-level `[agent.output]`. Whoever starts the run overrides both.
     ///
@@ -683,6 +718,30 @@ pub struct Stage {
     /// when the stage must not finish without submitting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<crate::output::OutputSpec>,
+
+    /// Mime type patterns this stage takes as parts, when the regions it
+    /// sees do not already say (`[stages.<name>.input] accepts`). Empty means
+    /// "whatever the visible regions accept"; see
+    /// [`Blueprint::stage_inputs`](crate::Blueprint::stage_inputs).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input_accepts: Vec<String>,
+
+    /// Mime type patterns whose parts reach this stage's model as text,
+    /// whatever the model takes (`[stages.<name>.input] as_text`): the text
+    /// bypass, forced. For a type the registry already calls text this
+    /// changes nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input_as_text: Vec<String>,
+
+    /// What each tool may be handed at this stage, as mime type patterns
+    /// (`[stages.<name>.tool_accepts]`: `spawn_agent = ["image/*"]`). A
+    /// stored part outside a tool's list is out of that tool's reach here:
+    /// `spawn_agent`'s `parts`, a script's `read_part` and `list_parts`, and
+    /// `context_export` see only what the list allows. A tool absent from
+    /// the table has no limit beyond what it takes itself, and inline text
+    /// is never hidden by one.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tool_accepts: BTreeMap<String, Vec<String>>,
 
     /// Whether this stage must call `submit_output` before it transitions.
     ///
@@ -703,6 +762,17 @@ pub struct Stage {
     pub hooks: StageHooks,
 }
 
+/// How specific a mime routing pattern is, so the most specific match wins:
+/// an exact `type/subtype` (2) beats a family `type/*` (1) beats the catch-all
+/// `*/*` (0). Mirrors the resolution order the mime registry itself uses.
+fn mime_pattern_specificity(pattern: &str) -> u8 {
+    match pattern {
+        "*/*" => 0,
+        p if p.ends_with("/*") => 1,
+        _ => 2,
+    }
+}
+
 impl Stage {
     /// Create a new stage with the specified configuration.
     pub fn new(name: String, model: ModelConfig) -> Self {
@@ -718,6 +788,7 @@ impl Stage {
             mode: StageMode::Autonomous,
             context_layout: None,
             context_hide: Vec::new(),
+            context_reset: Vec::new(),
             config: HashMap::new(),
             tool_permissions: HashMap::new(),
             requires_children: false,
@@ -736,10 +807,28 @@ impl Stage {
             nudge: None,
             sandbox: None,
             tool_result_routing: None,
+            output_routing: BTreeMap::new(),
             output: None,
+            input_accepts: Vec::new(),
+            input_as_text: Vec::new(),
+            tool_accepts: BTreeMap::new(),
             require_output: false,
             hooks: StageHooks::default(),
         }
+    }
+
+    /// The region a produced part of `mime_type` routes to under
+    /// [`Self::output_routing`], or `None` to leave it in `conversation`.
+    ///
+    /// The most specific matching pattern wins, so a table with both
+    /// `image/png` and `image/*` sends a PNG to the first and every other
+    /// image to the second, whatever order they appear in.
+    pub fn route_for_mime(&self, mime_type: &crate::mime::MimeType) -> Option<&str> {
+        self.output_routing
+            .iter()
+            .filter(|(pattern, _)| mime_type.matches(pattern))
+            .max_by_key(|(pattern, _)| mime_pattern_specificity(pattern))
+            .map(|(_, region)| region.as_str())
     }
 
     /// Add tools to this stage.
@@ -766,6 +855,39 @@ impl Stage {
         self
     }
 
+    /// The groups this stage's `available_tools` names, in list order.
+    pub fn tool_groups(&self) -> Vec<ToolGroup> {
+        super::groups_in(&self.available_tools)
+    }
+
+    /// Whether `available_tools` grants `group` outright, or through `@all`.
+    pub fn grants_group(&self, group: ToolGroup) -> bool {
+        self.tool_groups().iter().any(|g| g.covers(group))
+    }
+
+    /// Whether every built-in tool is granted, by `@builtin` or `@all`.
+    ///
+    /// The question every reader of `available_tools` that looks for one
+    /// particular built-in (`context_write`, `edit_file`, `shell`) has to
+    /// ask first, because with a group in the list the name is not there and
+    /// the tool is.
+    pub fn grants_all_builtins(&self) -> bool {
+        self.grants_group(ToolGroup::Builtin)
+    }
+
+    /// The entries of `available_tools` that name a tool rather than a group.
+    pub fn named_tools(&self) -> impl Iterator<Item = &String> {
+        self.available_tools
+            .iter()
+            .filter(|t| !super::is_tool_group_token(t))
+    }
+
+    /// The mime type patterns `tool` may be handed at this stage, when the
+    /// stage limits it; `None` when it does not.
+    pub fn tool_limit(&self, tool: &str) -> Option<&[String]> {
+        self.tool_accepts.get(tool).map(Vec::as_slice)
+    }
+
     /// Validate that this stage is well-formed.
     pub(super) fn validate(&self) -> std::result::Result<(), ValidationError> {
         if self.name.is_empty() {
@@ -775,12 +897,36 @@ impl Stage {
             });
         }
 
+        // A group-shaped entry that names no group (`@builtins`, `@ALL`) can
+        // match nothing, ever - and unlike a misspelled tool name, which the
+        // lint reports against the install's inventory, this one is wrong on
+        // the manifest's own terms.
+        if let Some(entry) = self
+            .available_tools
+            .iter()
+            .find(|t| super::unknown_group(t))
+        {
+            return Err(ValidationError::Stage {
+                stage: self.name.clone(),
+                message: format!(
+                    "available_tools entry '{entry}' looks like a tool group but names none; \
+                     the groups are {}",
+                    super::group_tokens_list()
+                ),
+            });
+        }
+
         // A `required_tools` entry the stage can't call is dead text: it looks
         // like it keeps a tool through an unattended run, and keeps nothing.
         // Rejected rather than ignored so the typo surfaces at `lev validate`
         // instead of at 3am in a `--yolo` run.
+        //
+        // A group grant makes the membership question unanswerable here (which
+        // tools `@builtin` covers is the install's to say), so with one present
+        // the name is only checked by the lint, which can see the inventory.
+        let grants_a_group = !self.tool_groups().is_empty();
         for tool in &self.required_tools {
-            if !self.available_tools.contains(tool) {
+            if !grants_a_group && !self.available_tools.contains(tool) {
                 return Err(ValidationError::Stage {
                     stage: self.name.clone(),
                     message: format!(

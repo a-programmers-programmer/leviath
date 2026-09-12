@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 
 use leviath_core::blueprint::StageMode;
 use leviath_core::{Blueprint, EdgeTransform, TransitionCondition};
+use leviath_providers::capabilities::pattern_covers;
 
 /// A blueprint's stages and transitions, ready to lay out and draw.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +47,13 @@ pub(crate) struct StageNode {
     pub(crate) max_iterations: Option<usize>,
     pub(crate) max_revisits: Option<usize>,
     pub(crate) description: Option<String>,
+    /// Mime type patterns the stage takes as parts beyond text: its
+    /// `[input] accepts`, or the `accepts` of the regions it sees. A region
+    /// that takes anything (`*/*`) is no constraint and is left out.
+    pub(crate) inputs: Vec<String>,
+    /// The types of the files the stage declares it hands back
+    /// (`[[stages.<name>.output.artifacts]]`), in declaration order.
+    pub(crate) outputs: Vec<String>,
 }
 
 /// What a node stands for.
@@ -139,6 +147,10 @@ pub(crate) struct StageEdge {
     /// Points at an ancestor on the depth-first walk from the entry: a
     /// revisit loop. Only layout-shaping edges are classified.
     pub(crate) back_edge: bool,
+    /// Artifact types the leaving stage declares that no region of the
+    /// target takes: they cross this path as stand-ins at best. Text is
+    /// always taken and never listed.
+    pub(crate) unseen: Vec<String>,
 }
 
 /// The word for an edge transform.
@@ -183,6 +195,30 @@ impl StageEdge {
 }
 
 impl StageNode {
+    /// What a box is sized for: the id, or more when the badge row needs
+    /// it. A box is `hint + 10` cells wide and its badge row gets `hint + 7`
+    /// of them, so the loop, end and mime badges that never change are
+    /// counted here and a stage that takes or hands back files gets a box
+    /// that shows it.
+    pub(crate) fn width_hint(&self) -> usize {
+        let id = self.id.trim_start_matches("ext:").chars().count();
+        let mut badges: Vec<String> = Vec::new();
+        if self.self_loop {
+            badges.push("↺ loops".to_string());
+        }
+        if self.is_terminal || self.allow_complete {
+            badges.push("⏹ can end".to_string());
+        }
+        if !self.inputs.is_empty() {
+            badges.push(format!("◧ {}", self.inputs.join(" ")));
+        }
+        if !self.outputs.is_empty() {
+            badges.push(format!("▤ {}", self.outputs.join(" ")));
+        }
+        let row = badges.join(" · ").chars().count();
+        id.max(row.saturating_sub(7))
+    }
+
     /// The word the node shows for what it is.
     pub(crate) fn kind_label(&self) -> &'static str {
         match &self.kind {
@@ -224,6 +260,7 @@ impl StageGraph {
                             transform: "direct",
                             class: EdgeClass::Primary,
                             back_edge: false,
+                            unseen: Vec::new(),
                         });
                     }
                     i + 1 == names.len()
@@ -244,6 +281,7 @@ impl StageGraph {
                                 transform: transform_label(&edge.transform),
                                 class: EdgeClass::of(&edge.condition),
                                 back_edge: false,
+                                unseen: Vec::new(),
                             });
                         }
                     }
@@ -265,6 +303,7 @@ impl StageGraph {
                         transform: "direct",
                         class: EdgeClass::FanOut,
                         back_edge: false,
+                        unseen: Vec::new(),
                     };
                     let worker = if let Some(agent) = &config.worker_agent {
                         let id = external_id(agent);
@@ -279,6 +318,8 @@ impl StageGraph {
                                 max_iterations: None,
                                 max_revisits: None,
                                 description: Some(format!("worker blueprint {agent}")),
+                                inputs: Vec::new(),
+                                outputs: Vec::new(),
                             });
                         }
                         edges.push(fan_out_edge(id));
@@ -315,6 +356,16 @@ impl StageGraph {
                 max_iterations: stage.max_iterations,
                 max_revisits: stage.max_revisits,
                 description: stage.description.clone(),
+                inputs: blueprint
+                    .stage_inputs(stage)
+                    .into_iter()
+                    .filter(|p| p != "*/*")
+                    .collect(),
+                outputs: stage
+                    .output
+                    .as_ref()
+                    .map(|o| o.artifacts.iter().map(|a| a.mime_type.clone()).collect())
+                    .unwrap_or_default(),
             });
         }
         nodes.extend(externals);
@@ -339,6 +390,32 @@ impl StageGraph {
             .map(|(i, n)| (n.id.as_str(), i))
             .collect();
         edges.sort_by_key(|e| (order[e.from.as_str()], order[e.to.as_str()]));
+
+        // What each stage takes, `*/*` included: a region with no `accepts`
+        // takes anything, and that is what decides whether a file crosses.
+        let takes: HashMap<&str, Vec<String>> = blueprint
+            .stages
+            .iter()
+            .map(|s| (s.name.as_str(), blueprint.stage_inputs(s)))
+            .collect();
+        for edge in &mut edges {
+            if edge.class == EdgeClass::Escape {
+                continue;
+            }
+            let (Some(from), Some(to)) = (
+                nodes.iter().find(|n| n.id == edge.from),
+                takes.get(edge.to.as_str()),
+            ) else {
+                continue;
+            };
+            edge.unseen = from
+                .outputs
+                .iter()
+                .filter(|t| !t.starts_with("text/"))
+                .filter(|t| !to.iter().any(|have| pattern_covers(have, t)))
+                .cloned()
+                .collect();
+        }
 
         let mut graph = StageGraph {
             nodes,
@@ -443,6 +520,75 @@ mod tests {
             .iter()
             .find(|e| e.from == from && e.to == to)
             .expect(&missing)
+    }
+
+    /// What a stage takes and hands back rides on its node, and a path
+    /// whose file the next stage cannot take says so; an escape path and a
+    /// hand-off to a worker blueprint are never judged.
+    #[test]
+    fn mime_in_and_out_ride_on_the_nodes_and_mark_a_path_that_drops_a_file() {
+        let g = graph(
+            r#"
+[agent]
+name = "mime"
+[context.regions]
+brief = { kind = "pinned", seed = "task_input", accepts = ["text/*"] }
+shots = { kind = "pinned", accepts = ["image/*", "audio/wav"] }
+[stages.render]
+[[stages.render.output.artifacts]]
+name = "final"
+type = "video/mp4"
+[[stages.render.output.artifacts]]
+name = "notes"
+type = "text/markdown"
+[stages.render.transitions.check]
+condition = "llm_choice"
+[stages.render.transitions.publish]
+[stages.render.transitions.recover]
+condition = "error"
+[stages.check]
+[stages.check.context.regions]
+clips = { kind = "pinned", accepts = ["video/*"] }
+scratch = { kind = "temporary" }
+[stages.check.transitions.publish]
+[stages.publish]
+mode = "fan_out"
+worker_agent = "uploader"
+[stages.publish.transitions]
+[stages.recover]
+[stages.recover.transitions]
+"#,
+        );
+        let render = g.node("render").unwrap();
+        assert_eq!(render.inputs, vec!["image/*", "audio/wav"]);
+        assert_eq!(render.outputs, vec!["video/mp4", "text/markdown"]);
+        // A region that takes anything is no constraint to show.
+        assert_eq!(g.node("check").unwrap().inputs, vec!["video/*"]);
+        assert!(g.node("check").unwrap().outputs.is_empty());
+        // check takes video in its own layout; publish inherits the shared
+        // one, which takes none, so the video crosses as a stand-in. The
+        // markdown is text and always crosses.
+        assert!(edge(&g, "render", "check").unseen.is_empty());
+        assert_eq!(edge(&g, "render", "publish").unseen, vec!["video/mp4"]);
+        assert!(edge(&g, "render", "recover").unseen.is_empty());
+        assert!(edge(&g, "check", "publish").unseen.is_empty());
+        assert!(edge(&g, "publish", "ext:uploader").unseen.is_empty());
+        assert!(g.node("ext:uploader").unwrap().inputs.is_empty());
+        // A box is sized for its badges when they outgrow the name: render's
+        // row is `◧ image/* audio/wav · ▤ video/mp4 text/markdown`, 47
+        // cells, less the 7 the box already allows past the id.
+        assert_eq!(render.width_hint(), 40);
+        assert_eq!(g.node("ext:uploader").unwrap().width_hint(), 8);
+        // A loop and an end count too.
+        let looped = graph(
+            "[agent]\nname = \"l\"\n[stages.plan]\n[stages.plan.transitions.plan]\n[stages.plan.transitions.done]\n[stages.done]\n[stages.done.transitions]\n",
+        );
+        // recover can end and inherits the shared layout: `⏹ can end · ◧
+        // image/* audio/wav` is 31 cells; check's `◧ video/*` fits its name.
+        assert_eq!(g.node("recover").unwrap().width_hint(), 24);
+        assert_eq!(g.node("check").unwrap().width_hint(), 5);
+        assert_eq!(looped.node("plan").unwrap().width_hint(), 4);
+        assert_eq!(looped.node("done").unwrap().width_hint(), 4);
     }
 
     #[test]
@@ -642,6 +788,7 @@ carry = ["task"]
         .into_iter()
         .map(|condition| {
             StageEdge {
+                unseen: Vec::new(),
                 from: "a".into(),
                 to: "b".into(),
                 condition,

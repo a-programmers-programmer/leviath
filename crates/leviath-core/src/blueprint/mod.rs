@@ -135,6 +135,13 @@ pub struct Blueprint {
     /// producing no output: a stage may still ask for one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<crate::output::OutputSpec>,
+
+    /// Rows this agent adds to the mime registry, `[mime_types]` in the
+    /// manifest: the types its tools produce and take, layered over the
+    /// operator's rows for this agent's runs only. Validated at parse; an
+    /// empty table is the common case and is not written back.
+    #[serde(default, skip_serializing_if = "toml::Table::is_empty")]
+    pub mime_types: toml::Table,
 }
 
 /// The `[safe_commands]` section of a manifest.
@@ -202,6 +209,7 @@ impl Blueprint {
             read_paths: None,
             safe_commands: None,
             output: None,
+            mime_types: toml::Table::new(),
         }
     }
 
@@ -221,6 +229,38 @@ impl Blueprint {
 
     /// The caller input keys this blueprint does read, in declaration order.
     ///
+    /// The mime type patterns `stage` takes as parts: its own
+    /// `[input] accepts` when it declares one, else the union of `accepts`
+    /// across the regions it sees. Text is always taken and never listed, so
+    /// an empty answer means "text only, unless a region takes anything".
+    /// A visible region with no `accepts` takes anything, and is reported as
+    /// `*/*`.
+    pub fn stage_inputs(&self, stage: &Stage) -> Vec<String> {
+        if !stage.input_accepts.is_empty() {
+            return stage.input_accepts.clone();
+        }
+        let layout = stage
+            .context_layout
+            .as_ref()
+            .unwrap_or(&self.context_layout);
+        let mut out: Vec<String> = Vec::new();
+        for region in &layout.regions {
+            if stage.context_hide.contains(&region.name) {
+                continue;
+            }
+            let patterns: Vec<String> = match region.accepts.is_empty() {
+                true => vec!["*/*".to_string()],
+                false => region.accepts.clone(),
+            };
+            for p in patterns {
+                if !p.starts_with("text/") && !out.contains(&p) {
+                    out.push(p);
+                }
+            }
+        }
+        out
+    }
+
     /// Used to turn "that agent takes no task" into a message naming what it
     /// takes instead, which is the difference between a dead end and a fix.
     pub fn caller_inputs(&self) -> Vec<&str> {
@@ -425,6 +465,18 @@ impl Blueprint {
                     )));
                 }
             }
+            // `reset` empties a region on entry. `conversation` and the other
+            // always-visible regions can be reset (that is the point - a stage
+            // starting on a clean conversation), but a name no layout declares
+            // is the same silent typo `hide` guards against.
+            for name in &stage.context_reset {
+                if !known.contains(name.as_str()) {
+                    return Err(bad(format!(
+                        "context.reset names region '{name}', which no layout in this \
+                         blueprint declares"
+                    )));
+                }
+            }
 
             if let Some(routing) = &stage.tool_result_routing {
                 // Routing is checked against what *this* stage can see, not
@@ -453,6 +505,24 @@ impl Blueprint {
                     if !visible.contains(region.as_str()) {
                         return Err(dead_drop(&format!("overrides.{tool}"), region));
                     }
+                }
+            }
+
+            // `output_routing` sends the model's produced parts to a region a
+            // *later* stage usually reads, so unlike `tool_routing` above it is
+            // checked against every region the blueprint declares, not only the
+            // ones this stage can see. A target no layout declares is still a
+            // dead drop - the part would land nowhere - so it is refused.
+            for (pattern, region) in &stage.output_routing {
+                if !known.contains(region.as_str()) {
+                    return Err(ValidationError::Stage {
+                        stage: stage.name.clone(),
+                        message: format!(
+                            "output_routing.\"{pattern}\" sends produced parts to region \
+                             '{region}', which no layout in this blueprint declares. Add it to a \
+                             [context.regions] table, or route to a region that exists."
+                        ),
+                    });
                 }
             }
 
@@ -603,10 +673,11 @@ impl Blueprint {
                     if !gate.require_modifications {
                         continue;
                     }
-                    let can_modify = stage.available_tools.iter().any(|t| {
-                        MODIFYING_TOOLS.contains(&t.as_str())
-                            || gate.tools.iter().any(|extra| extra == t)
-                    });
+                    let can_modify = stage.grants_all_builtins()
+                        || stage.available_tools.iter().any(|t| {
+                            MODIFYING_TOOLS.contains(&t.as_str())
+                                || gate.tools.iter().any(|extra| extra == t)
+                        });
                     if !can_modify {
                         return Err(ValidationError::Transition {
                             from: stage.name.clone(),
@@ -734,6 +805,8 @@ mod stage;
 pub use stage::*;
 mod transition;
 pub use transition::*;
+mod tool_groups;
+pub use tool_groups::*;
 
 #[cfg(test)]
 mod tests {
@@ -1338,6 +1411,11 @@ criteria = { kind = "pinned", max_tokens = 10, seed = "criteria" }"#,
         assert!(err.to_string().contains("no file-modifying tool"));
         // A built-in write tool satisfies it...
         assert!(gated(&["read_file", "edit_file"], &[]).validate().is_ok());
+        // ...so does a group that carries one, with neither name written...
+        assert!(gated(&["@builtin"], &[]).validate().is_ok());
+        assert!(gated(&["@all"], &[]).validate().is_ok());
+        // ...but not a group that carries none.
+        assert!(gated(&["@scripts"], &[]).validate().is_err());
         // ...as does one the gate itself declares (MCP / script toolchains).
         assert!(
             gated(&["read_file", "patch_file"], &["patch_file"])
@@ -1673,6 +1751,51 @@ criteria = { kind = "pinned", max_tokens = 10, seed = "criteria" }"#,
         let bp = Blueprint::new("t".into(), "".into(), vec![stage], make_layout());
 
         bp.validate().expect("the tool is on offer");
+    }
+
+    /// With a group in the list the membership question belongs to the
+    /// install, so validation takes the author's word and the lint checks.
+    #[test]
+    fn validate_accepts_a_required_tool_a_group_could_cover() {
+        let mut stage = Stage::new("plan".to_string(), make_model());
+        stage.available_tools = vec!["@builtin".to_string()];
+        stage.required_tools = vec!["ask_user_text".to_string()];
+        let bp = Blueprint::new("t".into(), "".into(), vec![stage], make_layout());
+
+        bp.validate().expect("the group may cover it");
+    }
+
+    #[test]
+    fn validate_rejects_a_group_shaped_entry_that_names_no_group() {
+        let mut stage = Stage::new("plan".to_string(), make_model());
+        stage.available_tools = vec!["read_file".to_string(), "@builtins".to_string()];
+        let bp = Blueprint::new("t".into(), "".into(), vec![stage], make_layout());
+
+        let err = bp.validate().expect_err("not a group");
+        let text = format!("{err:?}");
+        assert!(text.contains("@builtins"), "names the entry: {text}");
+        assert!(text.contains("@builtin,"), "lists the groups: {text}");
+    }
+
+    #[test]
+    fn stage_reports_its_groups_and_named_tools_separately() {
+        let mut stage = Stage::new("plan".to_string(), make_model());
+        stage.available_tools = vec![
+            "read_file".to_string(),
+            "@scripts".to_string(),
+            "github__create_issue".to_string(),
+        ];
+        assert_eq!(stage.tool_groups(), vec![ToolGroup::Scripts]);
+        assert!(stage.grants_group(ToolGroup::Scripts));
+        assert!(!stage.grants_group(ToolGroup::Mcp));
+        assert!(!stage.grants_all_builtins());
+        let named: Vec<&String> = stage.named_tools().collect();
+        assert_eq!(named, vec!["read_file", "github__create_issue"]);
+
+        stage.available_tools = vec!["@all".to_string()];
+        assert!(stage.grants_all_builtins());
+        assert!(stage.grants_group(ToolGroup::Mcp));
+        assert_eq!(stage.named_tools().count(), 0);
     }
 
     /// A stage required to produce an output, without the tool that produces

@@ -69,13 +69,14 @@ impl ToolService for NoTools {
         _progress: crate::pipeline::ToolProgress,
     ) -> BoxedToolExec {
         Box::new(move || {
-            Box::pin(async move { calls.into_iter().map(|c| (c.id, String::new())).collect() })
+            Box::pin(async move { calls.into_iter().map(|c| (c.id, "".into())).collect() })
         })
     }
 }
 
 fn text(content: &str) -> InferenceResponse {
     InferenceResponse {
+        parts: Vec::new(),
         content: content.to_string(),
         tool_calls: vec![],
         tokens_used: TokenUsage {
@@ -155,6 +156,7 @@ fn run_metadata(run_id: &str, started_at: i64) -> RunMetadata {
         title: None,
         title_error: None,
         unattended: false,
+        yolo_profile: None,
         read_paths: None,
         output_request: None,
         model_override: None,
@@ -193,11 +195,13 @@ fn setup() -> StageSetup {
             batch_tool_hint: false,
             shell_hint: false,
             request_timeout_secs: None,
+            as_text: Vec::new(),
         },
         routing: None,
         accepts_messages: true,
         context_layout: None,
         context_hide: Vec::new(),
+        context_reset: Vec::new(),
         system_prompt: None,
     }
 }
@@ -534,6 +538,35 @@ fn tool_call(id: &str) -> InferenceResponse {
 ///
 /// The re-drive is set out of reach here, so the run can only finish through
 /// the wake path.
+/// The housekeeping hook rides the same timer, so the daemon's periodic
+/// work (re-reading an edited config for the runs already under way) runs
+/// with nothing else waking the host.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn serve_runs_the_housekeeper_on_every_redrive() {
+    let mut host = host_with(vec![]);
+    host.set_redrive_interval(std::time::Duration::from_millis(20));
+    let kept = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = kept.clone();
+    host.set_housekeeper(Box::new(move |world| {
+        // Handed the world itself, so the hook can install a resource.
+        world
+            .world_mut()
+            .insert_resource(crate::blob_store::MimeLimits::default());
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }));
+    let shutdown = host.world_mut().shutdown_handle();
+    let (op_tx, op_rx) = mpsc::unbounded_channel();
+    let handle = tokio::spawn(async move {
+        host.serve(op_rx).await;
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    let runs = kept.load(std::sync::atomic::Ordering::SeqCst);
+    shutdown.notify_one();
+    drop(op_tx);
+    handle.await.unwrap();
+    assert!(runs >= 2, "the hook ran on the timer: {runs}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stage_boundary_is_crossed_without_waiting_for_the_redrive() {
     let mut host = host_with(vec![tool_call("c1"), tool_call("c2")]);
@@ -2191,6 +2224,7 @@ async fn unregistered_world_agents_are_adopted_and_become_cancellable() {
             title: None,
             title_error: None,
             unattended: false,
+            yolo_profile: None,
             read_paths: None,
             output_request: None,
             model_override: None,
@@ -2433,6 +2467,7 @@ async fn message_op_is_delivered() {
         agent_id: "agent-a".to_string(),
         content: "hi".to_string(),
         target_region: Some("conversation".to_string()),
+        parts: Vec::new(),
         reply,
     })
     .await;
@@ -2890,6 +2925,7 @@ async fn emit_events_broadcasts_agent_changes() {
             title: None,
             title_error: None,
             unattended: false,
+            yolo_profile: None,
             read_paths: None,
             output_request: None,
             model_override: None,
@@ -2963,6 +2999,7 @@ async fn a_generated_title_is_announced_once_and_then_carried_on_status() {
             title: None,
             title_error: None,
             unattended: false,
+            yolo_profile: None,
             read_paths: None,
             output_request: None,
             model_override: None,
@@ -3398,6 +3435,7 @@ async fn a_run_is_listed_once_however_often_it_is_recorded() {
         tool_calls: 0,
         last_progress_at: None,
         unattended: false,
+        yolo_profile: None,
         empty_output: false,
         read_paths: None,
         has_final_output: false,
@@ -3433,6 +3471,7 @@ async fn the_listing_of_finished_runs_is_capped() {
                 tool_calls: 0,
                 last_progress_at: None,
                 unattended: false,
+                yolo_profile: None,
                 empty_output: false,
                 read_paths: None,
                 has_final_output: false,
@@ -3702,7 +3741,7 @@ async fn mock_helpers_are_exercised() {
         }],
         crate::pipeline::noop_progress(),
     );
-    assert_eq!(exec().await, vec![("c".to_string(), String::new())]);
+    assert_eq!(exec().await, vec![("c".to_string(), "".into())]);
 }
 
 #[tokio::test]
@@ -4128,6 +4167,7 @@ async fn list_reports_blueprint_shape_and_unattended() {
             title: None,
             title_error: None,
             unattended: true,
+            yolo_profile: None,
             read_paths: None,
             output_request: None,
             model_override: None,

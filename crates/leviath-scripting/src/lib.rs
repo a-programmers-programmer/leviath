@@ -8,7 +8,9 @@
 
 pub mod engine;
 pub mod functions;
+pub mod mime_check;
 pub mod output_validator;
+pub mod parts;
 pub mod region_hook;
 pub mod stage_hook;
 pub mod tool;

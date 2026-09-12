@@ -24,6 +24,10 @@ pub struct ResolvedStage {
     /// caller-side (like the model and tool choices beside it) because only the
     /// caller knows what was asked for at launch.
     pub output: Option<leviath_core::output::OutputSpec>,
+    /// Operational lines to log for this stage at spawn: today, one per stage
+    /// whose head the user's `override_model` or `fallback_model` moved off
+    /// the blueprint's own choice. Empty when the blueprint's choice stands.
+    pub notes: Vec<String>,
 }
 
 /// Fallback context window used when a stage's provider isn't registered (so
@@ -147,6 +151,7 @@ pub(crate) fn stage_setup_from(
             temperature,
             max_output_tokens,
             extra_params,
+            as_text: stage.input_as_text.clone(),
             batch_tool_hint,
             shell_hint,
             request_timeout_secs: stage.model.request_timeout_secs,
@@ -155,6 +160,7 @@ pub(crate) fn stage_setup_from(
         accepts_messages: stage.accepts_messages,
         context_layout: stage.context_layout.clone(),
         context_hide: stage.context_hide.clone(),
+        context_reset: stage.context_reset.clone(),
         system_prompt,
     }
 }
@@ -194,10 +200,12 @@ pub(crate) fn spawn_agent(
             agent_id,
             blueprint,
             seeds,
+            parts: Vec::new(),
             stages,
             global_hints,
             global_nudge: leviath_core::NudgeConfig::default(),
             region_scripts: std::collections::HashMap::new(),
+            mime_registry: None,
         },
     )
 }
@@ -214,6 +222,9 @@ pub struct SeededSpawn {
     pub blueprint: leviath_core::Blueprint,
     /// Content for named caller-input regions, keyed by region name.
     pub seeds: std::collections::HashMap<String, String>,
+    /// Files the caller attached, written into their regions as stored parts
+    /// once the seeds are in.
+    pub parts: Vec<leviath_core::mime::InboundPart>,
     /// The blueprint's stages, already resolved against the provider registry.
     pub stages: Vec<ResolvedStage>,
     /// Config-level prompt hints, applied where the blueprint says nothing.
@@ -225,6 +236,11 @@ pub struct SeededSpawn {
         String,
         std::sync::Arc<leviath_scripting::region_hook::RegionScript>,
     >,
+    /// The run's mime registry, when the host built one (with the
+    /// blueprint's checks compiled and attached). Left `None`, one is built
+    /// here from the world's registry and the blueprint's own rows, with no
+    /// checks.
+    pub mime_registry: Option<crate::blob_store::RunMimeRegistry>,
 }
 
 /// Like `spawn_agent`, but seeds the context window from a name→content map
@@ -241,12 +257,44 @@ pub fn spawn_agent_seeded(world: &mut World, spawn: SeededSpawn) -> Result<Entit
         agent_id,
         mut blueprint,
         seeds,
+        parts,
         stages,
         global_hints,
         global_nudge,
         region_scripts,
+        mime_registry,
     } = spawn;
     let seeds = &seeds;
+    // The registry this run types its bytes by: the host's, or the world's
+    // rows with the blueprint's `[mime_types]` on top. A world without a
+    // registry (one assembled by hand in a test) has no run registry either.
+    let run_registry = match mime_registry {
+        Some(registry) => Some(registry),
+        None => world
+            .get_resource::<crate::blob_store::MimeRegistryHandle>()
+            .map(|r| {
+                crate::blob_store::RunMimeRegistry::new(
+                    &r.0,
+                    blueprint.mime_types.clone(),
+                    std::collections::BTreeMap::new(),
+                )
+            })
+            .transpose()
+            .map_err(|e| format!("[mime_types]: {e}"))?,
+    };
+    // Where attached bytes go, read before the world is borrowed for the
+    // spawn. A world without a store (one assembled by hand in a test)
+    // refuses a part rather than dropping it on the floor.
+    let mime_store = world
+        .get_resource::<crate::blob_store::BlobStoreHandle>()
+        .map(|s| s.0.clone())
+        .zip(run_registry.as_ref().map(|r| r.registry()));
+    let max_part_bytes = world
+        .get_resource::<crate::blob_store::MimeLimits>()
+        .map_or(
+            crate::blob_store::MimeLimits::default().max_part_bytes,
+            |l| l.max_part_bytes,
+        );
     // Everything below indexes `blueprint.stages`, `stages` and the per-stage
     // vectors built from them by position. `parse_manifest` guarantees at
     // least one stage, but this is `pub` and an embedder can hand-build a
@@ -293,6 +341,14 @@ pub fn spawn_agent_seeded(world: &mut World, spawn: SeededSpawn) -> Result<Entit
     // shape into its system prompt that its tool description already carries.
     let stage_outputs: Vec<Option<leviath_core::output::OutputSpec>> =
         stages.iter().map(|rs| rs.output.clone()).collect();
+    // Spawn-time notes ride each stage's operational log, tagged with the
+    // stage's index, so the substitution a user's model settings made is the
+    // first line anyone reading that stage's log sees.
+    let notes: Vec<(usize, String)> = stages
+        .iter()
+        .enumerate()
+        .flat_map(|(i, rs)| rs.notes.iter().cloned().map(move |line| (i, line)))
+        .collect();
     let stage_infs: Vec<StageInference> = stages
         .into_iter()
         .map(|rs| StageInference {
@@ -323,6 +379,22 @@ pub fn spawn_agent_seeded(world: &mut World, spawn: SeededSpawn) -> Result<Entit
     // pass through each region's on_write hook like any other entry.
     window.region_scripts = region_scripts;
     crate::context_setup::init_window_seeded(&mut window, &blueprint, seeds);
+    if !parts.is_empty() {
+        let Some((store, registry)) = mime_store else {
+            return Err("this world has no blob store, so it cannot take an attached part".into());
+        };
+        crate::context_setup::ingest_parts(
+            &mut window,
+            &blueprint,
+            parts,
+            &crate::context_setup::PartSink {
+                store: store.as_ref(),
+                registry: &registry,
+                run_id: &agent_id,
+                max_part_bytes,
+            },
+        )?;
+    }
     // Before stage 0's prompt is injected, so it has somewhere of its own to go
     // rather than being charged to whichever pinned region came first.
     let prompts: Vec<Option<String>> = setups.iter().map(|s| s.system_prompt.clone()).collect();
@@ -390,11 +462,17 @@ pub fn spawn_agent_seeded(world: &mut World, spawn: SeededSpawn) -> Result<Entit
     // Inserted after spawn: the bundle above is already at bevy's 15-tuple limit.
     world.entity_mut(entity).insert((
         ledger,
-        StageIoBuffer::default(),
+        StageIoBuffer {
+            output: Vec::new(),
+            logs: notes,
+        },
         crate::pipeline::response::GlobalNudge(global_nudge),
     ));
     if let Some(detector) = repetition {
         world.entity_mut(entity).insert(detector);
+    }
+    if let Some(registry) = run_registry {
+        world.entity_mut(entity).insert(registry);
     }
     if let Some(routing) = stage0_routing {
         world
@@ -482,11 +560,13 @@ mod stage_instructions_fit_tests {
                 batch_tool_hint: false,
                 shell_hint: false,
                 request_timeout_secs: None,
+                as_text: Vec::new(),
             },
             routing: None,
             accepts_messages: true,
             context_layout: None,
             context_hide: Vec::new(),
+            context_reset: Vec::new(),
             system_prompt: Some(prompt),
         };
         crate::pipeline::transition::apply_stage_context(&setup, &mut window)
@@ -550,11 +630,13 @@ mod stage_instructions_fit_tests {
                 batch_tool_hint: false,
                 shell_hint: false,
                 request_timeout_secs: None,
+                as_text: Vec::new(),
             },
             routing: None,
             accepts_messages: true,
             context_layout: None,
             context_hide: Vec::new(),
+            context_reset: Vec::new(),
             system_prompt: Some(prompt),
         };
         crate::pipeline::transition::apply_stage_context(&setup, &mut window)
@@ -636,11 +718,13 @@ mod stage_instructions_fit_tests {
                 batch_tool_hint: false,
                 shell_hint: false,
                 request_timeout_secs: None,
+                as_text: Vec::new(),
             },
             routing: None,
             accepts_messages: true,
             context_layout: None,
             context_hide: Vec::new(),
+            context_reset: Vec::new(),
             system_prompt: Some(prompt),
         };
         let err = crate::pipeline::transition::apply_stage_context(&setup, &mut window)
@@ -715,11 +799,13 @@ mod stage_instructions_fit_tests {
                 batch_tool_hint: false,
                 shell_hint: false,
                 request_timeout_secs: None,
+                as_text: Vec::new(),
             },
             routing: None,
             accepts_messages: true,
             context_layout: Some(scoped),
             context_hide: Vec::new(),
+            context_reset: Vec::new(),
             system_prompt: Some(prompt),
         };
         crate::pipeline::transition::apply_stage_context(&setup, &mut window)

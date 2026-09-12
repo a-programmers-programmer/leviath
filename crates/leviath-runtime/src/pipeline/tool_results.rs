@@ -1,5 +1,6 @@
 //! Applying completed tool batches: results, file tracking, modification accounting.
 
+use super::tools::typed_results;
 use super::*;
 
 /// The receiving end of the tool-outcomes channel, as a world resource.
@@ -54,7 +55,7 @@ const PATH_TOOLS: [&str; 5] = [
 pub(crate) fn annotate_path_errors(
     window: &ContextWindow,
     tool_calls: &[crate::components::ToolCall],
-    merged: &mut [(String, String)],
+    merged: &mut [crate::tool_bridge::ToolResult],
 ) {
     for (call, (_id, result)) in tool_calls.iter().zip(merged.iter_mut()) {
         if !result.starts_with("[error]") || !PATH_TOOLS.contains(&call.name.as_str()) {
@@ -89,8 +90,7 @@ pub(crate) fn annotate_path_errors(
             })
         });
         if let Some(hint) = hint {
-            result.push(' ');
-            result.push_str(&hint);
+            *result = format!("{result} {hint}").into();
         }
     }
 }
@@ -128,12 +128,60 @@ pub(crate) fn apply_tool_results(
     window: &mut ContextWindow,
     response_content: &str,
     tool_calls: &[crate::components::ToolCall],
-    tool_results: &[(String, String)],
+    tool_results: &[crate::tool_bridge::ToolResult],
     routing: Option<&leviath_core::blueprint::ToolResultRouting>,
     sensitivities: Option<&std::collections::HashMap<String, leviath_core::TaintLevel>>,
     reasoning: Option<String>,
 ) {
-    let response_tokens = leviath_core::estimate_tokens(response_content);
+    apply_tool_results_with_parts(
+        window,
+        Reply {
+            text: response_content,
+            parts: &[],
+            // No produced parts here, so there is nothing to route.
+            stage: None,
+        },
+        tool_calls,
+        tool_results,
+        routing,
+        sensitivities,
+        reasoning,
+    );
+}
+
+/// A reply as the assistant turn records it: its text and any mime the
+/// model produced beside its tool calls.
+pub(crate) struct Reply<'a> {
+    /// The reply's text.
+    pub(crate) text: &'a str,
+    /// The mime it produced, already stored.
+    pub(crate) parts: &'a [leviath_core::mime::Part],
+    /// The stage this reply came from, when its `output_routing` should send
+    /// some produced parts to regions of their own. `None` keeps every part
+    /// in the conversation.
+    pub(crate) stage: Option<&'a leviath_core::blueprint::Stage>,
+}
+
+/// [`apply_tool_results`] for a reply that produced mime beside its tool
+/// calls: the parts ride the assistant turn ahead of the tool results.
+pub(crate) fn apply_tool_results_with_parts(
+    window: &mut ContextWindow,
+    reply: Reply<'_>,
+    tool_calls: &[crate::components::ToolCall],
+    tool_results: &[crate::tool_bridge::ToolResult],
+    routing: Option<&leviath_core::blueprint::ToolResultRouting>,
+    sensitivities: Option<&std::collections::HashMap<String, leviath_core::TaintLevel>>,
+    reasoning: Option<String>,
+) {
+    // The stage may route some produced parts to regions of their own
+    // (`output_routing`). The assistant turn keeps the reply's text, its
+    // unrouted parts and its tool calls; the routed parts land in their
+    // regions as separate entries (written after the turn, since they go
+    // elsewhere than the conversation).
+    let routed = super::part_routing::split(reply.stage, reply.parts);
+    let content = super::response::reply_content(reply.text, &routed.kept)
+        .unwrap_or_else(|| leviath_core::region::EntryContent::text(reply.text));
+    let response_tokens = content.tokens_hint();
     let serialized: Vec<leviath_core::SerializedToolCall> = tool_calls
         .iter()
         .map(|tc| leviath_core::SerializedToolCall {
@@ -143,15 +191,16 @@ pub(crate) fn apply_tool_results(
             thought_signature: tc.thought_signature.clone(),
         })
         .collect();
-    let _ = window.add_assistant_turn(
+    let _ = window.add_assistant_turn_content(
         "conversation",
         leviath_core::EntryKind::AssistantTurn {
             tool_calls: serialized,
         },
-        response_content.to_string(),
+        content,
         response_tokens,
         reasoning,
     );
+    super::part_routing::store_routed(window, &routed);
 
     for (tool_call_id, result) in tool_results {
         let tool_name = tool_calls
@@ -182,11 +231,18 @@ pub(crate) fn apply_one_tool_result(
     window: &mut ContextWindow,
     tool_name: &str,
     tool_call_id: &str,
-    result: String,
+    result: leviath_core::region::EntryContent,
     routing: Option<&leviath_core::blueprint::ToolResultRouting>,
     sensitivities: Option<&std::collections::HashMap<String, leviath_core::TaintLevel>>,
 ) {
-    let mut result_text = result;
+    // The cap below is about text. A stored part is priced by its own
+    // estimate and kept whole: cutting an image in half is not a smaller
+    // image.
+    let stored: Vec<leviath_core::mime::Part> = result.stored().cloned().collect();
+    let mut result_text = match stored.is_empty() {
+        true => result.into_string(),
+        false => result.inline_text(),
+    };
     let tool_name = tool_name.to_string();
     let tool_call_id = tool_call_id.to_string();
 
@@ -209,7 +265,15 @@ pub(crate) fn apply_one_tool_result(
             result_text.push_str("\n[...truncated]");
         }
     }
-    let result_tokens = leviath_core::estimate_tokens(&result_text);
+    let result_content = match stored.is_empty() {
+        true => leviath_core::region::EntryContent::text(result_text),
+        false => {
+            let mut parts = vec![leviath_core::mime::Part::text(result_text)];
+            parts.extend(stored);
+            leviath_core::region::EntryContent::from_parts(parts)
+        }
+    };
+    let result_tokens = result_content.tokens_hint();
 
     let base_region = match routing {
         Some(r) => {
@@ -250,12 +314,12 @@ pub(crate) fn apply_one_tool_result(
     let add_kind = |window: &mut ContextWindow,
                     region: &str,
                     kind: leviath_core::EntryKind,
-                    content: String,
+                    content: leviath_core::region::EntryContent,
                     tokens: usize,
                     origin: crate::components::WriteOrigin|
      -> Stored {
-        let put = |w: &mut ContextWindow, c: String, t: usize| {
-            w.typed_write(origin, region, kind.clone(), c, t, taint_level)
+        let put = |w: &mut ContextWindow, c: leviath_core::region::EntryContent, t: usize| {
+            w.typed_write_content(origin, region, kind.clone(), c, t, taint_level)
         };
         match put(window, content.clone(), tokens) {
             Ok(()) => return Stored::Whole,
@@ -283,7 +347,7 @@ pub(crate) fn apply_one_tool_result(
             )
         };
         let trunc_tokens = leviath_core::estimate_tokens(&truncated);
-        match put(window, truncated, trunc_tokens) {
+        match put(window, truncated.into(), trunc_tokens) {
             Ok(()) => return Stored::Truncated { omitted },
             // The hook re-ran over the truncated text and refused that shape:
             // still a rejection, not a budget problem.
@@ -292,7 +356,7 @@ pub(crate) fn apply_one_tool_result(
             }
             Err(_) => {}
         }
-        let _ = put(window, "[result omitted]".to_string(), 5);
+        let _ = put(window, "[result omitted]".into(), 5);
         Stored::Dropped
     };
     let result_kind = || leviath_core::EntryKind::ToolResult {
@@ -309,7 +373,7 @@ pub(crate) fn apply_one_tool_result(
             window,
             "conversation",
             result_kind(),
-            result_text,
+            result_content,
             result_tokens,
             crate::components::WriteOrigin::System,
         );
@@ -322,8 +386,8 @@ pub(crate) fn apply_one_tool_result(
         // second sliding_window would desync from its tool_use (→ API 400), and
         // dropping the conversation tool_result would orphan the tool_use (the
         // assembler strips it, so the model can't see its own call landed → loops).
-        let preview: String = result_text.chars().take(160).collect();
-        let ellipsis = if result_text.len() > preview.len() {
+        let preview: String = result_content.chars().take(160).collect();
+        let ellipsis = if result_content.len() > preview.len() {
             "…"
         } else {
             ""
@@ -337,7 +401,7 @@ pub(crate) fn apply_one_tool_result(
             window,
             target_region,
             leviath_core::EntryKind::Text,
-            result_text,
+            result_content,
             result_tokens,
             crate::components::WriteOrigin::Agent,
         );
@@ -381,7 +445,7 @@ pub(crate) fn apply_one_tool_result(
             window,
             "conversation",
             result_kind(),
-            pointer,
+            pointer.into(),
             pointer_tokens,
             crate::components::WriteOrigin::System,
         );
@@ -416,7 +480,7 @@ pub(crate) fn apply_file_tracking(
     window: &mut ContextWindow,
     ft: &leviath_core::blueprint::FileTrackingConfig,
     tool_calls: &[crate::components::ToolCall],
-    merged: &mut [(String, String)],
+    merged: &mut [crate::tool_bridge::ToolResult],
 ) {
     let is_hashmap = window
         .get_region(&ft.region)
@@ -432,7 +496,7 @@ pub(crate) fn apply_file_tracking(
             continue;
         };
         let (body, verb) = match call.name.as_str() {
-            "read_file" if ft.track_reads => (result.clone(), "stored"),
+            "read_file" if ft.track_reads => (result.as_str().to_string(), "stored"),
             "write_file" if ft.track_writes => {
                 match call.arguments.get("content").and_then(|v| v.as_str()) {
                     Some(c) => (c.to_string(), "written"),
@@ -451,7 +515,8 @@ pub(crate) fn apply_file_tracking(
         *result = format!(
             "File {verb} in [{}] → ### [{}] ({} tokens). Reference it there; do not re-read this path.",
             ft.region, path, tokens
-        );
+        )
+        .into();
     }
 }
 
@@ -504,7 +569,7 @@ pub(crate) fn stage_modifying_tools(
 /// searches. `searches_empty == searches_run` is the only trace that survives.
 pub(crate) fn record_searches(
     tool_calls: &[crate::components::ToolCall],
-    merged: &[(String, String)],
+    merged: &[crate::tool_bridge::ToolResult],
     flags: Option<bevy_ecs::prelude::Mut<'_, crate::persistence::RunOutcomeFlags>>,
 ) {
     let Some(mut flags) = flags else { return };
@@ -540,10 +605,11 @@ fn search_found_nothing(result: &str) -> bool {
 /// itself failed) count as neither.
 pub(crate) fn record_modifications(
     tool_calls: &[crate::components::ToolCall],
-    merged: &[(String, String)],
+    merged: &[crate::tool_bridge::ToolResult],
     modifying: &[String],
     progress: Option<bevy_ecs::prelude::Mut<'_, StageProgress>>,
     flags: Option<bevy_ecs::prelude::Mut<'_, crate::persistence::RunOutcomeFlags>>,
+    workdir: Option<(&str, i64)>,
 ) {
     let mut progress = progress;
     let mut flags = flags;
@@ -573,6 +639,121 @@ pub(crate) fn record_modifications(
             flags.0.record_modification(path);
         }
     }
+    // A `shell` command names no path and is not a modifying tool, so the loop
+    // above never sees the files it wrote. When the batch ran one that landed,
+    // scan the working directory for files modified since the run began and
+    // fold them into the list, so "what it changed" names the chart the run was
+    // for, not only the script that drew it.
+    if let (Some(flags), Some((workdir, started_at))) = (flags.as_mut(), workdir) {
+        fold_shell_modifications(&mut flags.0, tool_calls, merged, workdir, started_at);
+    }
+}
+
+/// Fold the files a successful `shell` call left in `workdir` into `flags`, so a
+/// creation no modifying tool named is still counted as a change. A no-op when
+/// the batch ran no shell that landed. Split out from [`record_modifications`],
+/// which holds its state behind ECS `Mut` handles, so the scan is testable on a
+/// plain [`RunFlags`](leviath_core::run_meta::RunFlags) and a temp directory.
+fn fold_shell_modifications(
+    flags: &mut leviath_core::run_meta::RunFlags,
+    tool_calls: &[crate::components::ToolCall],
+    merged: &[crate::tool_bridge::ToolResult],
+    workdir: &str,
+    started_at: i64,
+) {
+    if !batch_ran_shell(tool_calls, merged) {
+        return;
+    }
+    for rel in workdir_modifications_since(
+        std::path::Path::new(workdir),
+        started_at,
+        MAX_SCANNED_MODIFICATIONS,
+        MAX_SCAN_DEPTH,
+    ) {
+        flags.note_modified_path(&rel);
+    }
+}
+
+/// The most workdir paths one scan folds into `modified_files`; the record cap,
+/// so a shell cannot push a run past what a modifying tool could.
+const MAX_SCANNED_MODIFICATIONS: usize = leviath_core::run_meta::MAX_TRACKED_MODIFIED_FILES;
+
+/// The deepest a modification scan descends. A shell's output is almost always
+/// shallow; this bounds a pathological tree.
+const MAX_SCAN_DEPTH: usize = 8;
+
+/// Whether the batch ran a `shell` call that landed (not refused, not an error).
+/// Emptiness is not "no effect" here: a silent `python plot.py` writes a file
+/// and prints nothing, so any successful shell run earns a scan.
+fn batch_ran_shell(
+    calls: &[crate::components::ToolCall],
+    merged: &[crate::tool_bridge::ToolResult],
+) -> bool {
+    calls
+        .iter()
+        .zip(merged.iter())
+        .any(|(call, (_id, result))| {
+            leviath_tools::canonical_tool_name(&call.name) == "shell"
+                && !result.starts_with("[denied]")
+                && !result.starts_with("[error]")
+        })
+}
+
+/// A file's mtime as unix seconds, or 0 when the platform will not say.
+fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Working-directory files modified at or after `since` (unix seconds), as
+/// paths relative to `workdir`, hidden entries skipped, bounded by `cap`
+/// results and `max_depth` levels of recursion. How a `shell` command's
+/// creations reach `modified_files`, which the modifying-tool path - keyed on a
+/// `path` argument no shell call carries - cannot see.
+fn workdir_modifications_since(
+    workdir: &std::path::Path,
+    since: i64,
+    cap: usize,
+    max_depth: usize,
+) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    let mut stack = vec![(workdir.to_path_buf(), 0usize)];
+    while let Some((dir, depth)) = stack.pop() {
+        if found.len() >= cap {
+            break;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if found.len() >= cap {
+                break;
+            }
+            if entry.file_name().to_string_lossy().starts_with('.') {
+                continue; // hidden files and dirs (.git, .cache) are noise
+            }
+            let path = entry.path();
+            // A metadata failure, a symlink, a socket: contributes nothing and
+            // no child, which is the right thing, and folds into the last arm.
+            match entry.metadata() {
+                Ok(meta) if meta.is_dir() => {
+                    if depth < max_depth {
+                        stack.push((path, depth + 1));
+                    }
+                }
+                Ok(meta) if meta.is_file() && mtime_secs(&meta) >= since => {
+                    let rel = path.strip_prefix(workdir).unwrap_or(&path);
+                    found.push(rel.to_string_lossy().replace('\\', "/"));
+                }
+                _ => {}
+            }
+        }
+    }
+    found.sort();
+    found
 }
 
 /// What `collect_tools` selects.
@@ -679,7 +860,7 @@ pub(crate) fn collect_tools(
         // ordered by the original tool calls.
         let mut parts = outcome.results;
         if let Some(ctx) = context_results {
-            parts.extend(ctx.0.iter().cloned());
+            parts.extend(typed_results(&ctx.0));
         }
         let mut merged = merge_in_call_order(&infer.tool_calls, &parts);
         // Modification accounting: count the file-writing calls this
@@ -699,6 +880,7 @@ pub(crate) fn collect_tools(
             &stage_modifying_tools(blueprint, cursor),
             progress,
             flags,
+            metadata.map(|m| (m.workdir.as_str(), m.started_at)),
         );
         // Record each call for the telemetry observer before file tracking
         // rewrites successful results; success is the `[error] ` result-text
@@ -764,5 +946,124 @@ pub(crate) fn collect_tools(
             .remove::<ContextToolResults>()
             .remove::<InFlightWork>()
             .insert(ReadyToInfer);
+    }
+}
+
+#[cfg(test)]
+mod modification_scan_tests {
+    use super::*;
+    use crate::components::ToolCall;
+    use leviath_core::region::EntryContent;
+    use leviath_core::run_meta::RunFlags;
+
+    /// A tool call with a name and no arguments.
+    fn call(name: &str) -> ToolCall {
+        ToolCall {
+            tool_id: format!("id-{name}"),
+            name: name.to_string(),
+            arguments: serde_json::json!({}),
+            thought_signature: None,
+        }
+    }
+
+    /// A result whose text is `body`.
+    fn result(body: &str) -> crate::tool_bridge::ToolResult {
+        ("id".to_string(), EntryContent::text(body))
+    }
+
+    /// Force a file's mtime to `secs` since the epoch.
+    fn set_mtime(path: &std::path::Path, secs: u64) {
+        let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
+    }
+
+    #[test]
+    fn the_scan_finds_new_files_skips_old_and_hidden_and_recurses() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // An old input, a new output, a hidden file, and a nested output.
+        std::fs::write(root.join("input.csv"), b"old").unwrap();
+        set_mtime(&root.join("input.csv"), 1_000);
+        std::fs::write(root.join("chart.png"), b"new").unwrap();
+        set_mtime(&root.join("chart.png"), 10_000);
+        std::fs::write(root.join(".hidden"), b"noise").unwrap();
+        set_mtime(&root.join(".hidden"), 10_000);
+        std::fs::create_dir(root.join("out")).unwrap();
+        std::fs::write(root.join("out/nested.png"), b"new").unwrap();
+        set_mtime(&root.join("out/nested.png"), 10_000);
+
+        // Recursing, everything at or after `since` that is not hidden.
+        let found = workdir_modifications_since(root, 5_000, 100, 8);
+        assert_eq!(found, vec!["chart.png", "out/nested.png"]);
+
+        // Depth 0 does not descend, so the nested output is not found.
+        let shallow = workdir_modifications_since(root, 5_000, 100, 0);
+        assert_eq!(shallow, vec!["chart.png"]);
+
+        // A missing directory scans to nothing rather than erroring.
+        let gone = workdir_modifications_since(&root.join("nope"), 0, 100, 8);
+        assert!(gone.is_empty());
+    }
+
+    #[test]
+    fn the_scan_stops_at_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for i in 0..3 {
+            let p = root.join(format!("f{i}.png"));
+            std::fs::write(&p, b"x").unwrap();
+            set_mtime(&p, 10_000);
+        }
+        // A positive cap stops the inner loop once it is full.
+        assert_eq!(workdir_modifications_since(root, 0, 1, 8).len(), 1);
+        // A zero cap stops before reading anything.
+        assert!(workdir_modifications_since(root, 0, 0, 8).is_empty());
+    }
+
+    #[test]
+    fn a_shell_that_landed_earns_a_scan_and_nothing_else_does() {
+        assert!(batch_ran_shell(&[call("shell")], &[result("ok")]));
+        assert!(!batch_ran_shell(
+            &[call("shell")],
+            &[result("[denied] refused")]
+        ));
+        assert!(!batch_ran_shell(
+            &[call("shell")],
+            &[result("[error] boom")]
+        ));
+        assert!(!batch_ran_shell(&[call("write_file")], &[result("ok")]));
+        assert!(!batch_ran_shell(&[], &[]));
+    }
+
+    #[test]
+    fn folding_adds_shell_outputs_only_when_a_shell_ran() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let wd = root.to_string_lossy().into_owned();
+        std::fs::write(root.join("chart.png"), b"x").unwrap();
+        set_mtime(&root.join("chart.png"), 10_000);
+
+        // No shell in the batch: the scan does not run, the list stays empty.
+        let mut flags = RunFlags::default();
+        fold_shell_modifications(
+            &mut flags,
+            &[call("write_file")],
+            &[result("ok")],
+            &wd,
+            5_000,
+        );
+        assert!(flags.modified_files.is_empty());
+
+        // A shell that landed: the created file joins the list, without bumping
+        // the modifying-tool-call count.
+        let mut flags = RunFlags::default();
+        fold_shell_modifications(&mut flags, &[call("shell")], &[result("")], &wd, 5_000);
+        assert_eq!(flags.modified_files, vec!["chart.png"]);
+        assert_eq!(flags.modified_file_count, 0);
     }
 }

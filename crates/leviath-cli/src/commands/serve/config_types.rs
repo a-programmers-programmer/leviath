@@ -35,14 +35,19 @@ where
 #[derive(Serialize, Deserialize)]
 pub(super) struct RedactedConfig {
     pub(super) default_provider: String,
-    /// `default_model`: the one model every stage runs on while it is set.
+    /// `override_model`: the one model every stage that allows a user default
+    /// starts on while it is set, ahead of what its blueprint names.
     ///
     /// Always serialized, `null` when nothing is set, which is the
     /// distinction a console needs. A daemon too old to report this omits the
     /// key entirely, and that has to read as "cannot say" rather than as
     /// "nothing is set" - without the field, a picker drew an empty box over
     /// a machine that had a model pinned.
-    pub(super) default_model: Option<String>,
+    pub(super) override_model: Option<String>,
+    /// `fallback_model`: the model a stage falls back to when none of the
+    /// models it names is configured here, never ahead of them. Always
+    /// serialized, `null` when unset, for the same reason as `override_model`.
+    pub(super) fallback_model: Option<String>,
     /// `[providers] provider_order`: the ordered provider preference for a bare
     /// model name, best first. Empty when the user set none, in which case
     /// `default_provider` alone decides. Always serialized (empty array, not
@@ -178,6 +183,42 @@ pub(super) const API_CAPABILITIES: &[&str] = &[
     "runs.parent",
     "runs.files.listing",
     "runs.files.workdir",
+    // `mime_type` on every file-listing entry, typed by the run's registry from
+    // the file's name. A console can decide whether to render a row, or whether
+    // to offer it to a region that `accepts` a type, without a request per file
+    // or a hardcoded extension table of its own.
+    "runs.files.mime_type",
+    // `input_types` and `output_types` on every `GET /api/models` entry: the
+    // mime type patterns a model takes and hands back. Announced so a
+    // console can offer "models that can see this image" without inferring
+    // it from names, and can tell a text-only answer from a missing field.
+    "models.mime_types",
+    // `parts` and `multipart/form-data` on `POST /api/agents` and
+    // `POST /api/agents/{id}/message`, and `@path` tokens in a task or
+    // message resolved inside the run's working directory: a caller can send
+    // files with a run. An older daemon reads `parts` as nothing at all.
+    "spawn.parts",
+    "messages.parts",
+    // `GET /api/agents/{id}/blobs` and `.../blobs/{sha256}`: the stored parts
+    // a run holds and their bytes, so a console can show an image the run
+    // produced without reaching into the workdir.
+    "runs.blobs",
+    // `GET /api/agents/{id}/files/raw?path=`: a workdir file's bytes under
+    // their own content type, where the JSON files route wraps text.
+    "runs.files.raw",
+    // `artifacts` on a run's answer as `{ name, path, mime_type, size,
+    // sha256 }` objects rather than paths.
+    "runs.result.artifacts",
+    // `GET /api/mime`: the effective mime registry and where each row
+    // came from.
+    "mime.registry",
+    // `PUT /api/mime` and `DELETE /api/mime`: write a row into
+    // `mime_types.toml` or take one out. Admin-gated, so announced whether or
+    // not `--allow-admin` was passed - the same narrower promise as the other
+    // admin routes, that this build has them, not that this daemon mounts
+    // them. A console offers "New type..." where it will land, and knows
+    // to fall back to handing over the TOML where it will not.
+    "mime.write",
     "runs.stages",
     // `cost_usd`, `unpriced_calls` and `cost_is_exact` on each stage record, and
     // the `visits` split beneath them. Without the price a console drawing a
@@ -261,6 +302,11 @@ pub(super) const API_CAPABILITIES: &[&str] = &[
     // `max_items`. A console that has this can show and edit the caps without
     // re-implementing the parser's defaults.
     "blueprints.fan_outs",
+    // `stage_routing` on the detail route: the stages that route the model's
+    // produced parts by mime type (`output_routing`) or empty a region on
+    // entry (`context.reset`), so a console shows or checks them without
+    // parsing the manifest.
+    "blueprints.stage_routing",
     "tools.list",
     // `GET /api/update`: how this copy was installed, and the command that
     // upgrades it. Announced because the fallback is guessing, and the console
@@ -298,6 +344,12 @@ pub(super) const API_CAPABILITIES: &[&str] = &[
     // circle the parameter exists to break: without it a console cannot tell
     // "this agent has no other scripts" from "this daemon does not look".
     "scripts.candidates",
+    // `mime_check` as a sixth `kind` on the scripts routes: the byte checks
+    // a mime row names, beside the config for the operator's rows and
+    // beside the agent for a blueprint's. Announced for the same reason
+    // `scripts.providers` is: a console offering the kind to an older
+    // daemon would put an editor in front of a 400.
+    "scripts.mime_checks",
     "config.gateways",
     // `kind`, `header_names` and `models` on each gateway `GET /api/config`
     // reports, and `kind`, `headers` and `models` on what `PUT /api/config`
@@ -373,6 +425,9 @@ pub(super) struct ApiLimits {
     /// Seconds a request may take before this server answers 408. `0` means
     /// there is no deadline. `--request-timeout-secs` over `[serve]`.
     pub(super) request_timeout_secs: u64,
+    /// Bytes one request body may carry: the ceiling on a multipart upload.
+    /// `[serve] max_upload_bytes`.
+    pub(super) max_upload_bytes: u64,
 }
 
 impl ApiLimits {
@@ -391,6 +446,7 @@ impl ApiLimits {
             max_tracked_modified_files: leviath_core::run_meta::MAX_TRACKED_MODIFIED_FILES,
             max_concurrent_requests: requests.max_concurrent_requests,
             request_timeout_secs: requests.request_timeout_secs,
+            max_upload_bytes: requests.max_upload_bytes,
         }
     }
 }
@@ -416,7 +472,7 @@ pub(super) struct WriteConfigReq {
     /// alone, `null` clears it, a string sets it. See [`double_option`].
     ///
     /// Unset is a real state here, and usually the better one: a pinned
-    /// `default_model` runs every stage of every blueprint on one model,
+    /// `override_model` runs every stage of every blueprint on one model,
     /// which puts the cheap stages on a top-tier price. A route that could
     /// set it and never unset it was a one-way door, the same gap
     /// `remove_gateways` exists to close for gateways.
@@ -425,7 +481,11 @@ pub(super) struct WriteConfigReq {
     /// `""` is not a model id, and a console that sends one by accident
     /// should hear about it instead of quietly losing the setting.
     #[serde(default, deserialize_with = "double_option")]
-    pub(super) default_model: Option<Option<String>>,
+    pub(super) override_model: Option<Option<String>>,
+    /// `fallback_model`, with the same three states and the same empty-string
+    /// refusal as `override_model`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub(super) fallback_model: Option<Option<String>>,
     pub(super) anthropic_key: Option<String>,
     pub(super) openai_key: Option<String>,
     pub(super) google_key: Option<String>,

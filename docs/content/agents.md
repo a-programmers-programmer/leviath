@@ -109,7 +109,8 @@ provider serves wins), tools, iteration cap, and context layout. Transitions for
 
 ```toml
 [stages.analyze.model]
-allow_user_default = true          # fall back to the user's default model, else fail closed
+allow_user_default = true          # let the host's override_model and fallback_model apply;
+                                   # false keeps this list exactly as written
 models = ["claude-sonnet-5", "gpt-5.4-mini"]
                                    # name models, not routes: whichever provider
                                    # the user configured is asked which it serves.
@@ -148,8 +149,12 @@ without saying so. `lev validate` reports both. See
 
 ### Which tools a stage gets
 
-`available_tools` lists what the stage may call. The match is exact, so a tool that is not named is
-not offered, however useful it might be.
+`available_tools` lists what the stage may call, by name or by kind: `@builtin`, `@subagent`,
+`@scripts`, `@mcp` and `@all` each grant every tool of that kind, so `["@builtin", "@scripts"]`
+is every built-in and every Rhai tool with nothing to keep in step. See
+[tool groups](/docs/tools#tool-groups) for what each reaches and what none of them grant.
+
+A tool that is not named and not reached by a group is not offered, however useful it might be.
 
 `available_global_tools = true` widens that list to every Rhai tool installed in the global
 `~/.leviath/tools/` directory at the moment the run spawns. It exists for tools nobody wrote into
@@ -169,8 +174,9 @@ available_global_tools = true
 ```
 
 `required_tools` is the exception to the unattended cut. A [`--yolo`](/docs/glossary) run drops
-every tool that waits on a person, and this is where a stage names the ones it wants kept anyway. Every entry must also
-appear in `available_tools`.
+every tool that waits on a person, and this is where a stage names the ones it wants kept anyway.
+Every entry must also appear in `available_tools`, by name or through a group that reaches it;
+`lev validate` checks the group case against the tools this install has.
 
 Naming a tool here also settles the `blocking-tool-in-autonomous-stage` lint for it, since listing
 it is how you say you meant it. See
@@ -315,6 +321,26 @@ The declarations do nothing on their own: the user's config must grant them, the
 read-only, and every access is checked against the symlink-resolved real path. Run
 `lev validate` to see which of them the config on this machine actually grants. See
 [Security](/docs/security) for the grant stanzas and the full matching rules.
+
+## Mime types the agent brings
+
+An agent whose tools make or take a format nothing else knows can describe it itself:
+
+```toml
+[mime_types."application/x-acme-scene"]
+family = "model"
+extensions = ["scene"]
+magic = "41434D45"
+check = "checks/scene.rhai"      # relative to this directory; refuses bytes that are not a scene
+```
+
+The rows are the same shape as the operator's
+[`mime_types.toml`](/docs/configuration#mime_typestoml) and layer over it for this agent's
+runs only, so a blueprint travels with the types it needs and never changes what another agent
+sees. They are checked when the manifest is parsed, so a misspelled field fails `lev validate`
+and the spawn, and a `check` script is compiled beside the agent's other scripts with the same
+fence: it has to live inside the blueprint's directory. [Mime](/docs/mime#the-registry) has
+every field and [Rhai mime checks](/docs/rhai-mime-checks) the script.
 
 ## How the coding agent verifies its work
 

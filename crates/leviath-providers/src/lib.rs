@@ -20,6 +20,9 @@ pub mod endpoint;
 pub mod failure;
 pub mod gemini;
 pub mod learned;
+pub mod mime;
+pub mod mime_output;
+pub mod mime_tables;
 pub mod ollama;
 pub mod openai;
 pub(crate) mod openai_compat;
@@ -29,13 +32,14 @@ pub mod provider;
 pub mod rate_limit;
 pub mod rhai_provider;
 pub(crate) mod text_tools;
+pub use text_tools::flatten_tool_turns;
 pub mod tokenizer;
 
 #[cfg(test)]
 mod test_support;
 
 pub use anthropic::AnthropicProvider;
-pub use capabilities::{LimitsSource, ModelCapabilities, ModelCapabilityOverride};
+pub use capabilities::{LimitsSource, ModelCapabilities, ModelCapabilityOverride, ModelMime};
 pub use claude_code::ClaudeCodeProvider;
 pub use codex::{CodexProvider, ProviderAuthStore, ProviderGrant};
 pub use endpoint::EndpointProvider;

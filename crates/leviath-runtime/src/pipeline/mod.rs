@@ -119,6 +119,7 @@ pub(crate) use tools::{
 pub use tools::{DynamicTools, ToolProgress, ToolService, noop_progress};
 #[cfg(test)]
 pub(crate) use tools::{barrier_then, cut_off_arguments_refusal, invalid_args_refusal};
+mod part_routing;
 mod response;
 pub use response::StageLedger;
 #[cfg(test)]
@@ -138,8 +139,9 @@ pub(crate) use inference::{
 };
 mod resolve;
 pub use resolve::{
-    ModelDefaults, ToolCatalog, ToolOwners, bare_default_model, expand_connector_grants,
-    filter_tools_for_stage, model_key, providers_tried, resolve_stage_model, resolve_stages,
+    HeadSource, ModelDefaults, ToolCatalog, ToolOwners, bare_user_model, expand_connector_grants,
+    filter_tools_for_stage, head_source, model_key, providers_tried, resolve_stage_model,
+    resolve_stages, tool_source,
 };
 mod stall;
 pub use stall::{DEFAULT_STALL_TIMEOUT_SECS, PausedForSetup, StallTimeout};

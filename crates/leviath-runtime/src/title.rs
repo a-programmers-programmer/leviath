@@ -841,6 +841,7 @@ mod tests {
         ) -> leviath_providers::Result<leviath_providers::InferenceResponse> {
             match self.reply {
                 Ok(reply) => Ok(leviath_providers::InferenceResponse {
+                    parts: Vec::new(),
                     content: reply.to_string(),
                     tool_calls: vec![],
                     tokens_used: leviath_providers::TokenUsage {
@@ -888,6 +889,7 @@ mod tests {
             title: None,
             title_error: None,
             unattended: false,
+            yolo_profile: None,
             read_paths: None,
             output_request: None,
             model_override: None,
@@ -1186,6 +1188,7 @@ mod tests {
                 },
                 finish_reason: leviath_providers::FinishReason::Complete,
                 reasoning: None,
+                parts: Vec::new(),
             })
         }
         async fn count_tokens(&self, _t: &str, _m: &str) -> usize {
@@ -1292,6 +1295,7 @@ mod tests {
                 tokens_used: leviath_providers::TokenUsage::new(1, 0, 0, 1),
                 finish_reason: leviath_providers::FinishReason::Complete,
                 reasoning: None,
+                parts: Vec::new(),
             })
         }
         async fn count_tokens(&self, _t: &str, _m: &str) -> usize {

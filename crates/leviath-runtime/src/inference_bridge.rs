@@ -158,6 +158,71 @@ impl Default for RetryPolicy {
 }
 
 /// A unit of inference work the dispatch system hands to the worker pool.
+/// What a job needs to fill its mime blocks with bytes right before sending:
+/// where the bytes are, what the model takes, and how much to send.
+#[derive(Clone)]
+pub(crate) struct JobHydration {
+    /// The run's blob store.
+    pub store: Arc<dyn leviath_core::mime::BlobStore>,
+    /// The run whose blobs to read.
+    pub run_id: String,
+    /// The registry, for the text bypass.
+    pub registry: Arc<leviath_core::mime::MimeRegistry>,
+    /// What the model takes and hands back.
+    pub mime: leviath_providers::ModelMime,
+    /// The bytes of stored media one request carries before the oldest parts
+    /// become stand-ins.
+    pub max_media_bytes: u64,
+    /// Mime type patterns the stage sends as text whatever the model takes.
+    pub as_text: Vec<String>,
+}
+
+impl JobHydration {
+    /// Fill `request`'s mime blocks, logging what happened when anything
+    /// was left out.
+    fn apply(&self, request: &mut InferenceRequest) {
+        // The stage's own bypass: a part of a type it named reaches the
+        // model as text unless the part itself said otherwise.
+        if !self.as_text.is_empty() {
+            for message in &mut request.messages {
+                let leviath_providers::MessageContent::Blocks(blocks) = &mut message.content else {
+                    continue;
+                };
+                for block in blocks {
+                    if let leviath_providers::ContentBlock::Mime { part, deliver, .. } = block
+                        && deliver.is_none()
+                        && part.mime_type.matches_any(&self.as_text)
+                    {
+                        *deliver = Some(leviath_core::mime::Delivery::Text);
+                    }
+                }
+            }
+        }
+        let fetch =
+            |blob: &leviath_core::mime::BlobRef| self.store.read(&self.run_id, &blob.sha256).ok();
+        let report = leviath_providers::mime::hydrate_request(
+            request,
+            &leviath_providers::mime::Hydration {
+                mime: &self.mime,
+                registry: &self.registry,
+                max_media_bytes: self.max_media_bytes,
+                fetch: &fetch,
+            },
+        );
+        if report.stand_ins > 0 || report.capped > 0 || !report.missing.is_empty() {
+            tracing::info!(
+                model = %request.model,
+                sent = report.sent,
+                as_text = report.as_text,
+                stand_ins = report.stand_ins,
+                capped = report.capped,
+                missing = report.missing.len(),
+                "[mime] stored parts the model did not receive as bytes"
+            );
+        }
+    }
+}
+
 pub(crate) struct InferenceJob {
     /// The agent this inference is for.
     pub entity: Entity,
@@ -174,6 +239,9 @@ pub(crate) struct InferenceJob {
     /// before anything was measured, or for a lane that has no window of its
     /// own to correct.
     pub calibration: Option<crate::pipeline::PromptCalibration>,
+    /// How to put the request's stored parts in front of the model, or `None`
+    /// for a lane that sends them as their stand-ins (routing, compaction).
+    pub hydration: Option<JobHydration>,
     /// Ask the provider to stream this answer and fold the chunks back into one
     /// response, rather than waiting for the whole thing at once.
     ///
@@ -259,12 +327,19 @@ pub async fn guard_context_window(
         return Ok(None);
     }
     let text = flatten_request_text(request);
+    // The text is counted; the mime blocks carrying bytes are charged at the
+    // registry's estimate, which is all any tokenizer here can say about them.
+    let mime = leviath_providers::mime::mime_tokens(request);
     let estimate =
-        crate::pipeline::calibrated_tokens(leviath_core::estimate_tokens(&text), calibration);
+        crate::pipeline::calibrated_tokens(leviath_core::estimate_tokens(&text), calibration)
+            .saturating_add(mime);
     if estimate.saturating_add(request.max_tokens) < max / COUNT_ABOVE_WINDOW_FRACTION {
         return Ok(None);
     }
-    let used = provider.count_tokens(&text, &request.model).await;
+    let used = provider
+        .count_tokens(&text, &request.model)
+        .await
+        .saturating_add(mime);
     if used.saturating_add(request.max_tokens) > max {
         return Err(ProviderError::TokenLimitExceeded {
             used,
@@ -453,12 +528,17 @@ pub(crate) async fn run_inference_job(
     let InferenceJob {
         entity,
         provider,
-        request,
+        mut request,
         permit,
         calibration,
         stream,
+        hydration,
     } = job;
-    let mut request = request;
+    // Bytes go in here and nowhere earlier: the assembled request, the
+    // journal and every snapshot carry references only.
+    if let Some(hydration) = &hydration {
+        hydration.apply(&mut request);
+    }
     let started = std::time::Instant::now();
     // Retry transient failures (connection reset, timeout, 429, 5xx) with
     // exponential backoff, holding the permit across the backoff; a permanent
@@ -576,6 +656,7 @@ mod tests {
 
     fn response(text: &str) -> InferenceResponse {
         InferenceResponse {
+            parts: Vec::new(),
             content: text.to_string(),
             tool_calls: vec![],
             tokens_used: leviath_providers::TokenUsage {
@@ -633,6 +714,7 @@ mod tests {
             permit: pools.try_acquire("p", "m").expect("free pool"),
             calibration: None,
             stream: false,
+            hydration: None,
         }
     }
 
@@ -661,6 +743,7 @@ mod tests {
             permit,
             calibration: None,
             stream: false,
+            hydration: None,
         };
         let (tx, mut rx) = mpsc::unbounded_channel();
         let cancel = crate::cancel::CancelToken::new();
@@ -714,6 +797,7 @@ mod tests {
             permit,
             calibration: None,
             stream: false,
+            hydration: None,
         };
         let (tx, mut rx) = mpsc::unbounded_channel();
         let policy = RetryPolicy {
@@ -861,6 +945,7 @@ mod tests {
             permit: pools.try_acquire("p", "m").expect("free pool"),
             calibration,
             stream: false,
+            hydration: None,
         }
     }
 
@@ -1200,6 +1285,7 @@ mod tests {
                     tokens: None,
                     finish_reason: None,
                     reasoning: None,
+                    parts: Vec::new(),
                 }),
                 Ok(leviath_providers::provider::StreamChunk {
                     delta: String::new(),
@@ -1207,6 +1293,7 @@ mod tests {
                     tokens: Some(leviath_providers::TokenUsage::new(7, 0, 0, 3)),
                     finish_reason: Some(leviath_providers::FinishReason::Complete),
                     reasoning: None,
+                    parts: Vec::new(),
                 }),
             ])))
         }
@@ -1247,6 +1334,7 @@ mod tests {
             permit: pools.try_acquire("p", "m").expect("free pool"),
             calibration: None,
             stream: true,
+            hydration: None,
         };
         let (tx, mut rx) = mpsc::unbounded_channel();
         run_inference_job(
@@ -1282,6 +1370,7 @@ mod tests {
             permit: pools.try_acquire("p", "m").expect("free pool"),
             calibration: None,
             stream: false,
+            hydration: None,
         };
         let (tx, mut rx) = mpsc::unbounded_channel();
         run_inference_job(
@@ -1662,5 +1751,109 @@ mod tests {
         assert_eq!(p.count_tokens("t", "m").await, 1);
         assert_eq!(p.max_context_tokens("m"), 100_000);
         let _ = p.capabilities("m");
+    }
+
+    #[test]
+    fn hydration_fills_mime_blocks_from_the_store_and_names_what_is_missing() {
+        use leviath_core::mime::{Blob, BlobStore, MemoryBlobStore, MimeRegistry, MimeType, Part};
+        use leviath_providers::{ContentBlock, Message, MessageContent, ModelMime};
+        let registry = Arc::new(MimeRegistry::builtin());
+        let store = Arc::new(MemoryBlobStore::new());
+        let blob = Blob::new(
+            MimeType::parse("image/png").unwrap(),
+            b"\x89PNG\r\n\x1a\nbody".to_vec(),
+        )
+        .named("a.png");
+        let reference = store.put("run-1", &blob, &registry).unwrap();
+        let stored = Part::stored(reference.clone()).named("a.png");
+        let missing = Part::stored(leviath_core::mime::BlobRef {
+            sha256: "0".repeat(64),
+            ..reference
+        })
+        .named("a.png");
+        let mut request = test_request();
+        request.messages.push(Message {
+            role: "user".to_string(),
+            content: MessageContent::Blocks(vec![
+                ContentBlock::mime(&stored).unwrap(),
+                ContentBlock::mime(&missing).unwrap(),
+            ]),
+            cache_breakpoint: false,
+            reasoning: None,
+        });
+        let hydration = JobHydration {
+            store,
+            run_id: "run-1".to_string(),
+            registry,
+            mime: ModelMime::new(&["text/*", "image/*"], &["text/*"]),
+            max_media_bytes: 64 * 1024 * 1024,
+            as_text: Vec::new(),
+        };
+        hydration.apply(&mut request);
+        // The stage's `as_text` sends a type the registry calls binary as
+        // text, when its bytes read as text; a part that chose native keeps it.
+        let scene = Blob::new(
+            MimeType::parse("application/x-scene").unwrap(),
+            b"v 1 2 3".to_vec(),
+        )
+        .named("scene.bin");
+        let scene = Part::stored(
+            hydration
+                .store
+                .put("run-1", &scene, &hydration.registry)
+                .unwrap(),
+        )
+        .named("scene.bin");
+        let mut as_text = test_request();
+        as_text.messages.push(Message {
+            role: "user".to_string(),
+            content: MessageContent::Blocks(vec![
+                ContentBlock::mime(&scene).unwrap(),
+                ContentBlock::mime(
+                    &stored
+                        .clone()
+                        .delivered(leviath_core::mime::Delivery::Native),
+                )
+                .unwrap(),
+            ]),
+            cache_breakpoint: false,
+            reasoning: None,
+        });
+        as_text.messages.push(Message {
+            role: "user".to_string(),
+            content: MessageContent::Text("plain".to_string()),
+            cache_breakpoint: false,
+            reasoning: None,
+        });
+        let forced = JobHydration {
+            as_text: vec!["application/*".to_string(), "image/*".to_string()],
+            ..hydration.clone()
+        };
+        forced.apply(&mut as_text);
+        let blocks_of = |content: &MessageContent| match content {
+            MessageContent::Blocks(blocks) => blocks.clone(),
+            MessageContent::Text(_) => Vec::new(),
+        };
+        let forced_blocks = blocks_of(&as_text.messages[0].content);
+        assert_eq!(
+            forced_blocks[0],
+            ContentBlock::Text {
+                text: "v 1 2 3".to_string()
+            }
+        );
+        assert!(
+            forced_blocks[1].is_hydrated_mime(),
+            "a part that chose native keeps it"
+        );
+        assert!(blocks_of(&MessageContent::Text("t".into())).is_empty());
+        let blocks = blocks_of(&request.messages[0].content);
+        assert!(blocks[0].is_hydrated_mime());
+        assert_eq!(
+            blocks[1],
+            ContentBlock::Text {
+                text: "[image/png, 12 B] a.png".to_string()
+            }
+        );
+        assert_eq!(leviath_providers::mime::mime_tokens(&request), 1600);
     }
 }

@@ -6,6 +6,7 @@
 //! module keeps the manifest/session/tool-source helpers still shared across the
 //! CLI, and the `RunArgs` the binary wires into that path.
 
+pub mod attach;
 pub(crate) mod manifest;
 pub(crate) mod session;
 pub(crate) mod task;
@@ -55,8 +56,21 @@ pub struct RunArgs {
     /// `stages/<n>/taint_audit.json` as `YoloAutoApprove`. Think twice before
     /// combining `--yolo` with an agent whose `[read_paths]` reach private
     /// files.
-    #[arg(long)]
-    pub yolo: bool,
+    ///
+    /// `--yolo=<profile>` runs under a named profile from `yolo.toml` beside
+    /// your config instead: the profile says which tool calls and shell
+    /// commands run unprompted, which still ask, and whether the model's
+    /// questions and the stage checkpoints still come to you. `lev yolo list`
+    /// shows the profiles you have. The equals sign is required, so
+    /// `lev run --yolo coder` keeps meaning "run coder, plain yolo".
+    #[arg(
+        long,
+        value_name = "PROFILE",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = ""
+    )]
+    pub yolo: Option<String>,
 
     /// Allow a tool outright (repeatable).
     #[arg(long)]
@@ -103,7 +117,7 @@ pub struct RunArgs {
 
     /// Ask for the final output in a particular shape, overriding whatever the
     /// blueprint declares. Any label works - `markdown`, `json`, `xml`, `a2ui`,
-    /// a media type, a house format - because nothing converts between shapes:
+    /// a mime type, a house format - because nothing converts between shapes:
     /// the label and any instructions are handed to the model, which produces
     /// the bytes. Read the answer back with `lev result <run-id>`.
     ///
@@ -126,6 +140,14 @@ pub struct RunArgs {
     #[arg(long, value_name = "JSON|@FILE")]
     pub output_schema: Option<String>,
 
+    /// Attach a file to the run: `path[:region][:type][:text]`. The file lands
+    /// in the named region (default: the task region) as a typed part. `:type`
+    /// names its mime type when the registry cannot tell; `:text` sends its
+    /// bytes to the model as text whatever the model takes. Repeatable. A
+    /// `@path` inside the task text does the same for that file.
+    #[arg(long, value_name = "PATH[:REGION][:TYPE][:text]")]
+    pub attach: Vec<String>,
+
     /// Dynamic per-region seed flags (`--<region> <text|@file>`), collected by an
     /// argv pre-scan in the binary since region names are blueprint-defined.
     /// clap skips this field; it is populated after parsing.
@@ -146,6 +168,7 @@ const KNOWN_RUN_FLAGS: &[&str] = &[
     "output-format",
     "output-instructions",
     "output-schema",
+    "attach",
     // Every flag `run` owns must be listed here. One that is missing is not a
     // parse error: the pre-scan silently reads it as a `--<region>` seed and
     // swallows the token after it.
@@ -189,6 +212,7 @@ pub fn output_request(
         schema,
         validator: None,
         on_validator_error: None,
+        artifacts: Vec::new(),
     }))
 }
 
@@ -506,5 +530,45 @@ mod tests {
         std::fs::write(&file, "x").unwrap();
         let err = effective_workdir(Some(file), cwd).unwrap_err();
         assert!(err.to_string().contains("not a directory"), "{err}");
+    }
+
+    /// `--yolo` alone is the bare flag, `--yolo=<name>` names a profile, and
+    /// the space form keeps meaning "bare flag, then the agent": otherwise
+    /// `lev run --yolo coder` would silently read `coder` as a profile.
+    #[test]
+    fn the_yolo_flag_takes_a_profile_only_with_an_equals_sign() {
+        use clap::Parser as _;
+        #[derive(clap::Parser)]
+        struct Probe {
+            #[command(flatten)]
+            run: RunArgs,
+        }
+        let p = Probe::try_parse_from(["lev", "coder", "--yolo"]).expect("bare flag");
+        assert_eq!(p.run.yolo.as_deref(), Some(""));
+        assert_eq!(p.run.path.as_deref(), Some("coder"));
+        let p = Probe::try_parse_from(["lev", "--yolo=careful", "coder"]).expect("named");
+        assert_eq!(p.run.yolo.as_deref(), Some("careful"));
+        assert_eq!(p.run.path.as_deref(), Some("coder"));
+        let p = Probe::try_parse_from(["lev", "--yolo", "coder"]).expect("space form");
+        assert_eq!(p.run.yolo.as_deref(), Some(""));
+        assert_eq!(p.run.path.as_deref(), Some("coder"));
+        let p = Probe::try_parse_from(["lev", "coder"]).expect("no flag");
+        assert!(p.run.yolo.is_none());
+    }
+
+    /// The argv pre-scan leaves `--yolo=<name>` alone: `yolo` is a known flag
+    /// whichever way its value is attached.
+    #[test]
+    fn the_pre_scan_passes_a_profile_flag_through() {
+        let (out, regions) = extract_region_flags(argv(&[
+            "lev",
+            "run",
+            "coder",
+            "--yolo=careful",
+            "--files",
+            "@x",
+        ]));
+        assert_eq!(out, argv(&["lev", "run", "coder", "--yolo=careful"]));
+        assert_eq!(regions.get("files").map(String::as_str), Some("@x"));
     }
 }

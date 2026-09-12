@@ -322,6 +322,9 @@ fn reload_one(
         // `--allow` and `--max-depth` stay unpersisted: losing them narrows what
         // the run may do, which is the harmless direction.
         yolo: meta.yolo,
+        // And the profile with it: a scoped run that came back as bare
+        // `--yolo` would have escalated across a restart.
+        yolo_profile: meta.yolo_profile.clone(),
         // Belt and braces: seeds aren't replayed on reload at all (see above),
         // so a resumed run can never re-execute a command seed.
         no_seed_commands: true,
@@ -332,6 +335,7 @@ fn reload_one(
         // caller's requested shape would silently revert the run to the
         // blueprint's partway through, and the caller would never see why.
         output: meta.output_request.clone(),
+        parts: Vec::new(),
     };
     let entity = build_agent_for_reload(world.world_mut(), deps, &args)?;
 
@@ -700,6 +704,7 @@ mod tests {
                 ..Default::default()
             },
             yolo: false,
+            yolo_profile: None,
             read_paths: None,
             // Non-default on purpose, like `flags` above: proves a reload puts
             // the run's answer back rather than dropping it (and then erasing
@@ -1052,7 +1057,7 @@ mod tests {
                 current_tokens: 4,
                 max_tokens: 100_000,
                 entries: vec![leviath_core::run_meta::RegionEntrySnapshot {
-                    content: "earlier turn".to_string(),
+                    content: "earlier turn".to_string().into(),
                     tokens: 4,
                     kind: leviath_core::region::EntryKind::UserMessage,
                     metadata: None,
@@ -1310,7 +1315,7 @@ mod tests {
             id: id.to_string(),
             name: name.to_string(),
             arguments: "{}".to_string(),
-            result: result.map(str::to_string),
+            result: result.map(Into::into),
             thought_signature: None,
         }
     }
@@ -1365,7 +1370,7 @@ mod tests {
                 RunRecord::ToolCallDone {
                     iteration: 9,
                     call_id: "c_done".to_string(),
-                    result: "Wrote 42 bytes to x.txt".to_string(),
+                    result: "Wrote 42 bytes to x.txt".to_string().into(),
                     at: 4,
                 },
             ],
@@ -1440,7 +1445,7 @@ mod tests {
                 max_tokens: 100_000,
                 entries: vec![
                     leviath_core::run_meta::RegionEntrySnapshot {
-                        content: "done".to_string(),
+                        content: "done".to_string().into(),
                         tokens: 1,
                         kind: EntryKind::AssistantTurn {
                             tool_calls: vec![leviath_core::region::SerializedToolCall {
@@ -1456,7 +1461,7 @@ mod tests {
                         reasoning: None,
                     },
                     leviath_core::run_meta::RegionEntrySnapshot {
-                        content: "Wrote it".to_string(),
+                        content: "Wrote it".to_string().into(),
                         tokens: 1,
                         kind: EntryKind::ToolResult {
                             tool_call_id: "c1".to_string(),
@@ -2371,5 +2376,50 @@ mod tests {
         assert!(!is_finished(&RunStatus::Cancelled));
         assert!(!is_finished(&RunStatus::Running));
         assert!(!is_finished(&RunStatus::WaitingInput));
+    }
+
+    /// A profiled run comes back under its profile, not under bare `--yolo`:
+    /// the name is restored and the profile's held checkpoints stay held.
+    #[tokio::test]
+    async fn reload_keeps_a_profiled_run_under_its_profile() {
+        crate::config::with_isolated_config_path_async("reload_yolo_profile", |cfg| async move {
+            std::fs::write(
+                cfg.join("yolo.toml"),
+                "[careful]\ndefault = \"ask\"\ncheckpoints = \"ask\"\n",
+            )
+            .unwrap();
+            let agent = agent_dir();
+            let manifest = agent.path().join("agent.leviath");
+            let runs = tempfile::tempdir().unwrap();
+            write_run(
+                runs.path(),
+                "run-prof",
+                manifest.to_str().unwrap(),
+                RunStatus::Running,
+                None,
+            );
+            let meta_path = runs.path().join("run-prof").join("meta.json");
+            let mut meta: RunMeta =
+                serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+            meta.yolo = true;
+            meta.yolo_profile = Some("careful".to_string());
+            std::fs::write(&meta_path, serde_json::to_string(&meta).unwrap()).unwrap();
+
+            let (world, entity) = reload_single(runs.path(), "run-prof").await;
+            let md = world
+                .world()
+                .get::<RunMetadata>(entity)
+                .expect("reloaded run has metadata");
+            assert!(md.unattended);
+            assert_eq!(md.yolo_profile.as_deref(), Some("careful"));
+            assert!(
+                world
+                    .world()
+                    .get::<leviath_runtime::components::InteractionAutoApprove>(entity)
+                    .is_none(),
+                "the profile's held checkpoints hold across a reload"
+            );
+        })
+        .await;
     }
 }

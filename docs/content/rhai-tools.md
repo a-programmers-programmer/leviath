@@ -41,8 +41,9 @@ A tool declares itself with leading `// @` directives and reads its arguments fr
 object. The recognized directives:
 
 - `// @tool <name>` is required and names the tool. A stage sees it when its `available_tools`
-  lists that name, or when the stage sets `available_global_tools = true` and the script lives in
-  `~/.leviath/tools/`.
+  lists that name or includes `@scripts`, the [tool group](/docs/tools#tool-groups) that grants
+  every Rhai tool the install has, or when the stage sets `available_global_tools = true` and the
+  script lives in `~/.leviath/tools/`.
 - `// @description <text>` is an optional one-liner shown to the model.
 - `// @param <name> <type> <required|optional> "<description>"` is repeatable. `<type>` is a JSON
   schema type: `string`, `integer`, `number`, `boolean`, `array`, `object`. A typo here produces a
@@ -52,9 +53,16 @@ object. The recognized directives:
 - `// @requires <cap> [<cap>...]` lists platform capabilities the tool needs (`network`, `shell`,
   `filesystem`), comma or space separated and repeatable. Leviath drops the tool where the platform
   cannot provide one.
+- `// @accepts <type> [...]` and `// @produces <type> [...]` name the mime types the tool reads as
+  [parts](/docs/mime) and hands back as parts (`image/*`, `audio/wav`), comma or space separated
+  and repeatable. Advisory: `lev tools` shows them, and a stage that needs a `video/mp4` can be
+  checked against the tools it holds.
 
 The script's return value becomes the tool result: a string is returned verbatim, anything else is
-JSON-encoded, and a bare `()` is an empty string. A missing optional param reads as `()`.
+JSON-encoded, and a bare `()` is an empty string. A missing optional param reads as `()`. One shape
+is special: a map with a `parts` list, `#{ content: "...", parts: [ ... ] }`, is a result that
+carries typed parts beside its text. Each entry is a part map as `write_part` or `find_part` handed
+it back; the text is the `content`, or nothing when it is left off.
 
 ## Host functions inside a tool
 
@@ -73,6 +81,16 @@ tool's `@requires` line is not a gate: it only filters which platforms discover 
 | `read_file(path)` | Reads a file, always confined to the workdir |
 | `write_file(path, content)` | Writes a file |
 | `env_var(name)` | Reads an environment variable. Credential-shaped names need [`allow_env_vars`](/docs/configuration#security) |
+| `read_part(name)` | The bytes of a stored [part](/docs/mime) the run holds, as a Rhai blob, by file name or by the first six or more characters of its sha256. Reading needs no permission: the part is already the run's |
+| `write_part(bytes [, type [, name]])` | Stores bytes as a part of the run and returns its map. The type is sniffed when left off, the name made up (`part-3.png`). Gated like `write_file`, and charged to the run's write budget |
+| `list_parts()` | Every stored part the run holds, as maps |
+| `find_part(name)` | One part's map by name or hash prefix, or `()` |
+
+A part map carries `mime_type`, `name`, `sha256`, `size`, `width`, `height`, `duration_ms`,
+`tokens` and `stand_in`. The parts a tool can name are the ones in the agent's context window when
+the batch was dispatched, plus whatever the tools in that batch wrote. A tool that takes an image by
+name reads `params.image` and calls `read_part` on it; the model names parts the way the stand-in
+in its context does, by file name.
 
 **These are pure** and need no permission, because they only transform values you already have:
 
@@ -109,6 +127,24 @@ fetches a URL, and hands the model readable prose instead of raw HTML:
 // @requires network
 let body = http_get(params.url);
 html_to_text(body)
+```
+
+A tool that makes a part. It takes a sprite by name, runs a shell command over its bytes, and
+hands the result back typed, so a model that draws sees the image and one that does not sees a
+line naming it:
+
+```rhai
+// @tool flip_sprite
+// @description Mirror a sprite left to right
+// @param image string required "the sprite's file name, as shown in context"
+// @accepts image/png
+// @produces image/png
+// @requires shell
+let src = read_part(params.image);
+write_file("work/in.png", encode_base64(src));
+shell("base64 -d work/in.png | convert - -flop work/out.png");
+let out = read_part("out.png");   // a file the shell wrote is not a part yet: attach it first
+#{ content: "flipped " + params.image, parts: [write_part(out, "image/png", "flipped.png")] }
 ```
 
 For parameter shapes that directives cannot express (enums, array `items`, numeric bounds), drop a
@@ -162,8 +198,8 @@ decision the model should be making each time ages badly and is hard to notice f
 
 To use an installed tool in the same run, the agent must be a `dynamic_tools` agent, which picks
 the new tool up on its next turn. Any later run sees it at spawn, and a stage advertises it when its
-`available_tools` names it or it sets `available_global_tools = true`. See [Tools](/docs/tools) for
-how a stage's tool set is put together.
+`available_tools` names it, includes `@scripts`, or the stage sets
+`available_global_tools = true`. See [Tools](/docs/tools) for how a stage's tool set is put together.
 
 ## Inspecting the inventory
 

@@ -21,9 +21,10 @@ use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 
 use bevy_ecs::entity::Entity;
 use leviath_core::interaction::{ApprovalScope, InteractionRequest};
+use leviath_core::region::EntryContent;
 use leviath_providers::ToolCall;
 use leviath_runtime::dynamic_interaction::{
-    InteractionBackend, UnattendedInteraction, dispatch_dynamic_interaction,
+    InteractionBackend, UnattendedInteraction, dispatch_dynamic_interaction_with_parts,
 };
 use leviath_runtime::interaction_hub::HubInteractionBackend;
 use leviath_runtime::pipeline::{ToolProgress, ToolService};
@@ -34,6 +35,10 @@ use tokio::sync::Mutex;
 
 use crate::config::ToolPolicy;
 use crate::tools::resolve_policy;
+
+#[cfg(test)]
+use super::tool_content::{Attached, with_attached};
+use super::tool_content::{answer_content, mcp_content};
 
 /// Everything one agent needs to execute a tool call: the executors, its policy
 /// layers, and its interaction backend. All fields are cheap `Arc`s so a clone is
@@ -177,6 +182,11 @@ pub(crate) struct AgentToolState {
     pub stage_required: Arc<StdMutex<HashSet<String>>>,
     /// Every stage's `required_tools`, indexed by stage index.
     pub stage_required_by_index: Arc<Vec<HashSet<String>>>,
+    /// What each tool may be handed at the current stage (`tool_accepts`),
+    /// by canonical tool name; a tool absent here has no limit.
+    pub stage_tool_accepts: Arc<StdMutex<HashMap<String, Vec<String>>>>,
+    /// Every stage's `tool_accepts`, indexed by stage index.
+    pub stage_tool_accepts_by_index: Arc<Vec<HashMap<String, Vec<String>>>>,
     /// Blueprint-level `[tool_permissions]`.
     pub agent_perms: Arc<HashMap<String, String>>,
     /// Config-level tool permissions, re-resolved when the run resumes.
@@ -194,6 +204,15 @@ pub(crate) struct AgentToolState {
     /// ever - unless the stage kept it in `required_tools`, in which case a real
     /// prompt is exactly what the blueprint asked for.
     pub unattended: bool,
+    /// The yolo profile this run's tool calls answer to, when it is a yolo
+    /// run: the built-in default for bare `--yolo`, the named one for
+    /// `--yolo=<name>`. `None` for an attended run. Re-read from `yolo.toml`
+    /// when a named run resumes, like the config layers beside it.
+    pub yolo: Arc<Live<Option<Arc<crate::yolo::YoloProfile>>>>,
+    /// The files a run may not change (`[security] lock_permission_files`),
+    /// empty when the lock is off. Re-read with the config when the run
+    /// resumes.
+    pub protected: Arc<Live<Vec<crate::tools::ProtectedPath>>>,
     /// The current stage name, for tagging interactions (re-synced on stage change).
     pub stage_name: Arc<StdMutex<String>>,
     /// Handle for the sub-agent tools (spawn/check/wait/send/kill), or `None`
@@ -214,6 +233,9 @@ pub(crate) struct AgentToolState {
     /// The host functions script tools call, with `[tool_script_permissions]`
     /// enforcement (Layer 3) already baked in.
     pub script_host: Arc<dyn leviath_scripting::ScriptHost>,
+    /// The stored parts the runtime offered from the window before the
+    /// current batch, which the script host reads by name. Shared with it.
+    pub offered_parts: Arc<StdMutex<Vec<leviath_core::mime::Part>>>,
     /// Present only for `dynamic_tools` agents: everything needed to re-discover
     /// and re-advertise this agent's tools mid-run.
     pub dynamic: Option<Arc<DynamicToolCtx>>,
@@ -266,6 +288,10 @@ pub(crate) struct ConfigSource {
     pub blueprint_read_paths: Option<leviath_core::blueprint::ReadPathsConfig>,
     /// The run's workdir, which read-path entries compile relative to.
     pub workdir: std::path::PathBuf,
+    /// The yolo profile the run was launched under by name, so a resume reads
+    /// the current `yolo.toml` for it. `None` for an attended run and for the
+    /// bare flag, which reads no file.
+    pub yolo_profile: Option<String>,
 }
 
 /// A minimal [`AgentToolState`] over `workdir`, for the daemon-level test of
@@ -353,6 +379,7 @@ impl AgentToolState {
             std::sync::atomic::Ordering::Relaxed,
         );
         self.writes.set_limits(config.limits.write_limits());
+        self.protected.set(crate::tools::permission_files(config));
         // The read-path set is the one layer here that can fail to compile, and
         // dropping the grants the run already had over a typo would tighten it
         // rather than widen it, which is the wrong direction for a file people
@@ -364,6 +391,25 @@ impl AgentToolState {
             &source.workdir,
         ) {
             self.builtins.set_read_paths(policy);
+        }
+        // The named yolo profile, from the file as it stands now. A name the
+        // file has lost, or a file that no longer loads, keeps the rules the
+        // run resumed with: dropping them would not be safer, it would be
+        // whichever of "prompt for everything" and "refuse everything" the
+        // code happened to fall into, and neither is what the person asked.
+        if let Some(name) = &source.yolo_profile {
+            match crate::yolo::resolve_for_spawn(true, Some(name)) {
+                Ok(profile) => self.yolo.set(profile),
+                Err(error) => {
+                    let error = error.to_string();
+                    tracing::warn!(
+                        profile = %name,
+                        error,
+                        "yolo.toml no longer resolves this run's profile; keeping the rules it \
+                         resumed with"
+                    );
+                }
+            }
         }
     }
 
@@ -421,6 +467,9 @@ pub(crate) struct DynamicToolCtx {
     pub reserved_names: HashSet<String>,
     /// Static (non-script) tool defs: built-in + sub-agent + MCP.
     pub static_defs: Vec<leviath_providers::Tool>,
+    /// Which MCP server owns each MCP def, so a refresh can tell an MCP def
+    /// from a fresh script def when a stage grants `@mcp` or `@scripts`.
+    pub mcp_owners: leviath_runtime::pipeline::ToolOwners,
     /// Each stage's `available_tools` (Layer-1 allowlist), by stage index.
     pub stage_available: Vec<Vec<String>>,
     /// Each stage's `required_tools` (human tools kept through an unattended
@@ -444,7 +493,7 @@ pub(crate) struct DynamicToolCtx {
 /// or MCP executor. Script tools are checked first so a discovered `.rhai` tool
 /// dispatches to the Rhai engine; the compiled script and permission-enforcing
 /// host run on a blocking thread (the engine is synchronous).
-async fn execute_tool(state: &AgentToolState, is_builtin: bool, tc: &ToolCall) -> String {
+async fn execute_tool(state: &AgentToolState, is_builtin: bool, tc: &ToolCall) -> EntryContent {
     // Sub-agent tools (spawn/check/wait/send/kill) reach the world through the
     // host rather than the builtin/MCP executors.
     //
@@ -457,8 +506,13 @@ async fn execute_tool(state: &AgentToolState, is_builtin: bool, tc: &ToolCall) -
     // that manifest's own command seeds and MCP servers.
     if crate::daemon::subagent::is_subagent_tool(&tc.name) {
         return match &state.subagent {
-            Some(handle) => crate::daemon::subagent::handle(handle, tc).await,
-            None => "[error] sub-agent tools are unavailable for this agent".to_string(),
+            Some(handle) => {
+                let limit = tool_limit(state, &tc.name);
+                crate::daemon::subagent::handle_within(handle, tc, limit.as_deref())
+                    .await
+                    .into()
+            }
+            None => "[error] sub-agent tools are unavailable for this agent".into(),
         };
     }
     if state
@@ -478,13 +532,14 @@ async fn execute_tool(state: &AgentToolState, is_builtin: bool, tc: &ToolCall) -
         // call serialises every MCP call in a batch behind the slowest server.
         // The client's own lock keeps calls to one server in order.
         let routed = state.mcp.lock().await.route(&tc.name);
-        super::seed_tool::mcp_text(match routed {
+        let result = match routed {
             Ok((client, original)) => {
                 leviath_mcp::ToolExecutor::call_routed(&client, &original, tc.arguments.clone())
                     .await
             }
             Err(e) => Err(e),
-        })
+        };
+        mcp_content(&tc.name, result, state.builtins.mime())
     }
 }
 
@@ -510,7 +565,7 @@ fn mark_dirty_on_tool_write(state: &AgentToolState, tc: &ToolCall) {
 }
 
 /// Run a Rhai script tool on a blocking thread and return its result string.
-async fn execute_script_tool(state: &AgentToolState, tc: &ToolCall) -> String {
+async fn execute_script_tool(state: &AgentToolState, tc: &ToolCall) -> EntryContent {
     let Some(tool) = state
         .script_tools
         .lock()
@@ -519,13 +574,33 @@ async fn execute_script_tool(state: &AgentToolState, tc: &ToolCall) -> String {
         .cloned()
     else {
         // Name was in `script_tool_names` but the tool is gone - treat as unknown.
-        return format!("[error] unknown script tool: {}", tc.name);
+        return format!("[error] unknown script tool: {}", tc.name).into();
     };
-    let host = state.script_host.clone();
+    // Through the stage's limit for this tool, when it has one: the parts
+    // outside it are not there for the script to find.
+    let host: Arc<dyn leviath_scripting::ScriptHost> = match tool_limit(state, &tc.name) {
+        Some(limit) => Arc::new(crate::daemon::script_host::LimitedHost::new(
+            state.script_host.clone(),
+            state.offered_parts.clone(),
+            &tc.name,
+            limit,
+        )),
+        None => state.script_host.clone(),
+    };
     let args = tc.arguments.clone();
     tokio::task::spawn_blocking(move || leviath_scripting::execute_script_tool(&tool, args, host))
         .await
         .unwrap_or_else(script_tool_join_failed)
+}
+
+/// The stage's `tool_accepts` list for `tool`, when it has one.
+fn tool_limit(state: &AgentToolState, tool: &str) -> Option<Vec<String>> {
+    state
+        .stage_tool_accepts
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(leviath_tools::canonical_tool_name(tool))
+        .cloned()
 }
 
 /// Last-resort net for a script tool: a panic that escaped the script engine's
@@ -536,8 +611,8 @@ async fn execute_script_tool(state: &AgentToolState, tc: &ToolCall) -> String {
 /// panics are contained inside `leviath_scripting`, leaving the arm unreachable
 /// from a test, while this body is directly unit-testable with a real
 /// `JoinError`. Mirrors `leviath_providers::rhai_provider`'s `task_failed`.
-fn script_tool_join_failed(e: tokio::task::JoinError) -> String {
-    format!("[error] script tool panicked: {e}")
+fn script_tool_join_failed(e: tokio::task::JoinError) -> EntryContent {
+    format!("[error] script tool panicked: {e}").into()
 }
 
 /// Charge the run for a write the call declares, the moment it is queued.
@@ -576,7 +651,7 @@ pub(crate) async fn dispatch_tools(
     state: Arc<AgentToolState>,
     calls: Vec<ToolCall>,
     progress: ToolProgress,
-) -> Vec<(String, String)> {
+) -> Vec<leviath_runtime::tool_bridge::ToolResult> {
     let stage_name = state
         .stage_name
         .lock()
@@ -585,7 +660,7 @@ pub(crate) async fn dispatch_tools(
 
     // Pass 1: sequential resolution. `slots[i].1 == None` means "execute in pass
     // 2"; the queued `(slot_index, is_builtin, call)` records what to run.
-    let mut slots: Vec<(String, Option<String>)> = Vec::with_capacity(calls.len());
+    let mut slots: Vec<(String, Option<EntryContent>)> = Vec::with_capacity(calls.len());
     let mut queued: Vec<(usize, bool, ToolCall)> = Vec::new();
     for tc in calls {
         let slot = slots.len();
@@ -605,12 +680,18 @@ pub(crate) async fn dispatch_tools(
             true => &UnattendedInteraction,
             false => &state.interaction,
         };
-        if let Some(result) =
-            dispatch_dynamic_interaction(interaction, &tc.name, &tc.id, &tc.arguments, &stage_name)
-                .await
+        if let Some((text, attached)) = dispatch_dynamic_interaction_with_parts(
+            interaction,
+            &tc.name,
+            &tc.id,
+            &tc.arguments,
+            &stage_name,
+        )
+        .await
         {
             // Journal the user's answer now: pass 2 hasn't run yet, and losing
             // an answered prompt to a crash means re-asking it on resume.
+            let result = answer_content(&tc.name, text, attached, state.builtins.mime());
             progress(&tc.id, &result);
             slots.push((tc.id, Some(result)));
             continue;
@@ -623,6 +704,22 @@ pub(crate) async fn dispatch_tools(
         if let Some(refusal) =
             crate::tools::escaping_write_refusal(&tc.name, &tc.arguments, state.builtins.workdir())
         {
+            let refusal: EntryContent = refusal.into();
+            progress(&tc.id, &refusal);
+            slots.push((tc.id.clone(), Some(refusal)));
+            continue;
+        }
+
+        // The files that decide what agents may do are not a run's to change,
+        // whatever its permissions say - same footing as the fence above.
+        if let Some(refusal) = crate::tools::protected_path_refusal(
+            &tc.name,
+            &tc.arguments,
+            state.builtins.workdir(),
+            crate::yolo::home().as_deref(),
+            &state.protected.get(),
+        ) {
+            let refusal: EntryContent = refusal.into();
             progress(&tc.id, &refusal);
             slots.push((tc.id.clone(), Some(refusal)));
             continue;
@@ -638,6 +735,7 @@ pub(crate) async fn dispatch_tools(
             state.builtins.workdir(),
             &state.writes,
         ) {
+            let refusal: EntryContent = refusal.into();
             progress(&tc.id, &refusal);
             slots.push((tc.id.clone(), Some(refusal)));
             continue;
@@ -681,6 +779,28 @@ pub(crate) async fn dispatch_tools(
                 state.blueprint_may_loosen(),
             )
         });
+        // The yolo profile, when this is a yolo run. It sees the policy the
+        // config layers settled on and says what runs unprompted, what still
+        // asks, and what is refused; it never lifts a configured deny.
+        let configured = policy;
+        let decision = {
+            let profile = state.yolo.get();
+            let is_script = state
+                .script_tool_names
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains(&tc.name);
+            crate::yolo::decide_under(
+                profile.as_ref().as_deref(),
+                &tc.name,
+                &tc.arguments,
+                configured,
+                crate::tools::launch_allows(&state.launch_overrides, &tc.name),
+                crate::yolo::ToolKind::classify(&tc.name, is_builtin, is_script),
+                state.builtins.workdir(),
+            )
+        };
+        let policy = decision.as_ref().map_or(configured, |d| d.policy);
         // A grant can only ever collapse `Ask` into `Allow`. It never reaches
         // `Deny`, and it never has to: a denied tool is not one the user was
         // ever offered a grant for.
@@ -690,6 +810,20 @@ pub(crate) async fn dispatch_tools(
         };
 
         match policy {
+            // A deny the profile added names the rule, and the file it lives
+            // in: `[tool_permissions]` is not where this one is lifted.
+            ToolPolicy::Deny if configured != ToolPolicy::Deny => {
+                let reason = decision.map(|d| d.reason).unwrap_or_default();
+                let result = format!(
+                    "[denied] Tool '{}' is refused by this run's yolo profile ({reason}). Edit \
+                     the profile in yolo.toml and resume this run (`lev resume`); the run \
+                     re-reads it and does not need restarting.",
+                    tc.name
+                );
+                let result: EntryContent = result.into();
+                progress(&tc.id, &result);
+                slots.push((tc.id.clone(), Some(result)));
+            }
             ToolPolicy::Deny => {
                 // Says what actually lifts it. The run re-reads its permissions
                 // when it resumes, so the message names an edit plus a resume
@@ -700,6 +834,7 @@ pub(crate) async fn dispatch_tools(
                      (`lev resume`); the run re-reads them and does not need restarting.",
                     tc.name
                 );
+                let result: EntryContent = result.into();
                 progress(&tc.id, &result);
                 slots.push((tc.id.clone(), Some(result)));
             }
@@ -724,7 +859,8 @@ pub(crate) async fn dispatch_tools(
                         queued.push((slot, is_builtin, tc));
                     }
                     Some(false) => {
-                        let result = declined_result(&tc.name, response.deny_feedback());
+                        let result: EntryContent =
+                            declined_result(&tc.name, response.deny_feedback()).into();
                         progress(&tc.id, &result);
                         slots.push((tc.id.clone(), Some(result)));
                     }
@@ -740,7 +876,8 @@ pub(crate) async fn dispatch_tools(
                             timeout_secs = timeout,
                             "approval prompt resolved unanswered; the call did not run"
                         );
-                        let result = unanswered_approval_result(&tc.name, timeout);
+                        let result: EntryContent =
+                            unanswered_approval_result(&tc.name, timeout).into();
                         progress(&tc.id, &result);
                         slots.push((tc.id.clone(), Some(result)));
                     }
@@ -850,6 +987,15 @@ impl CliToolService {
 }
 
 impl ToolService for CliToolService {
+    fn offer_parts(&self, entity: Entity, parts: Vec<leviath_core::mime::Part>) {
+        if let Some(state) = self.state_for(entity) {
+            *state
+                .offered_parts
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = parts;
+        }
+    }
+
     fn sync_stage(&self, entity: Entity, stage_index: usize, stage_name: &str) {
         // Take a handle and drop the `states` guard before touching anything
         // else. `states` is the process-wide map of *every* agent's tool state,
@@ -876,6 +1022,12 @@ impl ToolService for CliToolService {
                 .stage_required
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner) = required.clone();
+        }
+        if let Some(limits) = state.stage_tool_accepts_by_index.get(stage_index) {
+            *state
+                .stage_tool_accepts
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = limits.clone();
         }
         *state
             .stage_name
@@ -928,7 +1080,7 @@ impl ToolService for CliToolService {
                     None => calls
                         .into_iter()
                         .map(|c| {
-                            let result = "[error] agent has no tool state".to_string();
+                            let result: EntryContent = "[error] agent has no tool state".into();
                             progress(&c.id, &result);
                             (c.id, result)
                         })
@@ -996,7 +1148,10 @@ impl ToolService for CliToolService {
         let mut all = ctx.static_defs.clone();
         all.extend(script_defs);
         Some(leviath_runtime::pipeline::filter_tools_for_stage(
-            &all,
+            leviath_runtime::pipeline::ToolCatalog {
+                defs: &all,
+                owners: &ctx.mcp_owners,
+            },
             &available,
             required,
             ctx.unattended,
@@ -1020,6 +1175,7 @@ mod tests {
             blueprint_safe: None,
             blueprint_read_paths: None,
             workdir: std::env::temp_dir(),
+            yolo_profile: None,
         })
     }
 
@@ -1065,6 +1221,8 @@ mod tests {
         let builtin_names: HashSet<String> = builtins.names().into_iter().collect();
         let (script_tools, script_tool_names, script_host) = no_script_fields();
         Arc::new(AgentToolState {
+            stage_tool_accepts_by_index: Arc::new(Vec::new()),
+            stage_tool_accepts: Arc::new(StdMutex::new(HashMap::new())),
             writes: Arc::new(budget),
             builtins,
             mcp: Arc::new(Mutex::new(leviath_mcp::ToolExecutor::new())),
@@ -1083,12 +1241,15 @@ mod tests {
             blueprint_may_loosen: Arc::new(AtomicBool::new(false)),
             interaction: hub.backend_for("agent-a"),
             unattended: false,
+            yolo: Live::new(None),
+            protected: Live::new(Vec::new()),
             stage_name: Arc::new(StdMutex::new("main".to_string())),
             subagent: None,
             sandbox: None,
             script_tools,
             script_tool_names,
             script_host,
+            offered_parts: Arc::new(StdMutex::new(Vec::new())),
             dynamic: None,
             config_source: test_config_source(),
         })
@@ -1120,12 +1281,28 @@ mod tests {
         mcp: leviath_mcp::ToolExecutor,
         global: HashMap<String, ToolPolicy>,
     ) -> Arc<AgentToolState> {
-        let builtins = Arc::new(leviath_tools::BuiltinTools::new(
+        state_with_ctx(
+            hub,
+            mcp,
+            global,
             leviath_tools::ToolContext::new(std::env::temp_dir()),
-        ));
+        )
+    }
+
+    /// [`state_with`] over a tool context the caller built, for the tests
+    /// that give the tools a blob store.
+    fn state_with_ctx(
+        hub: &InteractionHub,
+        mcp: leviath_mcp::ToolExecutor,
+        global: HashMap<String, ToolPolicy>,
+        ctx: leviath_tools::ToolContext,
+    ) -> Arc<AgentToolState> {
+        let builtins = Arc::new(leviath_tools::BuiltinTools::new(ctx));
         let builtin_names: HashSet<String> = builtins.names().into_iter().collect();
         let (script_tools, script_tool_names, script_host) = no_script_fields();
         Arc::new(AgentToolState {
+            stage_tool_accepts_by_index: Arc::new(Vec::new()),
+            stage_tool_accepts: Arc::new(StdMutex::new(HashMap::new())),
             writes: Arc::new(unlimited_writes()),
             builtins,
             mcp: Arc::new(Mutex::new(mcp)),
@@ -1144,12 +1321,15 @@ mod tests {
             blueprint_may_loosen: Arc::new(AtomicBool::new(false)),
             interaction: hub.backend_for("agent-a"),
             unattended: false,
+            yolo: Live::new(None),
+            protected: Live::new(Vec::new()),
             stage_name: Arc::new(StdMutex::new("main".to_string())),
             subagent: None,
             sandbox: None,
             script_tools,
             script_tool_names,
             script_host,
+            offered_parts: Arc::new(StdMutex::new(Vec::new())),
             dynamic: None,
             config_source: test_config_source(),
         })
@@ -1170,7 +1350,7 @@ mod tests {
         calls: Vec<ToolCall>,
         answer: impl Fn(&InteractionRequest) -> InteractionResponse + Send + 'static,
         hub: InteractionHub,
-    ) -> Vec<(String, String)> {
+    ) -> Results {
         let task = tokio::spawn(async move { dispatch_tools(state, calls, noop_progress()).await });
         // Wait for the interaction to register, answer it, then collect.
         let response = loop {
@@ -1209,6 +1389,8 @@ mod tests {
         ));
         let builtin_names: HashSet<String> = builtins.names().into_iter().collect();
         let state = Arc::new(AgentToolState {
+            stage_tool_accepts_by_index: Arc::new(Vec::new()),
+            stage_tool_accepts: Arc::new(StdMutex::new(HashMap::new())),
             writes: Arc::new(unlimited_writes()),
             builtins,
             mcp: Arc::new(Mutex::new(leviath_mcp::ToolExecutor::new())),
@@ -1227,16 +1409,94 @@ mod tests {
             blueprint_may_loosen: Arc::new(AtomicBool::new(false)),
             interaction: hub.backend_for("agent-a"),
             unattended: false,
+            yolo: Live::new(None),
+            protected: Live::new(Vec::new()),
             stage_name: Arc::new(StdMutex::new("main".to_string())),
             subagent: None,
             sandbox: None,
             script_tools: Arc::new(StdMutex::new(set)),
             script_tool_names: Arc::new(StdMutex::new(script_tool_names)),
             script_host: host,
+            offered_parts: Arc::new(StdMutex::new(Vec::new())),
             dynamic: None,
             config_source: test_config_source(),
         });
         (state, dir)
+    }
+
+    /// A stage's `tool_accepts` for a script tool hides the parts outside
+    /// the list from the script, and names the limit when one is asked for.
+    #[tokio::test]
+    async fn a_script_tool_sees_only_the_parts_its_stage_lets_it_have() {
+        use leviath_core::mime::{Blob, BlobStore, MimeRegistry, MimeType, Part};
+        let hub = InteractionHub::new();
+        let mut allow = HashMap::new();
+        allow.insert("count".to_string(), ToolPolicy::Allow);
+        allow.insert("peek".to_string(), ToolPolicy::Allow);
+        let names: HashSet<String> = ["count".to_string(), "peek".to_string()]
+            .into_iter()
+            .collect();
+        let (state, _dir) = script_state(
+            &hub,
+            &[
+                ("count", "list_parts().len().to_string()"),
+                ("peek", "read_part(\"voice.wav\").len().to_string()"),
+            ],
+            names,
+            no_script_fields().2,
+            allow,
+        );
+        let store = leviath_core::mime::MemoryBlobStore::new();
+        let registry = MimeRegistry::builtin();
+        let png = store
+            .put(
+                "r",
+                &Blob::new(
+                    MimeType::parse("image/png").unwrap(),
+                    b"\x89PNG\r\n\x1a\nhero".to_vec(),
+                ),
+                &registry,
+            )
+            .unwrap();
+        let wav = store
+            .put(
+                "r",
+                &Blob::new(MimeType::parse("audio/wav").unwrap(), b"RIFFwav".to_vec()),
+                &registry,
+            )
+            .unwrap();
+        *state.offered_parts.lock().unwrap() = vec![
+            Part::text("words"),
+            Part::stored(png).named("hero.png"),
+            Part::stored(wav).named("voice.wav"),
+        ];
+        state
+            .stage_tool_accepts
+            .lock()
+            .unwrap()
+            .insert("count".to_string(), vec!["image/*".to_string()]);
+        state
+            .stage_tool_accepts
+            .lock()
+            .unwrap()
+            .insert("peek".to_string(), vec!["image/*".to_string()]);
+        let out = dispatch_tools(
+            state.clone(),
+            vec![
+                call("c1", "count", serde_json::json!({})),
+                call("c2", "peek", serde_json::json!({})),
+            ],
+            noop_progress(),
+        )
+        .await;
+        assert_eq!(out[0].1, "1");
+        let peek = out[1].1.to_string();
+        assert!(
+            peek.contains(
+                "'voice.wav' is audio/wav; at this stage peek may be handed only image/*"
+            ),
+            "{peek}"
+        );
     }
 
     #[tokio::test]
@@ -1426,6 +1686,7 @@ mod tests {
                     allow: vec![outside.path().to_string_lossy().to_string()],
                 }),
                 workdir: workdir.path().to_path_buf(),
+                yolo_profile: None,
             }),
             ..(*state_over(workdir.path(), allow)).clone()
         });
@@ -1478,6 +1739,7 @@ mod tests {
                     allow: vec![String::new()],
                 }),
                 workdir: workdir.path().to_path_buf(),
+                yolo_profile: None,
             }),
             ..(*state_over(workdir.path(), HashMap::new())).clone()
         });
@@ -1583,6 +1845,8 @@ mod tests {
         allow.insert("edit_file".to_string(), ToolPolicy::Allow);
         allow.insert("install_tool".to_string(), ToolPolicy::Allow);
         Arc::new(AgentToolState {
+            stage_tool_accepts_by_index: Arc::new(Vec::new()),
+            stage_tool_accepts: Arc::new(StdMutex::new(HashMap::new())),
             writes: Arc::new(unlimited_writes()),
             builtins,
             mcp: Arc::new(Mutex::new(leviath_mcp::ToolExecutor::new())),
@@ -1601,12 +1865,17 @@ mod tests {
             blueprint_may_loosen: Arc::new(AtomicBool::new(false)),
             interaction: hub.backend_for("a"),
             unattended: false,
+            yolo: Live::new(None),
+            protected: Live::new(Vec::new()),
             stage_name: Arc::new(StdMutex::new("main".to_string())),
             subagent: None,
             sandbox: None,
             script_tools: Arc::new(StdMutex::new(leviath_scripting::ScriptToolSet::default())),
             script_tool_names: Arc::new(StdMutex::new(HashSet::new())),
             script_host: no_script_fields().2,
+            // Upstream's stored-parts field; the fork's helper keeps its
+            // `dynamic` ctx-by-value shape from `main`.
+            offered_parts: Arc::new(StdMutex::new(Vec::new())),
             dynamic: Some(Arc::new(dynamic)),
             config_source: test_config_source(),
         })
@@ -1950,6 +2219,8 @@ mod tests {
         let builtin_names: HashSet<String> = builtins.names().into_iter().collect();
         let (script_tools, script_tool_names, script_host) = no_script_fields();
         let state = Arc::new(AgentToolState {
+            stage_tool_accepts_by_index: Arc::new(Vec::new()),
+            stage_tool_accepts: Arc::new(StdMutex::new(HashMap::new())),
             writes: Arc::new(unlimited_writes()),
             builtins,
             mcp: Arc::new(Mutex::new(leviath_mcp::ToolExecutor::new())),
@@ -1968,12 +2239,15 @@ mod tests {
             blueprint_may_loosen: Arc::new(AtomicBool::new(false)),
             interaction: hub.backend_for("a"),
             unattended: false,
+            yolo: Live::new(None),
+            protected: Live::new(Vec::new()),
             stage_name: Arc::new(StdMutex::new("main".to_string())),
             subagent: None,
             sandbox: None,
             script_tools,
             script_tool_names,
             script_host,
+            offered_parts: Arc::new(StdMutex::new(Vec::new())),
             dynamic: None,
             config_source: test_config_source(),
         });
@@ -2326,6 +2600,8 @@ mod tests {
         global.insert("write_file".to_string(), ToolPolicy::Deny);
         let (script_tools, script_tool_names, script_host) = no_script_fields();
         let state = Arc::new(AgentToolState {
+            stage_tool_accepts_by_index: Arc::new(Vec::new()),
+            stage_tool_accepts: Arc::new(StdMutex::new(HashMap::new())),
             writes: Arc::new(unlimited_writes()),
             builtins,
             mcp: Arc::new(Mutex::new(leviath_mcp::ToolExecutor::new())),
@@ -2344,12 +2620,15 @@ mod tests {
             blueprint_may_loosen: Arc::new(AtomicBool::new(false)),
             interaction: hub.backend_for("agent-a"),
             unattended: false,
+            yolo: Live::new(None),
+            protected: Live::new(Vec::new()),
             stage_name: Arc::new(StdMutex::new("main".to_string())),
             subagent: None,
             sandbox: None,
             script_tools,
             script_tool_names,
             script_host,
+            offered_parts: Arc::new(StdMutex::new(Vec::new())),
             dynamic: None,
             config_source: test_config_source(),
         });
@@ -2368,9 +2647,9 @@ mod tests {
         )
         .await;
         assert_eq!(out.len(), 3);
-        assert_eq!(out[0], ("c1".to_string(), "AAA".to_string()));
+        assert_eq!(out[0], ("c1".to_string(), "AAA".into()));
         assert!(out[1].0 == "c2" && out[1].1.contains("[denied]"));
-        assert_eq!(out[2], ("c3".to_string(), "BBB".to_string()));
+        assert_eq!(out[2], ("c3".to_string(), "BBB".into()));
     }
 
     /// Redirect containment at the layer that actually decides. Everything here
@@ -2395,6 +2674,8 @@ mod tests {
         global.insert("write_file".to_string(), ToolPolicy::Allow);
         let (script_tools, script_tool_names, script_host) = no_script_fields();
         let state = Arc::new(AgentToolState {
+            stage_tool_accepts_by_index: Arc::new(Vec::new()),
+            stage_tool_accepts: Arc::new(StdMutex::new(HashMap::new())),
             writes: Arc::new(unlimited_writes()),
             builtins,
             mcp: Arc::new(Mutex::new(leviath_mcp::ToolExecutor::new())),
@@ -2413,12 +2694,15 @@ mod tests {
             blueprint_may_loosen: Arc::new(AtomicBool::new(false)),
             interaction: hub.backend_for("agent-a"),
             unattended: false,
+            yolo: Live::new(None),
+            protected: Live::new(Vec::new()),
             stage_name: Arc::new(StdMutex::new("main".to_string())),
             subagent: None,
             sandbox: None,
             script_tools,
             script_tool_names,
             script_host,
+            offered_parts: Arc::new(StdMutex::new(Vec::new())),
             dynamic: None,
             config_source: test_config_source(),
         });
@@ -2831,17 +3115,25 @@ mod tests {
                 HashSet::new(),
                 HashSet::from(["ask_user_text".to_string()]),
             ]),
+            stage_tool_accepts: Arc::new(StdMutex::new(HashMap::new())),
+            stage_tool_accepts_by_index: Arc::new(vec![
+                HashMap::new(),
+                HashMap::from([("spawn_agent".to_string(), vec!["image/*".to_string()])]),
+            ]),
             agent_perms: Arc::new(HashMap::new()),
             global_perms: Live::new(HashMap::new()),
             blueprint_may_loosen: Arc::new(AtomicBool::new(false)),
             interaction: hub.backend_for("a"),
             unattended: false,
+            yolo: Live::new(None),
+            protected: Live::new(Vec::new()),
             stage_name: Arc::new(StdMutex::new("main".to_string())),
             subagent: None,
             sandbox: None,
             script_tools,
             script_tool_names,
             script_host,
+            offered_parts: Arc::new(StdMutex::new(Vec::new())),
             dynamic: None,
             config_source: test_config_source(),
         });
@@ -2856,6 +3148,22 @@ mod tests {
         assert_eq!(
             *state.stage_required.lock().unwrap(),
             HashSet::from(["ask_user_text".to_string()])
+        );
+        // And what the stage lets each tool be handed.
+        assert_eq!(
+            tool_limit(&state, "spawn_agent").as_deref(),
+            Some(["image/*".to_string()].as_slice())
+        );
+        assert!(tool_limit(&state, "read_file").is_none());
+
+        // The runtime's offer lands on the state the script host shares.
+        service.offer_parts(e, vec![leviath_core::mime::Part::text("x")]);
+        assert_eq!(state.offered_parts.lock().unwrap().len(), 1);
+        service.offer_parts(e, Vec::new());
+        assert!(state.offered_parts.lock().unwrap().is_empty());
+        service.offer_parts(
+            Entity::from_raw_u32(4242).expect("a small literal index is always a valid entity id"),
+            Vec::new(),
         );
 
         // An out-of-range index leaves perms as-is but still updates the name.
@@ -3379,7 +3687,10 @@ mod tests {
             max_depth: 3,
             no_seed_commands: false,
             unattended: false,
+            yolo_profile: None,
             model_override: None,
+            offered_parts: Arc::new(std::sync::Mutex::new(Vec::new())),
+            mime: None,
         };
         let builtins = Arc::new(leviath_tools::BuiltinTools::new(
             leviath_tools::ToolContext::new(std::env::temp_dir()),
@@ -3387,6 +3698,8 @@ mod tests {
         let builtin_names: HashSet<String> = builtins.names().into_iter().collect();
         let (script_tools, script_tool_names, script_host) = no_script_fields();
         let state = Arc::new(AgentToolState {
+            stage_tool_accepts_by_index: Arc::new(Vec::new()),
+            stage_tool_accepts: Arc::new(StdMutex::new(HashMap::new())),
             writes: Arc::new(unlimited_writes()),
             builtins,
             mcp: Arc::new(Mutex::new(leviath_mcp::ToolExecutor::new())),
@@ -3405,12 +3718,15 @@ mod tests {
             blueprint_may_loosen: Arc::new(AtomicBool::new(false)),
             interaction: hub.backend_for("agent-a"),
             unattended: false,
+            yolo: Live::new(None),
+            protected: Live::new(Vec::new()),
             stage_name: Arc::new(StdMutex::new("main".to_string())),
             subagent: Some(handle),
             sandbox: None,
             script_tools,
             script_tool_names,
             script_host,
+            offered_parts: Arc::new(StdMutex::new(Vec::new())),
             dynamic: None,
             config_source: test_config_source(),
         });
@@ -3445,6 +3761,69 @@ mod tests {
         .await;
         assert_eq!(out[0].0, "c1");
         assert!(out[0].1.contains("Ada"));
+    }
+
+    /// A file attached to an answer lands beside the text as a stored part
+    /// when the run has a store, typed by the registry and delivered as the
+    /// sender asked; without one the text says what was dropped.
+    #[tokio::test]
+    async fn an_answers_files_are_stored_beside_its_text() {
+        use leviath_core::mime::{InboundPart, MimeType};
+        fn ask(req: &InteractionRequest) -> InteractionResponse {
+            InteractionResponse::text(&req.id, "see the sketch").with_parts(vec![
+                InboundPart::from_bytes("sketch.png", b"\x89PNG\r\n\x1a\nsketch".to_vec())
+                    .delivered(leviath_core::mime::Delivery::Text),
+                InboundPart::from_bytes("notes", b"plain words".to_vec())
+                    .typed(MimeType::parse("text/plain").unwrap()),
+            ])
+        }
+        let call_it = || {
+            vec![call(
+                "c1",
+                "ask_user_text",
+                serde_json::json!({"prompt": "sketch?"}),
+            )]
+        };
+
+        let hub = InteractionHub::new();
+        let ctx = leviath_tools::ToolContext::new(std::env::temp_dir())
+            .with_mime(Arc::new(mime_for_answers(1024)));
+        let state = state_with_ctx(&hub, leviath_mcp::ToolExecutor::new(), HashMap::new(), ctx);
+        let out = dispatch_answering(state, call_it(), ask, hub).await;
+        let content = &out[0].1;
+        assert!(content.as_str().starts_with("see the sketch"), "{content}");
+        assert_eq!(content.stored_count(), 2);
+        let png = &content.parts()[1];
+        assert_eq!(png.mime_type.as_str(), "image/png");
+        assert_eq!(png.name.as_deref(), Some("sketch.png"));
+        assert_eq!(png.deliver, Some(leviath_core::mime::Delivery::Text));
+        assert_eq!(content.parts()[2].mime_type.as_str(), "text/plain");
+
+        let hub = InteractionHub::new();
+        let state = state_with(&hub, leviath_mcp::ToolExecutor::new(), HashMap::new());
+        let out = dispatch_answering(state, call_it(), ask, hub).await;
+        let content = &out[0].1;
+        assert!(content.as_str().contains("['sketch.png'"), "{content}");
+        assert!(
+            content
+                .as_str()
+                .contains("dropped: this run has no blob store")
+        );
+        assert!(
+            content.as_str().contains("text/plain block of"),
+            "{content}"
+        );
+        assert!(!content.has_stored());
+    }
+
+    /// The store the answer tests give their tools.
+    fn mime_for_answers(max: u64) -> leviath_tools::ToolMime {
+        leviath_tools::ToolMime {
+            store: Arc::new(leviath_core::mime::MemoryBlobStore::new()),
+            registry: Arc::new(leviath_core::mime::RegistryCell::default()),
+            run_id: "run-1".to_string(),
+            max_part_bytes: max,
+        }
     }
 
     #[tokio::test]
@@ -3533,17 +3912,26 @@ mod tests {
 
     /// The shared log a recording [`ToolProgress`] writes to.
     type ProgressLog = Arc<StdMutex<Vec<(String, String)>>>;
+    type Results = Vec<leviath_runtime::tool_bridge::ToolResult>;
 
     /// A recording [`ToolProgress`] plus the log it writes to.
     fn recording_progress() -> (ToolProgress, ProgressLog) {
         let log: ProgressLog = Arc::new(StdMutex::new(Vec::new()));
         let sink = log.clone();
-        let progress: ToolProgress = Arc::new(move |id: &str, result: &str| {
+        let progress: ToolProgress = Arc::new(move |id: &str, result| {
             sink.lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .push((id.to_string(), result.to_string()));
         });
         (progress, log)
+    }
+
+    /// Results as the log records them: text alone.
+    fn texts(results: &Results) -> Vec<(String, String)> {
+        results
+            .iter()
+            .map(|(id, r)| (id.clone(), r.to_string()))
+            .collect()
     }
 
     #[tokio::test]
@@ -3566,7 +3954,7 @@ mod tests {
         )
         .await;
         let logged = log.lock().unwrap_or_else(PoisonError::into_inner).clone();
-        assert_eq!(logged, out);
+        assert_eq!(logged, texts(&out));
         assert!(logged[0].1.contains("[denied]"));
     }
 
@@ -3588,7 +3976,7 @@ mod tests {
         )
         .await;
         let logged = log.lock().unwrap_or_else(PoisonError::into_inner).clone();
-        assert_eq!(logged, out);
+        assert_eq!(logged, texts(&out));
         assert_eq!(
             logged[0],
             ("c1".to_string(), "User answered: Yes".to_string())
@@ -3618,7 +4006,7 @@ mod tests {
         assert!(hub.answer(response));
         let out = task.await.unwrap();
         let logged = log.lock().unwrap_or_else(PoisonError::into_inner).clone();
-        assert_eq!(logged, out);
+        assert_eq!(logged, texts(&out));
         assert!(logged[0].1.contains("User declined"));
     }
 
@@ -3634,7 +4022,7 @@ mod tests {
         let results = exec().await;
         assert_eq!(
             log.lock().unwrap_or_else(PoisonError::into_inner).clone(),
-            results
+            texts(&results)
         );
     }
 
@@ -3778,5 +4166,256 @@ mod tests {
         )
         .await;
         assert!(out[0].1.contains("[error] tool error"));
+    }
+
+    /// A state deciding under `name` from `toml`, otherwise like [`state_with`].
+    fn profile_state(hub: &InteractionHub, toml: &str, name: &str) -> Arc<AgentToolState> {
+        let mut state = state_with(hub, leviath_mcp::ToolExecutor::new(), HashMap::new());
+        let file = crate::yolo::YoloFile::from_toml(toml).expect("profile parses");
+        Arc::get_mut(&mut state)
+            .expect("sole owner before dispatch")
+            .yolo = Live::new(file.get(name));
+        state
+    }
+
+    /// A deny the profile added is refused with a message naming the rule and
+    /// the file it lives in: `[tool_permissions]` is not where it is lifted.
+    #[tokio::test]
+    async fn a_profile_deny_is_refused_and_names_the_rule() {
+        let hub = InteractionHub::new();
+        let state = profile_state(
+            &hub,
+            "[p]\ndefault = \"allow\"\n[[p.shell.deny]]\ncommand = \"curl\"\n",
+            "p",
+        );
+        let out = dispatch_tools(
+            state,
+            vec![call(
+                "c1",
+                "shell",
+                serde_json::json!({"command": "curl https://x"}),
+            )],
+            noop_progress(),
+        )
+        .await;
+        let result = out[0].1.clone();
+        assert!(result.contains("[denied]"), "{result}");
+        assert!(result.contains("yolo profile"), "{result}");
+        assert!(result.contains("shell deny rule \"curl\""), "{result}");
+        assert!(result.contains("yolo.toml"), "{result}");
+        assert!(hub.pending().is_empty(), "a deny asks nobody");
+    }
+
+    /// Under `default = "allow"` a call that would ask runs unprompted; under
+    /// `default = "ask"` the ordinary prompt opens and an approval runs it.
+    #[tokio::test]
+    async fn a_profile_decides_between_running_and_asking() {
+        let hub = InteractionHub::new();
+        let state = profile_state(&hub, "[p]\ndefault = \"allow\"\n", "p");
+        let out = dispatch_tools(
+            state,
+            vec![call(
+                "c1",
+                "shell",
+                serde_json::json!({"command": "echo yolo-ran"}),
+            )],
+            noop_progress(),
+        )
+        .await;
+        let result = out[0].1.clone();
+        assert!(result.contains("yolo-ran"), "{result}");
+        assert!(hub.pending().is_empty(), "allowed means unprompted");
+
+        let hub = InteractionHub::new();
+        let state = profile_state(&hub, "[p]\ndefault = \"ask\"\n", "p");
+        let out = dispatch_answering(
+            state,
+            vec![call(
+                "c1",
+                "shell",
+                serde_json::json!({"command": "echo asked-first"}),
+            )],
+            |req| InteractionResponse::approval(&req.id, true, ApprovalScope::Once),
+            hub,
+        )
+        .await;
+        let result = out[0].1.clone();
+        assert!(result.contains("asked-first"), "{result}");
+    }
+
+    /// A resume reads the named profile from the file as it stands: an edit
+    /// applies, and a name the file has lost keeps the rules the run had.
+    #[tokio::test]
+    async fn reread_config_follows_a_named_profile_and_keeps_it_when_the_name_goes() {
+        crate::config::with_isolated_config_path_async("reread_yolo_profile", |cfg| async move {
+            std::fs::write(cfg.join("yolo.toml"), "[careful]\ndefault = \"ask\"\n").unwrap();
+            let hub = InteractionHub::new();
+            let mut state = state_with(&hub, leviath_mcp::ToolExecutor::new(), HashMap::new());
+            Arc::get_mut(&mut state).expect("sole owner").config_source = Arc::new(ConfigSource {
+                agent_name: "tester".to_string(),
+                blueprint_safe: None,
+                blueprint_read_paths: None,
+                workdir: std::env::temp_dir(),
+                yolo_profile: Some("careful".to_string()),
+            });
+            let default_of =
+                |state: &AgentToolState| state.yolo.get().as_ref().as_ref().map(|p| p.spec.default);
+            assert_eq!(default_of(&state), None);
+            state.reread_config(&Config::default());
+            assert_eq!(default_of(&state), Some(crate::yolo::rules::Waiver::Ask));
+
+            std::fs::write(cfg.join("yolo.toml"), "[careful]\ndefault = \"allow\"\n").unwrap();
+            state.reread_config(&Config::default());
+            assert_eq!(default_of(&state), Some(crate::yolo::rules::Waiver::Allow));
+
+            std::fs::write(cfg.join("yolo.toml"), "[other]\ndefault = \"ask\"\n").unwrap();
+            state.reread_config(&Config::default());
+            assert_eq!(default_of(&state), Some(crate::yolo::rules::Waiver::Allow));
+
+            // Bare `--yolo` and an attended run name nothing, and nothing is read.
+            let plain = state_with(&hub, leviath_mcp::ToolExecutor::new(), HashMap::new());
+            plain.reread_config(&Config::default());
+            assert!(plain.yolo.get().is_none());
+        })
+        .await;
+    }
+
+    /// The lock runs before policy: a `write_file` aimed at a permission file
+    /// is refused even under a profile that allows everything, and a resume
+    /// that turns the lock off lifts it.
+    #[tokio::test]
+    async fn the_permission_file_lock_refuses_before_policy() {
+        crate::config::with_isolated_config_path_async("lock-dispatch", |cfg| async move {
+            let hub = InteractionHub::new();
+            let state = profile_state(&hub, "[p]\ndefault = \"allow\"\n", "p");
+            state.reread_config(&Config::default());
+            assert!(!state.protected.get().is_empty());
+            let yolo = cfg.join("yolo.toml").display().to_string();
+            let out = dispatch_tools(
+                state.clone(),
+                vec![call(
+                    "c1",
+                    "write_file",
+                    serde_json::json!({"path": yolo, "content": "x"}),
+                )],
+                noop_progress(),
+            )
+            .await;
+            let result = out[0].1.clone();
+            assert!(result.contains("[denied]"), "{result}");
+            assert!(result.contains("is yolo.toml"), "{result}");
+            assert!(!cfg.join("yolo.toml").exists(), "nothing was written");
+
+            let unlocked = Config {
+                security: crate::config::SecurityConfig {
+                    lock_permission_files: false,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            state.reread_config(&unlocked);
+            assert!(state.protected.get().is_empty());
+        })
+        .await;
+    }
+}
+
+#[cfg(test)]
+mod mcp_content_tests {
+    use super::*;
+    use leviath_core::mime::{Blob, MemoryBlobStore, MimeType};
+
+    fn result(
+        success: bool,
+        blobs: Vec<Blob>,
+    ) -> anyhow::Result<leviath_mcp::execution::ExecutionResult> {
+        Ok(leviath_mcp::execution::ExecutionResult {
+            success,
+            data: serde_json::Value::Null,
+            text: "the answer".to_string(),
+            blobs,
+        })
+    }
+
+    fn png(name: Option<&str>) -> Blob {
+        let blob = Blob::new(
+            MimeType::parse("image/png").unwrap(),
+            b"\x89PNG\r\n\x1a\nabc".to_vec(),
+        );
+        match name {
+            Some(n) => blob.named(n),
+            None => blob,
+        }
+    }
+
+    fn mime(max: u64) -> leviath_tools::ToolMime {
+        leviath_tools::ToolMime {
+            store: Arc::new(MemoryBlobStore::new()),
+            registry: Arc::new(leviath_core::mime::RegistryCell::default()),
+            run_id: "run-1".to_string(),
+            max_part_bytes: max,
+        }
+    }
+
+    #[test]
+    fn binary_blocks_become_stored_parts_named_after_the_tool_or_the_resource() {
+        let m = mime(1024);
+        let out = mcp_content(
+            "srv__shot",
+            result(true, vec![png(None), png(Some("hero.png"))]),
+            Some(&m),
+        );
+        assert_eq!(out.parts().len(), 3);
+        assert!(
+            out.as_str()
+                .starts_with("the answer\n[image/png, 11 B] srv__shot-1.png\n"),
+            "{out}"
+        );
+        assert_eq!(out.parts()[2].name.as_deref(), Some("hero.png"));
+        assert_eq!(out.stored_count(), 2);
+    }
+
+    #[test]
+    fn a_block_the_run_cannot_hold_is_described_instead() {
+        let out = mcp_content("t", result(true, vec![png(None)]), None);
+        assert_eq!(
+            out.as_str(),
+            "the answer\n[image/png block of 11 B dropped: this run has no blob store]"
+        );
+        assert!(!out.has_stored());
+        // Bytes with neither a type nor a name are still accounted for.
+        let nameless = with_attached(
+            "t",
+            "the answer".to_string(),
+            vec![Attached {
+                declared: None,
+                name: None,
+                data: vec![1, 2, 3],
+                deliver: None,
+            }],
+            None,
+        );
+        assert!(
+            nameless.as_str().contains("[a file of 3 B dropped"),
+            "{nameless}"
+        );
+        let small = mime(4);
+        let out = mcp_content("t", result(true, vec![png(None)]), Some(&small));
+        assert!(
+            out.as_str()
+                .contains("[block dropped: 't-1.png' is 11 bytes, over the 4"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_failed_call_and_a_text_only_call_are_text() {
+        let m = mime(1024);
+        let out = mcp_content("t", result(false, vec![png(None)]), Some(&m));
+        assert_eq!(out, "[error] the answer");
+        let out = mcp_content("t", result(true, Vec::new()), Some(&m));
+        assert_eq!(out, "the answer");
+        let out = mcp_content("t", Err(anyhow::anyhow!("gone")), Some(&m));
+        assert_eq!(out, "[error] tool error: gone");
     }
 }

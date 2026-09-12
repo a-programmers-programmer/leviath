@@ -66,6 +66,7 @@ impl Provider for StubProvider {
     ) -> leviath_providers::Result<InferenceResponse> {
         match &self.reply {
             Ok(content) => Ok(InferenceResponse {
+                parts: Vec::new(),
                 content: content.clone(),
                 tool_calls: Vec::new(),
                 tokens_used: TokenUsage {
@@ -515,6 +516,45 @@ fn config_check_names_a_script_provider_whose_file_is_missing() {
     );
 }
 
+/// A `[mime_types]` row the registry refuses is skipped by the daemon, which
+/// then types that file by the built-in table. The config still loads, so
+/// this is a note on an OK line, naming the row.
+#[test]
+fn config_check_notes_a_mime_types_row_that_will_not_load() {
+    let config: Config = toml::from_str(
+        "default_provider = \"anthropic\"\n[mime_types.\"model/obj\"]\nfamilies = \"model\"\n",
+    )
+    .expect("the table takes arbitrary rows, so the typo deserializes");
+    let check = checked(
+        "doctor-config_check_notes_a_mime_types_row_that_will_not_load",
+        &config,
+        &ProviderRegistry::new(),
+    );
+    assert_eq!(check.status, CheckStatus::Ok);
+    assert!(
+        check
+            .detail
+            .contains("mime rows are ignored until fixed: [mime_types] in config.toml")
+            && check.detail.contains("model/obj"),
+        "got: {}",
+        check.detail
+    );
+    let clean: Config = toml::from_str(
+        "default_provider = \"anthropic\"\n[mime_types.\"model/obj\"]\ntext = true\n",
+    )
+    .unwrap();
+    let check = checked(
+        "doctor-config_check_accepts_a_good_mime_types_row",
+        &clean,
+        &ProviderRegistry::new(),
+    );
+    assert!(
+        !check.detail.contains("mime_types"),
+        "got: {}",
+        check.detail
+    );
+}
+
 /// A `[rate_limits]` entry naming no provider throttles nothing, and the
 /// unknown-key check cannot see it: the table takes arbitrary keys, so the
 /// typo deserializes perfectly.
@@ -574,6 +614,39 @@ fn config_check_counts_more_than_one_unread_key() {
             .detail
             .contains("2 keys in config.toml are read by nothing"),
         "got: {}",
+        check.detail
+    );
+}
+
+/// A config file still carrying a key that changed name gets a warning, not a
+/// note: the value's meaning changed with the name, and the line says what it
+/// was read as and that `lev update` rewrites it. It is not counted among the
+/// keys nothing reads, because something did.
+#[test]
+fn config_check_warns_about_a_renamed_key_still_in_the_file() {
+    let check = crate::config::with_isolated_config_path(
+        "doctor-config_check_warns_about_a_renamed_key_still_in_the_file",
+        |dir| {
+            std::fs::write(
+                dir.join("config.toml"),
+                "default_provider = \"ollama\"\ndefault_model = \"qwen3.8:latest\"\n",
+            )
+            .expect("write the config");
+            config_check(&Config::default(), &ProviderRegistry::new())
+        },
+    );
+    assert_eq!(check.status, CheckStatus::Warn, "{}", check.detail);
+    assert!(
+        check.detail.contains(
+            "`default_model = \"qwen3.8:latest\"` was read as `fallback_model = \"qwen3.8:latest\"`"
+        ),
+        "got: {}",
+        check.detail
+    );
+    assert!(check.detail.contains("lev update"), "got: {}", check.detail);
+    assert!(
+        !check.detail.contains("read by nothing"),
+        "a renamed key is read, not unread: {}",
         check.detail
     );
 }
@@ -721,7 +794,7 @@ fn config_check_is_quiet_when_every_rate_limit_names_a_real_provider() {
 fn resolve_check_uses_the_configured_default() {
     let config = Config {
         default_provider: "stub".to_string(),
-        default_model: Some("m-1".to_string()),
+        override_model: Some("m-1".to_string()),
         ..Config::default()
     };
     let registry = registry_with("stub", StubProvider::replying("hi"));
@@ -773,7 +846,7 @@ fn resolve_check_says_so_when_the_configured_default_never_wins() {
     // sent an investigation of a downgraded run in the wrong direction.
     let config = Config {
         default_provider: "openrouter".to_string(),
-        default_model: None,
+        override_model: None,
         ..Config::default()
     };
     let mut registry = registry_with("openrouter", StubProvider::replying("hi"));
@@ -802,7 +875,7 @@ fn resolve_check_says_so_when_the_configured_default_never_wins() {
 fn resolve_check_is_quiet_when_the_configured_default_does_win() {
     let config = Config {
         default_provider: "openrouter".to_string(),
-        default_model: Some("openai/gpt-4o-mini".to_string()),
+        override_model: Some("openai/gpt-4o-mini".to_string()),
         ..Config::default()
     };
     let registry = registry_with("openrouter", StubProvider::replying("hi"));
@@ -817,7 +890,7 @@ fn resolve_check_reads_a_qualified_default_model_bare_and_says_so() {
     // setting was read so the config can be tidied.
     let config = Config {
         default_provider: "stub".to_string(),
-        default_model: Some("stub/m-1".to_string()),
+        override_model: Some("stub/m-1".to_string()),
         ..Config::default()
     };
     let registry = registry_with("stub", StubProvider::replying("hi"));
@@ -848,10 +921,10 @@ fn resolve_check_does_not_second_guess_an_unregistered_default_provider() {
     // check's fail arm covers the case where nothing usable is left. Saying it
     // again here would put a note on every install with a stale provider name
     // in its config.
-    for default_model in [None, Some("m-1".to_string())] {
+    for override_model in [None, Some("m-1".to_string())] {
         let config = Config {
             default_provider: "ghost".to_string(),
-            default_model,
+            override_model,
             ..Config::default()
         };
         let registry = registry_with("anthropic", StubProvider::replying("hi"));
@@ -867,7 +940,7 @@ fn resolve_check_stays_quiet_under_an_explicit_model_override() {
     // default was passed over is noise.
     let config = Config {
         default_provider: "openrouter".to_string(),
-        default_model: None,
+        override_model: None,
         ..Config::default()
     };
     let registry = registry_with("stub", StubProvider::replying("hi"));
@@ -1703,5 +1776,43 @@ fn the_codex_check_falls_back_when_the_grant_names_no_account() {
         let check = codex_check(&config).expect("a check");
         assert_eq!(check.status, CheckStatus::Ok);
         assert_eq!(check.detail, "signed in");
+    });
+}
+
+/// `yolo.toml` is checked only when it is there: no file is no finding, a
+/// file that loads names its profiles, and one that does not is a failure
+/// because every `--yolo=<name>` is refused until it does.
+#[test]
+fn the_yolo_check_follows_the_file() {
+    crate::config::with_isolated_config_path("doctor-yolo", |dir| {
+        assert!(yolo_check().is_none(), "no file, no check");
+        std::fs::write(dir.join("yolo.toml"), "").unwrap();
+        let empty = yolo_check().expect("an empty file is still a file");
+        assert!(matches!(empty.status, CheckStatus::Ok), "{empty:?}");
+        assert!(
+            empty.detail.contains("defines no profiles"),
+            "{}",
+            empty.detail
+        );
+        std::fs::write(
+            dir.join("yolo.toml"),
+            "[careful]\ndefault = \"ask\"\n\n[loose]\ndefault = \"allow\"\n",
+        )
+        .unwrap();
+        let loaded = yolo_check().expect("a check");
+        assert!(matches!(loaded.status, CheckStatus::Ok));
+        assert!(
+            loaded.detail.contains("careful, loose"),
+            "{}",
+            loaded.detail
+        );
+        std::fs::write(dir.join("yolo.toml"), "[careful]\nblock = 1\n").unwrap();
+        let broken = yolo_check().expect("a check");
+        assert!(matches!(broken.status, CheckStatus::Fail));
+        assert!(
+            broken.detail.contains("refused until it loads"),
+            "{}",
+            broken.detail
+        );
     });
 }

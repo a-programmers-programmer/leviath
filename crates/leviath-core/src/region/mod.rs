@@ -6,8 +6,10 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod parts;
 pub mod policy;
 
+pub use parts::EntryContent;
 pub use policy::{Admission, EvictionStrategy, Volatility};
 
 /// The kind of content stored in a region entry.
@@ -246,7 +248,7 @@ impl RegionEntry {
         let meta = self.metadata.as_ref()?;
         Some(ChecklistItem {
             id: meta.get(ITEM_ID)?.as_u64()? as usize,
-            text: self.content.clone(),
+            text: self.content.to_string(),
             done: meta
                 .get(ITEM_DONE)
                 .and_then(|v| v.as_bool())
@@ -445,6 +447,12 @@ pub struct Region {
     #[serde(default)]
     pub volatility: Volatility,
 
+    /// Mime type patterns this region takes (`text/*`, `image/png`). Empty
+    /// means anything. A write carrying a part outside the list is refused
+    /// with the list, so the writer learns what the region is for.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accepts: Vec<String>,
+
     /// One line on what this region is for.
     ///
     /// Documentation first: it is what `GET /api/blueprints/{name}` reports and
@@ -486,9 +494,31 @@ impl Region {
             summarizable: true,
             admission: Admission::default(),
             volatility: Volatility::default(),
+            accepts: Vec::new(),
             description: None,
             describe_in_prompt: false,
         }
+    }
+
+    /// Whether every part of `content` is a type this region takes.
+    /// Always true for a region with no `accepts` list.
+    pub fn accepts_content(&self, content: &EntryContent) -> Result<(), crate::mime::MimeType> {
+        if self.accepts.is_empty() {
+            return Ok(());
+        }
+        match content
+            .parts()
+            .iter()
+            .find(|p| !p.mime_type.matches_any(&self.accepts))
+        {
+            Some(p) => Err(p.mime_type.clone()),
+            None => Ok(()),
+        }
+    }
+
+    /// How many stored parts the region holds across every entry.
+    pub fn stored_count(&self) -> usize {
+        self.content.iter().map(|e| e.content.stored_count()).sum()
     }
 
     /// Enable taint tracking for this region.
@@ -523,7 +553,7 @@ impl Region {
     /// named method that says which of the three it cares about.
     fn push_entry(
         &mut self,
-        content: String,
+        content: EntryContent,
         tokens: usize,
         metadata: Option<serde_json::Value>,
         kind: EntryKind,
@@ -531,9 +561,25 @@ impl Region {
         key: Option<&str>,
     ) -> crate::error::Result<()> {
         if let Some(schema) = &self.schema {
+            // A schema describes text. A stored part has no text to check, so
+            // a region that validates its entries takes text only.
+            if content.has_stored() {
+                return Err(crate::error::Error::ValidationFailed(format!(
+                    "region '{}' validates its entries and cannot hold a stored part",
+                    self.name
+                )));
+            }
             schema.validate(&content)?;
         }
-
+        if let Err(mime_type) = self.accepts_content(&content) {
+            return Err(crate::error::Error::RegionRefusedWrite {
+                region: self.name.clone(),
+                reason: format!(
+                    "it takes {} and this write carries {mime_type}",
+                    self.accepts.join(", ")
+                ),
+            });
+        }
         if self.current_tokens + tokens > self.max_tokens {
             // Which failure this is depends on whether anything would have been
             // dropped to fit. A region that never evicts reports being full,
@@ -607,11 +653,11 @@ impl Region {
     pub fn add_keyed_entry(
         &mut self,
         key: &str,
-        content: String,
+        content: impl Into<EntryContent>,
         tokens: usize,
     ) -> crate::error::Result<()> {
         self.push_entry(
-            content,
+            content.into(),
             tokens,
             None,
             EntryKind::default(),
@@ -637,12 +683,12 @@ impl Region {
     /// Add an entry with a taint level. Used when taint tracking is enabled.
     pub fn add_tainted_entry(
         &mut self,
-        content: String,
+        content: impl Into<EntryContent>,
         tokens: usize,
         taint_level: crate::taint::TaintLevel,
     ) -> crate::error::Result<()> {
         self.push_entry(
-            content,
+            content.into(),
             tokens,
             None,
             EntryKind::default(),
@@ -661,12 +707,12 @@ impl Region {
     /// both keeps its `ToolResult` kind and raises the region's taint level.
     pub fn add_typed_tainted_entry(
         &mut self,
-        content: String,
+        content: impl Into<EntryContent>,
         tokens: usize,
         kind: EntryKind,
         taint_level: crate::taint::TaintLevel,
     ) -> crate::error::Result<()> {
-        self.push_entry(content, tokens, None, kind, taint_level, None)
+        self.push_entry(content.into(), tokens, None, kind, taint_level, None)
     }
 
     /// Add a validation schema to this region.
@@ -679,9 +725,13 @@ impl Region {
     ///
     /// Validates content against schema if present, checks token budget,
     /// and adds the entry to the region.
-    pub fn add_entry(&mut self, content: String, tokens: usize) -> crate::error::Result<()> {
+    pub fn add_entry(
+        &mut self,
+        content: impl Into<EntryContent>,
+        tokens: usize,
+    ) -> crate::error::Result<()> {
         self.push_entry(
-            content,
+            content.into(),
             tokens,
             None,
             EntryKind::default(),
@@ -693,12 +743,12 @@ impl Region {
     /// Add an entry with metadata.
     pub fn add_entry_with_metadata(
         &mut self,
-        content: String,
+        content: impl Into<EntryContent>,
         tokens: usize,
         metadata: serde_json::Value,
     ) -> crate::error::Result<()> {
         self.push_entry(
-            content,
+            content.into(),
             tokens,
             Some(metadata),
             EntryKind::default(),
@@ -714,7 +764,7 @@ impl Region {
     /// text-prefix parsing.
     pub fn add_typed_entry(
         &mut self,
-        content: String,
+        content: impl Into<EntryContent>,
         tokens: usize,
         kind: EntryKind,
     ) -> crate::error::Result<()> {
@@ -729,13 +779,13 @@ impl Region {
     /// such token and no reason to grow a parameter for one.
     pub fn add_typed_entry_with_reasoning(
         &mut self,
-        content: String,
+        content: impl Into<EntryContent>,
         tokens: usize,
         kind: EntryKind,
         reasoning: Option<String>,
     ) -> crate::error::Result<()> {
         self.push_entry(
-            content,
+            content.into(),
             tokens,
             None,
             kind,
@@ -788,7 +838,19 @@ impl Region {
     pub fn upsert_by_key(
         &mut self,
         key: &str,
-        content: String,
+        content: impl Into<EntryContent>,
+        tokens: usize,
+    ) -> Result<(), String> {
+        self.upsert_by_key_content(key, content.into(), tokens)
+    }
+
+    /// [`Self::upsert_by_key`] with the content already typed. The generic
+    /// wrapper above stays a one-liner so each instantiation is trivially
+    /// exercised; the logic lives here, once.
+    fn upsert_by_key_content(
+        &mut self,
+        key: &str,
+        content: EntryContent,
         tokens: usize,
     ) -> Result<(), String> {
         // If key exists, update in place
@@ -928,8 +990,9 @@ impl Region {
 /// Each entry has content and metadata tracking its token usage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegionEntry {
-    /// The actual content of this entry
-    pub content: String,
+    /// The entry's typed parts, and the text they read as. A plain string
+    /// still lands here as one `text/plain` part; see [`EntryContent`].
+    pub content: EntryContent,
 
     /// Token count for this entry
     pub tokens: usize,
@@ -3048,7 +3111,7 @@ mod tests {
     #[test]
     fn test_region_entry_key_serde_skip_when_none() {
         let entry = RegionEntry {
-            content: "test".to_string(),
+            content: "test".into(),
             tokens: 5,
             timestamp: 0,
             metadata: None,
@@ -3063,7 +3126,7 @@ mod tests {
     #[test]
     fn test_region_entry_key_serde_roundtrip() {
         let entry = RegionEntry {
-            content: "test".to_string(),
+            content: "test".into(),
             tokens: 5,
             timestamp: 0,
             metadata: None,
@@ -3297,7 +3360,7 @@ mod tests {
     fn test_region_entry_serialization_with_key_field() {
         // Entry with key
         let entry_with_key = RegionEntry {
-            content: "some data".to_string(),
+            content: "some data".into(),
             tokens: 10,
             timestamp: 1234567890,
             metadata: None,
@@ -3313,7 +3376,7 @@ mod tests {
 
         // Entry without key
         let entry_no_key = RegionEntry {
-            content: "no key data".to_string(),
+            content: "no key data".into(),
             tokens: 7,
             timestamp: 1234567890,
             metadata: None,

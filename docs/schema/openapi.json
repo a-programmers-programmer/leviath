@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Leviath HTTP API",
-    "version": "0.5.8",
+    "version": "0.5.9",
     "description": "The REST and WebSocket surface `lev serve` puts in front of the shared-world daemon. Every route requires a bearer token. Paths here are checked against the router in crates/leviath-cli/src/commands/serve/mod.rs by a test in that file, so a route added without a spec entry fails the build. See https://leviath.dev/docs/api.",
     "license": {
       "name": "MIT"
@@ -49,6 +49,10 @@
     },
     {
       "name": "providers"
+    },
+    {
+      "name": "yolo",
+      "description": "The named profiles behind `lev run --yolo=<name>`."
     }
   ],
   "paths": {
@@ -262,7 +266,7 @@
           "blueprints"
         ],
         "summary": "Fetch one blueprint",
-        "description": "The catalog entry plus the manifest text, the context regions, and fan_outs: one entry per fan-out stage with its worker source, merge stage and both caps (max_workers, max_items) resolved as the daemon applies them, null meaning unlimited.",
+        "description": "The catalog entry plus the manifest text, the context regions, fan_outs (one entry per fan-out stage with its worker source, merge stage and both caps resolved as the daemon applies them, null meaning unlimited), and stage_routing (one entry per stage that routes the model's produced parts by mime type via output_routing, or empties a region on entry via context.reset).",
         "responses": {
           "200": {
             "$ref": "#/components/responses/Ok"
@@ -613,6 +617,25 @@
               "schema": {
                 "$ref": "#/components/schemas/SpawnAgentReq"
               }
+            },
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "request"
+                ],
+                "properties": {
+                  "request": {
+                    "type": "string",
+                    "description": "The JSON request, as the application/json body would carry it."
+                  },
+                  "part": {
+                    "type": "string",
+                    "format": "binary",
+                    "description": "A file for the task region. Repeatable. Name the field `part:<region>` for another region; the file's `filename` names the part and its `Content-Type` declares the type."
+                  }
+                }
+              }
             }
           }
         },
@@ -641,6 +664,9 @@
           },
           "408": {
             "$ref": "#/components/responses/Timeout"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error"
           },
           "503": {
             "$ref": "#/components/responses/Overloaded"
@@ -931,6 +957,219 @@
         }
       }
     },
+    "/api/agents/{id}/files/raw": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/Id"
+        }
+      ],
+      "get": {
+        "tags": [
+          "agents"
+        ],
+        "summary": "A workdir file's bytes, under its own content type",
+        "description": "Where `GET /api/agents/{id}/files?path=` wraps text in JSON, this serves the bytes as they are, typed by the mime registry from the file's bytes and name: an image the run wrote comes back as `image/png`, ready for an `<img>`. Confined to the run's working directory. `download=1` adds a `Content-Disposition: attachment` naming the file. Every response advertises `Accept-Ranges: bytes`; a `Range` header fetches part of the body.",
+        "parameters": [
+          {
+            "name": "path",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Workdir-relative path, or an absolute path inside the workdir."
+          },
+          {
+            "name": "download",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
+            },
+            "description": "Ask the browser to save the file rather than show it."
+          },
+          {
+            "name": "Range",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "A single byte range, `bytes=start-end` (an open end or a `-suffix` too), to fetch part of the body for seeking or resuming. A well-formed range is answered 206 with `Content-Range`; one past the end is 416. A malformed or multi-range header is ignored and the whole body served."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The file's bytes, under its mime type.",
+            "content": {
+              "*/*": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "206": {
+            "description": "The requested byte range, when a `Range` header asked for one. Carries `Content-Range: bytes start-end/total`.",
+            "content": {
+              "*/*": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "416": {
+            "description": "The `Range` header named bytes the body does not have. Carries `Content-Range: bytes */total`."
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "503": {
+            "$ref": "#/components/responses/Overloaded"
+          }
+        }
+      }
+    },
+    "/api/agents/{id}/blobs": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/Id"
+        }
+      ],
+      "get": {
+        "tags": [
+          "agents"
+        ],
+        "summary": "The stored parts a run holds",
+        "description": "Every stored part the run's context carries, by sha256: its type, name, size, dimensions, the regions carrying it, and whether the bytes are on disk under the run's `blobs/`. A part a user attached, a file `read_file` stored, an image an MCP tool returned, and an artifact the run submitted all appear here.",
+        "responses": {
+          "200": {
+            "description": "The listing.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BlobListing"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "503": {
+            "$ref": "#/components/responses/Overloaded"
+          }
+        }
+      }
+    },
+    "/api/agents/{id}/blobs/{sha256}": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/Id"
+        },
+        {
+          "name": "sha256",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          },
+          "description": "The part's sha256, 64 lowercase hex characters, as the listing and the run's context give it."
+        }
+      ],
+      "get": {
+        "tags": [
+          "agents"
+        ],
+        "summary": "The bytes of one stored part",
+        "description": "Served under the type the part was stored as, so an image renders in a browser. `download=1` adds a `Content-Disposition: attachment` carrying the part's name. A hash that is not 64 hex characters is refused; one the run does not hold is 404. Every response advertises `Accept-Ranges: bytes`; a `Range` header fetches part of the body.",
+        "parameters": [
+          {
+            "name": "download",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
+            },
+            "description": "Ask the browser to save the file rather than show it."
+          },
+          {
+            "name": "Range",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "A single byte range, `bytes=start-end` (an open end or a `-suffix` too), to fetch part of the body for seeking or resuming. A well-formed range is answered 206 with `Content-Range`; one past the end is 416. A malformed or multi-range header is ignored and the whole body served."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The bytes, under the part's mime type.",
+            "content": {
+              "*/*": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "206": {
+            "description": "The requested byte range, when a `Range` header asked for one. Carries `Content-Range: bytes start-end/total`.",
+            "content": {
+              "*/*": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "416": {
+            "description": "The `Range` header named bytes the body does not have. Carries `Content-Range: bytes */total`."
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "503": {
+            "$ref": "#/components/responses/Overloaded"
+          }
+        }
+      }
+    },
     "/api/agents/{id}/logs": {
       "parameters": [
         {
@@ -1137,11 +1376,42 @@
               "schema": {
                 "type": "object",
                 "required": [
-                  "content"
+                  "message"
                 ],
                 "properties": {
-                  "content": {
-                    "type": "string"
+                  "message": {
+                    "type": "string",
+                    "description": "The text. A `@path` token attaches that workdir file to the same entry."
+                  },
+                  "target_region": {
+                    "type": "string",
+                    "description": "The region to land in; the conversation when absent."
+                  },
+                  "parts": {
+                    "type": "array",
+                    "items": {
+                      "$ref": "#/components/schemas/PartRef"
+                    },
+                    "description": "Files already inside the run's working directory to send with the message."
+                  }
+                }
+              }
+            },
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "request"
+                ],
+                "properties": {
+                  "request": {
+                    "type": "string",
+                    "description": "The JSON request, as the application/json body would carry it."
+                  },
+                  "part": {
+                    "type": "string",
+                    "format": "binary",
+                    "description": "A file to send beside the message. Repeatable; `part:<region>` aims one at another region."
                   }
                 }
               }
@@ -1152,11 +1422,23 @@
           "202": {
             "description": "Accepted: the daemon holds it, and the work happens after the response."
           },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
           },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
           "408": {
             "$ref": "#/components/responses/Timeout"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error"
           },
           "503": {
             "$ref": "#/components/responses/Overloaded"
@@ -1208,17 +1490,93 @@
           "401": {
             "$ref": "#/components/responses/Unauthorized"
           },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
           "404": {
             "$ref": "#/components/responses/Error"
           },
           "408": {
             "$ref": "#/components/responses/Timeout"
           },
+          "413": {
+            "$ref": "#/components/responses/Error"
+          },
           "503": {
             "$ref": "#/components/responses/Overloaded"
           }
         },
-        "description": "Body: `request_id` (the open request's id) plus one of `value`, `choice_index`, or `approved` with an optional `scope` (`once`, `stage`, `session`). A deny (`approved: false`) may carry `feedback`, a string the model reads inside the tool result for the refused call: `[denied] User declined tool call '<tool>'. Feedback: <text>`. `feedback` beside `approved: true` is a 400. 202 once the daemon holds the answer, 404 when nothing with that id is open. Announced as `interaction.feedback`."
+        "description": "Body: `request_id` (the open request's id) plus one of `value`, `choice_index`, or `approved` with an optional `scope` (`once`, `stage`, `session`). A deny (`approved: false`) may carry `feedback`, a string the model reads inside the tool result for the refused call: `[denied] User declined tool call '<tool>'. Feedback: <text>`. `feedback` beside `approved: true` is a 400. 202 once the daemon holds the answer, 404 when nothing with that id is open. Announced as `interaction.feedback`.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "request_id"
+                ],
+                "properties": {
+                  "request_id": {
+                    "type": "string",
+                    "description": "The interaction to answer, from GET."
+                  },
+                  "value": {
+                    "type": "string",
+                    "description": "A free-text or edited answer. A `@path` token attaches that workdir file."
+                  },
+                  "choice_index": {
+                    "type": "integer",
+                    "description": "The chosen option, zero-based, for a multiple-choice or tool-approval prompt."
+                  },
+                  "approved": {
+                    "type": "boolean",
+                    "description": "Whether a tool approval or a confirmation is granted."
+                  },
+                  "scope": {
+                    "type": "string",
+                    "enum": [
+                      "once",
+                      "stage",
+                      "session"
+                    ],
+                    "description": "How long a grant holds: this call, this stage, or the whole run (`session`)."
+                  },
+                  "feedback": {
+                    "type": "string",
+                    "description": "On a deny, what the model should do instead."
+                  },
+                  "parts": {
+                    "type": "array",
+                    "items": {
+                      "$ref": "#/components/schemas/PartRef"
+                    },
+                    "description": "Files already inside the run's working directory to send with a text answer."
+                  }
+                }
+              }
+            },
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "request"
+                ],
+                "properties": {
+                  "request": {
+                    "type": "string",
+                    "description": "The JSON request, as the application/json body would carry it."
+                  },
+                  "part": {
+                    "type": "string",
+                    "format": "binary",
+                    "description": "A file to send beside a text answer. Repeatable; `part:<region>` aims one at another region."
+                  }
+                }
+              }
+            }
+          }
+        }
       }
     },
     "/api/providers": {
@@ -1586,6 +1944,183 @@
         }
       }
     },
+    "/api/mime": {
+      "get": {
+        "tags": [
+          "config"
+        ],
+        "summary": "The effective mime registry",
+        "description": "Every row of the mime registry this server resolves types with, keys sorted, each with where it came from: `builtin`, `config` (`[mime_types]` in config.toml), or the blueprint or provider that added it. A row names only what it sets, so a `family`, `text` or `extensions` that is absent is inherited from the pattern rows above it.",
+        "responses": {
+          "200": {
+            "description": "The listing.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MimeListing"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "503": {
+            "$ref": "#/components/responses/Overloaded"
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "config"
+        ],
+        "summary": "Add or update a mime row",
+        "description": "Write a row into `mime_types.toml` beside the config, or set the given fields on the row already there. Admin-only (needs `--allow-admin`; otherwise 405). Every field but `mime_type` is optional, and only the fields sent are changed. Validated the way `lev mime add` is: a type that is not `type/subtype`, a token rule that names none or more than one of `per_byte`/`per_pixel`/`per_second`/`fixed`, a `magic` that is not hex, or a `check` script that will not compile is a 400 and nothing is written. Announced as `mime.write`.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "mime_type"
+                ],
+                "properties": {
+                  "mime_type": {
+                    "type": "string",
+                    "description": "`type/subtype`, or `type/*` for a whole family."
+                  },
+                  "family": {
+                    "type": "string"
+                  },
+                  "text": {
+                    "type": "boolean"
+                  },
+                  "tokens": {
+                    "type": "object",
+                    "description": "One of `{ per_byte }`, `{ per_pixel, max? }`, `{ per_second }` or `{ fixed }`.",
+                    "properties": {
+                      "per_byte": {
+                        "type": "number"
+                      },
+                      "per_pixel": {
+                        "type": "integer"
+                      },
+                      "per_second": {
+                        "type": "integer"
+                      },
+                      "fixed": {
+                        "type": "integer"
+                      },
+                      "max": {
+                        "type": "integer"
+                      }
+                    }
+                  },
+                  "extensions": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "magic": {
+                    "type": "string",
+                    "description": "A hex prefix that identifies the bytes."
+                  },
+                  "stand_in": {
+                    "type": "string"
+                  },
+                  "check": {
+                    "type": "string",
+                    "description": "A Rhai check script path; an empty string lifts a broader row's check."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The row was written.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "mime_type": {
+                      "type": "string"
+                    },
+                    "created": {
+                      "type": "boolean",
+                      "description": "True when the row was new, false when it updated one already there."
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "405": {
+            "$ref": "#/components/responses/NotMounted"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "503": {
+            "$ref": "#/components/responses/Overloaded"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "config"
+        ],
+        "summary": "Remove a mime row",
+        "description": "Take a row out of `mime_types.toml` beside the config. Admin-only (needs `--allow-admin`; otherwise 405). A type with no row there is a 404. Announced as `mime.write`.",
+        "parameters": [
+          {
+            "name": "mime_type",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "`type/subtype` or `type/*`."
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Removed. No body."
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "405": {
+            "$ref": "#/components/responses/NotMounted"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "503": {
+            "$ref": "#/components/responses/Overloaded"
+          }
+        }
+      }
+    },
     "/api/doctor/live": {
       "post": {
         "tags": [
@@ -1605,6 +2140,404 @@
           },
           "409": {
             "description": "Another live doctor run is already in progress"
+          },
+          "503": {
+            "$ref": "#/components/responses/Overloaded"
+          }
+        }
+      }
+    },
+    "/api/yolo": {
+      "get": {
+        "tags": [
+          "yolo"
+        ],
+        "summary": "The profiles behind `--yolo=<name>`",
+        "description": "Lists `yolo.toml` as it stands, the same file a spawn reads: where it is, whether it exists and loads, and each profile's default, its three human knobs (`questions`, `checkpoints`, `gate`) and how many tool and shell rules of each kind it has. A file that does not load comes back with `exists: true`, an `error` naming the line, and no profiles, because that is what a spawn naming one would be refused with.",
+        "responses": {
+          "200": {
+            "description": "The listing.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "path": {
+                      "type": "string",
+                      "description": "The `yolo.toml` the profiles are read from."
+                    },
+                    "exists": {
+                      "type": "boolean"
+                    },
+                    "error": {
+                      "type": "string",
+                      "description": "Why the file does not load, when it does not; the profiles are then empty. Absent while it loads."
+                    },
+                    "profiles": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "name": {
+                            "type": "string"
+                          },
+                          "default": {
+                            "type": "string",
+                            "enum": [
+                              "allow",
+                              "ask"
+                            ]
+                          },
+                          "questions": {
+                            "type": "string",
+                            "enum": [
+                              "ask",
+                              "auto"
+                            ]
+                          },
+                          "checkpoints": {
+                            "type": "string",
+                            "enum": [
+                              "ask",
+                              "auto"
+                            ]
+                          },
+                          "gate": {
+                            "type": "string",
+                            "enum": [
+                              "ask",
+                              "auto"
+                            ]
+                          },
+                          "tool_rules": {
+                            "type": "array",
+                            "items": {
+                              "type": "integer"
+                            },
+                            "description": "`[allow, ask, deny]` entry counts."
+                          },
+                          "shell_rules": {
+                            "type": "array",
+                            "items": {
+                              "type": "integer"
+                            },
+                            "description": "`[allow, ask, deny]` rule counts."
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "503": {
+            "$ref": "#/components/responses/Overloaded"
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "yolo"
+        ],
+        "summary": "Replace `yolo.toml`",
+        "description": "Admin only. Mounted only when `lev serve --allow-admin` is passed: a profile is a grant of permissions, so writing the file is the same category of act as writing the config. The text is parsed and compiled first, and a save that would not load answers 400 with the same message a spawn would give, leaving the file on disk as it was. Answers with the listing `GET` returns.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "text"
+                ],
+                "properties": {
+                  "text": {
+                    "type": "string",
+                    "description": "The whole file, as TOML."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The listing.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "path": {
+                      "type": "string",
+                      "description": "The `yolo.toml` the profiles are read from."
+                    },
+                    "exists": {
+                      "type": "boolean"
+                    },
+                    "error": {
+                      "type": "string",
+                      "description": "Why the file does not load, when it does not; the profiles are then empty. Absent while it loads."
+                    },
+                    "profiles": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "name": {
+                            "type": "string"
+                          },
+                          "default": {
+                            "type": "string",
+                            "enum": [
+                              "allow",
+                              "ask"
+                            ]
+                          },
+                          "questions": {
+                            "type": "string",
+                            "enum": [
+                              "ask",
+                              "auto"
+                            ]
+                          },
+                          "checkpoints": {
+                            "type": "string",
+                            "enum": [
+                              "ask",
+                              "auto"
+                            ]
+                          },
+                          "gate": {
+                            "type": "string",
+                            "enum": [
+                              "ask",
+                              "auto"
+                            ]
+                          },
+                          "tool_rules": {
+                            "type": "array",
+                            "items": {
+                              "type": "integer"
+                            },
+                            "description": "`[allow, ask, deny]` entry counts."
+                          },
+                          "shell_rules": {
+                            "type": "array",
+                            "items": {
+                              "type": "integer"
+                            },
+                            "description": "`[allow, ask, deny]` rule counts."
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "405": {
+            "$ref": "#/components/responses/NotMounted"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "503": {
+            "$ref": "#/components/responses/Overloaded"
+          }
+        }
+      }
+    },
+    "/api/yolo/test": {
+      "post": {
+        "tags": [
+          "yolo"
+        ],
+        "summary": "What a profile would decide for one call",
+        "description": "The same code path a run takes, without running anything, so the answer here is the run's answer. `command` is for the shell; any other tool takes `arguments` as an object. `workdir` is where relative paths resolve, defaulting to the server's own. `configured` (`allow`, `ask`, `deny`) stands in for what the config layers resolve the tool to, otherwise that is read from the config in force; `kind` (`builtin`, `subagent`, `script`, `mcp`) says where the tool comes from for `@group` rules, otherwise it is guessed from the name; `allowed` decides as if `--allow <tool>` had been passed.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "profile",
+                  "tool"
+                ],
+                "properties": {
+                  "profile": {
+                    "type": "string"
+                  },
+                  "tool": {
+                    "type": "string"
+                  },
+                  "command": {
+                    "type": "string"
+                  },
+                  "arguments": {
+                    "type": "object"
+                  },
+                  "workdir": {
+                    "type": "string"
+                  },
+                  "configured": {
+                    "type": "string",
+                    "enum": [
+                      "allow",
+                      "ask",
+                      "deny"
+                    ]
+                  },
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "builtin",
+                      "subagent",
+                      "script",
+                      "mcp"
+                    ]
+                  },
+                  "allowed": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The decision.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "profile": {
+                      "type": "string"
+                    },
+                    "tool": {
+                      "type": "string"
+                    },
+                    "configured": {
+                      "type": "string",
+                      "enum": [
+                        "allow",
+                        "ask",
+                        "deny"
+                      ],
+                      "description": "What the config layers resolved the tool to, before the profile."
+                    },
+                    "policy": {
+                      "type": "string",
+                      "enum": [
+                        "allow",
+                        "ask",
+                        "deny"
+                      ],
+                      "description": "What the run would do: run it unprompted, open the ordinary approval prompt, or refuse it."
+                    },
+                    "reason": {
+                      "type": "string",
+                      "description": "The rule, the config, or the profile default that decided it."
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "503": {
+            "$ref": "#/components/responses/Overloaded"
+          }
+        }
+      }
+    },
+    "/api/yolo/{name}": {
+      "get": {
+        "tags": [
+          "yolo"
+        ],
+        "summary": "One profile in full",
+        "description": "`{\"name\", \"spec\", \"holds\"}`: the profile as parsed (the same keys the file has) and the list of things it still puts to a person, as `lev run` prints before a profiled run starts. 404 for a name the file does not have and for no file at all; 422 when the file does not load.",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The profile.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "name": {
+                      "type": "string"
+                    },
+                    "spec": {
+                      "type": "object"
+                    },
+                    "holds": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
           },
           "503": {
             "$ref": "#/components/responses/Overloaded"
@@ -1877,12 +2810,19 @@
                   "default_provider": {
                     "type": "string"
                   },
-                  "default_model": {
+                  "override_model": {
                     "type": [
                       "string",
                       "null"
                     ],
-                    "description": "Three states, unlike every other field here. Absent leaves the setting alone; `null` clears it, so each blueprint picks its own model per stage again; a string pins that model across every stage. An empty string is a 400, not a clear: `\"\"` is not a model id, and a form that posts its empty box should be told rather than silently lose the setting."
+                    "description": "Three states, unlike most fields here. Absent leaves the setting alone; `null` clears it, so each blueprint picks its own model per stage again; a string pins that model across every stage that allows a user default. An empty string is a 400, not a clear: `\"\"` is not a model id, and a form that posts its empty box should be told rather than silently lose the setting."
+                  },
+                  "fallback_model": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "description": "The model a stage falls back to when none of the models it names is configured on this machine. Same three states and the same empty-string refusal as `override_model`."
                   },
                   "anthropic_key": {
                     "type": "string"
@@ -2198,7 +3138,7 @@
           "scripts"
         ],
         "summary": "Tools an agent on this machine can call",
-        "description": "Built-ins, sub-agent tools, the named agent's own `tools/*.rhai` and the global ones, each with a `source`. `skipped` carries the `.rhai` files that were found and could not be offered, with the reason. MCP tools are not included; `/api/mcp/servers/{name}` answers for those.",
+        "description": "Built-ins, sub-agent tools, the named agent's own `tools/*.rhai` and the global ones, each with a `source`. `groups` lists the tokens `available_tools` accepts in place of names (`@all`, `@builtin`, `@subagent`, `@scripts`, `@mcp`), each with a one-line description, so a picker can offer a whole kind at once. `skipped` carries the `.rhai` files that were found and could not be offered, with the reason. MCP tools are not included; `/api/mcp/servers/{name}` answers for those.",
         "parameters": [
           {
             "name": "agent",
@@ -2231,7 +3171,7 @@
           "scripts"
         ],
         "summary": "Rhai scripts this scope can see",
-        "description": "Script tools from the agent's `tools/` and the global directory, the region hooks, stage hooks and output validators the agent's manifest declares, and the model providers in `~/.leviath/providers`. Each entry carries its kind, its source (`agent` or `global`), a `declared` flag and whether it compiles right now; an agent-scoped entry also carries `relative_path`, where the file sits relative to the agent's own directory, which is the spelling a manifest wants. A provider also carries a `provider` object with what its `// @` annotations declare. Providers are listed with or without `agent`, since nothing scopes one to an agent.",
+        "description": "Script tools from the agent's `tools/` and the global directory, the region hooks, stage hooks, output validators and mime checks the agent's manifest declares, the mime checks the operator's `mime_types.toml` and `[mime_types]` rows name (resolved against the config's directory), and the model providers in `~/.leviath/providers`. Each entry carries its kind, its source (`agent` or `global`), a `declared` flag and whether it compiles right now; an agent-scoped entry also carries `relative_path`, where the file sits relative to the agent's own directory, which is the spelling a manifest wants. A provider also carries a `provider` object with what its `// @` annotations declare. Providers are listed with or without `agent`, since nothing scopes one to an agent.",
         "parameters": [
           {
             "name": "agent",
@@ -2316,6 +3256,7 @@
                 "region_hook",
                 "stage_hook",
                 "output_validator",
+                "mime_check",
                 "provider"
               ]
             }
@@ -2371,6 +3312,7 @@
                 "region_hook",
                 "stage_hook",
                 "output_validator",
+                "mime_check",
                 "provider"
               ]
             }
@@ -2432,6 +3374,7 @@
                 "region_hook",
                 "stage_hook",
                 "output_validator",
+                "mime_check",
                 "provider"
               ]
             }
@@ -2637,6 +3580,13 @@
           "callback_secret": {
             "type": "string",
             "description": "Shared secret for the HMAC-SHA256 signature on that callback."
+          },
+          "parts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PartRef"
+            },
+            "description": "Files already inside the working directory to attach as typed parts. A `multipart/form-data` body carries files instead: a `request` field holding this JSON, then any number of file fields named `part` (bound for the task region) or `part:<region>`, each with a `filename` and a `Content-Type`. A `@path` token inside `task` or a region's text attaches that file too, resolved inside the working directory, and the text keeps the token."
           }
         }
       },
@@ -2727,7 +3677,7 @@
               "string",
               "null"
             ],
-            "description": "Whatever shape was asked for: \"markdown\", \"json\", \"a2ui\", a media type, anything. Not a closed set."
+            "description": "Whatever shape was asked for: \"markdown\", \"json\", \"a2ui\", a mime type, anything. Not a closed set."
           },
           "stage": {
             "type": "string",
@@ -2745,9 +3695,40 @@
           "artifacts": {
             "type": "array",
             "items": {
-              "type": "string"
+              "$ref": "#/components/schemas/Artifact"
             },
-            "description": "Files the run produced, as workdir-relative paths. An answer is one model response, so anything larger is a file named here. Fetch one with GET /api/agents/{id}/files?path=."
+            "description": "Files the run produced, typed and hashed. An answer is one model response, so anything larger is a file named here. Fetch one with GET /api/agents/{id}/files?path=."
+          }
+        }
+      },
+      "Artifact": {
+        "type": "object",
+        "required": [
+          "name",
+          "path",
+          "mime_type",
+          "size"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The name the stage declared for it, or the file name."
+          },
+          "path": {
+            "type": "string",
+            "description": "The file, relative to the run's working directory."
+          },
+          "mime_type": {
+            "type": "string",
+            "description": "Its mime type, from the registry or as declared."
+          },
+          "size": {
+            "type": "integer",
+            "description": "Size in bytes."
+          },
+          "sha256": {
+            "type": "string",
+            "description": "The hash the run's blob store holds the bytes under. Absent when the file was too large to store."
           }
         }
       },
@@ -3090,7 +4071,8 @@
           "max_history_limit",
           "max_tracked_modified_files",
           "max_concurrent_requests",
-          "request_timeout_secs"
+          "request_timeout_secs",
+          "max_upload_bytes"
         ],
         "properties": {
           "max_limit": {
@@ -3132,6 +4114,10 @@
           "request_timeout_secs": {
             "type": "integer",
             "description": "Seconds before a request is dropped with a 408; 0 is no deadline."
+          },
+          "max_upload_bytes": {
+            "type": "integer",
+            "description": "Bytes one request body may carry, which bounds a multipart upload. `[serve] max_upload_bytes`."
           }
         }
       },
@@ -3187,7 +4173,8 @@
         "description": "The active configuration with every credential reduced to whether one is set, plus what this server can do and how much it accepts.",
         "required": [
           "default_provider",
-          "default_model",
+          "override_model",
+          "fallback_model",
           "provider_order",
           "has_anthropic_key",
           "has_openai_key",
@@ -3204,12 +4191,19 @@
           "default_provider": {
             "type": "string"
           },
-          "default_model": {
+          "override_model": {
             "type": [
               "string",
               "null"
             ],
-            "description": "The model every stage runs on while it is set, as a bare model id on `default_provider`. `null` when nothing is pinned, which is the usual and generally better state: each blueprint then picks its own model per stage. Always sent, so a missing key means the server predates this field rather than meaning nothing is set."
+            "description": "The model every stage that allows a user default starts on while it is set, ahead of what its blueprint names, as a bare model id on `default_provider`. `null` when nothing is pinned, which is the usual and generally better state: each blueprint then picks its own model per stage. Always sent, so a missing key means the server predates this field rather than meaning nothing is set."
+          },
+          "fallback_model": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The model a stage falls back to when none of the models it names is configured here, never ahead of them, as a bare model id on `default_provider`. `null` when unset. Always sent."
           },
           "provider_order": {
             "type": "array",
@@ -3264,6 +4258,162 @@
           },
           "limits": {
             "$ref": "#/components/schemas/ApiLimits"
+          }
+        }
+      },
+      "PartRef": {
+        "type": "object",
+        "required": [
+          "path"
+        ],
+        "description": "A file inside the run's working directory, to attach as a typed part.",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "The file, relative to the working directory."
+          },
+          "region": {
+            "type": "string",
+            "description": "The region to put it in; the task region when absent."
+          },
+          "name": {
+            "type": "string",
+            "description": "The name the part carries; the file name when absent."
+          },
+          "mime_type": {
+            "type": "string",
+            "description": "Its mime type, when the bytes and name do not say."
+          },
+          "deliver": {
+            "type": "string",
+            "enum": [
+              "native",
+              "text",
+              "stand_in"
+            ],
+            "description": "How it reaches the model: as its own type, as text, or as a one-line stand-in."
+          },
+          "caption": {
+            "type": "string",
+            "description": "Text stored beside it."
+          }
+        }
+      },
+      "BlobEntry": {
+        "type": "object",
+        "required": [
+          "sha256",
+          "mime_type",
+          "size",
+          "tokens",
+          "regions",
+          "stored"
+        ],
+        "properties": {
+          "sha256": {
+            "type": "string",
+            "description": "The store's key: the bytes' sha256."
+          },
+          "mime_type": {
+            "type": "string",
+            "description": "The type the bytes were stored as."
+          },
+          "name": {
+            "type": "string",
+            "description": "The name the part carries, when the context gave it one."
+          },
+          "size": {
+            "type": "integer",
+            "description": "Size in bytes."
+          },
+          "width": {
+            "type": "integer",
+            "description": "Pixel width, when known."
+          },
+          "height": {
+            "type": "integer",
+            "description": "Pixel height, when known."
+          },
+          "duration_ms": {
+            "type": "integer",
+            "description": "Duration in milliseconds, when known."
+          },
+          "tokens": {
+            "type": "integer",
+            "description": "The token estimate the region was charged."
+          },
+          "regions": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The regions whose entries carry this part, in layout order."
+          },
+          "stored": {
+            "type": "boolean",
+            "description": "Whether the bytes are on disk under the run's blobs directory."
+          }
+        }
+      },
+      "BlobListing": {
+        "type": "object",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BlobEntry"
+            },
+            "description": "Every stored part, first appearance first."
+          }
+        }
+      },
+      "MimeTypeEntry": {
+        "type": "object",
+        "required": [
+          "mime_type",
+          "source"
+        ],
+        "properties": {
+          "mime_type": {
+            "type": "string",
+            "description": "The row's key: a type, or a pattern such as image/*."
+          },
+          "source": {
+            "type": "string",
+            "description": "Where the row came from: builtin, config, or a blueprint or provider name."
+          },
+          "family": {
+            "type": "string",
+            "description": "The family the row sets, when it sets one."
+          },
+          "text": {
+            "type": "boolean",
+            "description": "Whether the row calls the bytes text, when it says."
+          },
+          "extensions": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The extensions the row names, when it names any."
+          }
+        }
+      },
+      "MimeListing": {
+        "type": "object",
+        "required": [
+          "types"
+        ],
+        "properties": {
+          "types": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MimeTypeEntry"
+            },
+            "description": "Every row, keys sorted."
           }
         }
       }

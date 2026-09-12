@@ -11,9 +11,13 @@
       "default": "anthropic",
       "description": "Which provider a stage falls back to when it states no preference of its own. `lev setup` points this at a provider you configured; leaving it on one you did not is what makes `lev doctor` report a resolve failure."
     },
-    "default_model": {
+    "override_model": {
       "type": "string",
-      "description": "The model to pair with default_provider. Without it a stage naming no model falls through to a hard-coded last resort, which fails on a machine with no Anthropic key."
+      "description": "One model every stage that allows a user default starts on, ahead of the models its blueprint names: a bare model id on default_provider. Unset, the usual state, lets each blueprint pick per stage. Was `default_model` before 0.6; that key now loads as `fallback_model`."
+    },
+    "fallback_model": {
+      "type": "string",
+      "description": "The model a stage falls back to when none of the models it names is configured here, tried after all of them and before [providers] fallback_order: a bare model id on default_provider. Never moves a stage off a model its blueprint names."
     },
     "agent_paths": {
       "type": "array",
@@ -326,6 +330,11 @@
           "default": false,
           "description": "Honour every blueprint's own [tool_permissions] even where it exceeds the built-in default for a tool you have not configured. Off by default: a blueprint may still pre-approve web_search and web_fetch, and anything else is clamped to the default."
         },
+        "lock_permission_files": {
+          "type": "boolean",
+          "default": true,
+          "description": "Refuse any tool call from a run that would write config.toml, yolo.toml, the taint policy and its rules, or the providers/ and tools/ script directories, whatever the run's permissions. On by default; turn off only for an agent that manages this install."
+        },
         "shell_env": {
           "type": "string",
           "enum": [
@@ -376,6 +385,12 @@
           "minimum": 0,
           "default": 30,
           "description": "Seconds a request may take before it is answered 408. `0` disables the deadline. Websocket routes are not timed."
+        },
+        "max_upload_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 33554432,
+          "description": "Bytes one request body may carry: the ceiling on a multipart upload to POST /api/agents or POST /api/agents/{id}/message. 32 MiB by default."
         }
       }
     },
@@ -685,6 +700,20 @@
             "type": "number",
             "minimum": 0,
             "description": "USD per million output tokens."
+          },
+          "input_types": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Mime type patterns the model accepts in a request, text/* included: [\"text/*\", \"image/*\"] for a local vision model. Replaces what the provider reports."
+          },
+          "output_types": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Mime type patterns the model can hand back in a reply."
           }
         }
       }
@@ -801,6 +830,89 @@
       "type": "boolean",
       "default": true,
       "description": "Whether lev asks GitHub for a newer release once a day and says so under a command's output. Set false where reaching out is the problem rather than the answer."
+    },
+    "mime": {
+      "type": "object",
+      "description": "Limits on typed mime parts: how large one may be, how much text stays inline, how many stored parts one request carries.",
+      "additionalProperties": false,
+      "properties": {
+        "max_part_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Bytes one part may be. Default 33554432 (32 MiB)."
+        },
+        "inline_text_bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Bytes of text kept inline in an entry before the part is stored by hash. Default 1048576."
+        },
+        "max_media_bytes_per_request": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Bytes of stored media one model request carries before the oldest parts are sent as stand-ins; a backstop for vendor request-size limits a token budget cannot see. Default 67108864 (64 MiB)."
+        }
+      }
+    },
+    "mime_types": {
+      "type": "object",
+      "description": "Rows added to the mime registry, keyed by type/subtype or type/*. A row names only the fields it changes; the rest resolve from the built-in table. Such rows belong in mime_types.toml beside this file, whose rows layer over these; a table here still loads.",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "family": {
+            "type": "string",
+            "description": "What providers key their encoders on: text, image, audio, video, document, model, binary, or a name of your own."
+          },
+          "text": {
+            "type": "boolean",
+            "description": "The bytes are UTF-8 and may travel inline and reach a text model as text."
+          },
+          "tokens": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "How to estimate the part's tokens: exactly one of per_byte, per_pixel (with max), per_second, fixed.",
+            "properties": {
+              "per_byte": {
+                "type": "number",
+                "minimum": 0
+              },
+              "per_pixel": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "max": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "per_second": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "fixed": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          },
+          "extensions": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "File extensions, without the dot, that imply this type."
+          },
+          "magic": {
+            "type": "string",
+            "pattern": "^[0-9A-Fa-f]+$",
+            "description": "A hex prefix that identifies the bytes."
+          },
+          "stand_in": {
+            "type": "string",
+            "description": "The text a consumer that cannot take the type sees; supports {type} {name} {size} {dims} {duration}."
+          }
+        }
+      }
     }
   },
   "$defs": {

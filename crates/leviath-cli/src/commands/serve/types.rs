@@ -8,6 +8,7 @@ use clap::Args;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
+use super::artifact_types::ArtifactResp;
 use super::events::ServerEvent;
 use crate::config::Config;
 use crate::daemon::config_reload::ConfigReloader;
@@ -543,6 +544,9 @@ pub(super) struct BlueprintDetail {
     /// The blueprint's fan-out stages, with their limits as the daemon will
     /// apply them. Empty for a blueprint that never fans out.
     pub(super) fan_outs: Vec<FanOutInfo>,
+    /// The stages that route produced parts (`output_routing`) or reset a
+    /// region on entry (`context.reset`); empty when the blueprint does neither.
+    pub(super) stage_routing: Vec<super::blueprint_types::StageRoutingInfo>,
     /// The manifest exactly as it is on disk.
     ///
     /// Without this a console has no way to read what it is editing: naming
@@ -617,7 +621,7 @@ impl ValidateResponse {
 
 // ─── Agent types ────────────────────────────────────────────────────────────
 
-#[derive(Default, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 pub(super) struct SpawnAgentReq {
     pub(super) blueprint: String,
     pub(super) task: String,
@@ -627,6 +631,10 @@ pub(super) struct SpawnAgentReq {
     /// Approve every tool call for this run.
     #[serde(default)]
     pub(super) yolo: bool,
+    /// Run under a named profile from `yolo.toml` (the `--yolo=<name>` of
+    /// the CLI). Implies `yolo`.
+    #[serde(default)]
+    pub(super) yolo_profile: Option<String>,
     /// Tools to allow outright for this run.
     #[serde(default)]
     pub(super) allow: Vec<String>,
@@ -645,7 +653,7 @@ pub(super) struct SpawnAgentReq {
     /// `X-Leviath-Signature: sha256=<hex>` HMAC of the body keyed on this secret.
     pub(super) callback_secret: Option<String>,
     /// Ask for the run's final output in a particular shape, overriding what the
-    /// blueprint declares. Any label works - `markdown`, `xml`, `a2ui`, a media
+    /// blueprint declares. Any label works - `markdown`, `xml`, `a2ui`, a mime
     /// type, your own - because nothing converts between shapes: the label and
     /// instructions are handed to the model, which produces the bytes.
     pub(super) output_format: Option<String>,
@@ -662,6 +670,11 @@ pub(super) struct SpawnAgentReq {
     /// names what was retired. Supply this field when the new shape should
     /// still be checked.
     pub(super) output_schema: Option<serde_json::Value>,
+    /// Files already inside the working directory to attach as typed parts.
+    /// A `multipart/form-data` body carries files instead; a `@path` token
+    /// inside `task` or a region's text attaches that file too.
+    #[serde(default)]
+    pub(super) parts: Vec<super::upload::PartRef>,
 }
 
 /// A run's final output as the API serves it.
@@ -679,10 +692,10 @@ pub(crate) struct FinalOutputResp {
     pub submitted_at: i64,
     /// Whether the answer hit the size cap and was cut short.
     pub truncated: bool,
-    /// Files the run produced, as workdir-relative paths. Fetch one with
+    /// Files the run produced, typed and hashed. Fetch one with
     /// `GET /api/agents/{id}/files?path=`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub artifacts: Vec<String>,
+    pub artifacts: Vec<ArtifactResp>,
 }
 
 impl From<leviath_core::output::FinalOutput> for FinalOutputResp {
@@ -693,7 +706,7 @@ impl From<leviath_core::output::FinalOutput> for FinalOutputResp {
             stage: o.stage,
             submitted_at: o.submitted_at,
             truncated: o.truncated,
-            artifacts: o.artifacts,
+            artifacts: o.artifacts.into_iter().map(ArtifactResp::from).collect(),
         }
     }
 }
@@ -950,6 +963,11 @@ pub(super) struct RunFileEntry {
     /// True for a recorded path that resolves outside the workdir - possible
     /// when a tool was handed an absolute path. Reported rather than hidden.
     pub(super) outside_workdir: bool,
+    /// What the run's mime registry makes of the file from its name, so a
+    /// console can decide whether to render it without a request per row or a
+    /// guess of its own. Typed by extension only (not sniffed), and empty for
+    /// a directory. `GET .../files/raw` types the same bytes, sniffing them.
+    pub(super) mime_type: String,
 }
 
 /// Response of `GET /api/agents/{id}/files`: one file the run wrote, as text.
@@ -1125,6 +1143,10 @@ pub(super) struct SubmitInteractionReq {
     /// the plain deny every existing caller sends.
     #[serde(default)]
     pub(super) feedback: Option<String>,
+    /// Files already inside the working directory to send with a text
+    /// answer.
+    #[serde(default)]
+    pub(super) parts: Vec<super::upload::PartRef>,
 }
 
 #[derive(Deserialize)]
@@ -1132,6 +1154,9 @@ pub(super) struct SendMessageReq {
     pub(super) message: String,
     #[serde(default)]
     pub(super) target_region: Option<String>,
+    /// Files already inside the working directory to send with the message.
+    #[serde(default)]
+    pub(super) parts: Vec<super::upload::PartRef>,
 }
 
 // ─── Config types ───────────────────────────────────────────────────────────
@@ -1166,6 +1191,10 @@ pub(super) struct ModelEntry {
     pub(super) retires: Option<String>,
     /// USD per million tokens, when the provider's listing quotes a rate.
     pub(super) pricing: Option<leviath_providers::ModelPricing>,
+    /// Mime type patterns the model accepts in a request, `text/*` included.
+    pub(super) input_types: Vec<String>,
+    /// Mime type patterns the model can hand back.
+    pub(super) output_types: Vec<String>,
 }
 
 #[cfg(test)]
@@ -1288,7 +1317,8 @@ mod tests {
     fn redacted_config_serde_roundtrip() {
         let config = RedactedConfig {
             default_provider: "anthropic".to_string(),
-            default_model: Some("claude-sonnet-5".to_string()),
+            override_model: Some("claude-sonnet-5".to_string()),
+            fallback_model: None,
             provider_order: Vec::new(),
             has_anthropic_key: true,
             has_openai_key: false,
@@ -1312,7 +1342,7 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let parsed: RedactedConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.default_provider, "anthropic");
-        assert_eq!(parsed.default_model.as_deref(), Some("claude-sonnet-5"));
+        assert_eq!(parsed.override_model.as_deref(), Some("claude-sonnet-5"));
         assert!(parsed.has_anthropic_key);
         assert!(!parsed.has_openai_key);
     }

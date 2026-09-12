@@ -326,6 +326,11 @@ pub(crate) struct InferenceResult {
     /// provider issued one. Stored on the assistant turn so the next request
     /// hands it back; see `leviath_core::RegionEntry::reasoning`.
     pub reasoning: Option<String>,
+
+    /// Mime the model produced, already in the run's store, or a text part
+    /// saying what was dropped when it could not be stored. Written beside
+    /// the reply's text on the assistant turn.
+    pub parts: Vec<leviath_core::mime::Part>,
 }
 
 /// A tool call requested by the model.
@@ -354,6 +359,9 @@ pub struct AgentMessage {
     pub content: String,
     /// Which region to add the message to (default: "conversation")
     pub target_region: Option<String>,
+    /// Files attached to the message; stored when it is delivered and written
+    /// beside the text in one entry.
+    pub parts: Vec<leviath_core::mime::InboundPart>,
 }
 
 /// Inbox component for receiving messages sent to a running agent.
@@ -620,6 +628,7 @@ mod tests {
             agent_id: "agent-1".to_string(),
             content: "hello".to_string(),
             target_region: None,
+            parts: Vec::new(),
         });
         assert_eq!(inbox.messages.len(), 1);
 
@@ -636,6 +645,7 @@ mod tests {
                 agent_id: "a".to_string(),
                 content: content.to_string(),
                 target_region: None,
+                parts: Vec::new(),
             });
         }
 
@@ -874,6 +884,7 @@ mod tests {
             agent_id: "a".to_string(),
             content: "msg".to_string(),
             target_region: None,
+            parts: Vec::new(),
         });
         let _ = inbox.drain_all();
         assert!(inbox.messages.is_empty());
@@ -888,6 +899,7 @@ mod tests {
             agent_id: "agent-1".to_string(),
             content: "hello".to_string(),
             target_region: Some("conv".to_string()),
+            parts: Vec::new(),
         };
         let cloned = msg.clone();
         assert_eq!(cloned.agent_id, "agent-1");
@@ -949,6 +961,7 @@ mod tests {
             tokens_used: 100,
             cut_off_at: None,
             reasoning: None,
+            parts: Vec::new(),
         };
         assert_eq!(ir.response, "Hello");
         assert_eq!(ir.tool_calls.len(), 1);

@@ -13,12 +13,15 @@ pub(crate) struct ProcessResponse;
 pub(crate) struct InferenceResults(pub UnboundedReceiver<InferenceOutcome>);
 
 /// Convert a provider response into the stored `InferenceResult` component.
-/// (Ported from `AgentEngine::apply_inference_response`.)
+/// (Ported from `AgentEngine::apply_inference_response`.) `parts` are the
+/// response's mime once stored, from [`store_model_parts`].
 pub(crate) fn to_inference_result(
     response: &leviath_providers::InferenceResponse,
+    parts: Vec<leviath_core::mime::Part>,
 ) -> crate::components::InferenceResult {
     crate::components::InferenceResult {
         response: response.content.clone(),
+        parts,
         tool_calls: response
             .tool_calls
             .iter()
@@ -34,6 +37,74 @@ pub(crate) fn to_inference_result(
             .then_some(response.tokens_used.completion_tokens),
         reasoning: response.reasoning.clone(),
     }
+}
+
+/// Put the mime a model produced into the run's store, each as a stored
+/// part named as the provider named it. A blob the run cannot keep (no
+/// store, over the ceiling) becomes a text part saying so, so the model's
+/// own reply still records that it made something.
+pub(crate) fn store_model_parts(
+    blobs: Vec<leviath_core::mime::Blob>,
+    entity: Entity,
+    run_id: &str,
+    mime: &crate::blob_store::MimeParams,
+) -> Vec<leviath_core::mime::Part> {
+    if blobs.is_empty() {
+        return Vec::new();
+    }
+    // Drop byte-identical duplicates a model returned in one reply. Some
+    // gateways echo the same file more than once - a streamed image resent on a
+    // later delta, an `images` array with a repeat - and the store is
+    // content-addressed, so two identical blobs are one file on disk anyway;
+    // keeping both parts would only send the model its own output back twice.
+    // Exact bytes only: a model that returns two genuinely different files,
+    // even near-identical ones, keeps both.
+    let blobs = dedupe_identical_blobs(blobs);
+    let (sources, _) = mime.hydration_inputs(entity);
+    let Some((store, registry)) = sources else {
+        return blobs
+            .into_iter()
+            .map(|blob| {
+                leviath_core::mime::Part::text(format!(
+                    "[{} of {} from the model dropped: this run has no blob store]",
+                    blob.mime_type,
+                    leviath_core::mime::human_size(blob.bytes.len() as u64)
+                ))
+            })
+            .collect();
+    };
+    let sink = crate::context_setup::PartSink {
+        store: store.as_ref(),
+        registry: &registry,
+        run_id,
+        max_part_bytes: mime.max_part_bytes(),
+    };
+    blobs
+        .into_iter()
+        .enumerate()
+        .map(|(i, blob)| {
+            let name = blob
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("model-{}", i + 1));
+            let mut inbound = leviath_core::mime::InboundPart::from_bytes(name, blob.bytes);
+            inbound.mime_type = Some(blob.mime_type);
+            sink.store_part(&inbound).unwrap_or_else(|e| {
+                leviath_core::mime::Part::text(format!("[model output dropped: {e}]"))
+            })
+        })
+        .collect()
+}
+
+/// Keep the first of each byte-identical blob, in the order they arrived.
+/// Identity is the sha256 of the bytes, the same key the blob store uses, so
+/// this drops exactly what the store would have collapsed to one file.
+fn dedupe_identical_blobs(blobs: Vec<leviath_core::mime::Blob>) -> Vec<leviath_core::mime::Blob> {
+    let mut seen = std::collections::HashSet::new();
+    blobs
+        .into_iter()
+        .filter(|b| seen.insert(leviath_core::mime::sha256_hex(&b.bytes)))
+        .collect()
 }
 
 /// What a person has to do about a provider that could not be reached.
@@ -123,6 +194,7 @@ pub(crate) fn collect_inference(
     mut circuits: Option<ResMut<ProviderCircuits>>,
     policy: Option<Res<CircuitPolicy>>,
     persist: Option<Res<crate::pipeline::persist::PersistenceStage>>,
+    mime: crate::blob_store::MimeParams,
     mut commands: Commands,
 ) {
     crate::tick_scope::clear();
@@ -313,7 +385,13 @@ pub(crate) fn collect_inference(
                         ),
                     ));
                 }
-                let result = to_inference_result(&response);
+                let parts = store_model_parts(
+                    response.parts.clone(),
+                    outcome.entity,
+                    &state.agent_id,
+                    &mime,
+                );
+                let result = to_inference_result(&response, parts);
                 commands
                     .entity(outcome.entity)
                     .insert(result)
@@ -788,7 +866,7 @@ pub(crate) fn handle_empty_response(
             && progress.cut_off_nudges < MAX_CUT_OFF_NUDGES
         {
             progress.cut_off_nudges += 1;
-            store_text_reply(&mut window, &infer.response, infer.reasoning.clone());
+            store_reply(&mut window, infer, infer.reasoning.clone(), stage);
             inject_system_nudge(&mut window, &cut_off_nudge(cut_off_at));
             commands
                 .entity(entity)
@@ -805,14 +883,14 @@ pub(crate) fn handle_empty_response(
             // told "you have not written the file yet" with its own unwritten
             // draft in front of it can split it; one with nothing in front of
             // it drafts the whole thing again.
-            store_text_reply(&mut window, &infer.response, infer.reasoning.clone());
+            store_reply(&mut window, infer, infer.reasoning.clone(), stage);
             commands
                 .entity(entity)
                 .remove::<ReadyForTransition>()
                 .insert(ResolveTransition);
         } else {
             progress.text_only_nudges += 1;
-            store_text_reply(&mut window, &infer.response, infer.reasoning.clone());
+            store_reply(&mut window, infer, infer.reasoning.clone(), stage);
             let stage_name = stage.map(|s| s.name.as_str()).unwrap_or("");
             let regions = stage
                 .and_then(|s| s.context_layout.as_ref())
@@ -858,22 +936,47 @@ pub(crate) fn cut_off_nudge(cut_off_at: usize) -> String {
     )
 }
 
-/// Record a text-only reply in the conversation as the model's turn. A reply
-/// with nothing in it (a cut-off tool call, an empty answer) leaves no entry:
-/// an empty assistant message is noise to the next request and some
-/// providers refuse it outright.
-fn store_text_reply(window: &mut ContextWindow, text: &str, reasoning: Option<String>) {
-    if text.trim().is_empty() {
-        return;
+/// Record a reply with no tool calls in the conversation as the model's
+/// turn: its text and whatever mime it produced. A reply with nothing in it
+/// (a cut-off tool call, an empty answer) leaves no entry: an empty
+/// assistant message is noise to the next request and some providers refuse
+/// it outright.
+fn store_reply(
+    window: &mut ContextWindow,
+    infer: &crate::components::InferenceResult,
+    reasoning: Option<String>,
+    stage: Option<&leviath_core::blueprint::Stage>,
+) {
+    // The stage may send some produced parts to regions of their own
+    // (`output_routing`). The reply's text and any unrouted part stay in the
+    // conversation as the assistant turn; the routed parts land in their
+    // regions as separate entries.
+    let routed = super::part_routing::split(stage, &infer.parts);
+    if let Some(content) = reply_content(&infer.response, &routed.kept) {
+        let tokens = content.tokens_hint();
+        let _ = window.add_assistant_turn_content(
+            "conversation",
+            leviath_core::EntryKind::AssistantTurn { tool_calls: vec![] },
+            content,
+            tokens,
+            reasoning,
+        );
     }
-    let tokens = leviath_core::estimate_tokens(text);
-    let _ = window.add_assistant_turn(
-        "conversation",
-        leviath_core::EntryKind::AssistantTurn { tool_calls: vec![] },
-        text.to_string(),
-        tokens,
-        reasoning,
-    );
+    super::part_routing::store_routed(window, &routed);
+}
+
+/// A reply's text and produced parts as one entry's content, or `None` when
+/// there is nothing to record.
+pub(crate) fn reply_content(
+    text: &str,
+    parts: &[leviath_core::mime::Part],
+) -> Option<leviath_core::region::EntryContent> {
+    let mut all = Vec::with_capacity(parts.len() + 1);
+    if !text.trim().is_empty() {
+        all.push(leviath_core::mime::Part::text(text));
+    }
+    all.extend(parts.iter().cloned());
+    (!all.is_empty()).then(|| leviath_core::region::EntryContent::from_parts(all))
 }
 
 /// Append a `[System]` nudge to the conversation region: the one injection path

@@ -12,6 +12,9 @@ use leviath_core::{
 
 use crate::ContextWindow;
 
+pub(crate) mod parts;
+pub(crate) use parts::{PartSink, ingest_parts};
+
 /// Initialize a [`ContextWindow`] from a blueprint and seed its regions from a
 /// name→content map. Adds each layout region plus the infra
 /// `tool_results`/`conversation` regions, then fills each seed whose key matches
@@ -33,6 +36,7 @@ pub(crate) fn init_window_seeded(
         region.summarizable = region_def.summarizable;
         region.admission = region_def.admission;
         region.volatility = region_def.volatility;
+        region.accepts = region_def.accepts.clone();
         region.description = region_def.description.clone();
         region.describe_in_prompt = region_def.describe_in_prompt;
         window.add_region(region);
@@ -168,6 +172,7 @@ pub(crate) fn apply_layout(window: &mut ContextWindow, layout: &ContextLayout) {
         new_region.summarizable = region_def.summarizable;
         new_region.admission = region_def.admission;
         new_region.volatility = region_def.volatility;
+        new_region.accepts = region_def.accepts.clone();
         new_region.description = region_def.description.clone();
         new_region.describe_in_prompt = region_def.describe_in_prompt;
 

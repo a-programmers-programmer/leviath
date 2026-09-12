@@ -29,7 +29,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use leviath_core::Blueprint;
-use leviath_core::blueprint::StageMode;
+use leviath_core::blueprint::{StageMode, ToolGroup};
 use leviath_runtime::dynamic_interaction::BLOCKING_INTERACTION_TOOLS;
 use leviath_tools::canonical_tool_name;
 use serde::{Deserialize, Serialize};
@@ -156,6 +156,13 @@ pub(crate) struct LintEnv {
     /// MCP tools already resolved. Empty skips the unknown-tool check.
     pub known_tools: HashSet<String>,
 
+    /// Which group each known tool belongs to, so a check can say whether a
+    /// `@builtin`-style grant reaches a tool named elsewhere in the stage
+    /// (`required_tools`, `tool_permissions`). MCP tools are absent: their
+    /// `server__tool` shape already places them in [`ToolGroup::Mcp`]. Empty
+    /// means the question was never asked, and no group-aware check guesses.
+    pub tool_sources: HashMap<String, ToolGroup>,
+
     /// `(provider, model)` rows for providers whose catalog is closed enough to
     /// check against. A provider with no row here is not checked at all, which
     /// is what keeps open catalogs (Ollama, OpenRouter, script providers) from
@@ -243,11 +250,17 @@ impl LintEnv {
         // because `GET /api/tools` has to answer the same question and two
         // copies of "where does a tool come from" would not have stayed equal.
         // The lint wants only the names; the endpoint wants the sources too.
-        let known_tools =
-            crate::tool_inventory::ToolInventory::discover(Some(agent_dir), None).names();
+        let inventory = crate::tool_inventory::ToolInventory::discover(Some(agent_dir), None);
+        let known_tools = inventory.names();
+        let tool_sources = inventory
+            .tools
+            .iter()
+            .map(|t| (t.name.clone(), t.source.group()))
+            .collect();
 
         Self {
             known_tools,
+            tool_sources,
             known_models: crate::commands::models::closed_catalog_models(),
             available_providers: None,
             read_paths: None,
@@ -440,15 +453,19 @@ pub(crate) fn lint_manifest(
 
     let agent_permissions = blueprint.agent_tool_permissions();
 
+    findings.extend(lint_mime_types(blueprint));
     for stage in &blueprint.stages {
         let keys = declared.stage(&stage.name);
         findings.extend(lint_declarations(stage, keys));
         findings.extend(lint_tools(stage, env));
         findings.extend(lint_blocking_tools(stage));
         findings.extend(lint_tool_policies(stage, &agent_permissions));
+        findings.extend(lint_permission_clamp(stage, &agent_permissions));
         findings.extend(lint_models(stage, env));
         findings.extend(lint_output_stage(stage));
         findings.extend(lint_fanout_escape(stage));
+        findings.extend(lint_stage_mime(blueprint, stage));
+        findings.extend(lint_tool_accepts(stage));
     }
 
     // Worst first, stable within a severity so the order a check ran in is the
@@ -593,7 +610,9 @@ impl Declared {
 // than re-exported: `lint_manifest` is the only caller and the only entry point
 // anyone outside this module needs, so the individual checks stay internal.
 mod checks;
+mod mime;
 use checks::*;
+use mime::*;
 mod security;
 use security::*;
 

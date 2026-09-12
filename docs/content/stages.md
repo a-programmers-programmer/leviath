@@ -120,6 +120,12 @@ somewhere else.
 | `accepts_messages` | `true` | Whether `lev msg` reaches this stage. See [Human-in-the-loop](/docs/interaction) |
 | `allow_blocking_tools` | `false` | Marks an autonomous stage as deliberately offering the tools that wait on a person |
 | `available_global_tools` | `false` | Also advertises every Rhai tool installed in `~/.leviath/tools/` at spawn. See [which tools a stage gets](/docs/agents#which-tools-a-stage-gets) |
+| `input.accepts` | the visible regions' `accepts` | The mime types the stage takes as [parts](/docs/mime), used to prefer a model that can see them and by `lev validate` |
+| `input.as_text` | `[]` | Mime types whose parts reach this stage's model as text whatever the model takes |
+| `output.artifacts` | `[]` | The files the stage hands back beside its answer, by name and type. See [Final outputs](/docs/outputs#large-results) |
+| `output_routing` | `{}` | Where the model's produced parts go, by mime type: `"image/*" = "artwork"`. See [Routing produced parts](/docs/context#routing-produced-parts) |
+| `context.reset` | `[]` | Regions emptied when the stage is entered, for a clean slate. See [A clean slate for the next stage](/docs/context#a-clean-slate-for-the-next-stage) |
+| `tool_accepts` | `{}` | What each tool may be handed at this stage, as `tool = ["image/*"]`: a stored part outside the list is out of that tool's reach here. See [Mime](/docs/mime#what-a-tool-may-be-handed) |
 
 Three of those need a sentence more.
 

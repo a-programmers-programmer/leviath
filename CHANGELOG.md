@@ -56,11 +56,378 @@ same list.
   output the way `lev result` does, or one JSON object with `--json`, and
   exits non-zero when the run ends in error or is cancelled.
 
+- A stage can route the parts a model produces to regions of their own, by mime
+  type. `[stages.<name>.output_routing]` maps a mime pattern to a region
+  (`"image/*" = "artwork"`); a reply that mixes text and other parts is split
+  part by part, each part going to the most specific matching pattern's region,
+  and the text and any unmatched part staying in `conversation`. The point is to
+  hand a produced file (a picture from an image model, a document a generator
+  returns) to a later stage or the user instead of leaving it in the transcript,
+  so unlike `tool_routing` the target need only be a region the blueprint
+  declares. It is mime types throughout, so the same table routes audio, video
+  or any registered type (#400).
+- A stage can empty regions when it is entered, for a clean slate.
+  `[stages.<name>.context] reset = ["conversation"]` clears the named regions on
+  entry (the content is gone, not merely hidden), so a stage starts with only
+  what its visible regions hold. Unlike `hide`, `reset` may name `conversation`
+  (#400).
+- `submit_output` can name a file the run produced but never wrote to disk (a
+  picture from an image model, which lives in the run's store) as an artifact.
+  When the path is not a workdir file, the name, then a sha256 prefix, is
+  resolved against the run's produced parts, and a match is written to that path
+  before it is recorded, so the user and any later stage get a real file (#400).
+- A run's file listing types each entry. `GET /api/agents/{id}/files` entries
+  carry a `mime_type`, resolved by the run's registry from the file's name, so
+  a console can decide whether to render a file, or offer it to a region that
+  `accepts` a type, without a request per row or a guess of its own. Typed by
+  extension only (not sniffed) and empty for a directory; `.../files/raw` still
+  sniffs the bytes when an exact answer is needed. Announced as
+  `runs.files.mime_type` (#812).
+- Named yolo profiles. `lev run --yolo=<name>` runs under a profile from
+  `yolo.toml` beside `config.toml`, which says which tool calls run unprompted,
+  which still go through the ordinary approval prompt, and which are refused,
+  per tool (names, globs, `@groups`) and per shell command (word globs, with
+  `args` scoped to paths that resolve inside a tree), and whether the model's
+  questions, the stage checkpoints and the taint gate still reach a person. A
+  profile never lifts a configured deny. The file is read at spawn and when a
+  run resumes, so edits need no daemon restart; a child, a fan-out worker and a
+  restarted run inherit the name. `lev yolo list|show|test|init` reads and
+  tries the file, and `GET /api/yolo`, `GET /api/yolo/{name}`,
+  `POST /api/yolo/test` and the admin-only `PUT /api/yolo` do the same over
+  HTTP. `POST /api/agents` takes `yolo_profile`, which `--no-remote-yolo`
+  refuses with `yolo`.
+- `[security] lock_permission_files`, on by default: a run's `write_file`,
+  `edit_file` and `shell` calls that name `config.toml`, `yolo.toml`, the taint
+  policy and its rules, or the `providers/` and `tools/` script directories are
+  refused before any policy is consulted, `--yolo` or not, and a seed at spawn
+  is held to the same rule. An agent could otherwise widen what its next spawn
+  is allowed to do from inside a run.
+- Typed mime parts. A region entry, a tool result, a user message, a model
+  reply and a final output are each a list of parts, and a part is one piece
+  of content with a mime type: a paragraph, a PNG, a WAV clip, an MP4, a PDF,
+  an OBJ model. Text is a part like any other; its bytes travel inside the
+  entry, while any other part is stored once under `<run>/blobs/<sha256>` and
+  referenced by hash everywhere else, so the journal and `context.json` never
+  grow by a file's size. What a type *is* comes from a mime registry rather
+  than from code: the compiled defaults, then `[mime_types]` in the config,
+  each row naming a family, whether the bytes are text, a token rule,
+  extensions, a magic prefix and a stand-in template, and `[mime]` sets the
+  size ceilings. `lev doctor` reports a row that will not load. A region says
+  what it takes with `accepts = ["text/*", "image/png"]` and is bounded by its
+  token budget; a region with a `schema` takes text only. A snapshot or journal
+  written before this reads back unchanged, since a plain string is still how a
+  text-only entry is written (#400).
+- Every model says what it takes and what it can hand back, as mime type
+  patterns. The built-in tables know that Claude reads images and PDFs, that
+  Gemini also takes audio and video, which OpenAI models see, hear or draw,
+  and which Ollama builds are vision models; OpenRouter's listing corrects
+  that from its `architecture` block and Ollama's `/api/show` from its
+  `capabilities`; `[model_capabilities.<id>] input_types / output_types`
+  correct both, and a Rhai provider declares `// @input_types` and
+  `// @output_types`. For the vendors whose APIs report nothing per model,
+  the precise lists live in a compiled table refreshed from OpenRouter's
+  catalogue by `cargo xtask modalities`, as `cargo xtask prices` refreshes
+  list prices, so a model that takes images but not PDFs is described as
+  such rather than by a whole-vendor guess. `lev models` shows a `MIME`
+  column and takes `--accepts image/png`, `lev models show` prints both
+  lists, and `GET /api/models` carries `input_types` and `output_types`
+  (#400).
+- A stored part reaches the model. Assembly emits a mime block per stored
+  part beside a one-line stand-in that names it, and the inference lane
+  fills the bytes in right before the request goes out: as the vendor's own
+  image, audio or document block when the model's input types cover the
+  part, as text when the registry says the bytes are text (a `model/obj`
+  file goes to any text model as text), and as the stand-in alone
+  otherwise. A region that renders into the system prompt has its stored
+  parts lifted into one leading user message, so the prefix still caches.
+  Anthropic gets `image` and `document` blocks, the OpenAI-shaped providers
+  `image_url`, `input_audio` and `file` parts, Codex `input_image` and
+  `input_file`, and a Rhai provider the neutral `mime` block with the
+  base64 in `data`; the Claude Code transport and every lane that does not
+  hydrate send the stand-in. The journal and `context.json` never hold
+  base64. `[mime] max_media_bytes_per_request` caps the bytes of stored media
+  one request carries, oldest sent as stand-ins first, a backstop for the
+  vendor request-size limits a token budget cannot see (#400).
+- Stages declare typed inputs and outputs. `[stages.<name>.input] accepts`
+  states what a stage takes as parts (else the union of its visible regions'
+  `accepts`), and `as_text` names types whose parts reach the model as text
+  whatever it takes; a stage listing several models is resolved onto the one
+  that can see what it takes. `[[stages.<name>.output.artifacts]]` declares
+  the files a stage hands back by `name`, `type`, `required` and
+  `description`, and `submit_output` takes each as a path or as
+  `{ name, path, type }`: every file must exist inside the working
+  directory, a required one that is missing or a declared one of the wrong
+  type is refused back to the model, and each accepted file is typed,
+  hashed, stored as a part of the run and mirrored into `final_output`.
+  `artifacts` on the answer, in `meta.json`, on `GET /api/agents/{id}/result`
+  and on the completion webhook is now a list of `{ name, path, mime_type,
+  size, sha256 }` rather than paths; an answer recorded before this reads
+  back with each path's file name and an unknown type. `lev result` lists
+  them with their types and hashes, `lev validate` prints what each stage
+  takes and hands back and warns `mime-unseen` when a stage's models cannot
+  see a type its regions take (#400).
+- Rhai scripts handle parts. A script tool reads a stored part's bytes with
+  `read_part(name)` (by file name or hash prefix), stores new bytes with
+  `write_part(bytes [, type [, name]])`, sees what the run holds with
+  `list_parts()` and `find_part(name)`, and returns `#{ content, parts }`
+  to hand parts back on its result; `// @accepts` and `// @produces`
+  declare the types it takes and makes, which `lev tools` shows. The parts
+  a tool can name are the ones in the agent's context when the batch was
+  dispatched plus what the batch wrote. A custom region's `entries[i]`
+  carries `parts`, and a stage hook's `ctx.parts` lists each region's
+  stored parts (#400).
+- A tool result is text plus any stored parts the tool produced, all the
+  way through: the tool lane, the routed region entry, the journal's
+  `ToolCallDone` record (a plain string when it is text alone, so every
+  journal written before this reads back unchanged) and the crash-resume
+  replay. `read_file` on a file that is not text stores it as a typed part
+  rather than failing, an MCP server's `image`, `audio` and blob-carrying
+  `resource` blocks are decoded and stored beside its text, and a
+  `resource_link` is described with its URI and type. Two context tools
+  move bytes the other way: `context_attach` puts a workdir file into a
+  region as a part, with a caption and a key so a newer version replaces
+  the older, and `context_export` writes a stored part back into the
+  workdir by file name or hash prefix (#400).
+- Files reach a run over HTTP. `POST /api/agents` and `POST
+  /api/agents/{id}/message` take `multipart/form-data` (a `request` field
+  of JSON plus file fields named `part` or `part:<region>`), a JSON `parts`
+  list naming files inside the run's working directory, and `@path` tokens
+  in the task, a region's text or a message, resolved inside the working
+  directory. `GET /api/agents/{id}/blobs` lists the stored parts a run
+  holds and `/blobs/{sha256}` serves one under its own content type, `GET
+  /api/agents/{id}/files/raw?path=` serves a workdir file the same way, and
+  `GET /api/mime` lists the effective mime registry. Both byte routes
+  advertise `Accept-Ranges: bytes` and answer a single `Range` request with
+  `206 Partial Content` and a `Content-Range`, so a client can scrub or
+  resume. `[serve] max_upload_bytes` (32 MiB by default) bounds a request
+  body and is reported under `limits`. Announced as `spawn.parts`, `messages.parts`,
+  `runs.blobs`, `runs.files.raw`, `runs.result.artifacts` and
+  `mime.registry` (#400).
+- The mime registry can be written over HTTP, not only read. `PUT /api/mime`
+  adds a row to `mime_types.toml` beside the config, or sets the fields sent
+  on the one already there, and `DELETE /api/mime?mime_type=` takes one out -
+  the same file and the same validation `lev mime add` and `lev mime remove`
+  use, so a console can create the custom type a region, a stage input or a
+  declared artifact names without handing the operator a block of TOML to
+  paste. Both need `--allow-admin` and are announced as `mime.write` (#814).
+- Files reach a run from the command line. `lev run --attach
+  path[:region][:type][:text]` puts a file in a region as a typed part, a
+  `--<region> @file` whose bytes are not text attaches instead of seeding,
+  and a `@path` inside the task or a region's text attaches that file to
+  the same entry while the text keeps the name. `lev msg --attach` and a
+  `@path` in a message do the same for a running agent, with the files
+  landing beside the words as one entry. The control socket's spawn and
+  message requests carry `parts` (base64 on the wire), the daemon stores
+  each one under the run's `blobs/` and writes the reference into the
+  region, and a region that refuses the part's type or is over `[mime]
+  max_part_bytes` refuses the spawn by name, or drops the part from a
+  message and keeps the text (#400).
+- Files come back out from the command line. `lev result --artifact <name>`
+  streams one produced file to stdout, `--out <dir>` writes every produced
+  file (or the named one) into a directory, and `--open <name>` hands one
+  to the operating system; the bytes come from the run's store when the
+  answer recorded a hash, else from the working directory. `lev blobs
+  <run>` lists every stored part a run holds with its type, size, shape,
+  tokens, hash and regions, and `lev blobs <run> <name-or-hash>` fetches
+  one to stdout, `--out` a path, or `--open`. `lev mime list` prints the
+  effective mime registry with each row's source and `lev mime check
+  <file>` says what a file resolves to and how a model would see it. `lev
+  context --full` shows each stored part as its own row (#400).
+- A text answer to a question carries files. `lev respond --attach` and a
+  `@path` in the answer, a `@path` in a reply typed on the dashboard, and
+  `parts` or a multipart upload on `POST /api/agents/{id}/interaction` all
+  put typed parts on the answer; the run stores them and writes them beside
+  the words in the tool result, so the model reads the file where the
+  answer mentions it. A choice or an approval refuses files. The dashboard
+  shows an unfolded entry's stored parts as rows of their own in the
+  Context view, opens one with the operating system on `v` and writes it
+  into the run's working directory on `w`, lists the files a run produced
+  under its answer in the Final view, and attaches the files a task names
+  with `@path` when a run starts from the new-run screen, counting them on
+  the task box as you type. The new-run screen's Inputs pane gives a file
+  region a picker of the working directory, filtered to the types the region
+  accepts, so a file reaches a region by being chosen rather than named and
+  never with an `@`; a region takes as many files as its token budget allows,
+  added and removed in the picker. How many that is comes from the budget, not a
+  fixed count: the row and the picker name the budget (`≤117k tok`, the region's
+  share of the entry model's context window), each candidate shows its own token
+  cost, and a file that would overflow the budget is refused with the reason.
+  The run is stopped with a named error rather than started with a region that
+  cannot hold what it was given (#400).
+- The stage graph shows the mime a stage takes beyond text (`◧ image/*
+  audio/wav`, from its regions' `accepts` or its `[input] accepts`) and the
+  files it declares it hands back (`▤ video/mp4`), in the explorer, the
+  new-run preview, the agent editor and `lev validate --graph` alike. A path
+  whose file the next stage's regions cannot take carries `!` on its label,
+  and the explorer's caption names the type that would cross as a stand-in
+  (#400).
+- The operator's mime rows live in `mime_types.toml` beside `config.toml`,
+  the way yolo profiles live in `yolo.toml`: a key per type with the same
+  fields as before, layered over the compiled defaults and over a
+  `[mime_types]` table in the config, which still loads. `lev mime init`
+  writes a commented example, `lev mime list` names the file as a row's
+  source, `lev doctor` names it when it will not load, and
+  `lock_permission_files` keeps a run's tools out of it. An edit reaches
+  the next run without a restart (#400).
+- Every run types its bytes by its own copy of the mime registry: the
+  operator's rows with the blueprint's own `[mime_types]` layered on top,
+  built at spawn and read by the tools, the request builder and the message
+  path alike. A blueprint's rows reach that agent's runs only, are checked
+  when the manifest is parsed (a misspelled field fails `lev validate` and
+  the spawn), and travel with the agent (#400).
+- An edit to `mime_types.toml` or to `[mime_types]` in the config reaches
+  runs already under way, not only the next one. The daemon re-reads both on
+  its own timer, every thirty seconds, and rebuilds every live run's registry
+  over the new rows; a new run reads them as it spawns (#400).
+- A mime row may name a `check`: a Rhai script beside the file that names
+  it whose `check(bytes, mime_type)` refuses bytes that are not what they
+  claim. It runs once, where bytes are stored, so an upload, a tool result, a
+  `read_file`, a model's reply and a `submit_output` artifact are all refused
+  with the reason when they fail it; a check that cannot run refuses too. The
+  operator's checks are compiled when the registry is built and reported by
+  `lev doctor` when they will not load; a blueprint's at spawn, fenced to the
+  blueprint's directory like its other scripts. Nothing checks the bytes of a
+  type whose row names no check, as before (#400).
+- `lev mime add <type>` writes a row into `mime_types.toml` from flags
+  (`--family`, `--text`, `--tokens`, `--extensions`, `--magic`, `--stand-in`,
+  `--check`) and sets the fields given on a row that is there; `lev mime
+  remove <type>` takes one out; `lev mime show <type>` prints one type as
+  the registry resolves it. The file is checked before it is written. `lev
+  mime list` gains a check column and `lev mime check <file>` runs the
+  type's check over the file and prints the verdict. `lev mime init` says
+  in its help that it is optional (#400).
+- `mime_check` is a sixth `kind` on the scripts routes (`GET /api/scripts`,
+  `GET/PUT/DELETE /api/scripts/mime_check/{name}`, `POST
+  /api/scripts/validate`): the operator's checks are listed and addressed
+  relative to the config's directory, a blueprint's beside the agent with
+  `?agent=`. `scripts.mime_checks` in `capabilities` says so. `lev validate`
+  prints the rows a blueprint adds, the dashboard's type chooser offers them,
+  and a new `mime-type-overrides-builtin` lint warns when a blueprint row
+  changes the family or the text flag of a built-in type (#400).
+- `[stages.<name>.tool_accepts]`: what each tool may be handed at a stage,
+  as `tool = ["image/*"]`. A stored part outside the list is out of that
+  tool's reach there: `spawn_agent`'s `parts` refuses it by name, a script's
+  `list_parts` leaves it out and its `read_part` names the limit, and
+  `context_export` refuses it the same way. Inline text is never hidden.
+  `lev validate` prints each stage's limits and warns
+  (`tool-accepts-ungranted`) about a limit on a tool the stage does not
+  grant (#400).
+- The dashboard's new-run screen has an Inputs box: one slot per region the
+  blueprint takes from the caller beyond the task. A file typed there is
+  attached to that region as a typed part, the way `lev run --pictures
+  @photo.png` is, and text seeds it, so a picture no longer has to ride in
+  the task region to reach an agent from the dashboard. `Tab` from the
+  agent list stops there when the agent has such regions (#400).
+- The dashboard's agent editor is laid out around what moves through a
+  stage. Its tabs are *Behaviour*, *Inputs & outputs* (the regions the
+  stage reads and what each takes, what it takes beyond them and reads as
+  text, the answer's format, the files it hands back), *Models & tools*
+  (the chain, the tools, and what each tool may be handed at the stage)
+  and *Context & tools*. A region, a declared file and a loop's path open
+  in a window over the editor instead of replacing the inspector, and every
+  mime type field is one chooser of the families, every type the registry
+  knows and a typed `type/subtype`. The keys round-trip the way the
+  runtime reads them, and the graph beside the inspector wears the badges
+  as you edit (#400).
+- `lev agent-client` advertises `image` and `audio` prompt capabilities. An
+  image or audio block's bytes, and a `resource` block's `blob`, become
+  parts on the task region (or on the message, on a later prompt), a prompt
+  that is only files gets a line naming them, and a `resource_link` is
+  named in the text: one whose `file://` URI points inside the session's
+  working directory is read there and rides along as a part, marked as
+  attached, and any other is marked as not fetched. The files a run produced
+  follow its answer as `resource_link` blocks with a `file://` URI into the
+  session's working directory. Embedders get the same: `SpawnSpec::attach`,
+  `AgentWorld::send_message_with`, `InteractionResponse::with_parts`, and
+  `artifacts` on the answer (#400).
+- Mime a model produces comes back as parts. An OpenAI-shaped provider
+  reads data URIs off the reply (OpenRouter's `images` list, `image_url`
+  items in a content array, streamed or not) and a Rhai provider returns
+  them under `parts`; the runtime stores each one and writes it beside the
+  reply's text on the assistant turn, named as the provider named it, so
+  the next request, `lev blobs`, the dashboard and the API all see it. What
+  the run cannot keep is described in the reply instead. `perf-tools/mock.py`
+  draws a PNG with `LV_MOCK_IMAGE=1` (#400).
+- `spawn_agent` takes `parts`: stored parts of the parent run, by name or
+  sha256 prefix, read from the parent's store and put on the child's task
+  region as typed parts, delivered as the parent's were. A name that matches
+  nothing, or bytes the store has lost, refuses the spawn by name. A
+  compaction that replaces entries carrying stored parts with a text summary
+  names the parts it dropped in the run log; the bytes stay in the store
+  (#400).
+- The bundled `reviewer` (0.2.5) takes screenshots: a `screenshots` region
+  accepting `image/*`, filled with `--attach shot.png:screenshots` or a
+  `@path` in `--criteria`, that the scan and deep-review stages read as the
+  caller's evidence of intent or breakage (#400).
+- A renamed-key table (`config/renamed.rs`) that every surface reads: the
+  loader respells an old key in the file text before parsing, so a type
+  error still points at its line; the unread-key warning does not report it;
+  `lev doctor` warns with the same notice; and `lev update` lists it under a
+  `renamed-keys` migration and rewrites the file. The next rename is one
+  entry in that table. `Migration::apply` now receives the raw document too,
+  so a migration can quote a key that serde no longer reads.
+
+- The agent editor's *Inputs & outputs* tab reads as inputs and outputs:
+  an *Input types* row (the stage's own, or what its regions take, with the
+  regions listed under it), *Sent as text*, an *Output type* picked from
+  the plain shapes and the mime registry rather than typed, and one
+  *Output file* row per declared file. A fan-out's worker is picked from
+  the agent's other stages or the installed agents instead of typed, with
+  an *another…* row for an agent that is not installed here (#400).
+- The agent editor's tools chooser offers MCP servers. Every `[[mcp_servers]]`
+  in the config, and in the agent's own manifest, is a row that grants the
+  server whole (`available_connectors`), and each server is asked for its
+  tools when the Agents screen opens, so its tools appear one by one under
+  their `server__tool` names as the answers land; a server that could not
+  be asked says why on its row. A stage's tools row shows both (#400).
+
 ### Changed
 
 - The bundled `coder` agent's `implement` and `review` stages set
   `available_global_tools = true`, so the worker that performs the mechanical
   steps is offered the tools earlier runs installed.
+
+- `--yolo` takes an optional profile, `--yolo=<name>`, on `lev run` and
+  `lev agent-client`. The equals sign is required, so `lev run --yolo coder`
+  keeps meaning "run coder, plain yolo". The bare flag is unchanged.
+- `default_model` is two settings now, named for what they do. `override_model`
+  is what `default_model` was: while set, every stage that allows a user
+  default starts on it, ahead of the models its blueprint names. `fallback_model`
+  is new and is what the old name promised: tried after every model a stage
+  names and before `[providers] fallback_order`, so it carries a stage none
+  of whose own models is configured here and never moves a stage off a model
+  its blueprint chose. Unset is the valid default for both. A config written
+  before this loads its `default_model` as `fallback_model`, which is a change
+  of behaviour for that install: stages go back to their blueprint models. The
+  load says so, `lev doctor` warns, and `lev update` rewrites the key with the
+  user watching; setting `override_model` restores the old behaviour (#795).
+- A run says when one of those settings moved a stage off the model its
+  blueprint named: one `[model] stage 'fix' starts on openrouter/deepseek-v4-flash
+  (override_model); blueprint asked for openrouter/deepseek-v4-pro` line per
+  stage in the run's log at spawn, so it reaches `lev run` output, the
+  dashboard and the journal. A stage that starts on its own first choice says
+  nothing. `lev validate` prints `override_model` and `fallback_model` beside
+  `default_provider`.
+- `GET /api/config` reports `override_model` and `fallback_model` in place of
+  `default_model`, both always present and `null` when unset; `PUT
+  /api/config` takes both with the same three states (absent, `null`, a
+  string) and the same empty-string refusal. `default_model` is gone from the
+  API. `lev setup --default-model` is `--override-model`, with
+  `--fallback-model` beside it. In the wizard both settings sit on the
+  advanced tuning screen, as Override model and Fallback model, so the main
+  screen asks only for providers and their order. The embedding builder's `default_model(provider, model)` is
+  `override_model(provider, model)`, `default_provider(provider)` sets the
+  provider alone, `fallback_model(model)` is the new setting, and the old
+  `fallback_model(provider, model)` that appended to the failover chain is
+  `fallback_route(provider, model)`.
+
+### Removed
+
+- The opt-in Azure Artifact Signing step on the alpha build, along with the
+  `id-token` grant that existed only for it. It was never configured, so every
+  `lev.exe` to date shipped unsigned and nothing changes for users. The version
+  resource in `lev.exe` stays. Should signing ever be wanted, the SignPath
+  Foundation route in CONTRIBUTING is the one to add.
 
 ### Fixed
 
@@ -70,6 +437,187 @@ same list.
   agent is still named when it fails to load. A name is looked up only in the
   install tree, never in the current directory, so a typo run from inside an
   agent directory stays an error.
+
+- A model that hands back the same file twice in one reply is stored once. Some
+  image gateways (gemini-3-pro-image) return several byte-identical copies of a
+  picture in a single call; the store is content-addressed, so the copies were
+  already one file on disk, but each was kept as its own part and sent back to
+  the next stage. Byte-identical produced parts are now de-duplicated, keeping
+  the first. Parts that merely look alike but differ in any byte are untouched
+  (#400).
+- An image a stage drew reached the next stage, and an image-output model drew
+  the subject it was asked for. Two faults in how typed media crossed a stage
+  boundary made an image agent draw the wrong picture and then describe a
+  different one:
+  - `google/gemini-2.5-flash-image` ignores the system prompt and generates
+    from its user turn, but a stage's prompt lands in the system blocks with a
+    bare `Begin.` user nudge - the convention that makes a text model act - so
+    the model drew the nudge: "draw a rabbit" came back as a generic "start of
+    a journey" landscape. A model that does not read the system prompt now has
+    it folded into the first user turn, so the model generates the asked
+    subject. Whether a model reads the system prompt is the existing
+    `supports_system_prompt` capability (settable per model in
+    `[model_capabilities]`); no catalogue distinguishes the image model that
+    ignores it from the one that honours it, so that one is a compiled one-off.
+  - A model-produced image rode the assistant turn that made it, and a provider
+    refuses or ignores an image inside an assistant turn (Anthropic answers
+    `400: 'image' blocks are not permitted within assistant turns`), so the
+    next stage never saw it and described the task text instead of the picture.
+    A produced image is now lifted into a following user turn, where the next
+    stage's model actually sees it.
+- A run's `modified_files` missed a file a `shell` command created. Only a
+  modifying tool that names a `path` (`write_file`, `edit_file`) was recorded,
+  so an agent whose whole job was to draw a chart or build an artifact with a
+  script left "what it changed" empty or naming only the scaffolding, while
+  "browse the folder" found the file plainly. Now a batch that ran a `shell`
+  call that landed scans the working directory for files modified since the run
+  began (hidden entries skipped, bounded in breadth and depth) and folds them
+  into the list. The scan adds to the list without touching
+  `modified_file_count`, which counts modifying tool *calls* - a shell is not
+  one - so a run that only shelled still reports its outputs on
+  `GET /api/agents/{id}/files?source=modified` without double-counting a file a
+  second shell call re-touched (#816).
+- The agent editor's inspector wrapped its tab strip at its usual width,
+  which cut the last tab in two and drew every row one line below where
+  the mouse map had it, so a click landed on the row under the pointer.
+  The strip shortens its titles when the full ones do not fit, labels are
+  cut to their column, and the body is never wrapped. The inspector is
+  wider, `Tab`/`Shift-Tab` walk a stage's tabs (the arrows change a row in
+  place, as they do on every other panel, and `Esc` goes back to the
+  graph), a live row's label is no longer drawn in the dim colour that
+  meant "cannot be edited", a chooser keeps a long name clear of the
+  note beside it, a button row is its label with nothing in front of it,
+  and a stage's *Move up / down in the file* buttons are gone (the paths
+  decide the flow, so the order in the file changed nothing) (#400).
+- Starting a run from the dashboard that named a file with `@path` in the task
+  attached that file twice: the screen resolved it against its working
+  directory and the daemon resolved the same token again. A spawn now drops an
+  exact repeat (same region, name and bytes), so the model sees the picture
+  once. A file attached to two regions, or two different files, is unaffected
+  (#400).
+- `lev validate` warns (`blueprint-permission-clamped`) when a stage sets a
+  granted tool more permissively than its built-in default, which a downloaded
+  blueprint cannot do on its own: the runtime clamps `shell = "allow"` or
+  `write_file = "allow"` back to its default, so the tool still asks. The line
+  looked like a decision and silenced `implicit-shell-policy` without doing
+  anything; the warning names how to make it stick, or to drop it (#400).
+- A Rhai provider ships the mime types its models are built for, with a
+  `// @mime_type <type> family=... [text=...] [extensions=...] [magic=...]`
+  annotation, repeatable. The rows layer into every run's registry under the
+  built-in table, so a run that resolves onto the provider knows the type,
+  and the operator's config and a blueprint still win over it. `lev mime list`
+  shows each with a `provider:<name>` source (#400).
+- A model that cannot call tools (an image model such as Nano Banana, whose
+  listing says `supports_tools = false`) was sent every tool call and result
+  an earlier stage had left in the shared conversation, and its provider
+  refused the request outright ("Function calling is not enabled for this
+  model"), so a generate stage that a review stage looped back to died on
+  its second visit. Such a model now gets that history as prose, what was
+  called and what came back, and is advertised no tool whatever the stage
+  granted (the run log says so), so an image model can sit inside an
+  iterating graph (#400).
+- The test suite's blueprint route tests wrote their `test-bp-*` blueprints
+  into the developer's real `~/.leviath/agents`, and one that failed before
+  its own clean-up left them there. They run in a temp dir of their own now,
+  through the same kind of test-only path override the MCP routes use.
+- The crates.io publish on a stable release stopped at `leviath-alloc`. An
+  August hygiene commit marked the crate `publish = false` while the prod
+  workflow's publish loop still named it and `leviath-cli`'s default allocator
+  feature still pinned it by version, so the 0.5.8 release published
+  `leviath-net` and then retried a refused publish for thirty minutes before
+  giving up, leaving every other crate at 0.5.5 on the registry. The crate is
+  publishable again (it had shipped there through 0.5.5 already), and
+  `cargo xtask version --check` now reads each member's manifest and refuses
+  a `publish = false` crate that the publish loop names or that another
+  manifest pins by version.
+- The publish loop's order was also wrong for the current dependency graph:
+  `leviath-agent-client` sat before `leviath-tools`, which it tests against,
+  and cargo resolves dev-dependencies when packaging, so the publish would
+  have failed there next. The loop is reordered, and the same check now
+  reads every member's dependencies and refuses a list that names a crate
+  before one it depends on. The rest of 0.5.8 was published by hand from the
+  tag in that order.
+- `lev add` on a bundle file installs the blueprint under the name its
+  `agent.leviath` declares. It used the file's stem, and `lev pack` names its
+  output `<name>-<version>.leviath-bundle`, so installing a packed `coder`
+  put `coder-1.2.0` on disk: `lev list` and the API showed `coder`, because
+  they read the manifest, while `lev run coder`, `lev validate coder` and
+  `lev remove coder` looked for a directory that was not there. The file's
+  stem is now only the fallback for a bundle whose manifest declares no name,
+  and a manifest name that is not a plain directory name is refused the same
+  way a directory install refuses it. An install made before this fix keeps
+  its old directory; `lev remove <name>-<version>` clears it.
+
+## 0.5.9 - 2026-09-02
+
+### Added
+
+- `[providers] provider_order`, an ordered list of provider names, best
+  first, that decides which configured provider serves a blueprint model
+  named without one. It generalizes `default_provider` into a full ordering;
+  left empty, resolution is exactly what it was. Naming a subscription
+  transport (Codex, Claude Code) in the order is the deliberate opt-in that
+  lets a plan win a bare model name at the priority it is listed. Every
+  surface that writes config learned it: `GET /api/config` reports the
+  order and `PUT` replaces it, `lev doctor` flags an entry naming no
+  configured provider, and the config and OpenAPI schemas describe it.
+- `lev providers`, which lists the configured providers with the current
+  order, and `lev providers order <name>...` / `--clear` to set or drop it
+  from the command line. An unknown name is refused with the known list
+  rather than persisted as a silent no-op.
+- The setup wizard's Defaults screen replaces the single "Default provider"
+  chooser with a "Provider priority" list arranged in a drag-to-reorder
+  modal (drag a row by its grip, or move it with Shift+arrows or K/J); the
+  head of the order is written as `default_provider`.
+- `install_tool`, a built-in that persists a Rhai tool to `~/.leviath/tools`
+  so every future run can use it. Nothing an agent could do reached that
+  directory before. It compiles the script first and refuses a reserved or
+  malformed name, a `@tool` directive that disagrees with the name, an empty
+  `@description`, an oversized source, an existing script without
+  `overwrite`, a symlinked destination, or a `<name>.toml` sibling whose
+  `[tool]` name differs. The written file leads with a provenance line
+  naming who installed it and when. Like `write_file` and `shell` it
+  defaults to `ask`.
+- Tool groups in `available_tools`. An entry that starts with `@` grants a
+  whole kind of tool rather than one: `@builtin` (every compiled-in tool),
+  `@subagent`, `@scripts` (every Rhai tool, the agent's own and the global
+  ones), `@mcp` (every tool every connected server advertises) and `@all`.
+  Groups and names mix, so "every built-in plus these two scripts" is
+  `["@builtin", "summarize", "cite"]` and "everything" is `["@all"]`. A group
+  is resolved when the stage runs, so a script or MCP server added later is
+  offered without editing the manifest, and it grants visibility only: every
+  tool it reaches still goes through `tool_permissions`, the taint gate and
+  the approval prompts. `submit_output` and `fan_out` are never granted by a
+  group. `lev validate` refuses an entry that looks like a group and names
+  none, checks `required_tools` against what the groups reach on this
+  install (`required-tool-not-granted`), and reports an autonomous stage
+  granting `@builtin` once for the group rather than once per blocking tool.
+  The dashboard's tool chooser leads with the five groups and labels each
+  tool by where it comes from, and `GET /api/tools` carries the same
+  `groups` list for other clients.
+
+### Changed
+
+- `lev --help` groups the commands under Setup and configuration,
+  Blueprints, Running agents, Inspecting runs, and Servers instead of one
+  flat list of thirty. Every command is still `lev <command>`; only the help
+  reads differently.
+
+### Fixed
+
+- The dashboard's task editor, response box, deny-with-feedback prompt and
+  in-place document edit all submit on Ctrl+S. Ctrl+Enter reaches a program
+  only under the kitty keyboard protocol; elsewhere it arrives as a plain
+  Enter, and some macOS terminals swallow it or open a context menu on it,
+  which left the keyboard no way to start a run. Ctrl+Enter still works
+  where it arrives, and the hint bars name ^S.
+- The provider-priority modal accepts K and J to move a row. Apple Terminal
+  and others strip Shift from an arrow key before it reaches the
+  application, so Shift+Up/Down was the only keyboard reorder and it was
+  unreachable there.
+- The `install_tool` summary and the Rhai tools page pointed at an
+  `available_global_tools` stage key that does not exist. Both now say
+  `@scripts`, which does what that key claimed to.
 
 ## 0.5.8 - 2026-09-01
 

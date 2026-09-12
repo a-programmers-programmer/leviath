@@ -2632,6 +2632,109 @@ mode = "autonomous"
 }
 
 #[test]
+fn parse_manifest_region_accepts() {
+    let toml = r#"
+[agent]
+name = "typed-regions"
+
+[context.regions]
+art = { kind = "pinned", accepts = ["Image/*", "text/plain"] }
+any = { kind = "pinned" }
+"#;
+    let bp = parse_manifest(toml).unwrap();
+    let art = bp
+        .context_layout
+        .regions
+        .iter()
+        .find(|r| r.name == "art")
+        .unwrap();
+    assert_eq!(art.accepts, vec!["image/*", "text/plain"]);
+    let any = bp
+        .context_layout
+        .regions
+        .iter()
+        .find(|r| r.name == "any")
+        .unwrap();
+    assert!(any.accepts.is_empty());
+
+    for (bad, needle) in [
+        ("accepts = \"image/png\"", "expected a list"),
+        ("accepts = [1]", "expected a mime type string"),
+        ("accepts = [\"png\"]", "expected type/subtype or type/*"),
+        ("accepts = [\"a b/*\"]", "expected type/subtype or type/*"),
+    ] {
+        let toml = format!(
+            "[agent]\nname = \"typed-regions\"\n\n[context.regions]\nart = {{ kind = \"pinned\", {bad} }}\n"
+        );
+        let err = parse_manifest(&toml).unwrap_err().to_string();
+        assert!(err.contains(needle), "{bad}: {err}");
+    }
+}
+
+/// A blueprint's `[mime_types]` rows are carried as written, checked at
+/// parse so a bad row fails here rather than being skipped at the first file.
+#[test]
+fn parse_manifest_reads_and_checks_mime_type_rows() {
+    let toml = r#"
+[agent]
+name = "scenes"
+
+[mime_types."application/x-acme-scene"]
+family = "model"
+extensions = ["scene"]
+magic = "41434D45"
+check = "checks/scene.rhai"
+
+[mime_types."model/obj"]
+text = true
+"#;
+    let bp = parse_manifest(toml).expect("parses");
+    assert_eq!(bp.mime_types.len(), 2);
+    let reg = crate::mime::MimeRegistry::builtin()
+        .layered(&bp.mime_types, "blueprint")
+        .unwrap();
+    let scene = reg.info(&crate::mime::MimeType::parse("application/x-acme-scene").unwrap());
+    assert_eq!(scene.family, "model");
+    assert_eq!(scene.check.as_deref(), Some("checks/scene.rhai"));
+    assert_eq!(scene.source, "blueprint");
+    // Round-trips through the blueprint's own serialisation, and an empty
+    // table is left out of it.
+    let json = serde_json::to_string(&bp).unwrap();
+    assert!(json.contains("\"mime_types\""));
+    let back: crate::Blueprint = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.mime_types, bp.mime_types);
+    let plain = parse_manifest("[agent]\nname = \"plain\"\n").unwrap();
+    assert!(plain.mime_types.is_empty());
+    assert!(
+        !serde_json::to_string(&plain)
+            .unwrap()
+            .contains("mime_types")
+    );
+
+    for (bad, needle) in [
+        ("mime_types = 3", "[mime_types] must be a table"),
+        (
+            "[mime_types.png]\nfamily = \"image\"",
+            "[mime_types]: mime_types key png",
+        ),
+        (
+            "[mime_types.\"image/png\"]\nfamilies = 1",
+            "unknown field `families`",
+        ),
+        (
+            "[mime_types.\"image/png\"]\nmagic = \"zz\"",
+            "magic must be hex",
+        ),
+    ] {
+        // The bad rows come first, so a bare key lands at the top level
+        // rather than inside `[agent]`.
+        let toml = format!("{bad}\n\n[agent]\nname = \"scenes\"\n");
+        let err = parse_manifest(&toml).unwrap_err().to_string();
+        assert!(err.contains(needle), "{bad}: {err}");
+    }
+}
+
+#[test]
 fn parse_manifest_stage_accepts_messages_false() {
     let toml = r#"
 [agent]
@@ -3918,6 +4021,238 @@ mode = "autonomous"
     let bp = parse_manifest(toml).unwrap();
     let main = bp.find_stage("main").unwrap();
     assert!(main.tool_result_routing.is_none());
+}
+
+#[test]
+fn parse_stage_output_routing_maps_mime_patterns_to_regions() {
+    let toml = r#"
+[agent]
+name = "draw"
+
+[context.regions]
+artwork = { kind = "pinned" }
+notes = { kind = "pinned" }
+
+[stages.draw]
+mode = "autonomous"
+
+[stages.draw.output_routing]
+"image/*" = "artwork"
+"application/pdf" = "notes"
+"#;
+    let bp = parse_manifest(toml).unwrap();
+    let draw = bp.find_stage("draw").unwrap();
+    assert_eq!(draw.output_routing.get("image/*").unwrap(), "artwork");
+    assert_eq!(draw.output_routing.get("application/pdf").unwrap(), "notes");
+}
+
+#[test]
+fn parse_stage_output_routing_rejects_a_key_that_is_not_a_mime_pattern() {
+    let toml = r#"
+[agent]
+name = "draw"
+
+[context.regions]
+artwork = { kind = "pinned" }
+
+[stages.draw]
+mode = "autonomous"
+
+[stages.draw.output_routing]
+"not a mime" = "artwork"
+"#;
+    let err = parse_manifest(toml).expect_err("the key is not a mime type");
+    assert!(err.to_string().contains("output_routing"), "{err}");
+}
+
+#[test]
+fn parse_stage_output_routing_rejects_a_non_string_region() {
+    let toml = r#"
+[agent]
+name = "draw"
+
+[stages.draw]
+mode = "autonomous"
+
+[stages.draw.output_routing]
+"image/*" = 7
+"#;
+    let err = parse_manifest(toml).expect_err("the region must be a string");
+    assert!(err.to_string().contains("must be a region name"), "{err}");
+}
+
+#[test]
+fn output_routing_to_a_region_no_layout_declares_is_refused() {
+    let toml = r#"
+[agent]
+name = "draw"
+
+[context.regions]
+conversation = { kind = "sliding_window" }
+
+[stages.draw]
+mode = "autonomous"
+
+[stages.draw.output_routing]
+"image/*" = "artwork"
+"#;
+    let err = parse_manifest(toml)
+        .expect("shape is fine")
+        .validate()
+        .expect_err("artwork is not declared anywhere");
+    let msg = err.to_string();
+    assert!(msg.contains("artwork"), "{msg}");
+    assert!(msg.contains("output_routing"), "{msg}");
+}
+
+#[test]
+fn output_routing_to_a_declared_region_validates() {
+    let toml = r#"
+[agent]
+name = "draw"
+
+[context.regions]
+artwork = { kind = "pinned" }
+
+[stages.draw]
+mode = "autonomous"
+
+[stages.draw.output_routing]
+"image/*" = "artwork"
+"#;
+    parse_manifest(toml)
+        .expect("shape is fine")
+        .validate()
+        .expect("artwork is declared, so the route is valid");
+}
+
+#[test]
+fn context_reset_must_be_a_list() {
+    let toml = r#"
+[agent]
+name = "draw"
+
+[stages.describe]
+mode = "autonomous"
+
+[stages.describe.context]
+reset = "conversation"
+"#;
+    let err = parse_manifest(toml).expect_err("reset must be a list, not a string");
+    assert!(
+        err.to_string().contains("context.reset must be a list"),
+        "{err}"
+    );
+}
+
+#[test]
+fn route_for_mime_picks_the_most_specific_pattern() {
+    use crate::mime::MimeType;
+    let toml = r#"
+[agent]
+name = "draw"
+
+[context.regions]
+pngs = { kind = "pinned" }
+images = { kind = "pinned" }
+anything = { kind = "pinned" }
+
+[stages.draw]
+mode = "autonomous"
+
+[stages.draw.output_routing]
+"image/png" = "pngs"
+"image/*" = "images"
+"*/*" = "anything"
+"#;
+    let bp = parse_manifest(toml).unwrap();
+    let draw = bp.find_stage("draw").unwrap();
+    let png = MimeType::parse("image/png").unwrap();
+    let jpeg = MimeType::parse("image/jpeg").unwrap();
+    let pdf = MimeType::parse("application/pdf").unwrap();
+    assert_eq!(draw.route_for_mime(&png), Some("pngs"));
+    assert_eq!(draw.route_for_mime(&jpeg), Some("images"));
+    assert_eq!(draw.route_for_mime(&pdf), Some("anything"));
+}
+
+#[test]
+fn route_for_mime_is_none_when_nothing_matches() {
+    use crate::mime::MimeType;
+    let toml = r#"
+[agent]
+name = "draw"
+
+[context.regions]
+artwork = { kind = "pinned" }
+
+[stages.draw]
+mode = "autonomous"
+
+[stages.draw.output_routing]
+"image/*" = "artwork"
+"#;
+    let bp = parse_manifest(toml).unwrap();
+    let draw = bp.find_stage("draw").unwrap();
+    let text = MimeType::parse("text/plain").unwrap();
+    assert_eq!(draw.route_for_mime(&text), None);
+}
+
+#[test]
+fn parse_stage_context_reset_lists_the_regions_to_empty() {
+    let toml = r#"
+[agent]
+name = "draw"
+
+[context.regions]
+artwork = { kind = "pinned" }
+
+[stages.describe]
+mode = "autonomous"
+
+[stages.describe.context]
+reset = ["conversation", "artwork"]
+"#;
+    let bp = parse_manifest(toml).unwrap();
+    let describe = bp.find_stage("describe").unwrap();
+    assert_eq!(describe.context_reset, vec!["conversation", "artwork"]);
+}
+
+#[test]
+fn context_reset_may_name_the_conversation() {
+    // Unlike hide, reset is allowed on the always-visible regions.
+    let toml = r#"
+[agent]
+name = "draw"
+
+[stages.describe]
+mode = "autonomous"
+
+[stages.describe.context]
+reset = ["conversation"]
+"#;
+    parse_manifest(toml)
+        .expect("shape is fine")
+        .validate()
+        .expect("resetting the conversation is allowed");
+}
+
+#[test]
+fn context_reset_of_an_unknown_region_is_refused() {
+    let toml = r#"
+[agent]
+name = "draw"
+
+[stages.describe]
+mode = "autonomous"
+
+[stages.describe.context]
+reset = ["ghost"]
+"#;
+    let err = parse_manifest(toml)
+        .expect("shape is fine")
+        .validate()
+        .expect_err("ghost is not declared");
+    assert!(err.to_string().contains("context.reset"), "{err}");
 }
 
 #[test]
@@ -5890,4 +6225,126 @@ fn a_stage_sandbox_refuses_an_unknown_key_naming_it() {
         err.contains("stage 's': sandbox has unknown key 'netwrok'"),
         "{err}"
     );
+}
+
+#[test]
+fn a_stage_declares_what_it_takes_and_hands_back() {
+    let bp = parse_manifest(
+        r#"
+[agent]
+name = "artist"
+
+[context.regions]
+brief = { kind = "pinned", accepts = ["text/*"] }
+storyboard = { kind = "pinned", accepts = ["image/*", "image/png"] }
+scratch = { kind = "temporary" }
+
+[stages.look]
+mode = "autonomous"
+[stages.look.model]
+provider = "anthropic"
+model = "claude-sonnet-5"
+[stages.look.context]
+hide = ["scratch"]
+
+[stages.cut]
+mode = "autonomous"
+[stages.cut.model]
+provider = "anthropic"
+model = "claude-sonnet-5"
+[stages.cut.input]
+accepts = ["audio/wav"]
+as_text = ["model/*"]
+[stages.cut.tool_accepts]
+spawn_agent = ["Image/*", "audio/wav"]
+context_export = ["image/png"]
+[stages.cut.output]
+format = "markdown"
+[[stages.cut.output.artifacts]]
+name = "final"
+type = "Video/MP4"
+required = true
+description = "the cut"
+[[stages.cut.output.artifacts]]
+name = "notes"
+type = "text/*"
+"#,
+    )
+    .unwrap();
+    let look = &bp.stages[0];
+    assert_eq!(bp.stage_inputs(look), ["image/*", "image/png"]);
+    let cut = &bp.stages[1];
+    assert_eq!(bp.stage_inputs(cut), ["audio/wav"]);
+    assert_eq!(cut.input_as_text, ["model/*"]);
+    assert_eq!(
+        cut.tool_limit("spawn_agent"),
+        Some(["image/*".to_string(), "audio/wav".to_string()].as_slice())
+    );
+    assert_eq!(
+        cut.tool_limit("context_export"),
+        Some(["image/png".to_string()].as_slice())
+    );
+    assert!(cut.tool_limit("read_file").is_none());
+    assert!(look.tool_accepts.is_empty());
+    let spec = cut.output.as_ref().unwrap();
+    assert_eq!(spec.artifacts.len(), 2);
+    assert_eq!(spec.artifacts[0].name, "final");
+    assert_eq!(spec.artifacts[0].mime_type, "video/mp4");
+    assert!(spec.artifacts[0].required);
+    assert_eq!(spec.artifacts[0].description.as_deref(), Some("the cut"));
+    assert!(!spec.artifacts[1].required);
+    // A region that takes anything reports `*/*`.
+    let open = parse_manifest(
+        "[agent]\nname = \"o\"\n\n[context.regions]\ntask = { kind = \"pinned\" }\n\n[stages.s]\nmode = \"autonomous\"\n[stages.s.model]\nprovider = \"anthropic\"\nmodel = \"m\"\n",
+    )
+    .unwrap();
+    assert_eq!(open.stage_inputs(&open.stages[0]), ["*/*"]);
+}
+
+#[test]
+fn artifact_declarations_are_checked_at_load() {
+    let base = "[agent]\nname = \"a\"\n\n[context.regions]\ntask = { kind = \"pinned\" }\n\n[stages.s]\nmode = \"autonomous\"\n[stages.s.model]\nprovider = \"anthropic\"\nmodel = \"m\"\n";
+    for (tail, expect) in [
+        (
+            "[stages.s.output]\nartifacts = 5\n",
+            "must be a list of tables",
+        ),
+        (
+            "[stages.s.output]\nartifacts = [\"x\"]\n",
+            "must be a table",
+        ),
+        (
+            "[[stages.s.output.artifacts]]\ntype = \"video/mp4\"\n",
+            "needs a name",
+        ),
+        (
+            "[[stages.s.output.artifacts]]\nname = \"final\"\n",
+            "needs a type",
+        ),
+        (
+            "[[stages.s.output.artifacts]]\nname = \"final\"\ntype = \"video\"\n",
+            "not type/subtype",
+        ),
+        ("[stages.s.input]\nbogus = 1\n", "bogus"),
+        ("[stages.s.input]\naccepts = [\"nope\"]\n", "accepts"),
+        ("[stages.s.input]\nas_text = 5\n", "input"),
+        (
+            "[stages.s.tool_accepts]\nspawn_agent = []\n",
+            "must list at least one mime type",
+        ),
+        (
+            "[stages.s.tool_accepts]\nspawn_agent = \"image/*\"\n",
+            "tool_accepts has spawn_agent",
+        ),
+    ] {
+        let err = parse_manifest(&format!("{base}{tail}"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(expect), "{tail}: {err}");
+    }
+    // A limit table that is not a table.
+    let err = parse_manifest("[agent]\nname = \"a\"\n[stages.s]\ntool_accepts = 3\n")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("tool_accepts must be a table"), "{err}");
 }

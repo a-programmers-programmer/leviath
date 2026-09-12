@@ -167,6 +167,7 @@ fn fields_accepts_the_optional_ones_that_only_some_runs_carry() {
         "waiting_on",
         "output_request",
         "model_override",
+        "yolo_profile",
     ] {
         let r = resolve_ok(&[("fields", optional)]);
         let fields = r.fields.expect("fields set");
@@ -989,7 +990,7 @@ fn plant_journal(run_id: &str, content: &str, secret: Option<&str>) {
                     current_tokens: 1,
                     max_tokens: 100,
                     entries: vec![RegionEntrySnapshot {
-                        content: content.to_string(),
+                        content: content.to_string().into(),
                         tokens: 1,
                         kind: leviath_core::region::EntryKind::Text,
                         metadata: None,
@@ -1067,7 +1068,7 @@ fn plant_rich_journal(run_id: &str) {
 
     fn entry(content: &str) -> RegionEntrySnapshot {
         RegionEntrySnapshot {
-            content: content.to_string(),
+            content: content.to_string().into(),
             tokens: 1,
             kind: leviath_core::region::EntryKind::Text,
             metadata: None,
@@ -1127,7 +1128,7 @@ fn plant_rich_journal(run_id: &str) {
                 id: "c1".to_string(),
                 name: "write_file".to_string(),
                 arguments: r#"{"path":"toolneedle.rs"}"#.to_string(),
-                result: Some("wrote resultneedle".to_string()),
+                result: Some("wrote resultneedle".to_string().into()),
                 thought_signature: None,
             }],
             at: 2,
@@ -1287,7 +1288,7 @@ async fn a_context_search_names_the_region_that_matched() {
                     current_tokens: 1,
                     max_tokens: 100,
                     entries: vec![leviath_core::run_meta::RegionEntrySnapshot {
-                        content: "the plan mentions ctxneedle somewhere".to_string(),
+                        content: "the plan mentions ctxneedle somewhere".to_string().into(),
                         tokens: 1,
                         kind: leviath_core::region::EntryKind::Text,
                         metadata: None,
@@ -1448,7 +1449,7 @@ async fn deep_sources_that_read_files_and_find_nothing_are_quiet() {
                     current_tokens: 1,
                     max_tokens: 100,
                     entries: vec![leviath_core::run_meta::RegionEntrySnapshot {
-                        content: "nothing of interest".to_string(),
+                        content: "nothing of interest".to_string().into(),
                         tokens: 1,
                         kind: leviath_core::region::EntryKind::Text,
                         metadata: None,

@@ -161,6 +161,9 @@ pub(crate) struct StageView {
     pub models: Vec<String>,
     /// `available_tools`.
     pub tools: Vec<String>,
+    /// `available_connectors`: MCP servers whose whole tool set the stage
+    /// may use.
+    pub connectors: Vec<String>,
     /// `system_prompt`, or empty.
     pub system_prompt: String,
     /// `transition_prompt`, or empty.
@@ -173,6 +176,25 @@ pub(crate) struct StageView {
     /// Whether the stage has a `transitions` table with nothing in it: the
     /// run can end here.
     pub is_terminal: bool,
+    /// `[stages.<name>.input] accepts`: what the stage takes as parts when
+    /// its regions do not already say.
+    pub input_accepts: Vec<String>,
+    /// `[stages.<name>.input] as_text`: types whose parts reach the model as
+    /// text whatever it takes.
+    pub input_as_text: Vec<String>,
+    /// The files the stage declares it hands back, in declaration order.
+    pub artifacts: Vec<super::mime::ArtifactView>,
+    /// `[stages.<name>.output] format`, or empty.
+    pub output_format: String,
+    /// `[stages.<name>.tool_accepts]`: each tool and what it may be handed,
+    /// in document order.
+    pub tool_accepts: Vec<(String, Vec<String>)>,
+    /// `[stages.<name>.output_routing]`: the mime patterns the model's
+    /// produced parts are routed by, each to a region, in document order.
+    pub output_routing: Vec<(String, String)>,
+    /// `[stages.<name>.context] reset`: the regions emptied when the stage is
+    /// entered, in the order written.
+    pub context_reset: Vec<String>,
 }
 
 /// When a path is taken.
@@ -384,6 +406,9 @@ pub(crate) struct RegionView {
     pub overflow: Option<u64>,
     /// `description`, or empty.
     pub description: String,
+    /// `accepts`: the mime type patterns the region takes; empty is
+    /// anything.
+    pub accepts: Vec<String>,
 }
 
 /// The layout a stage runs with.
@@ -527,6 +552,7 @@ fn stage_view(name: &str, item: &Item) -> StageView {
             allow_complete: get_bool(table, "allow_complete"),
             models: model_chain(table.get("model")),
             tools: get_strings(table, "available_tools"),
+            connectors: get_strings(table, "available_connectors"),
             system_prompt: get_str(table, "system_prompt")
                 .unwrap_or_default()
                 .to_string(),
@@ -545,8 +571,34 @@ fn stage_view(name: &str, item: &Item) -> StageView {
                 .and_then(Item::as_table_like)
                 .is_some(),
             is_terminal: transitions.is_some_and(|t| t.is_empty()),
+            input_accepts: super::mime::input_list(item, super::mime::InputList::Accepts),
+            input_as_text: super::mime::input_list(item, super::mime::InputList::AsText),
+            artifacts: super::mime::artifacts_of(item),
+            output_format: super::mime::output_format_of(item),
+            tool_accepts: super::mime::tool_limits_of(item),
+            output_routing: output_routing_of(item),
+            context_reset: child(item, "context")
+                .map(|c| get_strings(c, "reset"))
+                .unwrap_or_default(),
         }
     }
+}
+
+/// `[stages.<name>.output_routing]`: mime pattern to region, in document
+/// order. An entry whose value is not a string is left out (and left alone).
+fn output_routing_of(item: &Item) -> Vec<(String, String)> {
+    child(item, "output_routing")
+        .map(|routing| {
+            routing
+                .iter()
+                .filter_map(|(pattern, region)| {
+                    region
+                        .as_str()
+                        .map(|r| (pattern.to_string(), r.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 impl ManifestDoc {
@@ -783,6 +835,7 @@ fn region_view(name: &str, table: &dyn TableLike) -> RegionView {
         description: get_str(table, "description")
             .unwrap_or_default()
             .to_string(),
+        accepts: get_strings(table, "accepts"),
     }
 }
 

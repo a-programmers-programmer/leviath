@@ -1107,7 +1107,7 @@ fn finish_tool_fan_out(world: &mut World, parent: Entity, w: &FanOutWaiting, cal
             &mut window,
             leviath_core::blueprint::FAN_OUT_TOOL,
             call_id,
-            report,
+            report.into(),
             routing.as_ref(),
             sensitivities.as_ref(),
         );
@@ -1421,6 +1421,7 @@ mod tests {
                         title: None,
                         title_error: None,
                         unattended: false,
+                        yolo_profile: None,
                         read_paths: None,
                         output_request: None,
                         model_override: None,
@@ -1476,11 +1477,13 @@ mod tests {
                 batch_tool_hint: false,
                 shell_hint: false,
                 request_timeout_secs: None,
+                as_text: Vec::new(),
             },
             routing: None,
             accepts_messages: true,
             context_layout: None,
             context_hide: Vec::new(),
+            context_reset: Vec::new(),
             system_prompt: None,
         }
     }
@@ -1538,6 +1541,7 @@ mod tests {
                     tokens_used: 0,
                     cut_off_at: None,
                     reasoning: None,
+                    parts: Vec::new(),
                 },
                 ProcessResponse,
             ))
@@ -1628,6 +1632,7 @@ mod tests {
             tokens_used: 0,
             cut_off_at: None,
             reasoning: None,
+            parts: Vec::new(),
         });
     }
 
@@ -3110,6 +3115,7 @@ mod tests {
                     tokens_used: 0,
                     cut_off_at: None,
                     reasoning: None,
+                    parts: Vec::new(),
                 },
                 crate::persistence::FinalOutput(leviath_core::output::FinalOutput::new(
                     "changed src/lib.rs; the failing test now passes",
@@ -3142,6 +3148,7 @@ mod tests {
                     tokens_used: 0,
                     cut_off_at: None,
                     reasoning: None,
+                    parts: Vec::new(),
                 },
             ))
             .id();
@@ -3280,6 +3287,7 @@ mod tests {
                     tokens_used: 0,
                     cut_off_at: None,
                     reasoning: None,
+                    parts: Vec::new(),
                 },
             ))
             .id();

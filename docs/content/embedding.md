@@ -3,7 +3,7 @@ title: Embedding
 description: Run the Leviath runtime inside your own Rust process with the leviath crate, with no CLI, daemon, or config file.
 group: Reference
 group_order: 3
-order: 15
+order: 16
 ---
 
 # Embedding Leviath in a Rust application
@@ -77,8 +77,10 @@ returning.
 | --- | --- |
 | `provider(creds)` | Register a provider from credentials. Repeatable. `ProviderCreds::simple(name)` covers key-free providers like `ollama`. |
 | `register_provider(name, arc)` | Register your own `Provider` implementation, including mocks for tests. Wins over a credentials entry with the same name. |
-| `default_model(provider, model)` | The fallback when none of a stage's listed models has a registered provider. |
-| `fallback_model(provider, model)` | Where a run moves when its provider fails mid-run, so a single-model blueprint survives an outage. |
+| `default_provider(provider)` | The provider bare model names route to. Each stage keeps the model its blueprint names. |
+| `override_model(provider, model)` | The provider above, plus one model every stage that allows a user default starts on, ahead of what its blueprint names. The embedded `override_model`. |
+| `fallback_model(model)` | A model on the default provider tried after every model a stage names, never ahead of them. The embedded `fallback_model`. |
+| `fallback_route(provider, model)` | Where a run moves when its provider fails mid-run, so a single-model blueprint survives an outage. Was `fallback_model` before 0.6. |
 | `prompt_hints(hints)` | Turn on the batch-tool and shell hints, which are off by default on the embed path. |
 | `tool_service(arc)` | Replace the built-in tool service with your own (see below). |
 | `state_dir(dir)` | Persist runs on disk in the daemon's layout (`dir/runs/<run_id>/`). Without it the world stays in memory. |
@@ -126,7 +128,21 @@ erroring, and the stream ends after `shutdown()`.
 that produced it. Reading it from the event avoids a second call and avoids racing the write to
 disk.
 
-`AgentWorld::result(&run_id)` asks for the same thing at any point while the run is loaded.
+`AgentWorld::result(&run_id)` asks for the same thing at any point while the run is loaded. Its
+`artifacts` are the files the run produced, each with a path relative to the workdir, a mime
+type, a size and the hash the run's blob store holds it under.
+
+Files go in the same way. `SpawnSpec::attach` puts an `InboundPart` on the spawn, typed by the
+run's registry unless the part declares a type and landing in the task region unless it names
+another; `send_message_with` sends a message with files; and an `InteractionResponse::text` answer
+takes files through `with_parts`. A `@path` inside the text is not resolved here, since an
+embedder has no working directory to resolve it against; attach the file and keep the name in the
+text, and the model reads the same name.
+
+```rust
+let spec = SpawnSpec::new(source, "edit @hero.png so the arm is longer", cwd)
+    .attach(InboundPart::from_bytes("hero.png", std::fs::read("hero.png")?));
+```
 
 Ask for a shape when you spawn. The label reaches the model untouched, so your own house format
 works with no support from this crate.

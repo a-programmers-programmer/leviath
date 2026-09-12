@@ -145,7 +145,16 @@ skips marked runs that have already finished.
 
 Agent blueprints on the left, the task on the right, and above the task the selected blueprint's
 stage graph, so you can see what an agent will do before you give it a task: how many stages, in
-what order, where it loops back. It follows the selection, previews bundled blueprints that are not
+what order, where it loops back. Between the graph and the task, when the blueprint takes
+[inputs from the caller](/docs/context#seeding-a-region) beyond the task (a `pictures` region with
+`seed = "input"`, a `--diff`), an **Inputs** box with one slot per region. A slot for a region
+that takes files opens a picker of the working directory, filtered to the types the region
+accepts, so you choose a file from a list rather than typing its name (and never with an `@`); a
+slot for a text region takes a line of text. A file region takes as many files as its token
+budget allows, added and removed in the same picker; the number is bound by the budget, never a
+fixed count. The slot names what the region takes, its token budget (`≤117k tok`, the region's
+share of the entry model's context window), and whether it is required. It follows the selection,
+previews bundled blueprints that are not
 installed yet from the copy inside the binary, and says so when a manifest cannot be read. It is
 the explorer's canvas showing the whole graph: drag to pan, wheel to zoom; on a screen too short to
 fit both, the task keeps its rows and the preview is skipped. Once
@@ -155,15 +164,17 @@ rather than back into the form.
 | Key | Action |
 |---|---|
 | `↑` / `↓` | Choose an agent. Any letter filters the list; `Backspace` shortens the filter |
-| `Tab` / `Enter` | Move from the agent list to the task |
-| `Ctrl+Enter` (in the task) | Start the run. Only a terminal with the kitty keyboard protocol (kitty, WezTerm, Ghostty, foot, recent Alacritty) can tell Ctrl+Enter from Enter; elsewhere it inserts a newline, and the Start button is the way to submit |
+| `Tab` / `Enter` | Move from the agent list to the inputs, when the agent has any, else to the task |
+| `↑` / `↓` (in the inputs) | Choose a slot. A file slot opens the picker on `Enter` (or `Ctrl+O`); a text slot takes what you type, and `Enter` moves to the next slot and, after the last, to the task. `Tab` to the task; `Shift+Tab` or `Esc` back to the agent list |
+| picker (in a file slot) | `↑` / `↓` move, any letter filters by name, `Space` selects or deselects the highlighted file, `Enter` confirms. `Enter` never selects on its own, so a slot can be left empty; `Esc` cancels. The list is the working directory only, so it never offers a file the run could not read, and each file shows its own token cost. The title shows the tokens the choice costs against the region's budget (its share of the model's context window); a file that would overflow the budget is refused with the reason, and a run that would not fit is stopped before it starts |
+| `Ctrl+S` (in the task) | Start the run. `Ctrl+Enter` also starts it, but only a terminal with the kitty keyboard protocol (kitty, WezTerm, Ghostty, foot, recent Alacritty) can tell Ctrl+Enter from Enter; elsewhere it inserts a newline, and `Ctrl+S` or the Start button is the way to submit |
 | `Enter` / `Alt+Enter` | Newline |
 | `Tab` (in the task) | Move to the Start button under the editor. `Enter` or `Space` there starts the run, as does a click on it; `Tab` or `Esc` returns to the agent list, `Shift+Tab` to the task |
-| `@` | Reference a file from the working directory: `↑` / `↓` choose a path, `Enter` or `Tab` inserts it, `Backspace` over the `@` ends the reference, `Esc` dismisses the list and keeps what you typed |
+| `@` | Reference a file from the working directory: `↑` / `↓` choose a path, `Enter` or `Tab` inserts it, `Backspace` over the `@` ends the reference, `Esc` dismisses the list and keeps what you typed. A path that names a file is attached to the task as a typed part when the run starts, and the task box's title counts them as you type; one that names nothing stays text, with a warning |
 | `Ctrl-Y` | Run unattended, so the agent approves its own tool calls |
 | `F1` | Help. `?` types a question mark here |
 | `Esc` (in the agent list) | Clear the filter, then close the screen |
-| `Esc` or `Shift+Tab` (in the task) | Back to the agent list |
+| `Esc` (in the task) | Back to the agent list; `Shift+Tab` back to the inputs, when there are any |
 
 
 The task box wraps: a task longer than the pane is wide folds onto the next
@@ -202,6 +213,7 @@ for a run whose blueprint could not be read, the flat tab strip stays.
 | `R` | Re-snake the path, undoing boxes you moved by hand |
 | `Enter` / Space | Fold or unfold the row under the Context tree's cursor |
 | `[` / `]` | Jump to the previous / next region in the Context view |
+| `v` / `w` | On a stored part's row in the Context view: open the file with whatever the OS opens it with, or write it into the run's working directory under its own name |
 | `,` / `.` | Step back and forward through context history |
 | `/` , then `n` / `N` | Search, then next / previous match |
 | `y` | Copy the pane to the clipboard |
@@ -212,17 +224,21 @@ for a run whose blueprint could not be read, the flat tab strip stays.
 | `?` / `F1` | Help |
 | `Ctrl-C` | Quit. `q` is unbound here, so a stray keystroke cannot close the dashboard mid-run |
 
+A `@path` in a typed response or message attaches that file from the run's working directory,
+the way it does on `lev respond --attach` and `lev msg`: the words keep the token, the file lands
+beside them as a typed part, and a token that names no file stays text with a warning toast.
+
 While you are typing a response, `Enter` inserts a newline, the way it does in the new-run task
-box, and `Ctrl+Enter` sends. Only a terminal with the kitty keyboard protocol can tell
-`Ctrl+Enter` from `Enter`; elsewhere `Tab` moves to the Send button under the box, where `Enter`
-or `Space` sends, as does a click on it. `PgUp` / `PgDn` scroll the document above the prompt, and
+box, and `Ctrl+S` sends. `Ctrl+Enter` sends too on a terminal with the kitty keyboard protocol,
+which is what it takes to tell `Ctrl+Enter` from `Enter`; `Tab` moves to the Send button under
+the box, where `Enter` or `Space` sends, as does a click on it. `PgUp` / `PgDn` scroll the document above the prompt, and
 `Esc` cancels. `/quit` or `/exit` on its own line ends the conversation when sent. An in-place
 document edit takes the same keys, with a Save button in place of Send. Single-line boxes (a
 rename, a filter, a server URL) still submit on `Enter`.
 
 A tool approval is a list of choices: `↑` / `↓` pick one and `Enter` answers. Its last row, "Deny
 with feedback", opens the same response box instead of answering, for the line or two that tells
-the run what to do instead of the call. `Ctrl+Enter` or the Send button sends it with the deny, and
+the run what to do instead of the call. `Ctrl+S` or the Send button sends it with the deny, and
 `Esc` goes back to the choices with nothing sent. The text reaches the model inside the refused
 call's tool result; see [Human-in-the-loop](/docs/interaction#tool-approval).
 
@@ -233,7 +249,13 @@ activates it, and a stray keypress does nothing. The safe answer holds focus to 
 
 The Context view is a tree, not one long scroll. Each region is a header row with its token bar;
 its entries are one-line stubs with a preview. Move with `↑`/`↓`, fold or unfold with `Enter` or
-Space (or by clicking the row), and jump between regions with `[` and `]`. While a search (`/`) is active everything is
+Space (or by clicking the row), and jump between regions with `[` and `]`. An unfolded entry that
+carries files (an attached image, a stored `read_file`, a submitted artifact) shows each as its own
+row above the text: the stand-in the model sees, the hash, the token estimate. With the cursor on
+one, `v` hands a copy to the program the operating system opens that kind of file with, and `w`
+writes it into the run's working directory. Nothing in the dashboard plays or draws a file. The
+Final view lists the files a run produced under its answer; their parts sit in the `final_output`
+region, where the same two keys reach them. While a search (`/`) is active everything is
 temporarily unfolded so matches inside entries stay reachable. Browsing history with `,`/`.` keeps
 your scroll position and fold state, and the context card's title shows which archived point you
 are on, in which stage, recorded when.
@@ -283,6 +305,10 @@ of everything it could do:
   The escape edges (`error`, `dead_end`, `stuck`, `max_iterations`) are hidden until you ask for
   them, because nearly every stage has one to the same hub; with the path in focus, `e` shows the
   escapes from the current stage. A fan-out stage that is running shows its worker counts.
+  A stage that takes [files](/docs/mime) beyond text wears what it takes (`◧ image/* audio/wav`,
+  from its regions' `accepts` or its `[input] accepts`), and one that declares files it hands back
+  wears their types (`▤ video/mp4`); a path whose file the next stage's regions cannot take
+  carries `!` on its label, and selecting it says which type would cross as a stand-in.
   Selecting a stage or an edge describes it on the line under the canvas. Boxes can be dragged
   into an arrangement you prefer; the explorer remembers it, and the view, for as long as the
   dashboard is open.
@@ -340,23 +366,45 @@ hidden, so the panel never reflows under the cursor:
 
 - **This agent**, when nothing is selected: description, which stage a run starts at, the model every
   stage tries first, and the shared context regions (`Enter` on one opens it).
-- **A stage**, on three tabs (`1` `2` `3`). *Behaviour*: how it works, description, tries, revisits,
+- **A stage**, on four tabs (`1` to `4`). *Behaviour*: how it works, description, tries, revisits,
   whether it may finish the run, the fan-out settings when it fans out, its loop back to itself when it
-  has one, the prompts, its place in the file, delete. *Model & tools*: the model chain (the first is
-  tried first; `Enter` swaps an entry, `x` drops it, `←` `→` or a drag on its `⠿` grip move it, the
-  last row adds a fallback) and the tools it may use, picked from every tool this install has
-  (`Space` toggles, `Enter` keeps).
-  *Context*: whether the stage sees the agent's shared regions or has a layout of its own, the regions
+  has one, the prompts, delete. The worker a fan-out runs as is picked
+  from the agent's other stages or from every agent installed here (with an *another…* row for
+  one that is not), and typed only when it is a query. *Inputs & outputs*: the input types (what
+  the stage takes as files beyond text; left empty it is whatever its regions take, and each
+  region is listed under it with the [mime](/docs/mime) it takes, `Enter` opening it), what is
+  sent to the model as text whatever it takes, the output type (picked from the plain shapes,
+  `markdown`, `json`, `text`, or any mime type), and the output files it declares it hands back
+  (`Enter` opens one, `x` drops it, the last row declares another and asks its name). *Models & tools*: the model chain (the first is tried first; `Enter` swaps an entry, `x`
+  drops it, `h` `l` or a drag on its `⠿` grip move it, the last row adds a fallback), the tools it may
+  use, picked from every tool this install has (`Space` toggles, `Enter` keeps): the groups, each
+  [MCP server](/docs/mcp) from your config and the agent's own manifest as a connector that grants
+  every tool it advertises, and, once the server has answered (it is asked when the screen opens),
+  its tools one by one under their `server__tool` names; and under them what
+  each tool may be handed at this stage (`Enter` picks the types, `x` lifts the limit): call another
+  agent with images only, or hand a tool that takes text and images only text here.
+  *Context & tools*: whether the stage sees the agent's shared regions or has a layout of its own, the regions
   it sees (`Enter` opens one), a button to give it its own layout or go back to the shared one, where
   tool results land by default, and per-tool routing (`Enter` on a row changes the region, `x` stops
   routing the tool).
 - **A path**: when it is taken, the hint the model routes on, whether it needs your approval, what
   context is carried across (everything, only pinned regions, everything summarized, or per-region
   rules: carry, summarize or drop each one, with the instructions the summary follows), delete.
-- **A context region**, opened from a region row: name, kind (each kind says what it does), share of
-  the context window and token cap, the sliding-window knobs when it is one, whether it must be filled
-  before the run goes on and what to say if it is not, what seeds it, description, delete. `Esc` goes
-  back to where the region was opened from.
+
+A region, a declared file and a stage's loop back to itself open in a window over the editor rather
+than in the inspector's place, so the panel they came from stays in view; `Esc` closes the window.
+
+- **A context region**: name, kind (each kind says what it does), share of the context window and
+  token cap, the sliding-window knobs when it is one, the mime types it takes and how many stored
+  parts it keeps, whether it must be filled before the run goes on and what to say if it is not, what
+  seeds it, description, delete.
+- **A declared file**: name, type or pattern, whether it is required, description, and a button to
+  drop the declaration.
+
+Every mime type field is one chooser: the families (`image/*`, `audio/*`, and so on), every type
+the registry knows (the built-in table, then your [`mime_types.toml`](/docs/configuration#mime_typestoml)),
+and an *another…* row that takes a `type/subtype` or `type/*` the list does not have. `Space`
+picks as many as the field takes, `Enter` keeps them, `x` on the field clears it.
 
 The models the chooser offers come from every provider in your config (asked when the screen
 opens, so the list fills in a moment later) on top of the built-in catalog, marked with the context
@@ -378,7 +426,7 @@ directory), so a graph opens the way you left it; it is never part of the manife
 | Key | Action |
 |---|---|
 | `Ctrl-S` | Save (checks first; errors block it and open the problems list) |
-| `Tab` | Move the keys between the graph and the inspector |
+| `Tab` | From the graph: move the keys to the inspector. On a stage's inspector: the next tab (`Shift-Tab` the one before). On any other panel: back to the graph |
 | `Ctrl-Z` / `Ctrl-Y` | Undo / redo (`Ctrl-Shift-Z` redoes too) |
 | `v` | The definition; `y` copies it, `Esc` closes it |
 | `p` | Open or close the problems list under the graph |
@@ -405,9 +453,9 @@ On the inspector:
 | `↑` / `↓` (or `k` / `j`), `Home` / `End` | Move between rows |
 | `Enter` | Edit the row: type into it, choose from a list, flip it, open it, or press the button |
 | `←` / `→` (or `h` / `l`) | Change the row in place: cycle a choice, step a number, flip a toggle, move a model in its chain |
-| `x` / `Backspace` | Remove the row: a model from the chain, a tool's routing |
-| `1` `2` `3` | A stage's tabs: behaviour, model & tools, context |
-| `Esc` | Back: a region or a loop's path returns to where it was opened from; otherwise to the graph |
+| `x` / `Backspace` | Remove the row: a model from the chain, a tool's routing, a file declaration, a list of types |
+| `1` `2` `3` `4` | A stage's tabs: behaviour, inputs & outputs, models & tools, context & tools |
+| `Esc` | Close the window a region, a file or a loop is open in; otherwise back to the graph |
 | mouse | Click a row to pick it (again to open it); click a tab to switch to it; drag a model's `⠿` grip to move it in the chain |
 
 A stage's model chain is a priority order, and the `⠿` grip at the start of each model row is how
@@ -432,7 +480,8 @@ In the prompts:
 Both boxes wrap and carry the formatting toolbar; see
 [Formatting a long-form box](#formatting-a-long-form-box).
 
-On a terminal under 110 columns the graph and the inspector take turns; `Tab` swaps them.
+On a terminal under 120 columns the graph and the inspector take turns: `Tab` moves to the
+inspector and `Esc` back to the graph.
 
 ### MCP servers (`m`)
 

@@ -674,6 +674,11 @@ pub struct RegionDefinition {
     /// [`RegionSeed`].
     #[serde(default)]
     pub seed: Option<RegionSeed>,
+
+    /// Mime type patterns this region takes; empty means anything. See
+    /// [`crate::region::Region::accepts`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accepts: Vec<String>,
 }
 
 impl RegionDefinition {
@@ -698,6 +703,7 @@ impl RegionDefinition {
             admission: crate::region::Admission::default(),
             volatility: crate::region::Volatility::default(),
             seed: None,
+            accepts: Vec::new(),
         }
     }
 

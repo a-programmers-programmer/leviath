@@ -118,11 +118,13 @@ impl EmbedSpawner {
             agent_id: args.run_id.clone(),
             blueprint,
             seeds,
+            parts: args.parts.clone(),
             stages,
             global_hints: self.hints,
             global_nudge: // The default nudge policy; blueprints override per stage/agent.
             leviath_core::NudgeConfig::default(),
             region_scripts: HashMap::new(),
+            mime_registry: None,
         },
         )?;
 
@@ -148,6 +150,7 @@ impl EmbedSpawner {
                 title: None,
                 title_error: None,
                 unattended: args.yolo,
+                yolo_profile: args.yolo_profile.clone(),
                 // The embedded spawner has no user config to grant against, so
                 // there is nothing to report; `[read_paths]` enforcement is the
                 // host's, through the tool context it supplies.
