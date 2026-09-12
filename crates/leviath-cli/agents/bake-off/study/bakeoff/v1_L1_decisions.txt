@@ -1,0 +1,104 @@
+BAKE_OFF label=L1 MERGE_DECISIONS
+Base = A. Rule: reconcile-first (superset of A and B). No renames detected.
+
+TYPE Agent: reconcile
+REASON: B dropped `implements Node`; A's Node interface is the base, retained so the merged type re-implements Node.
+FIELDS: implements Node
+
+TYPE ApprovalReview: reconcile
+REASON: B replaces scalar `reviewer` with the traversable binding and drops Node; keep B's reviewerBinding shape (models illegal states out), retain Node.
+FIELDS: reviewerBinding, implements Node
+
+TYPE ChoiceGate: reconcile
+REASON: B dropped `implements Node`; retain A's Node interface.
+FIELDS: implements Node
+
+TYPE ConfirmationGate: reconcile
+REASON: B dropped `implements Node`; retain A's Node interface.
+FIELDS: implements Node
+
+TYPE DecisionOption: reconcile
+REASON: B dropped `implements Node`; retain A's Node interface.
+FIELDS: implements Node
+
+TYPE Human: reconcile
+REASON: B dropped `implements Node`; retain A's Node interface.
+FIELDS: implements Node
+
+TYPE Proposal: reconcile
+REASON: B dropped `implements Node`; retain A's Node interface.
+FIELDS: implements Node
+
+TYPE ProposalChange: reconcile
+REASON: Union member sets differ (A: ProposalNotFound; B: ResourceNotFound) — the members are not mutually exclusive, so take the union.
+FIELDS: ResourceNotFound (union member)
+
+TYPE ProposalConnection: reconcile
+REASON: B dropped `implements PageConnection`; retain A's pagination interface.
+FIELDS: implements PageConnection
+
+TYPE ProposalEdge: reconcile
+REASON: B dropped `implements PageEdge`; retain A's edge interface.
+FIELDS: implements PageEdge
+
+TYPE ProposalRevision: reconcile
+REASON: B renames `revisionNumber`->`number` and drops Node; keep B's clearer `number` alongside A's base, retain Node.
+FIELDS: number, implements Node
+
+TYPE ProposalRevisionConnection: reconcile
+REASON: B dropped `implements PageConnection`; retain A's pagination interface.
+FIELDS: implements PageConnection
+
+TYPE ProposalRevisionEdge: reconcile
+REASON: B dropped `implements PageEdge`; retain A's edge interface.
+FIELDS: implements PageEdge
+
+TYPE RejectionReview: reconcile
+REASON: B replaces scalar `reviewer` with the traversable binding and drops Node; keep B's reviewerBinding shape, retain Node.
+FIELDS: reviewerBinding, implements Node
+
+TYPE Review: reconcile
+REASON: B replaces scalar `reviewer` with the traversable binding; keep B's reviewerBinding shape as the superset field.
+FIELDS: reviewerBinding
+
+TYPE ReviewDecision: reconcile
+REASON: Union member sets differ (A: ProposalNotFound; B: ResourceNotFound) — not mutually exclusive, take the union.
+FIELDS: ResourceNotFound (union member)
+
+TYPE ReviewRound: reconcile
+REASON: B renames `roundNumber`->`number` and drops Node; keep B's clearer `number` alongside A's base, retain Node.
+FIELDS: number, implements Node
+
+TYPE ReviewRoundConnection: reconcile
+REASON: B dropped `implements PageConnection`; retain A's pagination interface.
+FIELDS: implements PageConnection
+
+TYPE ReviewRoundEdge: reconcile
+REASON: B dropped `implements PageEdge`; retain A's edge interface.
+FIELDS: implements PageEdge
+
+TYPE ReviewerBinding: reconcile
+REASON: B dropped `implements Node`; retain A's Node interface.
+FIELDS: implements Node
+
+TYPE ReviewerBindingChange: reconcile
+REASON: Union member sets differ (A: ProposalNotFound; B: ResourceNotFound) — not mutually exclusive, take the union.
+FIELDS: ResourceNotFound (union member)
+
+TYPE ReviewerBindingConnection: reconcile
+REASON: B dropped `implements PageConnection`; retain A's pagination interface.
+FIELDS: implements PageConnection
+
+TYPE ReviewerBindingEdge: reconcile
+REASON: B dropped `implements PageEdge`; retain A's edge interface.
+FIELDS: implements PageEdge
+
+TYPE RevisionRequestReview: reconcile
+REASON: B replaces scalar `reviewer` with the traversable binding and drops Node; keep B's reviewerBinding shape, retain Node.
+FIELDS: reviewerBinding, implements Node
+
+RENAMES: none detected.
+
+NOTES:
+- Node, PageConnection, PageEdge, ProposalNotFound, ProposalResource are A-only: Node/PageConnection/PageEdge are the interface bases retained above; ProposalNotFound is retained as a union member on all three Change/Decision unions.
+- ResourceKind, ResourceNotFound are B-only: ResourceNotFound is adopted as the added union member; ResourceKind carries no A-side conflict.

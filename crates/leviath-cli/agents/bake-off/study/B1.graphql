@@ -1,0 +1,563 @@
+# ==============================================================================
+#  PROPOSAL — GATED-DECISION TYPE GROUP  (blind label: B1)
+# ==============================================================================
+#  Domain: human-in-the-loop proposals / decision gates in an agentic system.
+#  Agents author and iterate on a Proposal; a human decision gate asks a clear
+#  question; bound human reviewers cast verdicts; verdicts close the gate
+#  (approved / rejected) or bounce it back to the agent (changes requested);
+#  each bounce produces a Revision; the full story is a first-class Activity
+#  timeline on the proposal.
+#
+#  Design themes applied from the Composition Guide:
+#    - One Concept, One Type    : Proposal, DecisionGate, Review, Reviewer,
+#      Revision, ChangeRequirement each model exactly one concept. No mirrored
+#      "Detail/Summary" pairs — the proposal IS one type.
+#    - Gated-value pattern      : Proposal.outcome and Reviewer.progress are
+#      sum-type unions — illegal states are unrepresentable.
+#    - Edge-first where warranted: the reviewer<->gate relationship carries
+#      lifecycle + metadata, so it earns an edge type (Reviewer); simple
+#      one-hop links stay direct fields (proposal.author).
+#    - Hard invariants minimal  : `!` only where the type would be
+#      semantically incoherent without the value.
+#    - Naming sniff test        : statuses read as domain states, choices as
+#      the human's verbs — no transport/storage/protocol jargon.
+# ==============================================================================
+
+# =============================================================================
+# DIRECTIVES (execution plane — how the engine behaves, never data)
+# =============================================================================
+
+"""Declares the minimum role a caller needs to execute this field.
+Invisible to query authors; enforced by the authz middleware."""
+directive @policy(role: Role!) on FIELD_DEFINITION | OBJECT
+
+"""The mutation is safe to retry: identical requests produce identical state
+changes. Prevents double-submits from creating duplicate reviews, duplicate
+revisions, or double gate transitions."""
+directive @idempotent on FIELD_DEFINITION
+
+"""Roles a caller may hold in this system, referenced by @policy."""
+enum Role {
+  AGENT    # authors and re-submitters (the proposing side)
+  REVIEWER # a bound human reviewer who may cast a verdict
+  OPERATOR # system-level platform role (gate plumbing)
+}
+
+# =============================================================================
+# SCALARS
+# =============================================================================
+
+"""An ISO-8601 instant (UTC). Validated on input; serialized on output."""
+scalar DateTime
+
+"""A short structured text document (headings, bullets, emphasis). Not a
+plain string: markdown carries rendering and validation semantics clients
+rely on."""
+scalar Markdown
+
+# =============================================================================
+# COMMON INTERFACES
+# =============================================================================
+
+"""Anything addressable by identity in the proposal domain."""
+interface Node {
+  id: ID!
+}
+
+# =============================================================================
+# ENUMS
+# =============================================================================
+
+"""What kind of thing is being decided. Shapes reviewer framing and powers
+filters such as "list my pending budget proposals"."""
+enum ProposalKind {
+  PLAN_CHANGE       # altering an execution plan
+  SCOPE_CHANGE      # growing or shrinking scope
+  FUNDING           # spending / budget approval
+  RISK_ACCEPTANCE   # accepting a documented risk
+  PROCESS_EXCEPTION # deviating from standard procedure
+  OTHER             # open-ended human judgment call
+}
+
+"""The high-level lifecycle of a proposal, as its author sees it:
+draft -> under review -> (approved | rejected | changes requested)* .
+The detailed payload behind this summary lives in `Proposal.outcome`."""
+enum ProposalStatus {
+  DRAFT              # being authored; the gate is not yet open
+  AWAITING_REVIEW    # gate open; a human decision is in progress
+  CHANGES_REQUESTED  # a reviewer bounced it; the author is revising
+  APPROVED           # gate closed with approval
+  REJECTED           # gate closed with rejection
+}
+
+"""The concrete choices offered at a gate — the clear choice set the human is
+asked to decide among."""
+enum DecisionChoice {
+  APPROVE
+  REJECT
+  REQUEST_CHANGES
+}
+
+"""How many bound reviewers must decide, and in which combination, for the
+gate to settle."""
+enum ReviewPolicy {
+  ANY_BOUND_REVIEWER  # the first verdict closes the gate
+  ALL_BOUND_REVIEWERS # every bound reviewer must decide
+  QUORUM              # `quorum` approvals close the gate
+}
+
+"""A decision gate's discrete state machine."""
+enum GateState {
+  OPEN      # decision pending
+  RESOLVED  # outcome settled (approved or rejected)
+}
+
+"""Why an outcome is still pending."""
+enum PendingStage {
+  IN_DRAFT       # created but not submitted; gate not yet open
+  UNDER_REVIEW   # submitted; a human decision is in progress
+}
+
+"""The kind of change demanded back from the agent after a negative review."""
+enum ChangeCategory {
+  APPROACH
+  SCOPE
+  BUDGET
+  RISK
+  COMPLIANCE
+  CLARITY
+  OTHER
+}
+
+"""Whether a requested change blocks resubmission."""
+enum ChangePriority {
+  REQUIRED     # must be addressed before resubmission
+  RECOMMENDED  # strongly advised but not blocking
+}
+
+"""Whether an actor is an agent (author/proposer) or a human (reviewer/decider)."""
+enum ActorKind {
+  AGENT
+  HUMAN
+}
+
+# =============================================================================
+# ACTOR
+# =============================================================================
+
+"""An actor who authors or reviews proposals: either an agent or a human.
+One type, one concept — both share the same shape in this domain, so we do
+not grow parallel Human/Agent types (the `kind` enum discriminates)."""
+type Actor implements Node {
+  id: ID!
+  displayName: String!
+  kind: ActorKind!
+}
+
+# =============================================================================
+# PROPOSAL — the durable work unit of the decision
+# =============================================================================
+
+"""A candidate decision an agent submits for human ratification.
+A proposal owns a title, description, kind, a live gated outcome, the gate
+it is trying to pass, and the entire history of reviews and revisions."""
+type Proposal implements Node {
+  id: ID!
+
+  title: String!
+  description: Markdown
+
+  kind: ProposalKind!
+  status: ProposalStatus!
+
+  author: Actor!       # the agent that authored it
+
+  createdAt: DateTime!
+  updatedAt: DateTime!
+
+  """The specific thing being asked of the human. Present once the proposal
+  has been submitted at least once; null while still in draft."""
+  gate: DecisionGate
+
+  """The gated, structurally explicit outcome. Never a bare nullable — the
+  current state is a sum type (pending | approved | rejected | changes
+  requested), so the payload shape always matches the status."""
+  outcome: ProposalOutcome!
+
+  """Every verdict a bound reviewer has cast on this proposal's gates,
+  newest first."""
+  reviews: [Review!]!
+
+  """The author's revisions — the original submission is revision 1, every
+  CHANGES_REQUESTED response is a later number. Newest first."""
+  revisions: [Revision!]!
+
+  """Chronological story of the proposal: each submission and each verdict,
+  newest first. A client renders one timeline instead of merging lists."""
+  activity: [ProposalActivity!]!
+}
+
+# =============================================================================
+# GATED OUTCOME — the sum-type wrapper (hard invariant)
+# =============================================================================
+
+"""The state of a proposal, made structurally explicit. Exactly one variant
+is present at any time; absent or illegal combinations are unrepresentable."""
+union ProposalOutcome = PendingOutcome | ApprovedOutcome | RejectedOutcome | RequestChangesOutcome
+
+"""No settled verdict yet (draft or awaiting reviewers)."""
+type PendingOutcome {
+  stage: PendingStage!
+  since: DateTime!   # when this stage began
+}
+
+"""Approved — the gate settled with approval."""
+type ApprovedOutcome {
+  decidedAt: DateTime!
+  decidedBy: Actor!
+  rationale: Markdown
+  effectiveAt: DateTime   # when the approval takes effect (plan-dependent, hence nullable)
+}
+
+"""Rejected — the gate closed; the proposal will not pass as framed."""
+type RejectedOutcome {
+  decidedAt: DateTime!
+  decidedBy: Actor!
+  reason: Markdown!   # a rejection without a reason is semantically incoherent
+}
+
+"""Rejected with a request to revise — the proposal bounces back to its
+author carrying an explicit ask-back list."""
+type RequestChangesOutcome {
+  decidedAt: DateTime!
+  decidedBy: Actor!
+  requirements: [ChangeRequirement!]!   # the ask-back list
+  resubmitBy: DateTime                   # soft target for the resubmission
+}
+
+"""An ADDRESSABLE change demanded from the author by a negative review —
+addressable so clients can route requirement lists to the agent and let the
+agent mark them handled round by round."""
+type ChangeRequirement implements Node {
+  id: ID!
+  summary: String!
+  rationale: Markdown
+  category: ChangeCategory!
+  priority: ChangePriority!
+}
+
+# =============================================================================
+# THE DECISION GATE — the question asked of the human
+# =============================================================================
+
+"""The specific ask put before the humans: a direct question, the choice set
+they decide among, who may decide and by when. One gate per submission; it
+reopens whenever the proposal bounces back after changes are requested."""
+type DecisionGate implements Node {
+  id: ID!
+
+  question: String!           # the direct ask ("Approve the 14-day plan extension?")
+  choices: [DecisionChoice!]! # the unmistakable choice set (usually all three)
+
+  policy: ReviewPolicy!
+  quorum: Int!                # honoured under QUORUM / ALL_BOUND_REVIEWERS
+  deadline: DateTime          # soft deadline; null when none is set
+
+  reviewers: [Reviewer!]!     # who may decide — first-class bindings below
+  reviews: [Review!]!         # every verdict cast on this gate
+
+  openedAt: DateTime!         # first submission
+  openedBy: Actor!
+  state: GateState!           # OPEN until settled
+  proposal: Proposal!         # traversal back to the asking proposal
+}
+
+# =============================================================================
+# REVIEWER — an edge, not a mirror of Actor
+# =============================================================================
+
+"""The binding of a human to a gate: WHO may decide, WHEN the binding was
+made, BY WHOM, and what they did when they acted. The binding carries its
+own lifecycle (bound -> waiting -> decided), so it earns an edge type —
+queries like "which of my reviewers haven't decided yet" hit this node
+directly instead of re-deriving it from the Actor."""
+type Reviewer implements Node {
+  id: ID!
+  boundAt: DateTime!
+  boundBy: Actor!             # who declared the binding
+  actor: Actor!               # the bound human
+  gate: DecisionGate!
+  progress: ReviewerProgress! # gated: still waiting vs decided
+}
+
+"""A reviewer's local state — a sum type: either they are still waiting, or
+they have decided and the verdict is attached. Explicit, not a nullable
+`review` field with implicit "null = hasn't looked yet" meaning."""
+union ReviewerProgress = ReviewerWaiting | ReviewerDecided
+
+type ReviewerWaiting {
+  since: DateTime!
+}
+
+type ReviewerDecided {
+  review: Review!
+}
+
+# =============================================================================
+# REVIEW — a single human verdict
+# =============================================================================
+
+"""A single vote a reviewer cast on a gate. The atomic unit of human
+judgment — timestamped, attributed, and immutable once cast."""
+type Review implements Node {
+  id: ID!
+  choice: DecisionChoice!
+  decidedAt: DateTime!
+  rationale: Markdown
+  reviewer: Actor!
+  gate: DecisionGate!
+}
+
+# =============================================================================
+# REVISION — the agent's bounce-back
+# =============================================================================
+
+"""One reworking of the proposal — the original submission is revision 1,
+every CHANGES_REQUESTED response is a later number. Revisions summarize
+what changed and which ask-backs they handle."""
+type Revision implements Node {
+  id: ID!
+  number: Int!                        # 1, 2, 3 — the iteration count
+  summary: Markdown                   # what changed in this round
+  submittedAt: DateTime!
+  submittedBy: Actor!                 # whoever did the rework
+  addressesRequirements: [ChangeRequirement!]!  # ask-backs answered this round
+  previous: Revision                  # prior revision; null on the first
+}
+
+# =============================================================================
+# ACTIVITY TIMELINE — review + revision history as one feed
+# =============================================================================
+
+"""A single chronological event in a proposal's arc: a submission (which is
+a Revision, the first being revision 1) or a Review verdict. Clients render
+one timeline instead of merging lists by hand."""
+union ProposalActivity = SubmissionEvent | ReviewEvent
+
+type SubmissionEvent implements Node {
+  id: ID!
+  submittedAt: DateTime!
+  submittedBy: Actor!
+  revision: Revision!
+}
+
+type ReviewEvent implements Node {
+  id: ID!
+  review: Review!
+}
+
+# =============================================================================
+# QUERIES
+# =============================================================================
+
+"""Queries are read-only; all writes go through Mutation."""
+type Query {
+  proposal(id: ID!): Proposal
+  gate(id: ID!): DecisionGate
+  actor(id: ID!): Actor
+
+  """Fetch proposals, filtered and sorted. `reviewer` returns proposals that
+  still await that reviewer's verdict; `author` scopes to one agent's
+  proposals; `statuses` / `kinds` narrow the queue; `first`/`after` paginate."""
+  proposals(
+    first: Int
+    after: String
+    reviewer: ID
+    author: ID
+    statuses: [ProposalStatus!]
+    kinds: [ProposalKind!]
+  ): ProposalConnection!
+}
+
+# =============================================================================
+# CONNECTIONS
+# =============================================================================
+
+"""A paginated window over a proposal list."""
+type ProposalConnection {
+  edges: [ProposalEdge!]!
+  pageInfo: PageInfo!
+  totalCount: Int!
+}
+
+type ProposalEdge {
+  cursor: String!
+  node: Proposal!
+}
+
+type PageInfo {
+  hasNextPage: Boolean!
+  endCursor: String
+}
+
+# =============================================================================
+# MUTATIONS — thin `Input` shapes expressing intent, not output mirrors
+# =============================================================================
+
+"""Every write in the proposal domain, role-gated via @policy and retry-safe
+via @idempotent where double-submission is the real risk."""
+type Mutation {
+  """Draft a new proposal. Created in DRAFT; the gate opens on submit."""
+  createProposal(input: CreateProposalInput!): Proposal! @policy(role: AGENT)
+
+  """Edit the proposal's content while it is in DRAFT or CHANGES_REQUESTED."""
+  updateProposal(id: ID!, input: UpdateProposalInput!): Proposal! @policy(role: AGENT)
+
+  """Open the gate: submit the proposal for review. Binds the supplied
+  reviewers and flips status to AWAITING_REVIEW. Retry-safe."""
+  submitProposal(id: ID!, input: OpenGateInput!): Proposal! @idempotent @policy(role: AGENT)
+
+  """The author's response to CHANGES_REQUESTED: records a Revision and
+  reopens the gate for another review pass."""
+  reviseProposal(id: ID!, input: ReviseProposalInput!): Proposal! @policy(role: AGENT)
+
+  """A bound human reviewer casts a verdict on a gate. Deterministic: the
+  same request repeated yields one Review, never two."""
+  castReview(id: ID!, input: ReviewInput!): Proposal! @idempotent @policy(role: REVIEWER)
+
+  """Bind an actor as a reviewer on an open gate."""
+  bindReviewer(id: ID!, actor: ID!): DecisionGate! @policy(role: AGENT)
+
+  """Unbind a reviewer (e.g. reassignment) before they have cast."""
+  unbindReviewer(id: ID!, binding: ID!): DecisionGate! @policy(role: AGENT)
+
+  """Adjust the gate's deadline while it is still open."""
+  setGateDeadline(id: ID!, deadline: DateTime!): DecisionGate! @policy(role: AGENT)
+}
+
+# =============================================================================
+# INPUTS
+# =============================================================================
+
+"""What the author supplies to create a proposal. Intent, not state."""
+input CreateProposalInput {
+  title: String!
+  description: Markdown
+  kind: ProposalKind!
+}
+
+"""Edits to an existing proposal — each field optional; the mutation applies
+only the supplied ones."""
+input UpdateProposalInput {
+  title: String
+  description: Markdown
+  kind: ProposalKind
+}
+
+"""What it takes to open a gate: the question, who may decide, by when."""
+input OpenGateInput {
+  question: String!
+  deadline: DateTime
+  policy: ReviewPolicy!
+  quorum: Int!             # approvals required under QUORUM / ALL policies
+  reviewers: [ID!]!        # actor IDs to bind as reviewers
+}
+
+"""The author's reply to a changes-requested bounce."""
+input ReviseProposalInput {
+  summary: Markdown!
+  addressesRequirements: [ID!]   # ChangeRequirement ids being answered
+}
+
+"""What a human reviewer voices when deciding on a proposal."""
+input ReviewInput {
+  choice: DecisionChoice!
+  rationale: Markdown
+  requirements: [ChangeRequirementInput!]  # meaningful only when choice = REQUEST_CHANGES
+}
+
+input ChangeRequirementInput {
+  summary: String!
+  reason: Markdown
+  category: ChangeCategory!
+  priority: ChangePriority!
+}
+
+# =============================================================================
+# RATIONALE
+# =============================================================================
+# (Every type above is chosen deliberately; here is the reasoning, per the
+# Composition Guide.)
+#
+# 1. ONE CONCEPT, ONE TYPE
+#    Proposal / DecisionGate / Review / Reviewer / Revision / ChangeRequirement /
+#    Actor each model exactly one domain concept. No ProposalDetail / Proposal
+#    Summary pairs, no parallel HumanUser / AgentUser types — Actor carries a
+#    `kind` enum because humans and agents share the same shape here. The gate
+#    (what is asked), the review (a single cast verdict) and the reviewer
+#    (a binding's lifecycle) are three concepts, so they are three types; not
+#    collapsed into "the decision".
+#
+# 2. DECISION TREE APPLIED IN ORDER
+#    - ProposalStatus, ProposalKind, DecisionChoice, ReviewPolicy, GateState,
+#      PendingStage, ChangeCategory, ChangePriority, ActorKind, Role -> enums
+#      (closed value sets, no attached data).
+#    - Node -> interface (shared identity contract).
+#    - ProposalOutcome, ReviewerProgress, ProposalActivity -> unions
+#      (semantically related but structurally divergent payloads).
+#    - DateTime, Markdown -> custom scalars (validation/serialization
+#      semantics, not plain strings).
+#
+# 3. GATED-VALUE PATTERN (the centrepiece)
+#    Proposal.outcome is a *union* (Pending / Approved / Rejected /
+#    RequestChanges) instead of a nullable `decision:` field whose null
+#    conflates "draft", "awaiting", "no decision yet". Illegal states become
+#    unrepresentable: you can only read `requirements` when the state truly
+#    is RequestChanges, and only read `effectiveAt` once approved. The same
+#    wrapper shapes Reviewer.progress (Waiting vs Decided), so "has not
+#    decided" can never be mistaken for "decided with no review attached".
+#
+# 4. EDGE-FIRST, NOT EDGE-ONLY
+#    The reviewer<->gate relationship carries its own lifecycle (boundAt /
+#    boundBy / progress), so it is an edge type — Reviewer. Metadata-free
+#    one-hop links stay direct fields: proposal.author, proposal.gate.
+#
+# 5. NO ID-SOUP, NO MIRROR INPUTS
+#    Relationships are traversable fields (proposal.outcome -> ProposalOutcome;
+#    gate.proposal -> Proposal; proposal.gate -> DecisionGate). Raw IDs appear
+#    only to ADDRESS an existing entity (bindReviewer(actor: ID!),
+#    addressesRequirements: [ID!]). Inputs are thin intent documents
+#    (title / kind / question / policy), never 1:1 mirrors of output types.
+#
+# 6. HARD vs SOFT INVARIANTS
+#    Hard (schema structure): choice enums, `reason: Markdown!` on rejection,
+#    the ask-back list only reachable via the RequestChanges variant, the gate
+#    only reachable after submit. Soft (resolver): only a live bound reviewer
+#    may cast; a proposal cannot be resubmitted while a gate is open; a verdict
+#    cannot be cast after the gate settled; a rejection without `rationale`
+#    triggers a soft validation warning. These live in code and evolve fast.
+#
+# 7. DIRECTIVES VS FIELDS
+#    Data clients read and filter (question, choices, policy, deadline,
+#    statuses) are fields. Execution-only concerns (@policy on who may
+#    create/cast/bind; @idempotent on submit and castReview so double-clicks
+#    never double-decide) are directives — invisible to query authors, no
+#    directive creep.
+#
+# 8. WOULD I QUERY THIS?
+#    - `proposals(reviewer: ME, statuses: [AWAITING_REVIEW])` — the reviewer's
+#      inbox. must-ask.
+#    - `proposal.outcome { ... on RequestChangesOutcome { requirements } }` —
+#      the agent's to-do list. must-ask.
+#    - `gate.reviewers { progress }` — who is still outstanding. must-ask.
+#    - `proposal.activity` — the timeline render. must-ask.
+#    - totalCount / pageInfo / cursor — real paging UIs. all earn their seat.
+#    Omitted as no real client selects them: backend-only shard keys, queue
+#    names, or chain-of-command metadata.
+#
+# 9. DRIFT TEST
+#    Schema and code co-evolve symmetrically: reviseProposal forces a Revision
+#    resolver and a gate reopening; a new outcome variant (e.g. TIMED_OUT)
+#    prompts changes in both the union and the decision resolver. Neither
+#    side is the master.
+# =============================================================================

@@ -1,0 +1,6 @@
+[L0] lane0 complete iters=7 -> /data/work/leviath/study/bakeoff/v0_L0L0.graphql (23538B)
+[L0] lane1 complete iters=4 -> /data/work/leviath/study/bakeoff/v0_L0L1.graphql (44746B)
+[L0] lane0 23522B vs lane1 44744B -> DIFFERENT-recurse
+[L1] lane0 FAILED: 'dict' object has no attribute 'lower'
+[L1] lane1 FAILED: 'dict' object has no attribute 'lower'
+[L1] ABORT: missing output

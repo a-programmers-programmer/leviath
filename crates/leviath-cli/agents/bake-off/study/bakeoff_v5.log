@@ -1,0 +1,19 @@
+[L0] Running level 0 (independent iteration on seed)...
+[L0] lane0 complete iters=10 -> /data/work/leviath/study/bakeoff/v0_L0L0.graphql (45690B)
+[L0] lane1 complete iters=13 -> /data/work/leviath/study/bakeoff/v0_L0L1.graphql (54110B)
+[L0] lane0 45690B vs lane1 54080B -> DIFFERENT-recurse
+
+[L1] Running diff-based merge level...
+[L1] Diff: 5 only-A, 4 only-B, 47 identical, 13 divergent (diff size: 1663B vs 45690+54080=99770B raw)
+[L1] lane0 complete iters=3 -> /data/work/leviath/study/bakeoff/v1_L0_decisions.txt (1635B)
+[L1] lane1 complete iters=3 -> /data/work/leviath/study/bakeoff/v1_L1_decisions.txt (1608B)
+[L1] using decisions from v1_L0_decisions.txt: 13 decisions, 1 renames
+[L1] Merged -> /data/work/leviath/study/bakeoff/v1_merged.graphql (49019B)
+
+[L2] Running diff-based merge level...
+[L2] Diff: 0 only-A, 0 only-B, 68 identical, 0 divergent (diff size: 19B vs 49019+49019=98038B raw)
+[L2] lane0 complete iters=5 -> /data/work/leviath/study/bakeoff/v2_L0_decisions.txt (2520B)
+[L2] lane1 complete iters=6 -> /data/work/leviath/study/bakeoff/v2_L1_decisions.txt (1497B)
+[L2] using decisions from v2_L0_decisions.txt: 1 decisions, 0 renames
+[L2] Merged -> /data/work/leviath/study/bakeoff/v2_merged.graphql (49144B)
+RESULT: CONVERGED at level 2 (no diff between candidates)

@@ -1,0 +1,22 @@
+[L0] Running level 0 (independent iteration on seed)...
+[L0L0 attempt1] PARSE GATE PASS: v0_L0L0.graphql
+[L0L1 attempt1] PARSE GATE PASS: v0_L0L1.graphql
+[L0] lane0 RunStatus.COMPLETE iters=9 valid=True -> /data/work/leviath/study/bakeoff/v0_L0L0.graphql (49682B)
+[L0] lane1 RunStatus.COMPLETE iters=19 valid=True -> /data/work/leviath/study/bakeoff/v0_L0L1.graphql (36157B)
+[L0] lane0 49680B vs lane1 36157B -> DIFFERENT-recurse
+[L0 lane0] PARSE GATE PASS: v0_L0L0.graphql
+[L0 lane1] PARSE GATE PASS: v0_L0L1.graphql
+
+[L1] Running diff-based merge level...
+[L1] Diff: 3 only-A, 5 only-B, 42 identical, 19 divergent (diff size: 1454B vs 49680+36157=85837B raw)
+[L1] lane0 complete iters=2 -> /data/work/leviath/study/bakeoff/v1_L0_decisions.txt (2742B)
+[L1] lane1 complete iters=3 -> /data/work/leviath/study/bakeoff/v1_L1_decisions.txt (2831B)
+[L1] using decisions from v1_L0_decisions.txt: 19 decisions, 3 renames
+[L1] Merged -> /data/work/leviath/study/bakeoff/v1_merged.graphql (22691B)
+[L1 merge] PARSE GATE PASS: v1_merged.graphql
+
+[L2] Running diff-based merge level...
+[L2] Diff: 0 only-A, 0 only-B, 66 identical, 0 divergent (diff size: 19B vs 22691+22691=45382B raw)
+[L2] CONVERGED — no divergence between candidates; nothing to arbitrate. -> /data/work/leviath/study/bakeoff/v2_merged.graphql
+[L2 converged] PARSE GATE PASS: v2_merged.graphql
+RESULT: CONVERGED at level 2 (no diff between candidates)
