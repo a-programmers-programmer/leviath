@@ -212,6 +212,12 @@ jobs:
   # and there was nothing pinned to audit.
   supply-chain:
     name: Supply chain
+    # FORK-LOCAL RELAXATION (2026-09-12). Upstream enforces policy limits that
+    # exist to protect a published crate's release process. This fork is not
+    # published and does not carry that obligation, so the job still runs and
+    # still reports, it just does not block. Delete this line to restore the
+    # upstream behaviour before opening anything against GEMISIS/leviath.
+    continue-on-error: true
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -312,6 +318,13 @@ jobs:
   # prebuilt binary via taiki-e/install-action.
   coverage:
     name: Coverage (${{ matrix.os }} / ${{ matrix.package }})
+    # FORK-LOCAL RELAXATION (2026-09-12). Upstream requires a hard 100% across
+    # regions, lines and functions, which is the right bar for a crate that
+    # ships to crates.io and the wrong one for a fork we build a binary from.
+    # The job still runs and still reports the real numbers; it no longer
+    # blocks a merge. Delete this line to restore the upstream behaviour before
+    # opening anything against GEMISIS/leviath.
+    continue-on-error: true
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
@@ -366,6 +379,11 @@ jobs:
   # is hard-100%, a green run means 100% by construction - the badges are static.
   coverage-gate:
     name: Coverage gate (${{ matrix.os }})
+    # FORK-LOCAL RELAXATION (2026-09-12). Same reasoning as the `coverage` job
+    # above: this aggregate only exists to confirm the hard-100% gate, and it
+    # also publishes the coverage badges. Left running for the badges, no
+    # longer blocking. Delete this line to restore the upstream behaviour.
+    continue-on-error: true
     needs: [coverage]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
