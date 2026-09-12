@@ -18986,4 +18986,56 @@ mod model_parts {
         assert_eq!(artwork.content.len(), 1);
         assert_eq!(artwork.content[0].content.stored_count(), 1);
     }
+
+// ─── A final-output stage that hits its iteration cap keeps the output ─────
+
+/// A final-output stage that exhausts its iteration budget must keep the output
+/// it already has, not error. The stage was cut off, not refused: whatever it
+/// said in its last turn before the cap fired is the answer it produced.
+///
+/// Before Part B the runtime set AgentStatus::Error, which treats a capped
+/// output the same as a run that never called submit_output — the two are
+/// different and a caller needs to tell them apart.
+#[test]
+fn a_final_output_stage_that_hits_its_iteration_cap_keeps_the_output_it_has() {
+    let mut world = World::new();
+    let mut conv = conversation_window();
+    // The stage spoke on its last turn — the output it had when the cap fired.
+    conv.add_typed_entry(
+        "conversation",
+        leviath_core::EntryKind::AssistantTurn { tool_calls: vec![] },
+        "the answer it had at the cap".to_string(),
+        6,
+    )
+    .unwrap();
+    let e = world
+        .spawn((
+            owing_bp(None),
+            StageCursor { index: 0 },
+            owing_state(),
+            conv,
+            ResolveTransition,
+            StageOutcome::MaxIterations,
+        ))
+        .id();
+    run_require_output(&mut world);
+    // The stage is still transition-ready — require_final_output left it alone
+    // because it was already ending, but it recorded the flag.
+    assert!(
+        world.get::<ResolveTransition>(e).is_some(),
+        "a capped stage follows its own transition edge"
+    );
+    // And the output was captured from its last turn.
+    let Some(final_output) = world.get::<crate::persistence::FinalOutput>(e) else {
+        panic!("a capped final-output stage must keep the output it produced");
+    };
+    assert_eq!(
+        final_output.0.stage, "summary",
+        "output is attributed to the stage that produced it"
+    );
+    assert_eq!(
+        final_output.0.content, "the answer it had at the cap",
+        "the output is what the stage said on its last turn"
+    );
+}
 }
