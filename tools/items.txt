@@ -1,0 +1,65 @@
+===== crates/leviath-runtime/src/fanout.rs
+   52    53     2 | const DEFAULT_FANOUT_DEPTH: usize = 3;
+   55    71    17 | pub trait FanOutSpawner: Send + Sync {
+   73    76     4 | pub struct FanOutSpawnerRes(pub Arc<dyn FanOutSpawner>);
+   78    85     8 | struct ActiveWorker {
+   87   109    23 | pub enum FanOutOrigin {
+  111   129    19 | pub struct FanOutWaiting {
+  131   156    26 | pub struct FanOutState {
+  158   198    41 | impl FanOutWaiting {
+  200   233    34 | pub fn restore_fan_out_waiting(
+  235   241     7 | pub(crate) struct FannedOut;
+  243   248     6 | pub(crate) struct AuthoritativeFanOutPending;
+  250   256     7 | pub(crate) struct PreviousWorkItems(pub Vec<String>);
+  258   262     5 | const FRAMED_PREVIOUS_ITEMS: usize = 12;
+  264   275    12 | type FrameSplitRoundQuery = (
+  277   312    36 | pub(crate) fn frame_split_round(
+  314   345    32 | pub(crate) fn prepare_authoritative_fanouts(
+  347   433    87 | pub(crate) fn start_authoritative_fanouts(world: &mut World) {
+  435   465    31 | fn split_round_framing(round: usize, previous: &[String]) -> String {
+  467   470     4 | pub(crate) const MAX_WORKER_STARTS_PER_PASS: usize = 4;
+  472   481    10 | pub struct WorkItem {
+  483   493    11 | pub(crate) struct FanOutRequest {
+  495   498     4 | pub(crate) fn is_fan_out_tool(name: &str) -> bool {
+  500   536    37 | pub(crate) fn parse_fan_out_call(arguments: &serde_json::Value) -> Res
+  538   605    68 | fn authoritative_items(
+  607   618    12 | pub struct FanOutBudget(pub usize);
+  620   641    22 | fn run_tree_size(world: &World, entity: Entity) -> usize {
+  643   659    17 | fn blueprint_fan_out_max_items(world: &World, entity: Entity) -> Optio
+  661   696    36 | pub(crate) fn config_for(request: &FanOutRequest, stage: Option<&FanOu
+  698   710    13 | pub(crate) struct PendingFanOut {
+  712   813   102 | pub(crate) fn start_pending_fan_outs(world: &mut World) {
+  815   870    56 | pub(crate) fn begin_fan_out(
+  872   973   102 | pub(crate) fn fan_out_collect(world: &mut World) {
+  975   978     4 | pub(crate) struct MergedWorker;
+  980  1016    37 | pub(crate) fn slim_merged_workers(
+ 1018  1045    28 | fn finish_fan_out(world: &mut World, parent: Entity, w: FanOutWaiting)
+ 1047  1066    20 | fn finish_stage_fan_out(world: &mut World, parent: Entity, w: &FanOutW
+ 1068  1116    49 | fn finish_tool_fan_out(world: &mut World, parent: Entity, w: &FanOutWa
+ 1118  1140    23 | fn leave_fan_out(world: &mut World, parent: Entity, config: &FanOutCon
+ 1142  1224    83 | fn start_worker(
+ 1226  1270    45 | pub(crate) fn child_output_content(world: &World, child: Entity) -> Op
+ 1272  1320    49 | fn worker_terminal_result(world: &World, worker: Entity) -> Option<Res
+ 1322  1333    12 | fn worker_requires_output(world: &World, worker: Entity) -> bool {
+===== crates/leviath-core/src/manifest/stage.rs
+    6     7     2 | const INPUT_KEYS: &[&str] = &["accepts", "as_text"];
+    9    60    52 | pub(super) const STAGE_KEYS: &[&str] = &[
+   62    68     7 | pub(super) const CONTEXT_KEYS: &[&str] = &["regions", "hide", "reset"]
+   70    81    12 | pub(super) const HOOK_KEYS: &[&str] = &[
+   83    90     8 | pub(super) const TOOL_ROUTING_KEYS: &[&str] = &[
+   92   102    11 | pub(super) const GATE_KEYS: &[&str] = &[
+  104   115    12 | pub(super) const EDGE_KEYS: &[&str] = &[
+  117   118     2 | pub(super) const TOOL_POLICIES: &[&str] = &["allow", "ask", "deny"];
+  120   139    20 | pub(super) fn validate_tool_policy(where_: &str, tool: &str, policy: &
+  141   163    23 | pub(super) fn reject_unknown_keys(
+  165   249    85 | fn parse_tool_override(
+  251   705   455 | pub(super) fn parse_stage(stage_name: &str, stage_value: &toml::Value)
+  707   735    29 | fn fan_out_number(
+  737   932   196 | pub(super) fn apply_stage_mode(
+  934   969    36 | pub(super) fn parse_stage_hooks(
+  971  1115   145 | pub(super) fn parse_transitions(
+ 1117  1161    45 | pub(super) fn parse_transition_gate(
+ 1163  1179    17 | pub(super) fn parse_stuck_config(where_: &str, edge: &toml::Value) -> 
+ 1181  1191    11 | pub(super) fn parse_context_transform(t: &toml::Value) -> ContextTrans
+ 1193  1213    21 | pub(super) fn parse_nudge_config(
+ 1215  1233    19 | pub(super) const INTERACTION_POINT_KEYS: &[&str] = &[
