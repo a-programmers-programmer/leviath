@@ -210,7 +210,12 @@ pub(super) fn finish_stage_fan_out(world: &mut World, parent: Entity, w: &FanOut
 /// or (for a blueprint whose workers write files and whose parent does not need
 /// to read their prose) somewhere it is cheaply dropped. That flexibility is not
 /// a fan-out feature; it is the one every tool already has.
-pub(super) fn finish_tool_fan_out(world: &mut World, parent: Entity, w: &FanOutWaiting, call_id: &str) {
+pub(super) fn finish_tool_fan_out(
+    world: &mut World,
+    parent: Entity,
+    w: &FanOutWaiting,
+    call_id: &str,
+) {
     let routing = world
         .get::<crate::components::ToolResultRoutingComponent>(parent)
         .map(|r| r.routing.clone());
