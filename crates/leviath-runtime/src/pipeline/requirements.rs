@@ -322,12 +322,54 @@ pub(crate) fn require_final_output(
         // case. Left unrecorded the run reports `output_forced: 0`, which reads
         // as "nothing was required" rather than "the requirement went unmet".
         if outcome.is_some() {
-            tracing::warn!(
-                stage = %stage.name,
-                "stage ended without its required final output"
-            );
-            if let Some(flags) = flags.as_mut() {
-                flags.0.output_forced += 1;
+            // When the stage hit its iteration cap: adopt whatever the model
+            // last said as its final output. The stage was cut off, not
+            // refused: whatever it produced in its last turn before the cap
+            // fired is the answer it had. Recording it here means the terminal
+            // branch in transition.rs sees a present FinalOutput and reports
+            // Complete rather than Error.
+            //
+            // An error outcome, on the other hand, is a refusal - the stage
+            // failed and its output is not trustworthy.
+            if matches!(outcome, Some(StageOutcome::MaxIterations)) {
+                let last = window
+                    .get_region("conversation")
+                    .and_then(|r| {
+                        r.content.iter().rev().find_map(|e| {
+                            let text = e.content.trim();
+                            (!text.is_empty()).then(|| text.to_owned())
+                        })
+                    });
+                match last {
+                    Some(text) => {
+                        tracing::info!(
+                            stage = %stage.name,
+                            "stage capped; adopting its last turn as final output"
+                        );
+                        commands.entity(entity).insert(
+                            crate::persistence::FinalOutput(leviath_core::output::FinalOutput::new(
+                                &text, None, state.current_stage.clone(), 0,
+                            )),
+                        );
+                    }
+                    None => {
+                        tracing::warn!(
+                            stage = %stage.name,
+                            "stage ended without its required final output"
+                        );
+                        if let Some(flags) = flags.as_mut() {
+                            flags.0.output_forced += 1;
+                        }
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    stage = %stage.name,
+                    "stage ended without its required final output"
+                );
+                if let Some(flags) = flags.as_mut() {
+                    flags.0.output_forced += 1;
+                }
             }
             continue;
         }
