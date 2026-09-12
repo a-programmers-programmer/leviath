@@ -37,18 +37,26 @@ mod report;
 mod worker_sources;
 use report::*;
 use worker_sources::merge_worker_sources;
-mod framing;
 mod authoritative;
-mod requests;
 mod collect;
-use framing::*;
-use authoritative::*;
-use requests::*;
-use collect::*;
-pub(crate) use framing::frame_split_round;
+mod framing;
+mod requests;
+// `requests` and `collect` are re-exported to the crate, not just into this
+// module: their items are the fan-out engine's surface within `leviath-runtime`
+// and callers reach them as `crate::fanout::<item>` (`pipeline/tools.rs`,
+// `world.rs`). A plain `use requests::*;` here would make every one of them a
+// private import, and every such call an E0603.
+pub(crate) use collect::*;
+pub(crate) use requests::*;
+
+// `framing` and `authoritative` are listed item by item: a glob would carry
+// nothing the rest of the crate may see, and the two systems (`frame_split_round`,
+// `start_authoritative_fanouts`) plus their marker are the whole of what leaves
+// this module.
 pub(crate) use authoritative::{
     AuthoritativeFanOutPending, prepare_authoritative_fanouts, start_authoritative_fanouts,
 };
+pub(crate) use framing::frame_split_round;
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
@@ -546,7 +554,10 @@ pub(crate) fn child_output_content(world: &World, child: Entity) -> Option<Strin
 /// "10 succeeded, 0 failed" over ten empty sections, which is worse than an
 /// error: the merge stage cannot tell an empty answer from a missing one, so it
 /// writes a confident merge of nothing.
-pub(super) fn worker_terminal_result(world: &World, worker: Entity) -> Option<Result<String, String>> {
+pub(super) fn worker_terminal_result(
+    world: &World,
+    worker: Entity,
+) -> Option<Result<String, String>> {
     match agent_status(world, worker) {
         None => Some(Err("worker vanished".to_string())),
         Some(AgentStatus::Complete) => {
