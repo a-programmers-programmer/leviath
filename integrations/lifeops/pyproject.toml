@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lifeops-mcp"
+version = "0.1.0"
+description = "Google-authenticated MCP adapter for LifeOps Desk and Leviath"
+requires-python = ">=3.12"
+dependencies = ["fastmcp==2.14.7", "httpx==0.28.1"]
+
+[project.optional-dependencies]
+test = ["pytest==9.1.1", "pytest-asyncio==1.4.0"]
+
+[project.scripts]
+lifeops-mcp = "lifeops_mcp.server:main"
+
+[tool.setuptools.packages.find]
+include = ["lifeops_mcp*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

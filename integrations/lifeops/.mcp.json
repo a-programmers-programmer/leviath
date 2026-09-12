@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "lifeops": {
+      "type": "http",
+      "url": "${LIFEOPS_MCP_URL}"
+    }
+  }
+}
