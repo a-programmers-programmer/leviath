@@ -422,6 +422,11 @@ pub(crate) fn start_authoritative_fanouts(world: &mut World) {
                 tokens_used: 0,
                 cut_off_at: None,
                 reasoning: None,
+                // Upstream added `parts` to InferenceResult (the mime the model
+                // produced, already in the run's store). This synthesised result
+                // comes from the fan-out path, not a model reply, so it produces
+                // no parts. Dropped by the upstream sync merge; restored here.
+                parts: Vec::new(),
             },
             crate::pipeline::ReadyForTools,
         ));
