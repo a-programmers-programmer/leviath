@@ -313,9 +313,44 @@ fn check_manifest(path: &std::path::Path) -> Result<CheckedManifest, ManifestChe
     })
 }
 
-/// Print the "valid blueprint" summary + non-fatal warnings.
+/// The one-line verdict for a blueprint, given whether the lint rejected it.
+///
+/// Pure so the honesty rule is assertable without capturing stdout: a rejected
+/// blueprint must never yield a line containing "is valid", because that is the
+/// string a sweeper greps for. "is NOT valid" contains "is valid" as a
+/// substring, so the failure line is worded to avoid it entirely.
+fn verdict_line(blueprint: &leviath_core::Blueprint, failed: bool) -> String {
+    if failed {
+        format!("✗ Blueprint '{}' is not valid.", blueprint.name)
+    } else {
+        format!("✓ Blueprint '{}' is valid.", blueprint.name)
+    }
+}
+
+/// Print the "valid blueprint" verdict + the summary below it.
+///
+/// Only ever called once the lint has run and found nothing fatal, so the tick
+/// and the exit status cannot disagree.
 fn print_success(blueprint: &leviath_core::Blueprint) {
-    println!("✓ Blueprint '{}' is valid.", blueprint.name);
+    println!("{}", verdict_line(blueprint, false));
+    print_summary(blueprint);
+}
+
+/// Print the "not valid" verdict + the same summary, for a blueprint the lint
+/// rejected.
+///
+/// The summary is still worth showing - it names the stages and inputs the
+/// findings below are about - but the verdict line must not be a tick, or a
+/// sweeper grepping for "is valid" reads a broken blueprint as clean.
+fn print_failure(blueprint: &leviath_core::Blueprint) {
+    println!("{}", verdict_line(blueprint, true));
+    print_summary(blueprint);
+}
+
+/// The blueprint summary both verdicts print: stage count, inputs, mime rows,
+/// and the stage graph. Carries no verdict of its own, so it cannot be mistaken
+/// for one.
+fn print_summary(blueprint: &leviath_core::Blueprint) {
     println!(
         "  {} stages, version {}",
         blueprint.stages.len(),
@@ -547,14 +582,14 @@ fn execute_reporting_outcome(
 
     // The human report is three separate printers. JSON is one document, so it
     // is built after the lint and emitted once, and none of these run.
+    //
+    // The verdict line ("is valid" / "is NOT valid") is deliberately NOT printed
+    // here: it is printed after the lint below, once the errors are known. A
+    // tick printed before the lint is a lie whenever the lint then fails, and a
+    // sweeper grepping stdout for "is valid" reads a broken blueprint as clean.
     if !args.json {
-        print_success(&checked.blueprint);
         print_script_tool_report(checked.agent_dir());
         print_global_script_report();
-        if args.graph {
-            println!();
-            println!("{}", graph_text(&checked.blueprint, args.width));
-        }
     }
 
     let mut env = LintEnv::offline(checked.agent_dir());
@@ -586,8 +621,24 @@ fn execute_reporting_outcome(
         }
         false => print_findings(&findings),
     };
+    let failed = errors > 0 || (args.deny_warnings && warnings > 0);
 
-    if errors > 0 || (args.deny_warnings && warnings > 0) {
+    // The verdict is printed only now, after the lint, so it always agrees with
+    // the exit status the caller will see. In prose mode the summary and graph
+    // ride along with it; `--json` already emitted the whole report above.
+    if !args.json {
+        if failed {
+            print_failure(&checked.blueprint);
+        } else {
+            print_success(&checked.blueprint);
+        }
+        if args.graph {
+            println!();
+            println!("{}", graph_text(&checked.blueprint, args.width));
+        }
+    }
+
+    if failed {
         return Ok(ValidateOutcome::LintFailed { errors, warnings });
     }
     Ok(ValidateOutcome::Success)
@@ -1530,6 +1581,31 @@ text = true
             mime_lines(&parse(&one)),
             vec!["  Mime types: adds 1 row for its runs: image/gif".to_string()]
         );
+    }
+
+    /// The verdict line is the string a sweeper greps for, so a rejected
+    /// blueprint must not produce one that reads as clean. This is the
+    /// regression guard for the bug where `print_success` ran before the lint
+    /// and ticked a blueprint that then exited 1.
+    #[test]
+    fn verdict_line_never_ticks_a_rejected_blueprint() {
+        let toml = make_blueprint_toml(
+            r#"
+[stages.main]
+mode = "autonomous"
+model = { provider = "anthropic", model = "claude-sonnet-4-6" }
+description = "Main stage"
+max_iterations = 5
+"#,
+        );
+        let bp = parse(&toml);
+        assert_eq!(verdict_line(&bp, false), "✓ Blueprint 'test' is valid.");
+        let failed = verdict_line(&bp, true);
+        assert!(
+            !failed.contains("is valid"),
+            "a rejected blueprint's verdict must not contain the clean-tick string: {failed}"
+        );
+        assert_eq!(failed, "✗ Blueprint 'test' is not valid.");
     }
 
     #[test]
