@@ -41,7 +41,35 @@ re-runs the whole acceptance surface once.
   reads; they are not in this sub-order's commit.
 - The GQL-02 change set (`python/`, `tools/`, the two evidence files and
   `.gql02-base`) was untracked at base and is added by this sub-order's local
-  commit. See section 7.
+  commit `e48f48d0`. Committed diff stat:
+
+```
+ .gql02-base                                        |   1 +
+ docs/workflow/evidence/gql-02-acceptance.md        | 143 ++++
+ docs/workflow/evidence/run-gql02-acceptance.sh     |  88 ++
+ python/leviath_reconcile/__init__.py               |  65 ++
+ python/leviath_reconcile/__main__.py               |  17 +
+ python/leviath_reconcile/adapters/__init__.py      |  27 +
+ .../leviath_reconcile/adapters/python_adapter.py   | 405 +++++++++
+ .../leviath_reconcile/adapters/schema_adapter.py   | 405 +++++++++
+ python/leviath_reconcile/baseline.py               | 173 ++++
+ python/leviath_reconcile/cli.py                    | 388 +++++++++
+ python/leviath_reconcile/crosswalk.py              | 278 +++++++
+ python/leviath_reconcile/diff.py                   | 232 ++++++
+ python/leviath_reconcile/e2e_real.py               | 223 +++++
+ .../leviath_reconcile/fixtures/workflow_model.py   | 391 +++++++++
+ python/leviath_reconcile/identity.py               | 517 ++++++++++++
+ python/leviath_reconcile/invariants.py             | 278 +++++++
+ python/leviath_reconcile/model.py                  | 298 +++++++
+ python/leviath_reconcile/pin.py                    | 404 +++++++++
+ python/leviath_reconcile/reconcile.py              | 912 +++++++++++++++++++++
+ python/leviath_reconcile/scenarios.py              | 663 +++++++++++++++
+ python/leviath_reconcile/test_pin.py               | 189 +++++
+ tools/generate_code_counterpart.py                 | 231 ++++++
+ 22 files changed, 6328 insertions(+)
+```
+
+- Verbatim acceptance transcript: `docs/workflow/evidence/gql-02-acceptance-run.txt`.
 
 ## 4. Definition of Done — clause by clause
 
