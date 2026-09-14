@@ -1,6 +1,6 @@
 == GQL-02 acceptance: shared reconciliation rules and conflict detection
 == repo: /data/work/graphql-realization/gql-02/repo
-== HEAD: e48f48d0cafbcfb7354740d784fe0067f44ec4da
+== HEAD: 67e166496ebec784285b57c7c27e1639acd5b2de
 == base: 15dc182e0bc6c28dfa93f4b8dd3c423372808f61
 == python: Python 3.12.14  graphql-core: 3.2.5
 
@@ -98,7 +98,7 @@ exit=0
 
 === [5] pinned acceptance tests (GQL-02b)
 .............                                                            [100%]
-13 passed in 2.56s
+13 passed in 2.61s
 exit=0
 
 === [6] gate discrimination: a drifted contract must FAIL loudly
@@ -122,11 +122,7 @@ fbda5372c826d1a0ba651b9bbbe6c0088170468f5da12f3b9ce02c85119e6fb1    21158  pytho
 79479ed622614dfa87b54fe91501bad003a36c9d1aed0c07e5b3cc3e34b3b672     8503  python/leviath_reconcile/fixtures/workflow_model.py
 ea1965f49ff83b85812a2a691058aeb235713c0935c3a7856cce6b4901b56fbe     8550  tools/generate_code_counterpart.py
 
-=== [8] resulting diff stat vs base
- docs/workflow/evidence/gql-02-acceptance.md        | 143 ++++
- docs/workflow/evidence/run-gql02-acceptance.sh     |  88 ++
- docs/workflow/schema-workflow.graphql              | 265 +++++-
- docs/workflow/workflow-schema-decisions.md         |  11 +
+=== [8] resulting diff stat vs base (committed only; reproducible)
  python/leviath_reconcile/__init__.py               |  65 ++
  python/leviath_reconcile/__main__.py               |  17 +
  python/leviath_reconcile/adapters/__init__.py      |  27 +
@@ -146,6 +142,10 @@ ea1965f49ff83b85812a2a691058aeb235713c0935c3a7856cce6b4901b56fbe     8550  tools
  python/leviath_reconcile/scenarios.py              | 663 +++++++++++++++
  python/leviath_reconcile/test_pin.py               | 189 +++++
  tools/generate_code_counterpart.py                 | 231 ++++++
- 23 files changed, 6576 insertions(+), 27 deletions(-)
+ 19 files changed, 6096 insertions(+)
+informational, grows with each evidence commit:
+ 23 files changed, 6507 insertions(+)
+informational, worktree contract files vs base (GQL-01, uncommitted):
+ 2 files changed, 249 insertions(+), 27 deletions(-)
 
 GQL-02 acceptance: PASS

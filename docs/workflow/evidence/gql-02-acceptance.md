@@ -15,6 +15,16 @@ re-runs the whole acceptance surface once.
 | GQL-02b | contract pin + adapter binding (`pin.py`, `test_pin.py`, `pin-check`) | PASS (harvested) |
 | GQL-02c | this acceptance packet + verifier script + local commit | PASS |
 
+The acceptance run below was executed at HEAD `67e166496ebec784285b57c7c27e1639acd5b2de`
+(`GQL-02c: acceptance run transcript + diff-stat correction`), on top of
+`e48f48d0cafbcfb7354740d784fe0067f44ec4da`
+(`GQL-02: shared reconciliation rules and conflict detection`), on top of base
+`15dc182e0bc6c28dfa93f4b8dd3c423372808f61`.
+
+This packet and its transcript are added by the local commit that follows
+`67e16649`. A file cannot contain the hash of the commit that adds it, so the
+run-time HEAD `67e16649` is the recorded one and step 8 diffs commits only.
+
 ## 2. Contract identity (pin before dependent implementation, re-verified at acceptance)
 
 - Accepted fingerprint (printed-SDL SHA-256):
@@ -28,20 +38,34 @@ re-runs the whole acceptance surface once.
 
 - Base commit: `15dc182e0bc6c28dfa93f4b8dd3c423372808f61`
   (`fix: satisfy fmt and clippy on the synced tree`)
-- Resulting diff stat vs base, tracked files only:
 
-```
- docs/workflow/schema-workflow.graphql      | 265 ++++++++++++++++++++++++++---
- docs/workflow/workflow-schema-decisions.md |  11 ++
- 2 files changed, 249 insertions(+), 27 deletions(-)
-```
+All readings below use that one base. Every number was measured with
+`git diff --shortstat` and is stated with its exact scope, because the same base
+yields different numbers for different scopes.
 
-  Those two tracked edits are GQL-01's contract repair, not GQL-02's. They are
-  reported here because they are part of the working tree the acceptance run
-  reads; they are not in this sub-order's commit.
-- The GQL-02 change set (`python/`, `tools/`, the two evidence files and
-  `.gql02-base`) was untracked at base and is added by this sub-order's local
-  commit `e48f48d0`. Committed diff stat:
+| Reading | Scope | Diff stat |
+| --- | --- | --- |
+| A | worktree contract files vs base (GQL-01 edit, **uncommitted**) | 2 files, 249 insertions(+), 27 deletions(-) |
+| B | commit `e48f48d0` only (GQL-02 code set) | 22 files, 6328 insertions(+) |
+| B' | commit `67e16649` only (evidence correction) | 2 files, 180 insertions(+), 1 deletion(-) |
+| C | committed `python`+`tools`+`docs/workflow/evidence` vs base | 22 files, 6506 insertions(+) |
+| D | committed all vs base | 23 files, 6507 insertions(+) |
+| E | committed `python`+`tools` vs base | 19 files, 6096 insertions(+) |
+| I | committed `docs/workflow/evidence` only vs base | 3 files, 410 insertions(+) |
+
+The readings reconcile exactly: `E + I = 6096 + 410 = 6506 = C`, and
+`C + .gql02-base(1) = 6507 = D`.
+
+Reading A is the GQL-01 contract repair (`docs/workflow/schema-workflow.graphql`,
+`docs/workflow/workflow-schema-decisions.md`). It is **not** GQL-02's and it is
+**not committed** by this sub-order. It is reported because the acceptance run
+reads the same working tree.
+
+The GQL-02 change set (`python/`, `tools/`, the evidence files and `.gql02-base`)
+was untracked at base. It is added by local commit `e48f48d0`; the evidence
+correction is `67e16649`. Neither is pushed.
+
+Committed diff stat of `e48f48d0`:
 
 ```
  .gql02-base                                        |   1 +
@@ -86,7 +110,7 @@ Verifier script: `docs/workflow/evidence/run-gql02-acceptance.sh`.
 Run from repo root: `bash docs/workflow/evidence/run-gql02-acceptance.sh`.
 
 ```
-== HEAD: 15dc182e0bc6c28dfa93f4b8dd3c423372808f61
+== HEAD: 67e166496ebec784285b57c7c27e1639acd5b2de
 == base: 15dc182e0bc6c28dfa93f4b8dd3c423372808f61
 == python: Python 3.12.14  graphql-core: 3.2.5
 
@@ -94,10 +118,10 @@ Run from repo root: `bash docs/workflow/evidence/run-gql02-acceptance.sh`.
 [2] verify-contract     -> result=PASS, observed == pinned                                                              exit=0
 [3] e2e-real            -> result=PASS, schema 2136 facts graphql-core, code 1995 facts python-ast                       exit=0
 [4] pin-check           -> result=PASS, pinned == observed, pingpong ok, changed=[false,false,false]                     exit=0
-[5] pytest test_pin.py  -> 13 passed in 2.86s                                                                           exit=0
+[5] pytest test_pin.py  -> 13 passed                                                                                    exit=0
 [6] verify-contract with wrong pin -> "contract drift: expected 000...0, observed ff9d..."                              exit=1 (expect 1) OK
 [7] artifact hashes     -> see section 6
-[8] diff stat vs base   -> see section 3
+[8] diff stat vs base   -> committed-only, reproducible; see section 3
 
 GQL-02 acceptance: PASS
 SCRIPT_EXIT=0
@@ -106,7 +130,15 @@ SCRIPT_EXIT=0
 Step 6 is the discrimination check: the gate must fail on a drifted contract, not
 merely report a difference. It returned exit 1 as required.
 
+Step 8 diffs two commits (`$BASE HEAD`), never the working tree. So its number is
+reproducible. It is scoped to `python tools` (reading E, 19 files, 6096
+insertions). The full committed number (reading D) grows by one file each time an
+evidence commit is added, so the script prints it as informational only, never as
+the acceptance number.
+
 ## 6. Artifact hashes (sha256, bytes)
+
+Source artifacts (working tree, unchanged by this sub-order):
 
 ```
 2cb5a7653f706bed42d3cd5787a3896701fce24884072afa9063a297db835a4f    16977  docs/workflow/schema-workflow.graphql
@@ -124,6 +156,21 @@ fbda5372c826d1a0ba651b9bbbe6c0088170468f5da12f3b9ce02c85119e6fb1    21158  pytho
 543159bdc9fc933eb4fa09441825df24835f4351dd359dc5e028f43353c36672    15975  python/leviath_reconcile/adapters/python_adapter.py
 79479ed622614dfa87b54fe91501bad003a36c9d1aed0c07e5b3cc3e34b3b672     8503  python/leviath_reconcile/fixtures/workflow_model.py
 ea1965f49ff83b85812a2a691058aeb235713c0935c3a7856cce6b4901b56fbe     8550  tools/generate_code_counterpart.py
+```
+
+Evidence files (hashes frozen before commit; these are the blobs the local
+commit adds — the packet cannot contain its own hash, so it is excluded):
+
+```
+e5097265b1d2cc413eec9b40f76e5315ea287f94c08c256d9d0c289a24d822d7     4101  docs/workflow/evidence/run-gql02-acceptance.sh
+8cfe9ebf3f42c035167480200ec8d37649db2f8d523cf0a6f0e40b283b779b0b     8485  docs/workflow/evidence/gql-02-acceptance-run.txt
+```
+
+Superseded at `67e16649` (earlier revision of the same two files):
+
+```
+b31f6dd23fdd10bae20d8d6007816ddb0030b9a775ac79bdb708cc3dd7e3aefd     3507  run-gql02-acceptance.sh
+08042f3b8f24232bdf5a5571f29a1dba13d65a7018deb316b05c69e6cbe0f154     8511  gql-02-acceptance-run.txt
 ```
 
 ## 7. Real Bead ID and Leviath run ID
@@ -157,8 +204,8 @@ This acceptance sub-order (GQL-02c) calls no provider: the verifier is offline.
 
 ## 9. Rollback
 
-- Local commit only, no push. Revert with `git reset --soft HEAD~1` (keeps the
-  working tree) or `git reset --hard HEAD~1`.
+- Local commits only, no push. Revert with `git reset --soft HEAD~2` (keeps the
+  working tree) or `git reset --hard HEAD~2`.
 - Full removal of the GQL-02 code set: delete `repo/python/` and `repo/tools/`.
 - No destructive data migration, no production-store write.
 

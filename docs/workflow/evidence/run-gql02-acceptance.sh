@@ -74,10 +74,17 @@ for p in paths:
         print(f"(missing)              {p}")
 PY
 
-step 8 "resulting diff stat vs base"
+step 8 "resulting diff stat vs base (committed only; reproducible)"
+# Committed-only by design, so the number never depends on the working tree.
+# Scoped to python+tools because the evidence files are the record itself: a diff
+# that included them would change with every evidence commit. The unstable full
+# number is printed afterwards as informational only.
 BASE="$(cat .gql02-base 2>/dev/null || echo 15dc182e0bc6c28dfa93f4b8dd3c423372808f61)"
-git --no-pager diff --stat "$BASE" -- python tools docs/workflow 2>/dev/null || \
-  git --no-pager diff --stat "$BASE" 2>/dev/null
+git --no-pager diff --stat "$BASE" HEAD -- python tools 2>/dev/null
+printf 'informational, grows with each evidence commit:\n'
+git --no-pager diff --shortstat "$BASE" HEAD 2>/dev/null
+printf 'informational, worktree contract files vs base (GQL-01, uncommitted):\n'
+git --no-pager diff --shortstat "$BASE" -- docs/workflow/schema-workflow.graphql docs/workflow/workflow-schema-decisions.md 2>/dev/null
 
 echo
 if [ "$FAILED" -eq 0 ]; then
