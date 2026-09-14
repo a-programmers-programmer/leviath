@@ -15,15 +15,18 @@ re-runs the whole acceptance surface once.
 | GQL-02b | contract pin + adapter binding (`pin.py`, `test_pin.py`, `pin-check`) | PASS (harvested) |
 | GQL-02c | this acceptance packet + verifier script + local commit | PASS |
 
-The acceptance run below was executed at HEAD `67e166496ebec784285b57c7c27e1639acd5b2de`
-(`GQL-02c: acceptance run transcript + diff-stat correction`), on top of
-`e48f48d0cafbcfb7354740d784fe0067f44ec4da`
-(`GQL-02: shared reconciliation rules and conflict detection`), on top of base
-`15dc182e0bc6c28dfa93f4b8dd3c423372808f61`.
+The acceptance run below was executed at the run-time HEAD
+`5ed2ba6c69ee4b55d5a8dbbfb25fbf27b4a6b649`
+(`GQL-02c: correct acceptance diff readings and make step 8 reproducible`), on
+top of `67e16649` (transcript + first diff-stat correction), on top of
+`e48f48d0` (`GQL-02: shared reconciliation rules and conflict detection`), on
+top of base `15dc182e0bc6c28dfa93f4b8dd3c423372808f61`.
 
-This packet and its transcript are added by the local commit that follows
-`67e16649`. A file cannot contain the hash of the commit that adds it, so the
-run-time HEAD `67e16649` is the recorded one and step 8 diffs commits only.
+Rule for the self-reference: a file cannot contain the hash of the commit that
+adds it. So the transcript's `== HEAD:` line is the run-time HEAD, which is the
+parent of the commit that adds the transcript. Step 8 diffs commits only
+(`$BASE HEAD`), so its numbers do not depend on the working tree and repeat
+exactly on every re-run.
 
 ## 2. Contract identity (pin before dependent implementation, re-verified at acceptance)
 
@@ -43,18 +46,26 @@ All readings below use that one base. Every number was measured with
 `git diff --shortstat` and is stated with its exact scope, because the same base
 yields different numbers for different scopes.
 
-| Reading | Scope | Diff stat |
-| --- | --- | --- |
-| A | worktree contract files vs base (GQL-01 edit, **uncommitted**) | 2 files, 249 insertions(+), 27 deletions(-) |
-| B | commit `e48f48d0` only (GQL-02 code set) | 22 files, 6328 insertions(+) |
-| B' | commit `67e16649` only (evidence correction) | 2 files, 180 insertions(+), 1 deletion(-) |
-| C | committed `python`+`tools`+`docs/workflow/evidence` vs base | 22 files, 6506 insertions(+) |
-| D | committed all vs base | 23 files, 6507 insertions(+) |
-| E | committed `python`+`tools` vs base | 19 files, 6096 insertions(+) |
-| I | committed `docs/workflow/evidence` only vs base | 3 files, 410 insertions(+) |
+Each reading names the commit it was measured at. Only reading E is the
+acceptance number; it does not change when the evidence files change.
 
-The readings reconcile exactly: `E + I = 6096 + 410 = 6506 = C`, and
-`C + .gql02-base(1) = 6507 = D`.
+| Reading | Measured at | Scope | Diff stat |
+| --- | --- | --- | --- |
+| A | worktree vs base | contract files (GQL-01 edit, **uncommitted**) | 2 files, 249 insertions(+), 27 deletions(-) |
+| B | commit `e48f48d0` only | GQL-02 code set | 22 files, 6328 insertions(+) |
+| B' | commit `67e16649` only | first evidence correction | 2 files, 180 insertions(+), 1 deletion(-) |
+| E | any HEAD vs base | committed `python`+`tools` | 19 files, 6096 insertions(+) |
+| C | `67e16649` vs base | committed `python`+`tools`+`evidence` | 22 files, 6506 insertions(+) |
+| D | `67e16649` vs base | committed all | 23 files, 6507 insertions(+) |
+| I | `67e16649` vs base | committed `docs/workflow/evidence` only | 3 files, 410 insertions(+) |
+
+The readings at `67e16649` reconcile exactly:
+`E + I = 6096 + 410 = 6506 = C`, and `C + .gql02-base(1) = 6507 = D`.
+
+Readings C, D and I grow with each evidence commit; at the current HEAD
+`5ed2ba6c` they are C = 6560, D = 6561, I = 464. Reading E is unchanged at
+6096. That is why step 8 prints E as the acceptance number and the other two
+as informational only.
 
 Reading A is the GQL-01 contract repair (`docs/workflow/schema-workflow.graphql`,
 `docs/workflow/workflow-schema-decisions.md`). It is **not** GQL-02's and it is
@@ -110,7 +121,7 @@ Verifier script: `docs/workflow/evidence/run-gql02-acceptance.sh`.
 Run from repo root: `bash docs/workflow/evidence/run-gql02-acceptance.sh`.
 
 ```
-== HEAD: 67e166496ebec784285b57c7c27e1639acd5b2de
+== HEAD: 5ed2ba6c69ee4b55d5a8dbbfb25fbf27b4a6b649
 == base: 15dc182e0bc6c28dfa93f4b8dd3c423372808f61
 == python: Python 3.12.14  graphql-core: 3.2.5
 
