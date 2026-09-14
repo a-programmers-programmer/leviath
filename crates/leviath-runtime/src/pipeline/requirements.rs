@@ -279,18 +279,44 @@ type FinalOutputQuery = (
     Option<&'static mut crate::persistence::RunOutcomeFlags>,
 );
 
+/// The last non-empty text in the conversation region, if any.
+///
+/// Shared by the two give-up branches of [`require_final_output`]: a stage that
+/// hit its iteration cap and a stage that exhausted its re-entry budget both end
+/// with whatever the model last said. Adopting it is the difference between a
+/// partial answer and no answer at all, so the two paths must not drift.
+fn last_conversation_text(window: &ContextWindow) -> Option<String> {
+    window.get_region("conversation").and_then(|r| {
+        r.content.iter().rev().find_map(|e| {
+            let text = e.content.trim();
+            (!text.is_empty()).then(|| text.to_owned())
+        })
+    })
+}
+
 /// Required-output gate: hold a stage that owes a final output and has not
 /// submitted one, nudge it, and re-run - bounded, then give up loudly.
 ///
 /// The same shape as [`require_context_regions`] and the edge gate's
 /// `require_modifications`, and deliberately so: a missing output never strands
-/// a run. When the re-entry budget is spent the transition proceeds and the run
-/// records `output_forced`, so a caller reading `meta.json` can tell "no answer
-/// because the agent never gave one" from "no answer because nobody asked".
+/// a run.
 ///
-/// Skipped when the stage ended on an error or max-iterations outcome, which
-/// take precedence: an agent that already failed should follow its error edge
-/// rather than be told to summarise.
+/// There are two ways the budget runs out, and both end the same way. A stage
+/// that leaves on the max-iterations edge, and a stage whose re-entry budget is
+/// spent without ever submitting, are both *cut off* rather than *refused* -
+/// each is holding the last thing the model said. Adopting that last turn as the
+/// stage's `FinalOutput` is what turns a run that did real work and produced
+/// nothing into one that hands back a partial answer, and it is why such a run
+/// now ends `Complete` instead of the terminal arm's `Error`.
+///
+/// Only a stage that has nothing at all to adopt (an empty conversation) leaves
+/// the run's `output_forced` flag set - the honest signal that the requirement
+/// went unmet, distinguishable in `meta.json` from "no answer because nobody
+/// asked".
+///
+/// Skipped when the stage ended on an error outcome, which takes precedence: an
+/// agent that actively failed should follow its error edge, and its output is
+/// not trustworthy, rather than be told to summarise.
 ///
 /// Whether *this stage* submitted is the question, not whether the run holds an
 /// output from anywhere. A blueprint whose worker stage submits and whose later
@@ -332,15 +358,7 @@ pub(crate) fn require_final_output(
             // An error outcome, on the other hand, is a refusal - the stage
             // failed and its output is not trustworthy.
             if matches!(outcome, Some(StageOutcome::MaxIterations)) {
-                let last = window
-                    .get_region("conversation")
-                    .and_then(|r| {
-                        r.content.iter().rev().find_map(|e| {
-                            let text = e.content.trim();
-                            (!text.is_empty()).then(|| text.to_owned())
-                        })
-                    });
-                match last {
+                match last_conversation_text(&window) {
                     Some(text) => {
                         tracing::info!(
                             stage = %stage.name,
@@ -384,13 +402,45 @@ pub(crate) fn require_final_output(
         let cap = leviath_core::blueprint::DEFAULT_OUTPUT_REENTRY_CAP;
         let round = reentries.map_or(0, |r| r.0);
         if round >= cap {
-            tracing::warn!(
-                stage = %stage.name,
-                attempts = cap,
-                "stage never produced its required final output; proceeding without one"
-            );
-            if let Some(flags) = flags.as_mut() {
-                flags.0.output_forced += 1;
+            // The budget is spent: the stage was never going to call
+            // `submit_output`, and holding it any longer only re-bills the same
+            // prompt. Proceed - but do not proceed *empty*. This is the same
+            // give-up the iteration cap takes, reached by a different door, and
+            // it deserves the same answer: adopt whatever the model last said
+            // as the stage's final output. A partial answer is what the run
+            // actually produced; discarding it here is how a run that did real
+            // work ended `error` with `produced_output: false` and nothing to
+            // hand back.
+            //
+            // Only when there is genuinely nothing to adopt does the run record
+            // `output_forced`, which is the honest signal that the requirement
+            // went unmet.
+            match last_conversation_text(&window) {
+                Some(text) => {
+                    tracing::info!(
+                        stage = %stage.name,
+                        attempts = cap,
+                        "stage exhausted its output budget; adopting its last turn as final output"
+                    );
+                    commands.entity(entity).insert(crate::persistence::FinalOutput(
+                        leviath_core::output::FinalOutput::new(
+                            &text,
+                            None,
+                            state.current_stage.clone(),
+                            0,
+                        ),
+                    ));
+                }
+                None => {
+                    tracing::warn!(
+                        stage = %stage.name,
+                        attempts = cap,
+                        "stage never produced its required final output; proceeding without one"
+                    );
+                    if let Some(flags) = flags.as_mut() {
+                        flags.0.output_forced += 1;
+                    }
+                }
             }
             continue; // proceed rather than strand the run
         }

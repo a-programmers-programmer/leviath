@@ -791,6 +791,48 @@ impl RunMeta {
         }
     }
 
+    /// The key under which a paused run's "superseded" annotation is stored in
+    /// [`Self::metadata`].
+    ///
+    /// A run is *superseded* when a **later** run has taken over from it and that
+    /// successor is already terminal (`complete` / `error` / `cancelled`), so the
+    /// predecessor has no work left to do. The value is
+    /// `<successor_run_id>:<successor_status>`, written durably into `meta.json`
+    /// by the paused-run sweep (`/data/work/queue/bin/sweep-superseded-paused-runs.py`).
+    ///
+    /// Named here rather than spelled out at each site so the writer (the sweep)
+    /// and the reader (restart recovery in [`crate`]'s `restore` module) cannot
+    /// drift apart: a key typo on either side would silently turn the annotation
+    /// back into a run that pages in on every restart.
+    pub const SUPERSEDED_KEY: &'static str = "superseded";
+
+    /// Whether this run carries a non-empty [`Self::SUPERSEDED_KEY`] annotation.
+    ///
+    /// Restart recovery consults this so a superseded predecessor is not paged
+    /// back in: it is left on disk, paused and annotated, exactly as
+    /// `RULES-paused-runs.md` requires - never resumed, never deleted, so
+    /// `lev resume <id>` can still reach it by hand.
+    #[must_use]
+    pub fn is_superseded(&self) -> bool {
+        self.metadata
+            .get(Self::SUPERSEDED_KEY)
+            .is_some_and(|v| !v.trim().is_empty())
+    }
+
+    /// The successor `(run_id, status)` that superseded this run, if annotated.
+    ///
+    /// The value is `<successor_run_id>:<successor_status>`; a value without a
+    /// colon yields the whole string as the run id and an empty status, so a
+    /// hand-written annotation still parses.
+    #[must_use]
+    pub fn superseded_by(&self) -> Option<(&str, &str)> {
+        let v = self.metadata.get(Self::SUPERSEDED_KEY)?.trim();
+        if v.is_empty() {
+            return None;
+        }
+        Some(v.split_once(':').unwrap_or((v, "")))
+    }
+
     /// A newly accepted run: [`RunStatus::Starting`], both timestamps now, every
     /// counter at zero and every optional field unset.
     ///

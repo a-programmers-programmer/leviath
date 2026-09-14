@@ -14626,6 +14626,138 @@ fn an_exhausted_budget_proceeds_and_records_that_it_was_forced() {
     );
 }
 
+/// The re-entry budget is a *different* give-up from the iteration cap, and it
+/// used to end differently: the stage proceeded with no output at all, so the
+/// terminal arm set `AgentStatus::Error` and the run handed back nothing.
+///
+/// A stage that spent its budget trying is still holding whatever it last said.
+/// That is a partial answer, not an absence, and the run has to keep it - the
+/// same adoption the iteration-cap branch already does.
+#[test]
+fn an_exhausted_budget_keeps_the_last_turn_as_a_partial_output() {
+    let mut world = World::new();
+    let mut conv = conversation_window();
+    conv.add_typed_entry(
+        "conversation",
+        leviath_core::EntryKind::AssistantTurn { tool_calls: vec![] },
+        "partial: the rows are loaded, the merge is not written".to_string(),
+        9,
+    )
+    .unwrap();
+    let e = world
+        .spawn((
+            owing_bp(Some(2)),
+            StageCursor { index: 0 },
+            owing_state(),
+            conv,
+            ResolveTransition,
+            OutputReentries(leviath_core::blueprint::DEFAULT_OUTPUT_REENTRY_CAP),
+            crate::persistence::RunOutcomeFlags::default(),
+        ))
+        .id();
+    run_require_output(&mut world);
+    assert!(
+        world.get::<ResolveTransition>(e).is_some(),
+        "the run still finishes rather than hanging"
+    );
+    let output = world
+        .get::<crate::persistence::FinalOutput>(e)
+        .expect("the last turn is adopted as a partial output, not discarded");
+    assert_eq!(output.0.stage, "summary");
+    assert_eq!(
+        output.0.content,
+        "partial: the rows are loaded, the merge is not written"
+    );
+    assert_eq!(
+        world
+            .get::<crate::persistence::RunOutcomeFlags>(e)
+            .expect("flags")
+            .0
+            .output_forced,
+        0,
+        "an adopted output discharges the requirement; nothing was forced"
+    );
+}
+
+/// The two systems, end to end: a stage that spent its output budget and then
+/// reached the terminal arm used to come out `Error` with no output on disk.
+/// With the partial output adopted, the same run comes out `Complete` and hands
+/// the answer back - which is the whole point of the fix, and the reason the
+/// unit test above is not enough on its own.
+#[test]
+fn a_budget_exhausted_final_output_stage_completes_rather_than_erroring() {
+    let mut world = World::new();
+    let mut conv = conversation_window();
+    conv.add_typed_entry(
+        "conversation",
+        leviath_core::EntryKind::AssistantTurn { tool_calls: vec![] },
+        "partial answer, kept".to_string(),
+        4,
+    )
+    .unwrap();
+    let bp = owing_bp(None);
+    let e = world
+        .spawn((
+            bp,
+            StageCursor { index: 0 },
+            owing_state(),
+            StageProgress::default(),
+            StageInferences(vec![si("m")]),
+            setups(1),
+            conv,
+            VisitCounts::default(),
+            ResolveTransition,
+            OutputReentries(leviath_core::blueprint::DEFAULT_OUTPUT_REENTRY_CAP),
+        ))
+        .id();
+    // The two systems run in the order the pipeline schedules them.
+    let mut s = Schedule::default();
+    s.add_systems((require_final_output, resolve_transition).chain());
+    s.run(&mut world);
+    assert_eq!(
+        world.get::<AgentState>(e).unwrap().status,
+        AgentStatus::Complete,
+        "an adopted partial answer is a success, not a missing-output error"
+    );
+    let output = world
+        .get::<crate::persistence::FinalOutput>(e)
+        .expect("the partial answer is on the run");
+    assert_eq!(output.0.content, "partial answer, kept");
+}
+
+/// The other half of the same branch: when there is genuinely nothing to adopt,
+/// the run must still say the requirement went unmet rather than invent an
+/// empty answer.
+#[test]
+fn an_exhausted_budget_with_nothing_to_adopt_still_records_it_was_forced() {
+    let mut world = World::new();
+    let e = world
+        .spawn((
+            owing_bp(Some(2)),
+            StageCursor { index: 0 },
+            owing_state(),
+            conversation_window(),
+            ResolveTransition,
+            OutputReentries(leviath_core::blueprint::DEFAULT_OUTPUT_REENTRY_CAP),
+            crate::persistence::RunOutcomeFlags::default(),
+        ))
+        .id();
+    run_require_output(&mut world);
+    assert!(
+        world.get::<crate::persistence::FinalOutput>(e).is_none(),
+        "there was nothing to adopt"
+    );
+    assert_eq!(
+        world
+            .get::<crate::persistence::RunOutcomeFlags>(e)
+            .expect("flags")
+            .0
+            .output_forced,
+        1,
+        "an empty conversation leaves the flag as the only honest signal"
+    );
+}
+
 /// The flags are optional on the entity, and an agent without them still has to
 /// finish. Recording the outcome is a courtesy to whoever reads the run
 /// afterwards; it is not what keeps the run moving.

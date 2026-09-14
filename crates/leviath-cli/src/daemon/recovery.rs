@@ -279,7 +279,10 @@ fn mark_crashed(run_dir: &Path, meta: RunMeta, reason: &str, now_secs: i64) {
 /// This governs paging a run back in on demand. Startup recovery has its own
 /// filter in `triage_restores`, which still drops cancelled runs: somebody
 /// stopped that run on purpose, and restarting the daemon is not them changing
-/// their mind.
+/// their mind. That filter also drops runs annotated **superseded**
+/// (`metadata.superseded`, written by `sweep-superseded-paused-runs`): a later
+/// run already finished in their place, so paging them in would re-queue work
+/// nobody is waiting for.
 fn is_finished(status: &RunStatus) -> bool {
     matches!(status, RunStatus::Complete | RunStatus::Error)
 }
@@ -840,6 +843,63 @@ mod tests {
         let (run_id, entity) = &restored[0];
         assert_eq!(run_id, "run-paused");
         assert_eq!(world.agent_status(*entity), Some(AgentStatus::Paused));
+    }
+
+    /// A paused predecessor whose successor already finished is annotated
+    /// `metadata.superseded` by `sweep-superseded-paused-runs`. On restart it must
+    /// NOT be paged back in - while its unannotated twin still is, and the
+    /// annotated run's directory is left on disk (never deleted), so
+    /// `lev resume` can still reach it by hand.
+    #[tokio::test]
+    async fn reload_skips_a_superseded_run_but_keeps_its_dir() {
+        let agent = agent_dir();
+        let manifest = agent.path().join("agent.leviath");
+        let runs = tempfile::tempdir().unwrap();
+        write_run(
+            runs.path(),
+            "pred-superseded",
+            manifest.to_str().unwrap(),
+            RunStatus::Paused,
+            None,
+        );
+        write_run(
+            runs.path(),
+            "plain-paused",
+            manifest.to_str().unwrap(),
+            RunStatus::Paused,
+            None,
+        );
+        // Annotate the predecessor exactly as the sweep does: durably, in meta.json.
+        let meta_path = runs.path().join("pred-superseded").join("meta.json");
+        let mut meta: RunMeta =
+            serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+        meta.metadata
+            .insert("superseded".to_string(), "succ:complete".to_string());
+        std::fs::write(&meta_path, serde_json::to_string(&meta).unwrap()).unwrap();
+
+        let (mut world, cli) = test_world();
+        let hub = InteractionHub::new();
+        let mcp = Arc::new(Mutex::new(ToolExecutor::new()));
+        let restored = reload_persisted_agents(
+            &mut world,
+            crate::daemon::spawn::SpawnDeps {
+                tool_service: cli.as_ref(),
+                config: &Config::default(),
+                shared_mcp: mcp,
+                mcp_tool_defs: &[],
+                mcp_tool_owners: &Default::default(),
+                hub: &hub,
+                now_secs: 999,
+                subagent_tx: sub_tx().clone(),
+            },
+            runs.path(),
+        );
+
+        // Only the unannotated run came back.
+        let ids: Vec<&str> = restored.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["plain-paused"]);
+        // The superseded run was skipped, not deleted - `lev resume` can still reach it.
+        assert!(runs.path().join("pred-superseded").join("meta.json").exists());
     }
 
     /// Reload one run from `runs_dir` and hand back the world plus its entity.

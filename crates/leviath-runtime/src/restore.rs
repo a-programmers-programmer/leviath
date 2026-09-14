@@ -38,18 +38,29 @@ pub(crate) enum RestorePriority {
     Active,
 }
 
-/// Classify one persisted run for restart recovery from its on-disk status and
-/// whether it is parked mid fan-out (a `<run_dir>/fanout.json` is present).
+/// Classify one persisted run for restart recovery from its on-disk status,
+/// whether it is parked mid fan-out (a `<run_dir>/fanout.json` is present), and
+/// whether it carries the **superseded** annotation
+/// ([`RunMeta::is_superseded`], written by `sweep-superseded-paused-runs`).
 ///
 /// Returns `None` for a **terminal** run (`Complete` / `Error` / `Cancelled`) -
-/// those are never resumed. A run parked on a fan-out is [`Blocked`] regardless of
-/// its status: it can't progress until its children finish.
+/// those are never resumed - and for a **superseded** run: a later run already
+/// took over and finished, so paging the predecessor back in on every restart
+/// only re-queues work nobody is waiting for. The run dir is left intact (never
+/// deleted): only the reload is skipped, so `lev resume <id>` still reaches it.
+///
+/// A run parked on a fan-out is [`Blocked`] regardless of its status: it can't
+/// progress until its children finish.
 ///
 /// [`Blocked`]: RestorePriority::Blocked
 pub(crate) fn classify_restore(
     status: &RunStatus,
     parked_on_fanout: bool,
+    superseded: bool,
 ) -> Option<RestorePriority> {
+    if superseded {
+        return None;
+    }
     match status {
         RunStatus::Complete | RunStatus::Error | RunStatus::Cancelled => None,
         _ if parked_on_fanout => Some(RestorePriority::Blocked),
@@ -61,7 +72,9 @@ pub(crate) fn classify_restore(
 }
 
 /// Triage a set of persisted runs into the order they should be restored on
-/// restart: drop terminal runs, then rank the rest **actionable-first**
+/// restart: drop terminal runs, drop runs annotated **superseded**
+/// ([`RunMeta::is_superseded`], `metadata.superseded` written by
+/// `sweep-superseded-paused-runs`), then rank the rest **actionable-first**
 /// (`RestorePriority::Active` before `Blocked`), breaking ties by most-recently
 /// updated. Each input is `(meta, parked_on_fanout)` where `parked_on_fanout` is
 /// whether the run has a `fanout.json` (see `classify_restore`); the returned
@@ -75,7 +88,12 @@ pub fn triage_restores(candidates: Vec<(RunMeta, bool)>) -> Vec<RunMeta> {
     let mut ranked: Vec<(RestorePriority, RunMeta)> = candidates
         .into_iter()
         .filter_map(|(meta, parked)| {
-            classify_restore(&meta.status, parked).map(|prio| (prio, meta))
+            // A superseded predecessor (a later run already finished in its place)
+            // is never paged back in. The annotation lives in meta.json, so this
+            // holds across restarts; the run dir is untouched and `lev resume`
+            // still works by hand.
+            let superseded = meta.is_superseded();
+            classify_restore(&meta.status, parked, superseded).map(|prio| (prio, meta))
         })
         .collect();
     // Higher priority first; within a tier, most-recently updated first. `sort_by`
@@ -1049,38 +1067,73 @@ mod tests {
     #[test]
     fn classify_restore_skips_terminal_and_ranks_the_rest() {
         // Terminal → skipped.
-        assert_eq!(classify_restore(&RunStatus::Complete, false), None);
-        assert_eq!(classify_restore(&RunStatus::Error, false), None);
-        assert_eq!(classify_restore(&RunStatus::Cancelled, false), None);
+        assert_eq!(classify_restore(&RunStatus::Complete, false, false), None);
+        assert_eq!(classify_restore(&RunStatus::Error, false, false), None);
+        assert_eq!(classify_restore(&RunStatus::Cancelled, false, false), None);
         // Actionable → Active.
         assert_eq!(
-            classify_restore(&RunStatus::Running, false),
+            classify_restore(&RunStatus::Running, false, false),
             Some(RestorePriority::Active)
         );
         assert_eq!(
-            classify_restore(&RunStatus::Starting, false),
+            classify_restore(&RunStatus::Starting, false, false),
             Some(RestorePriority::Active)
         );
         // No immediate progress → Blocked.
         assert_eq!(
-            classify_restore(&RunStatus::WaitingInput, false),
+            classify_restore(&RunStatus::WaitingInput, false, false),
             Some(RestorePriority::Blocked)
         );
         assert_eq!(
-            classify_restore(&RunStatus::Paused, false),
+            classify_restore(&RunStatus::Paused, false, false),
             Some(RestorePriority::Blocked)
         );
         assert_eq!(
-            classify_restore(&RunStatus::CompleteInteractive, false),
+            classify_restore(&RunStatus::CompleteInteractive, false, false),
             Some(RestorePriority::Blocked)
         );
         // Parked mid fan-out is Blocked even when otherwise Running.
         assert_eq!(
-            classify_restore(&RunStatus::Running, true),
+            classify_restore(&RunStatus::Running, true, false),
             Some(RestorePriority::Blocked)
         );
         // A terminal run parked on a fan-out is still skipped.
-        assert_eq!(classify_restore(&RunStatus::Complete, true), None);
+        assert_eq!(classify_restore(&RunStatus::Complete, true, false), None);
+        // Superseded beats everything: even a Running run is skipped, because a
+        // later run already finished in its place.
+        assert_eq!(classify_restore(&RunStatus::Running, false, true), None);
+        assert_eq!(classify_restore(&RunStatus::Paused, false, true), None);
+        assert_eq!(classify_restore(&RunStatus::Running, true, true), None);
+    }
+
+    /// A paused predecessor annotated `metadata.superseded` by the sweep is
+    /// dropped from triage, while its unannotated twin is still restored. This is
+    /// the read side of the annotation the sweep writes - without it the
+    /// predecessor pages back in on every restart.
+    #[test]
+    fn triage_drops_a_superseded_predecessor_but_keeps_its_twin() {
+        let mut superseded = meta_with("pred-superseded", RunStatus::Paused, 500);
+        superseded
+            .metadata
+            .insert("superseded".to_string(), "succ:complete".to_string());
+        assert!(superseded.is_superseded());
+        assert_eq!(superseded.superseded_by(), Some(("succ", "complete")));
+
+        let plain = meta_with("plain-paused", RunStatus::Paused, 400);
+        assert!(!plain.is_superseded());
+        assert_eq!(plain.superseded_by(), None);
+
+        let order: Vec<String> = triage_restores(vec![(superseded, false), (plain, false)])
+            .into_iter()
+            .map(|m| m.run_id)
+            .collect();
+        assert_eq!(order, vec!["plain-paused".to_string()]);
+
+        // An empty value is not an annotation: a hand-cleared key must not silently
+        // suppress recovery.
+        let mut cleared = meta_with("cleared", RunStatus::Paused, 300);
+        cleared.metadata.insert("superseded".to_string(), "  ".to_string());
+        assert!(!cleared.is_superseded());
     }
 
     #[test]
