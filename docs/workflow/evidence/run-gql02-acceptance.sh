@@ -39,7 +39,10 @@ step 4 "contract pin + both adapters bound end-to-end + no ping-pong"
 PYTHONPATH=python python3 -m leviath_reconcile pin-check --json; echo "exit=$?"
 
 step 5 "pinned acceptance tests (GQL-02b)"
-PYTHONPATH=python python3 -m pytest python/leviath_reconcile/test_pin.py -q; echo "exit=$?"
+# pytest -q ends with a wall-clock tail. Strip it so the recorded transcript repeats.
+PYTHONPATH=python python3 -m pytest python/leviath_reconcile/test_pin.py -q 2>&1 \
+  | sed -E 's/ in [0-9]+\.[0-9]+s$//'
+echo "exit=${PIPESTATUS[0]}"
 
 step 6 "gate discrimination: a drifted contract must FAIL loudly"
 check "verify-contract with wrong pin" 1 \

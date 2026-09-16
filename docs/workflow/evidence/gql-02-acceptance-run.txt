@@ -1,6 +1,6 @@
 == GQL-02 acceptance: shared reconciliation rules and conflict detection
 == repo: /data/work/graphql-realization/gql-02/repo
-== HEAD: 5ed2ba6c69ee4b55d5a8dbbfb25fbf27b4a6b649
+== HEAD: 7b6e050e89e6aea7b51453e633fbe9209c50a844
 == base: 15dc182e0bc6c28dfa93f4b8dd3c423372808f61
 == python: Python 3.12.14  graphql-core: 3.2.5
 
@@ -98,7 +98,7 @@ exit=0
 
 === [5] pinned acceptance tests (GQL-02b)
 .............                                                            [100%]
-13 passed in 2.83s
+13 passed
 exit=0
 
 === [6] gate discrimination: a drifted contract must FAIL loudly
@@ -144,7 +144,7 @@ ea1965f49ff83b85812a2a691058aeb235713c0935c3a7856cce6b4901b56fbe     8550  tools
  tools/generate_code_counterpart.py                 | 231 ++++++
  19 files changed, 6096 insertions(+)
 informational, grows with each evidence commit:
- 23 files changed, 6561 insertions(+)
+ 23 files changed, 6572 insertions(+)
 informational, worktree contract files vs base (GQL-01, uncommitted):
  2 files changed, 249 insertions(+), 27 deletions(-)
 

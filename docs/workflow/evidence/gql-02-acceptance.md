@@ -16,17 +16,18 @@ re-runs the whole acceptance surface once.
 | GQL-02c | this acceptance packet + verifier script + local commit | PASS |
 
 The acceptance run below was executed at the run-time HEAD
-`5ed2ba6c69ee4b55d5a8dbbfb25fbf27b4a6b649`
-(`GQL-02c: correct acceptance diff readings and make step 8 reproducible`), on
-top of `67e16649` (transcript + first diff-stat correction), on top of
-`e48f48d0` (`GQL-02: shared reconciliation rules and conflict detection`), on
-top of base `15dc182e0bc6c28dfa93f4b8dd3c423372808f61`.
+`7b6e050e89e6aea7b51453e633fbe9209c50a844`
+(`GQL-02c: commit corrected acceptance packet`), on top of `5ed2ba6c`
+(correct acceptance diff readings, reproducible step 8), on top of `67e16649`
+(transcript + first diff-stat correction), on top of `e48f48d0`
+(`GQL-02: shared reconciliation rules and conflict detection`), on top of base
+`15dc182e0bc6c28dfa93f4b8dd3c423372808f61`.
 
-Rule for the self-reference: a file cannot contain the hash of the commit that
-adds it. So the transcript's `== HEAD:` line is the run-time HEAD, which is the
-parent of the commit that adds the transcript. Step 8 diffs commits only
-(`$BASE HEAD`), so its numbers do not depend on the working tree and repeat
-exactly on every re-run.
+Both evidence files are now byte-identical on re-run: `run-gql02-acceptance.sh`
+is deterministic, and the transcript it writes is stable. The only line that can
+differ between two runs is the `== HEAD:` line, and it differs only when HEAD
+moves. The wall-clock tail of `pytest -q` is stripped by the script so it cannot
+drift. Verified: two consecutive runs `diff` exit 0.
 
 ## 2. Contract identity (pin before dependent implementation, re-verified at acceptance)
 
@@ -61,11 +62,13 @@ acceptance number; it does not change when the evidence files change.
 
 The readings at `67e16649` reconcile exactly:
 `E + I = 6096 + 410 = 6506 = C`, and `C + .gql02-base(1) = 6507 = D`.
+That identity holds at every commit, because `E` and `.gql02-base` never change.
 
-Readings C, D and I grow with each evidence commit; at the current HEAD
-`5ed2ba6c` they are C = 6560, D = 6561, I = 464. Reading E is unchanged at
-6096. That is why step 8 prints E as the acceptance number and the other two
-as informational only.
+Readings C, D and I grow with each evidence commit; reading E is fixed at 6096.
+That is why step 8 prints E as the acceptance number, and prints C, D, I only as
+"informational". Do not read a fixed value for C, D or I off this packet: read
+them from the fresh step 8 output. Any number quoted here for them would go stale
+at the next evidence commit — that is the whole reason step 8 is scoped to E.
 
 Reading A is the GQL-01 contract repair (`docs/workflow/schema-workflow.graphql`,
 `docs/workflow/workflow-schema-decisions.md`). It is **not** GQL-02's and it is
@@ -169,15 +172,26 @@ fbda5372c826d1a0ba651b9bbbe6c0088170468f5da12f3b9ce02c85119e6fb1    21158  pytho
 ea1965f49ff83b85812a2a691058aeb235713c0935c3a7856cce6b4901b56fbe     8550  tools/generate_code_counterpart.py
 ```
 
-Evidence files (hashes frozen before commit; these are the blobs the local
-commit adds — the packet cannot contain its own hash, so it is excluded):
+Evidence files. Each pair is the blob at the named commit, read with
+`git show <commit>:<path>`, so the pair and the commit always agree. The packet
+cannot contain the hash of the commit that adds it, so the packet itself is
+excluded.
+
+At `7b6e050e` (this commit — the blobs the local commit adds):
 
 ```
 e5097265b1d2cc413eec9b40f76e5315ea287f94c08c256d9d0c289a24d822d7     4101  docs/workflow/evidence/run-gql02-acceptance.sh
-8cfe9ebf3f42c035167480200ec8d37649db2f8d523cf0a6f0e40b283b779b0b     8485  docs/workflow/evidence/gql-02-acceptance-run.txt
+d49529634b69b3537b4f7b95d45e24f38dc67ae5a752468475f54ef81ba7e46e     8485  docs/workflow/evidence/gql-02-acceptance-run.txt
 ```
 
-Superseded at `67e16649` (earlier revision of the same two files):
+At `5ed2ba6c` (first reproducible step 8; the transcript was then re-cut):
+
+```
+e5097265b1d2cc413eec9b40f76e5315ea287f94c08c256d9d0c289a24d822d7     4101  run-gql02-acceptance.sh
+8cfe9ebf3f42c035167480200ec8d37649db2f8d523cf0a6f0e40b283b779b0b     8485  gql-02-acceptance-run.txt
+```
+
+At `67e16649` (first evidence correction; both files superseded since):
 
 ```
 b31f6dd23fdd10bae20d8d6007816ddb0030b9a775ac79bdb708cc3dd7e3aefd     3507  run-gql02-acceptance.sh
