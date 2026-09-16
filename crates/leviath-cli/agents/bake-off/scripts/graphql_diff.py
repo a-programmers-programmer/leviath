@@ -460,20 +460,6 @@ def _normalize_field(field_text: str) -> str:
     return ' '.join(clean_lines)
 
 
-# ── merge engine ─────────────────────────────────────────────────────────
-
-@dataclass
-class MergeDecision:
-    """A decision for one divergent type."""
-    type_name: str
-    action: str  # 'keep_a', 'keep_b', 'reconcile'
-    reason: str = ""
-    # For 'reconcile': which fields to include
-    include_fields: list[str] = field(default_factory=list)
-    # For 'reconcile': custom body text (if the lane writes a merged definition)
-    custom_body: Optional[str] = None
-
-
 # ══════════════════════════════════════════════════════════════════════════
 # AST-BASED MERGE — the replacement for the broken string-pasting approach.
 # ══════════════════════════════════════════════════════════════════════════
@@ -482,25 +468,10 @@ class MergeDecision:
 _SCHEMA_SENTINEL = object()
 
 
-def _ast_name_map(doc: DocumentNode) -> dict:
-    """Build {name_or_sentinel -> definition} from a parsed DocumentNode.
-
-    Names are strings (from ``def.name.value``).  The ``schema`` definition
-    (if any) is stored under ``_SCHEMA_SENTINEL`` because it has no name.
-    """
-    m = {}
-    for d in doc.definitions:
-        if hasattr(d, 'name') and d.name and d.name.value:
-            m[d.name.value] = d
-        elif d.kind == 'schema_definition':
-            m[_SCHEMA_SENTINEL] = d
-    return m
-
-
 class _RenameVisitor(_GqlVisitor):
     """Visitor that rewrites NamedType references."""
 
-    def __init__(self, renames: dict[str, str]):
+    def __init__(self, renames: dict):
         super().__init__()
         self.renames = renames
 
@@ -510,7 +481,7 @@ class _RenameVisitor(_GqlVisitor):
         return None
 
 
-def _apply_renames_ast(doc: DocumentNode, renames: dict[str, str]) -> DocumentNode:
+def _apply_renames_ast(doc: DocumentNode, renames: dict) -> DocumentNode:
     """Return a new DocumentNode with all named-type references rewritten."""
     if not renames:
         return doc
@@ -524,335 +495,255 @@ def _definition_name(d):
     return None
 
 
+# ── merge engine ─────────────────────────────────────────────────────────
+
+@dataclass
+class MergeDecision:
+    """A structured decision for ONE divergent type.
+
+    `sources` maps every decided key of the merged type - field names, enum
+    values or union members, depending on the type's kind - to the candidate it
+    comes from: ``'a'`` or ``'b'``. `implements` does the same for interface
+    names. Both maps are total over the permitted key set; totality and every
+    other rule live in :mod:`merge_decisions`, which is the only authority on
+    what a legal decision is.
+
+    There is deliberately no way to express a decision in prose here. The
+    pre-GQL-09 engine guessed a base side and a field set out of the English in
+    `reason` ("adopt B's fields", "restore X from A"); that produced merges no
+    reviewer could reproduce from the decision record.
+    """
+
+    type_name: str
+    action: str                                    # keep_a | keep_b | reconcile
+    reason: str = ""
+    sources: dict = field(default_factory=dict)
+    implements: dict = field(default_factory=dict)
+
+
+#: AST definition kind -> the attribute holding the keys a decision chooses
+#: between. graphql-core names these `object_type_definition`, etc.
+_AST_GROUP_ATTR = {
+    'object_type_definition': 'fields',
+    'interface_type_definition': 'fields',
+    'input_object_type_definition': 'fields',
+    'enum_type_definition': 'values',
+    'union_type_definition': 'types',
+}
+
+
+def group_keys(td: TypeDef) -> list[str]:
+    """The decided key names of a *regex-parsed* TypeDef (diff-side view)."""
+    if td.kind in ('type', 'interface', 'input'):
+        return list(td.fields.keys())
+    if td.kind == 'enum':
+        return list(td.enum_values)
+    if td.kind == 'union':
+        return list(td.union_members)
+    return []
+
+
+def _norm_body(text: str) -> str:
+    """Whitespace/comment-insensitive body text, for structural rename proposals."""
+    lines = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith('#'):
+            continue
+        lines.append(stripped)
+    return ' '.join(lines)
+
+
+def propose_renames(diff: 'SchemaDiff') -> list[tuple[str, str]]:
+    """Propose (only-A name -> only-B name) pairs **structurally**.
+
+    A pair is proposed when the two definitions have the same kind and the same
+    normalized body, so the only difference is the name. This replaces the
+    hard-coded domain guess list the pre-GQL-09 driver carried
+    ("ResourceKind -> ProposalResource" and friends): a rename is now a checked
+    structural fact, and a proposed pair still needs an explicit decision.
+    """
+    proposals = []
+    for a_name in diff.only_a:
+        a_def = diff.a_types[a_name]
+        if a_def.kind in ('scalar', 'schema', 'directive'):
+            continue
+        a_body = _norm_body(a_def.body.replace(a_name, '@NAME@'))
+        for b_name in diff.only_b:
+            b_def = diff.b_types[b_name]
+            if a_def.kind != b_def.kind:
+                continue
+            b_body = _norm_body(b_def.body.replace(b_name, '@NAME@'))
+            if a_body == b_body:
+                proposals.append((a_name, b_name))
+    return sorted(proposals)
+
+
+def _ast_keys(node, attr: str) -> list[str]:
+    out = []
+    for item in getattr(node, attr, None) or ():
+        name = getattr(getattr(item, 'name', None), 'value', None)
+        if name and name not in out:
+            out.append(name)
+    return out
+
+
+def _ast_key_order(attr: str, a_def, b_def) -> list[str]:
+    """A's order first, then B-only keys in B's order - the deterministic merge order."""
+    keys = _ast_keys(a_def, attr)
+    keys += [k for k in _ast_keys(b_def, attr) if k not in keys]
+    return keys
+
+
+def _reconcile_definition(a_def, b_def, decision: MergeDecision):
+    """Build the reconciled AST node for one type from the decision's sources.
+
+    Deterministic by construction: the key order is A-then-B-extra, and each key
+    is taken from exactly the side the decision names. Nothing is inferred.
+    """
+    if b_def is None:
+        return a_def
+    attr = _AST_GROUP_ATTR.get(a_def.kind)
+    base = copy.deepcopy(a_def)
+    if attr is None:                     # scalar / schema: nothing keyed to merge
+        return base
+
+    a_nodes = {k: n for k, n in zip(_ast_keys(a_def, attr),
+                                    getattr(a_def, attr) or ())}
+    b_nodes = {k: n for k, n in zip(_ast_keys(b_def, attr),
+                                    getattr(b_def, attr) or ())}
+    merged = []
+    for key in _ast_key_order(attr, a_def, b_def):
+        source = decision.sources.get(key)
+        if source == 'a' and key in a_nodes:
+            merged.append(copy.deepcopy(a_nodes[key]))
+        elif source == 'b' and key in b_nodes:
+            merged.append(copy.deepcopy(b_nodes[key]))
+        else:
+            raise ValueError(
+                f"reconcile decision for {decision.type_name!r} names source "
+                f"{source!r} for {key!r}, which is not available on that side"
+            )
+    setattr(base, attr, tuple(merged))
+
+    if attr == 'fields' and hasattr(base, 'interfaces'):
+        a_ifaces = list(getattr(a_def, 'interfaces', None) or ())
+        b_ifaces = list(getattr(b_def, 'interfaces', None) or ())
+        by_name = {}
+        for node in b_ifaces + a_ifaces:                 # A wins the same name
+            by_name[node.name.value] = node
+        kept = []
+        for name in [n.name.value for n in a_ifaces] + \
+                    [n.name.value for n in b_ifaces if n.name.value not in
+                     {i.name.value for i in a_ifaces}]:
+            source = decision.implements.get(name)
+            if source in ('a', 'b'):
+                kept.append(copy.deepcopy(by_name[name]))
+            else:
+                raise ValueError(
+                    f"reconcile decision for {decision.type_name!r} has no source "
+                    f"for interface {name!r}"
+                )
+        base.interfaces = tuple(kept)
+    return base
+
+
 def apply_merge(
     seed_a_text: str,
     seed_b_text: str,
-    decisions: list[MergeDecision],
-    renames: Optional[dict[str, str]] = None,
-    detected_renames: Optional[dict[str, str]] = None,
+    decisions: list,
+    renames: Optional[dict] = None,
 ) -> str:
-    """Apply merge decisions to produce a reconciled schema (AST-based).
+    """Apply validated decisions to produce a reconciled schema (AST-based).
 
-    The output is *always* valid SDL because it is produced by
-    :func:`graphql.language.print_ast` from a properly-constructed
-    :class:`graphql.language.ast.DocumentNode`.  No string concatenation,
-    no orphaned prose, no duplicate definitions.
+    The output is always valid SDL because it is produced by
+    :func:`graphql.language.print_ast` from a properly-constructed document. No
+    string concatenation, no orphaned prose, no duplicate definitions.
+
+    This function trusts its input: the decisions must already have passed
+    :func:`merge_decisions.validate`. Callers that hold a decision *document*
+    should call :func:`merge_decisions.merge` instead, which validates first.
 
     Parameters
     ----------
-    seed_a_text: Schema A text (base).
-    seed_b_text: Schema B text.
-    decisions:   List of :class:`MergeDecision` for divergent types.
-    renames:     ``{old_name: new_name}`` for explicit renames.
-    detected_renames:
-        Auto-detected same-concept renames.  Merged into *renames*
-        automatically (new name wins).
-
-    Returns
-    -------
-    str
-        Merged schema SDL.
+    seed_a_text / seed_b_text: the two candidates.
+    decisions: the validated decisions for the divergent types.
+    renames:   ``{old_name: new_name}`` for the renames decided as renames.
     """
-    # --- 1. Parse both schemas into ASTs ------------------------------------
     doc_a = _gql_parse(seed_a_text)
     doc_b = _gql_parse(seed_b_text)
 
     # --- 2. Name-indexed maps -----------------------------------------------
     a_by_name: dict = {}
     for d in doc_a.definitions:
-        nm = _definition_name(d)
-        key = nm if nm is not None else _SCHEMA_SENTINEL
-        a_by_name[key] = d
-
+        a_by_name[_definition_name(d) or _SCHEMA_SENTINEL] = d
     b_by_name: dict = {}
     for d in doc_b.definitions:
-        nm = _definition_name(d)
-        key = nm if nm is not None else _SCHEMA_SENTINEL
-        b_by_name[key] = d
+        b_by_name[_definition_name(d) or _SCHEMA_SENTINEL] = d
 
-    a_names = {k for k in a_by_name if k is not _SCHEMA_SENTINEL}
-    b_names = {k for k in b_by_name if k is not _SCHEMA_SENTINEL}
-
-    # --- 3. Collapse renames -----------------------------------------------
-    all_renames = dict(detected_renames or {})
-    all_renames.update(renames or {})
-
-    # Build decision map
+    all_renames = dict(renames or {})
     decision_map = {d.type_name: d for d in decisions}
 
     # --- 4. Assemble the merged definition list ----------------------------
-    # We iterate through doc_a.definitions in original order.  For each
-    # definition we decide whether to keep A's version, replace with B's
-    # version, reconcile the two, or (for renamed types) drop it entirely
-    # so the B-named version can be appended later.
-    #
-    # After processing A's list, we append:
-    #   - B-only definitions (names in B but not in A, modulo renames)
-    #   - Renamed-to definitions (the B version of a renamed type)
-
     merged_defs: list = []
-    emitted: set = set()   # names already emitted (to prevent duplicates)
-    renamed_from_a: set = set(all_renames.keys())  # A-names to skip
+    emitted: set = set()
+    renamed_from_a: set = set(all_renames.keys())
 
     for d in doc_a.definitions:
         name = _definition_name(d)
         key = name if name is not None else _SCHEMA_SENTINEL
 
         if name is not None and name in renamed_from_a:
-            # Skip — this type is being renamed; B's version is appended later.
+            # Being renamed: B's definition is appended in step 6.
             continue
 
         if name is not None and name in decision_map:
             dec = decision_map[name]
-            if dec.action == 'keep_b':
-                if key in b_by_name:
-                    d = copy.deepcopy(b_by_name[key])
-                # fall through to emit
+            if dec.action == 'keep_b' and key in b_by_name:
+                d = copy.deepcopy(b_by_name[key])
             elif dec.action == 'reconcile':
-                d = _reconcile_definition_ast(
-                    d, b_by_name.get(key), dec
-                )
-                # fall through to emit
-            # else: keep_a — keep d as-is
+                d = _reconcile_definition(d, b_by_name.get(key), dec)
 
-        # Mark emitted
-        if name is not None:
-            emitted.add(name)
-        if key is _SCHEMA_SENTINEL:
-            emitted.add(_SCHEMA_SENTINEL)
-
+        emitted.add(key)
         merged_defs.append(copy.deepcopy(d))
 
-    # --- 5. Append B-only definitions (not in A, not rename targets) -----
+    # --- 5. Append B-only definitions (not in A, not rename targets) ------
     rename_targets = set(all_renames.values())
     for d in doc_b.definitions:
         name = _definition_name(d)
         key = name if name is not None else _SCHEMA_SENTINEL
-
         if key in emitted:
             continue
         if name is not None and name in rename_targets:
-            # This is a renamed-to type — will be handled next.
             continue
         emitted.add(key)
         merged_defs.append(copy.deepcopy(d))
 
     # --- 6. Emit B versions of renamed types -------------------------------
-    for old_name, new_name in all_renames.items():
+    for old_name, new_name in sorted(all_renames.items()):
         if new_name in b_by_name and new_name not in emitted:
             emitted.add(new_name)
             merged_defs.append(copy.deepcopy(b_by_name[new_name]))
 
     # --- 7. Build the final document and serialize -------------------------
     merged_doc = DocumentNode(definitions=tuple(merged_defs))
-
-    # Apply renames across the whole AST (rewrite NamedType references)
     merged_doc = _apply_renames_ast(merged_doc, all_renames)
-
     return _gql_print_ast(merged_doc)
 
 
+# ── compatibility route ──────────────────────────────────────────────────
 
-def _reconcile_definition_ast(
-    a_def,
-    b_def,
-    decision: MergeDecision,
-):
-    """Build a reconciled AST definition node by parsing decision language.
+def parse_decisions(text: str, a_text: Optional[str] = None,
+                    b_text: Optional[str] = None):
+    """Deprecated shim. Structured v1 JSON only; prose is rejected.
 
-    Decision language conventions understood:
-    - "adopt B's fields" / "B's evolved" → start from B, add A pieces
-    - "restore X from A" → add A's field X to the chosen base
-    - "implements Node (from A)" → use A's interfaces
-    - "implements CommandProblem" → explicit interface change
-    - "keep A's implements Node" → keep A's interface list
-    - Otherwise: A is base, pull individual include_fields from B.
-
-    Returns a (possibly new) AST node — the original is never mutated.
+    Kept so an existing caller importing this name gets a *clear* rejection
+    instead of a silently wrong merge. New code should use
+    :mod:`merge_decisions` directly.
     """
-    if b_def is None:
-        return a_def
+    from merge_decisions import parse_decisions as _parse
 
-    reason = (decision.reason or '')
-    include_items = decision.include_fields or ()
-
-    # Also consult include_items for hints like "adopt B's fields"
-    include_text = ' '.join(include_items) if include_items else ''
-    combined_lower = (reason + ' ' + include_text).lower()
-
-    # ── Determine base side ──────────────────────────────────────────────
-    base_is_b = False
-    reason_lower = combined_lower
-    if 'adopt b' in reason_lower or "b's fields" in reason_lower or "b's evolved" in reason_lower:
-        base_is_b = True
-    if ('restore' in reason_lower and 'from a' in reason_lower) or \
-       ('restore' in reason_lower and 'from A' in reason):
-        base_is_b = True
-
-    base = copy.deepcopy(b_def if base_is_b else a_def)
-    other = a_def if base_is_b else b_def
-
-    # ── Parse interface hints ────────────────────────────────────────────
-    a_iface_names = {i.name.value for i in a_def.interfaces} if hasattr(a_def, 'interfaces') and a_def.interfaces else set()
-    b_iface_names = {i.name.value for i in b_def.interfaces} if hasattr(b_def, 'interfaces') and b_def.interfaces else set()
-
-    # Extract explicit "implements <Name>" from reason
-    impl_matches = re.findall(r'implement\w*\s+([A-Z]\w*)', reason + ' ' + include_text)
-    explicit_ifaces = set(impl_matches)
-
-    final_ifaces = None  # None = don't touch
-
-    if explicit_ifaces:
-        # "implements CommandProblem" or "implements Node"
-        final_ifaces = explicit_ifaces
-    elif 'keep a' in reason_lower and 'implements' in reason_lower:
-        final_ifaces = a_iface_names
-    elif base_is_b and a_iface_names - b_iface_names:
-        # B is base but A had interfaces B dropped — restore A's extras
-        # if reason mentions "Node" or "implements"
-        if 'node' in reason_lower or 'implements' in reason_lower:
-            final_ifaces = b_iface_names | a_iface_names
-    else:
-        # Default: keep base's interfaces
-        final_ifaces = set(getattr(base, 'interfaces', ()) and {i.name.value for i in base.interfaces} or ())
-
-    if final_ifaces is not None and hasattr(base, 'interfaces'):
-        new_ifaces = []
-        for iface_name in final_ifaces:
-            found = None
-            for src in (a_def, b_def):
-                if hasattr(src, 'interfaces') and src.interfaces:
-                    for i in src.interfaces:
-                        if i.name.value == iface_name:
-                            found = i
-                            break
-                if found:
-                    break
-            if found:
-                new_ifaces.append(found)
-            else:
-                new_ifaces.append(NamedTypeNode(name=NameNode(value=iface_name)))
-        base.interfaces = tuple(new_ifaces)
-
-    # ── Handle fields ────────────────────────────────────────────────────
-    if hasattr(base, 'fields'):
-        a_field_map = {f.name.value: f for f in a_def.fields} if hasattr(a_def, 'fields') else {}
-        b_field_map = {f.name.value: f for f in b_def.fields} if hasattr(b_def, 'fields') else {}
-        base_field_names = {f.name.value for f in base.fields}
-
-        fields_to_add = set()
-
-        # Parse include_fields for actual field names
-        for item in include_items:
-            clean = re.sub(r'\(.*', '', item).strip()  # strip parentheticals
-            clean = re.sub(r'\s+plus\s+.*', '', clean, flags=re.IGNORECASE).strip()
-            clean = re.sub(r';.*', '', clean).strip()
-            clean = re.sub(r'^adopt\s+', '', clean, flags=re.IGNORECASE).strip()
-            if not clean:
-                continue
-            # Skip prose / interface names
-            if clean[0].isupper() and clean not in a_field_map and clean not in b_field_map:
-                continue  # likely an interface name or prose
-            if clean.startswith('implements'):
-                continue
-            # Check if it's a valid field name from either side
-            if clean in a_field_map or clean in b_field_map:
-                if clean not in base_field_names:
-                    fields_to_add.add(clean)
-
-        # "restore X from A"
-        restore_matches = re.findall(r'restore\w*\s+(\w+)\s+from\s+A', reason, re.IGNORECASE)
-        for fname in restore_matches:
-            if fname in a_field_map and fname not in base_field_names:
-                fields_to_add.add(fname)
-
-        # If base_is_b and A has extra fields mentioned in reason, add them
-        if base_is_b:
-            a_extra = set(a_field_map) - set(b_field_map)
-            for fname in a_extra:
-                if fname.lower() in reason_lower:
-                    fields_to_add.add(fname)
-
-        new_fields = list(base.fields)
-        added = set(base_field_names)
-        for fname in fields_to_add:
-            if fname not in added:
-                src = a_field_map.get(fname) or b_field_map.get(fname)
-                if src:
-                    new_fields.append(copy.deepcopy(src))
-                    added.add(fname)
-        base.fields = tuple(new_fields)
-
-    return base
-
-
-# ── decision parsing ─────────────────────────────────────────────────────
-
-def parse_decisions(text: str) -> tuple[list[MergeDecision], dict[str, str]]:
-    """
-    Parse merge decisions from a lane's output text.
-
-    Expected format (one per line or block):
-      TYPE <name>: keep_a | keep_b | reconcile
-      REASON: <text>
-      FIELDS: <comma-separated list>  (for reconcile)
-      RENAME <old> -> <new>: keep_a | keep_b
-      REASON: <text>
-
-    Returns (decisions, renames) where renames is {old_name: new_name} for keep_b renames.
-    """
-    decisions = []
-    renames = {}
-    current = None
-    current_rename_old = None
-    current_rename_new = None
-    current_rename_action = None
-
-    for line in text.split('\n'):
-        line = line.strip()
-        if not line or line.startswith('#'):
-            continue
-
-        # Check for RENAME line first
-        rename_match = re.match(r'RENAME\s+(\S+)\s*->\s*(\S+)\s*:\s*(keep_a|keep_b)', line, re.IGNORECASE)
-        if rename_match:
-            # Save any pending TYPE decision
-            if current:
-                decisions.append(current)
-                current = None
-            old_name = rename_match.group(1)
-            new_name = rename_match.group(2)
-            action = rename_match.group(3).lower()
-            if action == 'keep_b':
-                renames[old_name] = new_name
-            continue
-
-        type_match = re.match(r'TYPE\s+(\S+)\s*:\s*(keep_a|keep_b|reconcile)', line, re.IGNORECASE)
-        if type_match:
-            if current:
-                decisions.append(current)
-            current = MergeDecision(
-                type_name=type_match.group(1),
-                action=type_match.group(2).lower(),
-            )
-            continue
-
-        if current:
-            reason_match = re.match(r'REASON\s*:\s*(.*)', line, re.IGNORECASE)
-            if reason_match:
-                current.reason = reason_match.group(1)
-                continue
-
-            fields_match = re.match(r'FIELDS\s*:\s*(.*)', line, re.IGNORECASE)
-            if fields_match:
-                current.include_fields = [f.strip() for f in fields_match.group(1).split(',') if f.strip()]
-                continue
-
-    if current:
-        decisions.append(current)
-
-    return decisions, renames
-
+    return _parse(text, a_text, b_text)
 
 # ── test helpers ─────────────────────────────────────────────────────────
 
@@ -1028,7 +919,11 @@ def test_parse_decisions():
 def test_real_candidates():
     """Test diff on the actual v0_L0L0 and v0_L0L1 candidate schemas."""
     import os
-    bo = '/data/work/leviath/study/bakeoff'
+    import sys
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import harnessql_paths
+    bo = harnessql_paths.legacy_study() or harnessql_paths.agent_dir() / "study"
+    bo = os.path.join(str(bo), 'bakeoff')
     a_path = os.path.join(bo, 'v0_L0L0.graphql')
     b_path = os.path.join(bo, 'v0_L0L1.graphql')
 

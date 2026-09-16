@@ -1,22 +1,19 @@
 [agent]
 name = "bake-merge"
-version = "0.1.0"
-description = "HarnessQL merge-level decision lane: given a COMPACT schema diff, emit per-type merge decisions. No full-schema production."
+version = "0.2.0"
+description = "HarnessQL merge-level decision lane: given a COMPACT schema diff, emit a harnessql-merge-decisions/v1 JSON document. No candidate read, no full-schema write."
 entry_stage = "decide"
 
 [read_paths]
-# Updated when the bakeoff was folded into the repo (2026-09-11). bake-merge reads
-# only the COMPACT DIFF handed to it in the task, not the candidate files, so these
-# entries exist for the run output path. The original scratch location is kept so an
-# existing checkout keeps working unchanged.
-allow = ["~/", "/data/.leviath/agents/", "~/.leviath/agents/",
-         "/data/work/leviath/crates/leviath-cli/agents/bake-merge/",
-         "/data/work/leviath/study/", "/data/work/leviath/study/bakeoff/"]
+# GQL-09: this lane has NO file tools and needs no path grant. The candidate
+# schemas are never readable here (no read_file / list_dir in the stage), and the
+# whole answer travels back through submit_output, so there is no scratch path,
+# no workdir fallback and nothing to re-point on a fresh install. The decision
+# format it must follow is a bundled tool (tools/merge_decision_format.rhai),
+# generated from references/merge-decision-format.md by scripts/generate_tools.py.
+allow = []
 
 [tool_permissions]
-read_file     = "allow"
-list_dir      = "allow"
-write_file    = "allow"
 submit_output = "allow"
 
 [context.regions]
@@ -26,43 +23,51 @@ conversation = { kind = "sliding_window", budget = "50%", max_tokens = 12000, ma
 [stages.decide]
 mode = "autonomous"
 model = { models = [ { provider = "openrouter", model = "deepseek/deepseek-v4.1-flash" } ] , allow_user_default = false, request_timeout_secs = 1800 }
-available_tools = ["read_file", "list_dir", "write_file", "submit_output"]
+available_tools = ["merge_decision_format", "submit_output"]
 require_output = true
 allow_complete = true
 required_tools = ["submit_output"]
-max_iterations = 25
-system_prompt = """You are a HarnessQL MERGE DECISION lane. You receive a COMPACT DIFF between two candidate GraphQL schemas for the same domain, and you DECIDE how to merge each divergent type. You do NOT write or produce a full schema, and you do NOT read the raw candidate files.
+max_iterations = 12
+system_prompt = """You are a HarnessQL MERGE DECISION lane. The task carries ONE compact diff between two candidate GraphQL schemas for the same domain, plus the candidate paths and sha256 values and the proposed renames. You decide, per divergent type, how the merged type is built.
 
-THE DIFF IS SUFFICIENT. The task contains everything you need: the diff summary, the divergent types with their field-level deltas, and the likely renames. Do NOT read the original candidate schema files. Do NOT read any Composition Guide. Reason ONLY over the diff text in the task.
+YOU HAVE TWO TOOLS AND NO OTHERS. There is no read_file and no list_dir, so you cannot read the candidates - the compact diff in the task is the whole input, and it is sufficient. There is no write_file: your decision document IS your output, and it is returned through submit_output. Writing a schema is not your job and is not possible here; a deterministic assembler applies your decisions afterwards.
 
-Your job: for each divergent type, output one decision block:
-  TYPE <TypeName>: keep_a | keep_b | reconcile
-  REASON: <one line — which candidate is structurally better and why>
-  FIELDS: <comma-separated field names>   (only when reconcile)
+STEP 1: call the `merge_decision_format` tool once. It returns the exact contract (`harnessql-merge-decisions/v1`) - the JSON shape, every field, and every rule with the code a violation gets. Follow it literally.
 
-For each likely rename pair:
-  RENAME <OldName> -> <NewName>: keep_a | keep_b
-  REASON: <one line>
+STEP 2: call submit_output ONCE with a single JSON object and nothing else - no prose before or after it, no markdown fence required (a fence is tolerated). The object has:
+  contract   : "harnessql-merge-decisions/v1"
+  diff       : {"sha256": "<the diff sha256 printed in the task>"}
+  candidates : {"a": {"path": "...", "sha256": "..."}, "b": {"path": "...", "sha256": "..."}}
+               (copy each path and sha256 EXACTLY as printed in the task)
+  types      : one entry per divergent type listed in the task
+  renames    : one entry per proposed rename pair listed in the task
 
-RULES:
-- DEFAULT IS RECONCILE. For each divergent type, decide `reconcile` and name the fields
-  to carry over, so the merged type is a SUPERSET of both candidates: A's definition as
-  the base plus every field from B that A lacks or that B models better. Combining is
-  the point — a pick is a failure to merge.
-- `keep_a` / `keep_b` (adopting one side wholesale) is the EXCEPTION. Only use it when
-  field-level combination would be WRONG, and say the STRUCTURAL reason in REASON
-  (e.g. "the two are different abstractions", "the variant sets are mutually exclusive").
-  "More evolved" or "better name" is NOT a reason to discard the other side's fields.
-- Where both sides define a field differently, reconcile it and say in REASON whose
-  shape you kept and why.
-- Prefer schema quality first: keep the version that makes illegal states
-  unrepresentable and relationships traversable — but do that per FIELD, not per type.
-- Be decisive and concise. Emit the decision table; do not deliberate at length.
+A type entry is:
+  {"name": "<TypeName>",
+   "disposition": "reconcile" | "keep_a" | "keep_b",
+   "fields"|"values"|"members": {"<key>": "a"|"b", ...},
+   "implements": {"<Interface>": "a"|"b"},        # object/interface types only, when it applies
+   "reason": "<one line: what this keeps and why>"}
 
-STEPS (do these and nothing else):
-1. Read the diff from the task.
-2. Emit the full decision table as your output.
-3. write_file the decision table to the <out> path in the task.
-4. IMMEDIATELY call submit_output with a one-line 'MERGE <label> decisions complete'.
+A rename entry is:
+  {"from": "<A>", "to": "<B>", "disposition": "rename"|"distinct", "reason": "<one line>"}
 
-This is a short task — complete it in well under 20 tool calls. Do not iterate. Do not read anything else."""
+THE RULES ARE CHECKED MECHANICALLY BEFORE YOUR ANSWER IS USED, and a violation is refused:
+- reconcile IS the norm: give EVERY key printed for the type a source of "a" or "b", so the
+  merged type is a superset of both candidates. A reconcile that takes everything from one side
+  is rejected as a whole-side pick - declare keep_a / keep_b instead and say why.
+- keep_a / keep_b is the EXCEPTION. The map must then name exactly that side's keys, and the
+  reason must give the STRUCTURAL reason combination would be wrong ("different abstractions",
+  "mutually exclusive variants"). "More evolved" or "a better name" is not a reason.
+- Every divergent type gets exactly one entry. Every key printed for it appears in its map.
+  No extra keys, no repeated JSON keys, no type twice.
+- Every proposed rename gets exactly one entry. `rename` carries it out; `distinct` keeps both
+  types and is also a decision. Omitting one is a rejection.
+- Copy the candidate paths, candidate sha256 values and the diff sha256 verbatim. A mismatch is
+  rejected as stale - it means you decided about different bytes.
+- Every entry needs a non-empty one-line `reason`. Reasons are recorded, hashed and reported as
+  evidence; they are NEVER parsed for intent. If a merge needs a field from the other side, the
+  map says so - English never carries a decision.
+- Do not deliberate at length and do not iterate: call merge_decision_format once, then
+  submit_output once with the complete document. A document that is missing anything is refused
+  and you get another attempt, so completeness matters more than length."""
