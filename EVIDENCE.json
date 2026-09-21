@@ -1,0 +1,65 @@
+{
+  "base_commit": "15dc182e",
+  "work_commit": "d3f41d5beabb6b0f46197307c2656b4c2207adad",
+  "branch": "fleet/gql-03",
+  "run_id": "R01M2MCP7QDGQ6AJV9FQJT47GHG",
+  "commands": [
+    {
+      "cmd": "python3 -m pytest tests/test_protocol.py -q",
+      "cwd": ".",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "sh evidence/verify.sh",
+      "cwd": ".",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "sh evidence/hermetic.sh",
+      "cwd": ".",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "python3 -c \"import re,sys; s=open('repo/python/leviath_schema_ls/server.py').read(); assert '\\\"command\\\"' not in s; assert not re.search(r'subprocess|os\\\\.system|Popen|exec\\\\(|eval\\\\(' , s); assert '\\\"unwrap\\\"' not in s and '\\\"secret\\\"' not in s; assert 'requiresConfirmation' in s; assert 'STALE_VERSION_CODE = -32002' in s; print('server safety greps OK')\"",
+      "cwd": ".",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "python3 -c \"import ast; ast.parse(open('repo/python/leviath_schema_ls/server.py').read()); ast.parse(open('tests/test_protocol.py').read()); print('AST OK')\"",
+      "cwd": ".",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "git -C repo merge-base --is-ancestor 15dc182e fleet/gql-03",
+      "cwd": ".",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "git -C repo ls-files --error-unmatch python/leviath_schema_ls/server.py",
+      "cwd": ".",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "test \"$(grep -c assert tests/test_protocol.py)\" -ge 43",
+      "cwd": ".",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "diff -r vendor/python/leviath_reconcile /data/work/graphql-realization/gql-02/repo/python/leviath_reconcile --exclude=__pycache__",
+      "cwd": ".",
+      "expect_rc": 0
+    }
+  ],
+  "artifacts": [
+    "REPORT.md",
+    "EVIDENCE.json",
+    "evidence/test_output.txt",
+    "evidence/verify.sh",
+    "evidence/hermetic.sh",
+    "conftest.py",
+    "repo/python/leviath_schema_ls/__init__.py",
+    "repo/python/leviath_schema_ls/__main__.py",
+    "repo/python/leviath_schema_ls/server.py",
+    "tests/test_protocol.py"
+  ]
+}

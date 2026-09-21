@@ -1,0 +1,96 @@
+# commands.log — GQL-03
+
+All commands ran from the working directory:
+/data/wt/T01M2KX1Z7XQY3DDS1GFJJWWWP8-a1
+
+## 1. Protocol test (GREEN)
+
+$ python3 -m pytest tests/test_protocol.py -v > evidence/test_output.txt 2>&1
+$ echo "EXIT=$?"
+EXIT=0
+
+=================== test session starts ===================
+platform linux -- Python 3.12.14, pytest-9.1.1, pluggy-1.6.0
+rootdir: /data/wt/T01M2KX1Z7XQY3DDS1GFJJWWWP8-a1
+collected 6 items
+
+tests/test_protocol.py::test_a_initialize PASSED
+tests/test_protocol.py::test_b_open_and_clean_diagnostics PASSED
+tests/test_protocol.py::test_c_edit_and_source_ranged_diagnostics PASSED
+tests/test_protocol.py::test_d_code_action_is_text_only_and_clears_the_conflict PASSED
+tests/test_protocol.py::test_e_stale_edit_is_rejected PASSED
+tests/test_protocol.py::test_f_edit_before_open_and_diagnostic_safety PASSED
+==================== 6 passed in 1.27s ====================
+
+## 2. Evidence script
+
+$ sh evidence/verify.sh
+... 8 checks ...
+ALL CHECKS PASSED
+VERIFY_RC=0
+(4 of 8 checks re-run the test; the other 4 are safety greps.)
+
+$ sh evidence/hermetic.sh
+6 passed in 1.28s
+HERMETIC OK: the test needs nothing outside the working directory
+HERMETIC_RC=0
+
+## 3. Safety greps
+
+$ grep -n '"command"' repo/python/leviath_schema_ls/server.py
+NO MATCH -> rc 1 (the check is "no match", so the script exits 0)
+
+$ grep -En 'subprocess|os\.system|Popen|exec\(|eval\(' repo/python/leviath_schema_ls/server.py
+NO MATCH
+
+$ grep -En '"(unwrap|secret)"' repo/python/leviath_schema_ls/server.py
+NO MATCH
+
+## 4. Test integrity
+
+$ grep -c assert tests/test_protocol.py
+43
+(was 43 before this work order; unchanged)
+
+## 5. Repository
+
+$ git -C repo log --oneline -2
+d3f41d5b GQL-03: schema language server (diagnostics, versioned code actions)
+15dc182e fix: satisfy fmt and clippy on the synced tree
+
+$ git -C repo rev-parse --abbrev-ref HEAD
+fleet/gql-03
+
+$ git -C repo merge-base --is-ancestor 15dc182e fleet/gql-03
+rc=0
+
+$ git -C repo push origin fleet/gql-03
+Everything up-to-date      (branch already published)
+PUSH_RC=0
+
+## 6. GQL-02 untouched (read-only engine)
+
+$ diff -r vendor/python/leviath_reconcile \
+         /data/work/graphql-realization/gql-02/repo/python/leviath_reconcile \
+         --exclude=__pycache__
+DIFF_RC=0
+output: empty (0 bytes) -> the vendored engine is byte-identical to GQL-02
+
+$ find vendor/python/leviath_reconcile -name '*.py' | wc -l
+18
+$ find /data/work/graphql-realization/gql-02/repo/python/leviath_reconcile -name '*.py' | wc -l
+18
+
+## 7. Mechanical check
+
+$ python3 /data/fleet/fleet/verify_wo.py
+WO_RC=0
+{"ok": true, "reason": "9 command(s) re-executed with the declared exit codes; 10 artifact(s) present"}
+
+$ python3 /data/fleet/fleet/harness.py precheck --db /data/fleet/graph.db \
+    --task T01M2KX1Z7XQY3DDS1GFJJWWWP8 --workdir "$PWD"
+CHECK_PASS {"type": "test", "detail": "rc=0 want=0", "rc": 0}
+
+## Spend
+
+$0.00. No paid model call. No network access. No infrastructure changed.
