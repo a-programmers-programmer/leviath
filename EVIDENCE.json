@@ -1,0 +1,80 @@
+{
+  "base_commit": "15dc182e0bc6c28dfa93f4b8dd3c423372808f61",
+  "commands": [
+    {
+      "cmd": "python3 -m unittest discover -s tests -p 'test_*.py'",
+      "cwd": "repo/crates/leviath-cli/agents/graphql-schema",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "python3 -m unittest discover -s tests -p 'test_gate.py'",
+      "cwd": "repo/crates/leviath-cli/agents/graphql-schema",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "python3 -m unittest discover -s tests -p 'test_join.py'",
+      "cwd": "repo/crates/leviath-cli/agents/graphql-schema",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "python3 live_join.py",
+      "cwd": ".",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "python3 evidence/proof_gql10.py",
+      "cwd": ".",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "git diff --quiet 15dc182e0bc6c28dfa93f4b8dd3c423372808f61 -- crates/leviath-cli/agents/graphql-schema/scripts/gate.py && test \"$(sha256sum crates/leviath-cli/agents/graphql-schema/scripts/gate.py | cut -d' ' -f1)\" = 554c3f7e66e1bfed7c808cbf16a92cff28e7ebac0157ea44e85845be83f8ee39",
+      "cwd": "repo",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "git diff --quiet 15dc182e0bc6c28dfa93f4b8dd3c423372808f61 -- crates/leviath-cli/agents/graphql-schema/tests/test_gate.py",
+      "cwd": "repo",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "test \"$(git rev-parse --abbrev-ref HEAD)\" = fleet/gql-10 && test \"$(git rev-parse HEAD)\" = b1e67845cd0a96dfc18cbae9a2bdf3ed15e17d62",
+      "cwd": "repo",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "test \"$(grep -c '    def test_' tests/test_gate.py)\" = 24 && test \"$(grep -c '    def test_' tests/test_join.py)\" -ge 19",
+      "cwd": "repo/crates/leviath-cli/agents/graphql-schema",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "! grep -qE 'accepted\\.json.*(write_text|write_bytes)' scripts/join_candidates.py",
+      "cwd": "repo/crates/leviath-cli/agents/graphql-schema",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "grep -q 'repairs' hooks/protocol.rhai && grep -q 'route = \"blocked\"' hooks/protocol.rhai && grep -q 'repairs = { kind = \"pinned\", max_tokens = 256 }' agent.leviath",
+      "cwd": "repo/crates/leviath-cli/agents/graphql-schema",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "python3 -c \"import json;d=json.load(open('evidence/live-join-mine.json'));assert d['all_pass'] is True;assert len(d['scenarios'])==7;assert all(s['pass'] for s in d['scenarios'])\"",
+      "cwd": ".",
+      "expect_rc": 0
+    }
+  ],
+  "artifacts": [
+    "REPORT.md",
+    "EVIDENCE.json",
+    "evidence/proof_gql10.py",
+    "evidence/live-join-mine.json",
+    "evidence/GREEN-tests-mine.txt",
+    "evidence/diff-mine.patch",
+    "evidence/base-commit-mine.txt",
+    "live_join.py",
+    "repo/crates/leviath-cli/agents/graphql-schema/scripts/join_candidates.py",
+    "repo/crates/leviath-cli/agents/graphql-schema/tests/test_join.py",
+    "repo/crates/leviath-cli/agents/graphql-schema/scripts/gate.py",
+    "repo/crates/leviath-cli/agents/graphql-schema/agent.leviath",
+    "repo/crates/leviath-cli/agents/graphql-schema/hooks/protocol.rhai"
+  ]
+}
