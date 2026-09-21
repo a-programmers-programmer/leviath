@@ -1,0 +1,116 @@
+{
+  "task": "T01M2NCFG6TRXX6QN6YE4B4XHZX",
+  "run": "R01M2NCFR0TT971HMFJ6835396Y",
+  "title": "GQL-24-A: typed adapter over the real daemon for runs/blueprints/stages/artifacts/commands",
+  "status": "complete",
+  "done_check": {
+    "cmd": "test -s REPORT.md && test -s EVIDENCE.json && python3 -c \"import json;json.load(open('EVIDENCE.json'))\" && python3 -m pytest -q tests/test_daemon_adapter.py",
+    "rc": 0,
+    "result": "23 passed in 2.30s",
+    "skipped": 0
+  },
+  "daemon": {
+    "binary": "lev",
+    "path": "/usr/local/bin/lev",
+    "cli_version": "0.5.9",
+    "inner_build": "lev-0.6.0-36025f69-v2",
+    "control_socket": "/data/.leviath/control.sock",
+    "home": "/data/.leviath",
+    "verified_live": true,
+    "live_tests_ran": true
+  },
+  "harness_bug": {
+    "cmd": "python3 /data/fleet/fleet/harness.py precheck --db /data/fleet/graph.db --task T01M2NCFG6TRXX6QN6YE4B4XHZX --workdir $PWD",
+    "error": "AttributeError: 'str' object has no attribute 'get'",
+    "where": "fleet/checks.py:39 run_check: check.get(\"type\")",
+    "cause": "the stored check on this task is a plain string, not a typed dict",
+    "impact": "precheck and declare-artifact for this task cannot run their own check; declare-artifact still recorded paths",
+    "workaround": "ran the contract check by hand in the shell; rc=0"
+  },
+  "checkpoints": [
+    {
+      "n": 1,
+      "when": "start",
+      "note": "wrote REPORT.md and EVIDENCE.json stubs (0210 rule 1: never empty)"
+    },
+    {
+      "n": 2,
+      "when": "after capture",
+      "note": "captured live daemon responses into fixtures/; wrote fixtures/MANIFEST.json"
+    },
+    {
+      "n": 3,
+      "when": "after green",
+      "note": "adapter + 23 passing tests + fixtures captured from live daemon; REPORT.md and EVIDENCE.json written",
+      "harness": "CHECKPOINT /data/wt/T01M2NCFG6TRXX6QN6YE4B4XHZX-a1/CHECKPOINT.md 118 B"
+    }
+  ],
+  "transports": [
+    {
+      "name": "control",
+      "how": "unix socket /data/.leviath/control.sock, newline-delimited JSON, token from control.token",
+      "ops_used": ["authenticate", "list", "status", "list_interactions"]
+    },
+    {
+      "name": "cli",
+      "how": "lev <cmd> --json; strip ANSI and log lines, then json.loads",
+      "cmds_used": ["ps", "stages", "timeline", "blobs", "result", "list", "--help"]
+    }
+  ],
+  "fixtures": [
+    {"path": "fixtures/control_list.json", "surface": "control list", "type": "RunList"},
+    {"path": "fixtures/control_welcome.json", "surface": "control authenticate hello", "type": "Welcome"},
+    {"path": "fixtures/control_status.json", "surface": "control status", "type": "StatusReply"},
+    {"path": "fixtures/control_interactions.json", "surface": "control list_interactions", "type": "InteractionsReply"},
+    {"path": "fixtures/cli_ps.json", "surface": "lev ps --json", "type": "RunList"},
+    {"path": "fixtures/cli_stages_live.json", "surface": "lev stages <live> --json", "type": "List[Stage]"},
+    {"path": "fixtures/cli_stages_done.json", "surface": "lev stages <done> --json", "type": "List[Stage]"},
+    {"path": "fixtures/cli_timeline_live.json", "surface": "lev timeline <live> --json", "type": "List[Timeline]"},
+    {"path": "fixtures/cli_timeline_done.json", "surface": "lev timeline <done> --json", "type": "List[Timeline]"},
+    {"path": "fixtures/blobs_sample.json", "surface": "lev blobs <done> --json", "type": "Blob"},
+    {"path": "fixtures/cli_list.json", "surface": "lev list --json", "type": "BlueprintList"},
+    {"path": "fixtures/cli_commands.json", "surface": "lev --help", "type": "CommandCatalogue"},
+    {"path": "fixtures/result.json", "surface": "lev result <done> --json", "type": "FinalOutput"},
+    {"path": "fixtures/MANIFEST.json", "surface": "every capture with its rc, kind, run_id and key set"}
+  ],
+  "artifacts": [
+    {"path": "REPORT.md", "sha256": "ac5caab880eccb3a6df3999f29a428270793e438197cf12a39b63d088a2e445a"},
+    {"path": "tests/test_daemon_adapter.py", "sha256": "6adf32b4160a8a880dff1c25b9926169bf680d38f2ad41027f23dbfb015ad02c"},
+    {"path": "levdaemon/__init__.py", "sha256": "4fa33804b2af1f538d7d6022857c513bc37e818888088a154186b336e625fed4"},
+    {"path": "levdaemon/cli.py", "sha256": "cfcffb79c9d2cd6722e62ebd98a213c6a06e844bf9386d699aa056a2118112f6"},
+    {"path": "levdaemon/commands.py", "sha256": "772e018cfe9694b7b648cc7836b7a864753b5a4514ad09746b13486cfe8ac895"},
+    {"path": "levdaemon/control.py", "sha256": "364413afde4480ed590b5460611272643460d2b541c4e5de7295e9843f61d23b"},
+    {"path": "levdaemon/models_runs.py", "sha256": "000a426d618684650d4898d60abe06ceb52792b7b9fba983d801a310fbfe89ed"},
+    {"path": "levdaemon/models_stages.py", "sha256": "c5febbde57bf0e8450c2c01573c3161b5e8b1f1166097c98c8494ae4cc021f98"},
+    {"path": "levdaemon/record.py", "sha256": "5b5652bbecb54a834a18a4e26dbe09eae1f1524cad4d0dff7341cd15237a1f95"},
+    {"path": "fixtures/MANIFEST.json", "sha256": "081acf803576887e15cd53e71520c46dc61119ac49abb8ab59ca0cbdf939ef1c"}
+  ],
+  "tests": {
+    "file": "tests/test_daemon_adapter.py",
+    "offline": 19,
+    "live": 4,
+    "total": 23,
+    "passed": 23,
+    "failed": 0,
+    "skipped": 0
+  },
+  "commands": [
+    {"cmd": "lev --version", "result": "lev 0.5.9"},
+    {"cmd": "python3 tmp/capture_all.py", "result": "wrote fixtures/*.json and fixtures/MANIFEST.json"},
+    {"cmd": "python3 -m pytest -q tests/test_daemon_adapter.py", "result": "23 passed"},
+    {"cmd": "sha256sum REPORT.md tests/test_daemon_adapter.py levdaemon/*.py fixtures/MANIFEST.json", "result": "hashes recorded above"},
+    {"cmd": "python3 /data/fleet/fleet/harness.py checkpoint --db /data/fleet/graph.db --task T01M2NCFG6TRXX6QN6YE4B4XHZX --workdir $PWD --text '0210 checkpoint: ...'", "result": "CHECKPOINT written"},
+    {"cmd": "python3 /data/fleet/fleet/harness.py declare-artifact ... --path <each file>", "result": "task declares 11 artifacts"}
+  ],
+  "findings": [
+    "No `lev commands` subcommand exists; `lev commands --json` exits rc=2. The command catalogue is parsed from grouped `lev --help` text (5 groups, 36 commands).",
+    "Control `list` and `lev ps --json` send different run shapes. The CLI adds age_secs and working_secs; control adds result. One Run type parses both.",
+    "region_tokens is a flat map region->tokens with a per-run varying region set. RegionTokens keeps the raw map and validates every value is a non-negative int.",
+    "`lev result` exits rc=1 when a run has no final output; the adapter returns None.",
+    "`lev blobs` returns an empty list for many runs; empty is valid.",
+    "control `status` returns null for an unknown run id.",
+    "Run.read_paths is absent on some live runs, so it is optional.",
+    "health.inference lists the same model under two spellings: deepseek-v4.1-flash and deepseek/deepseek-v4.1-flash.",
+    "Blueprint.read_paths is a text line; declared_read_paths parses the first integer."
+  ]
+}
