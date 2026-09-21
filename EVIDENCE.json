@@ -1,0 +1,50 @@
+{
+  "base_commit": "15dc182e0bc6c28dfa93f4b8dd3c423372808f61",
+  "commands": [
+    {
+      "cmd": "PYTHONPATH=python python3 -m leviath_reconcile selftest",
+      "cwd": ".",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "PYTHONPATH=python python3 -m leviath_reconcile e2e-real --json",
+      "cwd": ".",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "PYTHONPATH=python python3 -m leviath_reconcile pin-check --json",
+      "cwd": ".",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "PYTHONPATH=python python3 -m pytest python/leviath_reconcile/test_pin.py -q",
+      "cwd": ".",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "PYTHONPATH=python python3 -m leviath_reconcile verify-contract --expected 0000000000000000000000000000000000000000000000000000000000000000",
+      "cwd": ".",
+      "expect_rc": 1
+    },
+    {
+      "cmd": "python3 tools/check_gql02_dod.py --json",
+      "cwd": ".",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "sha256sum -c tools/gql02-artifact-hashes.sha256",
+      "cwd": ".",
+      "expect_rc": 0
+    }
+  ],
+  "artifacts": [
+    "REPORT.md",
+    "EVIDENCE.json",
+    "EVIDENCE-DOD.json",
+    "tools/check_gql02_dod.py",
+    "tools/gql02-artifact-hashes.sha256",
+    "docs/workflow/evidence/gql-02-acceptance-run.txt",
+    "docs/workflow/evidence/gql-02-acceptance.md",
+    "docs/workflow/evidence/run-gql02-acceptance.sh"
+  ]
+}
