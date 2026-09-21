@@ -1,0 +1,65 @@
+{
+  "base_commit": "2d9e476",
+  "commands": [
+    {
+      "cmd": "bash -n proof/run_proof.sh",
+      "cwd": ".",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "bash proof/run_proof.sh > proof/proof.log 2>&1",
+      "cwd": ".",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "grep -c 'PROOF PASS' proof/proof.log",
+      "cwd": ".",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "grep -q 'written: 0  unchanged: 17' proof/proof.log",
+      "cwd": ".",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "grep -q 'contract identity rejected' proof/proof.log",
+      "cwd": ".",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "grep -q 'verify: PASS' proof/proof.log",
+      "cwd": ".",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "PYTHONPATH=repo/python python3 -m pytest repo/python/leviath_codegen/test_codegen.py -q",
+      "cwd": ".",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "python3 -c \"import hashlib;print(hashlib.sha256(open('tmp/proof/out/contract/schema.graphql','rb').read()).hexdigest())\" | grep -q ff9df4e32b05747ee3605042407dcc7e17a347f41bc1464ce567c2f484813559",
+      "cwd": ".",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "git -C repo show --stat --oneline HEAD",
+      "cwd": ".",
+      "expect_rc": 0
+    }
+  ],
+  "artifacts": [
+    "REPORT.md",
+    "EVIDENCE.json",
+    "proof/run_proof.sh",
+    "proof/proof.log",
+    "contract/schema-workflow.graphql",
+    "repo/python/leviath_codegen/__init__.py",
+    "repo/python/leviath_codegen/__main__.py",
+    "repo/python/leviath_codegen/cli.py",
+    "repo/python/leviath_codegen/generate.py",
+    "repo/python/leviath_codegen/model.py",
+    "repo/python/leviath_codegen/render.py",
+    "repo/python/leviath_codegen/verify.py",
+    "repo/python/leviath_codegen/test_codegen.py"
+  ]
+}
