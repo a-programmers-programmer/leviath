@@ -1,0 +1,15 @@
+{
+  "steps": [
+    {"name": "start", "inputs": [], "outputs": [{"name": "result", "type": "string"}], "command": ["echo", "{\"result\": \"hello\"}"]},
+    {"name": "left", "inputs": [{"step": "start", "port": "result", "as_name": "in_val"}],
+     "outputs": [{"name": "result", "type": "string"}],
+     "command": ["python3", "-c", "import json,sys;d=json.load(sys.stdin);print(json.dumps({'result':d['in_val'].upper()}))"]},
+    {"name": "right", "inputs": [{"step": "start", "port": "result", "as_name": "in_val"}],
+     "outputs": [{"name": "result", "type": "string"}],
+     "command": ["python3", "-c", "import json,sys;d=json.load(sys.stdin);print(json.dumps({'result':d['in_val'][::-1]}))"]},
+    {"name": "join", "inputs": [{"step": "left", "port": "result", "as_name": "left_val"},
+                                 {"step": "right", "port": "result", "as_name": "right_val"}],
+     "outputs": [{"name": "combined", "type": "string"}],
+     "command": ["python3", "-c", "import json,sys;d=json.load(sys.stdin);print(json.dumps({'combined':d['left_val']+'|'+d['right_val']}))"]}
+  ]
+}

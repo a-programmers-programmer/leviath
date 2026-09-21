@@ -1,0 +1,75 @@
+{
+  "base_commit": "5079d866ad6e582794f814666a3155f78bf04ad7",
+  "head_commit": "9f42b391ae8e59edd1519de813d7d2f31ace1950",
+  "branch": "fleet/gql-07",
+  "repo": "a-programmers-programmer/leviath",
+  "workdir": "/data/wt/T01M2KX1Z7Y7Q7SBQ2Z7BM4S7N4-a1",
+  "contract_fingerprint": "ff9df4e32b05747ee3605042407dcc7e17a347f41bc1464ce567c2f484813559",
+  "provider_spend_usd": 0,
+  "commands": [
+    {
+      "cmd": "git rev-parse HEAD",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "python3 evidence/verify_dod.py",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "python3 -m pytest tests/ -q",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "python3 -m pytest tests/test_workflow_dod.py tests/test_determinism.py -q",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "python3 -m leviath_workflow run --dag tests/fixtures/branch_join.json | python3 -c \"import json,sys; d=json.load(sys.stdin); assert d['ok'] is True and d['blocked'] is False; assert len(d['results'])==4; assert d['results']['join']['outputs']['combined']=='HELLO|olleh'; assert d['results']['left']['outputs']['result']=='HELLO'; assert d['results']['right']['outputs']['result']=='olleh'\"",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "python3 -m leviath_workflow step --dag tests/fixtures/branch_join.json --step left --input in_val=hello | python3 -c \"import json,sys; d=json.load(sys.stdin); assert d['ok'] is True; assert d['mode']=='step' and d['step']=='left'; assert list(d['results'])==['left']; assert d['results']['left']['outputs']['result']=='HELLO'; assert d['dag_check']['ok'] is True\"",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "python3 -m leviath_workflow run --dag tests/fixtures/cycle.json > /tmp/gql07_cycle.json; test $? -eq 1 && python3 -c \"import json; d=json.load(open('/tmp/gql07_cycle.json')); assert d['blocked'] is True and d['results']=={}; assert any('cycle' in e.lower() for e in d['errors'])\"",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "python3 -m leviath_workflow run --dag tests/fixtures/missing_endpoint.json >/dev/null; test $? -eq 1",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "python3 -m leviath_workflow run --dag tests/fixtures/sensitive_unapproved.json > /tmp/gql07_sens.json; test $? -eq 1 && python3 -c \"import json; d=json.load(open('/tmp/gql07_sens.json')); assert d['blocked'] is True and d['results']=={}; assert any('unapproved' in e.lower() for e in d['errors'])\"",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "python3 -m leviath_workflow run --dag tests/fixtures/sensitive_unapproved.json --waive-step push_prod --waiver-identity release-manager --waiver-reason 'approved by CAB-42' | python3 -c \"import json,sys; d=json.load(sys.stdin); assert d['ok'] is True and d['blocked'] is False; w=d['waivers'][0]; assert w['identity']=='release-manager' and w['reason']=='approved by CAB-42' and w['severity']=='WARN' and w['step']=='push_prod'\"",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "python3 -m leviath_workflow run --dag tests/fixtures/sensitive_unapproved.json --waive-step push_prod --waiver-identity '' --waiver-reason '' >/dev/null; test $? -eq 1",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "for s in 0 1 7 12345 random; do PYTHONHASHSEED=$s python3 -m leviath_workflow run --dag tests/fixtures/cycle.json | sha256sum; done | awk '{print $1}' | sort -u | wc -l | grep -qx 1",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "grep -c 'PASS' evidence/dod_transcript.txt && test \"$(grep -c 'FAIL' evidence/dod_transcript.txt)\" = \"0\"",
+      "expect_rc": 0
+    }
+  ],
+  "artifacts": [
+    "REPORT.md",
+    "EVIDENCE.json",
+    "commands.log",
+    "evidence/dod_transcript.txt",
+    "evidence/pytest-v.txt",
+    "evidence/verify_dod.py",
+    "evidence/run_branch_join.json",
+    "evidence/run_cycle.json",
+    "evidence/step_mode.json",
+    "docs/workflow/edge-invariant-rules.json"
+  ]
+}

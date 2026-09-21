@@ -1,0 +1,32 @@
+GQL-07 — exact commands, working directory /data/wt/T01M2KX1Z7Y7Q7SBQ2Z7BM4S7N4-a1
+
+# provenance
+git rev-parse HEAD              -> 154570c90f7f4b5f8a1a52609a36a1527b3bca5f   rc=0
+git rev-parse --abbrev-ref HEAD -> fleet/gql-07                              rc=0
+git rev-list --max-parents=0 HEAD -> 5079d866ad6e582794f814666a3155f78bf04ad7 rc=0
+
+# DoD proof (CLI + runner, all four lines)
+python3 evidence/verify_dod.py            rc=0   35 PASS / 0 FAIL -> evidence/dod_transcript.txt
+python3 -m pytest tests/ -q               rc=0   20 passed -> evidence/pytest-v.txt
+
+# DoD line 1: branch/join DAG runs with typed outputs
+python3 -m leviath_workflow run --dag tests/fixtures/branch_join.json  rc=0   join.combined == "HELLO|olleh", 4 steps
+# DoD line 2: individual step runs through the same checks
+python3 -m leviath_workflow step --dag tests/fixtures/branch_join.json --step left --input in_val=hello  rc=0
+# DoD line 3: blockers (each must exit 1)
+python3 -m leviath_workflow run --dag tests/fixtures/cycle.json               rc=1  blocked=true
+python3 -m leviath_workflow run --dag tests/fixtures/missing_endpoint.json    rc=1  blocked=true
+python3 -m leviath_workflow run --dag tests/fixtures/sensitive_unapproved.json rc=1 blocked=true
+pytest tests/test_workflow.py::test_incompatible_port_types_blocked            rc=0  (port mismatch blocks)
+# DoD line 4: WARN waiver identity + reason survive in run evidence
+python3 -m leviath_workflow run --dag tests/fixtures/sensitive_unapproved.json \
+        --waive-step push_prod --waiver-identity release-manager \
+        --waiver-reason "approved by CAB-42"                                   rc=0  waivers[0] = {release-manager, approved by CAB-42, WARN}
+
+# determinism: same DAG -> same evidence bytes under 5 hash seeds
+for s in 0 1 7 12345 random; do PYTHONHASHSEED=$s python3 -m leviath_workflow run \
+        --dag tests/fixtures/cycle.json | sha256sum; done
+  -> 9618a2d7d773e4dff68ef7ac56ad322760d34839e01ccbb6b2787c9e874f0216 for all five
+
+# artifacts
+sha256sum evidence/*.txt evidence/*.json leviath_workflow/*.py tests/*.py tests/fixtures/*.json

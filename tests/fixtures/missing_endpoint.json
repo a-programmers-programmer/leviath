@@ -1,0 +1,6 @@
+{
+  "steps": [
+    {"name": "consumer", "inputs": [{"step": "ghost", "port": "x"}],
+     "outputs": [{"name": "out", "type": "string"}], "command": ["echo", "{}"]}
+  ]
+}

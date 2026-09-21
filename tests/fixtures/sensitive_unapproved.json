@@ -1,0 +1,7 @@
+{
+  "steps": [
+    {"name": "push_prod", "inputs": [], "outputs": [{"name": "msg", "type": "string"}],
+     "command": ["python3", "-c", "import json;print(json.dumps({'msg': 'pushed'}))"],
+     "sensitive": true}
+  ]
+}

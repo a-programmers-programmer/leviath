@@ -1,0 +1,6 @@
+{
+  "steps": [
+    {"name": "A", "inputs": [{"step": "C", "port": "z"}], "outputs": [{"name": "x", "type": "string"}], "command": ["echo", "{}"]},
+    {"name": "C", "inputs": [{"step": "A", "port": "x"}], "outputs": [{"name": "z", "type": "string"}], "command": ["echo", "{}"]}
+  ]
+}
