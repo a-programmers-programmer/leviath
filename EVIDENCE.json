@@ -1,0 +1,278 @@
+{
+  "task": "T01M2NM86900F87JF9C6PX4CBAT",
+  "title": "GQL-11-B: deterministic replay of the authoring runbook (no model calls)",
+  "run_id": "R01M2NNY1ENA2J7JZ1183ZWG8HS",
+  "base_commit": "15dc182e0bc6c28dfa93f4b8dd3c423372808f61",
+  "base_branch": "fleet/gql-11",
+  "repo_used": "/data/wt/T01M2KX1Z7Y15Y2E6VCKPKZNB5D-a2/repo",
+  "model_calls": 0,
+  "deterministic": true,
+  "entrypoint": "bash replay.sh",
+  "replay_exit_code": 0,
+  "replay_summary": {
+    "steps_run": 9,
+    "failures": 0,
+    "skips": 4,
+    "negative_cases": 2,
+    "assertions": 11,
+    "assertions_failed": 0
+  },
+  "commands": [
+    {
+      "id": "S0",
+      "cwd": ".",
+      "cmd": "python3 -c 'import graphql; print(\"graphql-core\", graphql.version)'",
+      "expect_rc": 0,
+      "observed_rc": 0,
+      "note": "dependency import; graphql-core 3.2.6"
+    },
+    {
+      "id": "S1",
+      "cwd": ".",
+      "cmd": "cp -r fixtures/gql-11/blueprint/examples/task-board tmp/replay/graphql-contract",
+      "expect_rc": 0,
+      "observed_rc": 0,
+      "artifacts": ["tmp/replay/graphql-contract/"]
+    },
+    {
+      "id": "S1b",
+      "cwd": ".",
+      "cmd": "diff -r fixtures/gql-11/blueprint/examples/task-board tmp/replay/graphql-contract",
+      "expect_rc": 0,
+      "observed_rc": 0,
+      "note": "seed is byte-identical to the tracked example"
+    },
+    {
+      "id": "S2",
+      "cwd": ".",
+      "cmd": "python3 fixtures/gql-11/blueprint/scripts/gate.py check --root tmp/replay/graphql-contract",
+      "expect_rc": 0,
+      "observed_rc": 0,
+      "artifacts": ["tmp/replay/checked.json"],
+      "status": "checked",
+      "fingerprint": "8d0e63943e584388cdd154c33a07a0551679558c38f9f88f49e1612f24a05b9a",
+      "errors": []
+    },
+    {
+      "id": "S3a",
+      "cwd": ".",
+      "cmd": "python3 - FP fixtures/gql-11/review.template.json tmp/replay/review.json  (fill fingerprint)",
+      "expect_rc": 0,
+      "observed_rc": 0,
+      "artifacts": ["tmp/replay/review.json"]
+    },
+    {
+      "id": "S3b",
+      "cwd": ".",
+      "cmd": "python3 fixtures/gql-11/blueprint/scripts/gate.py accept --root tmp/replay/graphql-contract --review tmp/replay/review.json",
+      "expect_rc": 0,
+      "observed_rc": 0,
+      "artifacts": ["tmp/replay/graphql-contract/accepted.json"],
+      "status": "accepted",
+      "note": "accepted.json is written by the gate only, never by hand"
+    },
+    {
+      "id": "S3c",
+      "cwd": ".",
+      "cmd": "python3 fixtures/gql-11/blueprint/scripts/gate.py verify --root tmp/replay/graphql-contract",
+      "expect_rc": 0,
+      "observed_rc": 0,
+      "status": "accepted"
+    },
+    {
+      "id": "S4a",
+      "cwd": ".",
+      "cmd": "printf '\\nImplementer proposes an additive field.\\n' >> tmp/replay/graphql-contract/design.md && python3 fixtures/gql-11/blueprint/scripts/gate.py verify --root tmp/replay/graphql-contract",
+      "expect_rc": 1,
+      "observed_rc": 1,
+      "status": "blocked",
+      "negative_case": true,
+      "error": "Contract changed after acceptance; rerun the workflow",
+      "note": "NEGATIVE CASE 1: deliberately invalid input (contract edited after acceptance). Failure expected, recorded and asserted."
+    },
+    {
+      "id": "S4b",
+      "cwd": ".",
+      "cmd": "python3 fixtures/gql-11/blueprint/scripts/gate.py check --root tmp/replay/graphql-contract",
+      "expect_rc": 0,
+      "observed_rc": 0,
+      "artifacts": ["tmp/replay/checked2.json"],
+      "fingerprint": "a58d798980e10624801ab1a866c5b0e73065c0c55bb880a795c7590c08dd727b",
+      "note": "fingerprint changed after the edit"
+    },
+    {
+      "id": "S4c",
+      "cwd": ".",
+      "cmd": "python3 fixtures/gql-11/blueprint/scripts/gate.py accept --root tmp/replay/graphql-contract --review tmp/replay/review2.json && python3 fixtures/gql-11/blueprint/scripts/gate.py verify --root tmp/replay/graphql-contract",
+      "expect_rc": 0,
+      "observed_rc": 0,
+      "artifacts": ["tmp/replay/review2.json", "tmp/replay/graphql-contract/accepted.json"],
+      "status": "accepted"
+    },
+    {
+      "id": "S4d",
+      "cwd": ".",
+      "cmd": "cp fixtures/gql-11/blueprint/examples/task-board/design.md tmp/replay/graphql-contract/design.md && python3 fixtures/gql-11/blueprint/scripts/gate.py accept --root tmp/replay/graphql-contract --review tmp/replay/review.json",
+      "expect_rc": 0,
+      "observed_rc": 0,
+      "artifacts": ["tmp/replay/accepted.json"],
+      "note": "pristine seed restored and re-sealed"
+    },
+    {
+      "id": "S5",
+      "cwd": ".",
+      "cmd": "SKIP: no tracked command emits client.ts or manifest.json",
+      "expect_rc": null,
+      "observed_rc": null,
+      "skip": true,
+      "note": "client-interface codegen is NOT IMPLEMENTED; skipped with an explicit SKIP line, never faked"
+    },
+    {
+      "id": "S5b",
+      "cwd": ".",
+      "cmd": "python3 tmp/replay/bp/scripts/generate_tool.py",
+      "expect_rc": 0,
+      "observed_rc": 0,
+      "artifacts": ["tmp/replay/bp/tools/graphql_contract_gate.rhai", "tmp/replay/bp/tools/graphql_contract_guide.rhai"],
+      "sha256": "3cee8427edfe43624a9b14864785ebd7171df66d0957259ad4a8b7afae2d5437",
+      "note": "the only tracked generator; embeds gate.py into the Rhai tool"
+    },
+    {
+      "id": "S5c",
+      "cwd": ".",
+      "cmd": "diff tmp/replay/bp/tools/graphql_contract_gate.rhai fixtures/gql-11/blueprint/tools/graphql_contract_gate.rhai",
+      "expect_rc": 0,
+      "observed_rc": 0,
+      "note": "generated tool matches the tracked tool byte for byte (same sha256)"
+    },
+    {
+      "id": "S6a",
+      "cwd": ".",
+      "cmd": "SKIP: live model run is NOT RUN: the tracked agent.leviath names fleet-forbidden models",
+      "expect_rc": null,
+      "observed_rc": null,
+      "skip": true,
+      "note": "no model calls permitted; the step is a null, not faked"
+    },
+    {
+      "id": "S6b",
+      "cwd": ".",
+      "cmd": "lev validate fixtures/gql-11/blueprint",
+      "expect_rc": 0,
+      "observed_rc": 0,
+      "note": "blueprint is valid; lev validate makes no model call"
+    },
+    {
+      "id": "S6c",
+      "cwd": ".",
+      "cmd": "python3 - tmp/replay/task_record.json  (read the recorded task record from /data/fleet/graph.db)",
+      "expect_rc": 0,
+      "observed_rc": 0,
+      "artifacts": ["tmp/replay/task_record.json"],
+      "note": "workflow execution replayed against the recorded task/attempt records, no model calls"
+    },
+    {
+      "id": "S7a",
+      "cwd": ".",
+      "cmd": "python3 fixtures/gql-11/blueprint/scripts/gate.py verify --root tmp/replay/graphql-contract --expected-fingerprint 8d0e63943e584388cdd154c33a07a0551679558c38f9f88f49e1612f24a05b9a",
+      "expect_rc": 0,
+      "observed_rc": 0,
+      "status": "accepted",
+      "note": "confirm gate accepts the true pin"
+    },
+    {
+      "id": "S7b",
+      "cwd": ".",
+      "cmd": "python3 fixtures/gql-11/blueprint/scripts/gate.py verify --root tmp/replay/graphql-contract --expected-fingerprint 0000000000000000000000000000000000000000000000000000000000000000",
+      "expect_rc": 1,
+      "observed_rc": 1,
+      "negative_case": true,
+      "note": "NEGATIVE CASE 2: the confirm gate rejects a different contract (exit 1)"
+    },
+    {
+      "id": "S8",
+      "cwd": ".",
+      "cmd": "python3 -m unittest discover -s fixtures/gql-11/blueprint/tests",
+      "expect_rc": 0,
+      "observed_rc": 0,
+      "note": "Ran 24 tests, OK"
+    }
+  ],
+  "negative_cases": [
+    {
+      "id": "NEG-1",
+      "step": "S4a",
+      "invalid_input": "a line appended to tmp/replay/graphql-contract/design.md after acceptance",
+      "expected": "exit 1, status blocked",
+      "observed_rc": 1,
+      "observed_status": "blocked",
+      "observed_error": "Contract changed after acceptance; rerun the workflow",
+      "asserted": true
+    },
+    {
+      "id": "NEG-2",
+      "step": "S7b",
+      "invalid_input": "--expected-fingerprint 0000...0000 (a wrong parent pipeline pin)",
+      "expected": "exit 1",
+      "observed_rc": 1,
+      "asserted": true
+    }
+  ],
+  "skip_steps": [
+    {
+      "step": "S5",
+      "runbook_step": "5. Generated interfaces",
+      "reason": "no tracked command emits client.ts or manifest.json",
+      "faked": false
+    },
+    {
+      "step": "S5",
+      "runbook_step": "5. Generated interfaces",
+      "reason": "the only tracked generator is scripts/generate_tool.py, which embeds gate.py into the Rhai tool",
+      "faked": false
+    },
+    {
+      "step": "S5",
+      "runbook_step": "5. Generated interfaces",
+      "reason": "client.ts / manifest.json remain a null; a future task must commit a generator",
+      "faked": false
+    },
+    {
+      "step": "S6a",
+      "runbook_step": "6. Workflow execution",
+      "reason": "live model run is NOT RUN: the tracked agent.leviath names fleet-forbidden models (gemini-3.5-flash, claude-opus-5)",
+      "faked": false
+    }
+  ],
+  "artifacts": [
+    {"path": "replay.sh", "sha256": "01436572155f2c7fa33e99b0b6b4926fd0ab664c96a287eb043b9684b3182d29"},
+    {"path": "REPORT.md", "note": "hash omitted; REPORT.md is the prose record of this file"},
+    {"path": "EVIDENCE.json", "note": "self-referential hash omitted by design"},
+    {"path": "tmp/replay_stdout.txt", "note": "full transcript of bash replay.sh; regenerate with: bash replay.sh > tmp/replay_stdout.txt"},
+    {"path": "tmp/replay.log", "sha256": "d829a8121def06592f01dff609d042e7297d94f4420f1d001778446b375188aa"},
+    {"path": "tmp/replay/checked.json"},
+    {"path": "tmp/replay/checked2.json"},
+    {"path": "tmp/replay/accepted.json"},
+    {"path": "tmp/replay/review.json"},
+    {"path": "tmp/replay/review2.json"},
+    {"path": "tmp/replay/task_record.json"},
+    {"path": "tmp/replay/graphql-contract/accepted.json"},
+    {"path": "tmp/replay/bp/tools/graphql_contract_gate.rhai", "sha256": "3cee8427edfe43624a9b14864785ebd7171df66d0957259ad4a8b7afae2d5437"},
+    {"path": "fixtures/gql-11/blueprint/scripts/gate.py", "sha256": "554c3f7e66e1bfed7c808cbf16a92cff28e7ebac0157ea44e85845be83f8ee39"},
+    {"path": "fixtures/gql-11/blueprint/tools/graphql_contract_gate.rhai", "sha256": "3cee8427edfe43624a9b14864785ebd7171df66d0957259ad4a8b7afae2d5437"},
+    {"path": "fixtures/gql-11/BRIEF.md"},
+    {"path": "fixtures/gql-11/README.md"},
+    {"path": "fixtures/gql-11/review.template.json"}
+  ],
+  "fixture": {
+    "path": "fixtures/gql-11",
+    "blueprint_files": 17,
+    "source": "git archive HEAD crates/leviath-cli/agents/graphql-schema from the base commit",
+    "note": "vendored so replay.sh is self-contained and needs no external checkout"
+  },
+  "harness": {
+    "checkpoint_0210": true,
+    "declared_artifacts": ["REPORT.md", "EVIDENCE.json", "replay.sh"],
+    "iterations_used": "well under the 150 budget"
+  }
+}
