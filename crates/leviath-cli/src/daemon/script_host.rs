@@ -18,8 +18,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use std::sync::Mutex as StdMutex;
+
 use leviath_core::floor_char_boundary;
+use leviath_core::mime::Part;
 use leviath_scripting::ScriptHost;
+use leviath_scripting::parts::{part_matches, part_summary};
 use leviath_tools::ShellExecutor;
 use tokio::process::Command as TokioCommand;
 
@@ -110,6 +114,13 @@ pub(crate) struct DaemonScriptHost {
     /// `write_file` and a redirect in its `shell` are writes the run pays
     /// for like any other; without this they were the two that did not.
     writes: Option<Arc<crate::daemon::tool_service::WriteBudget>>,
+    /// The run's blob store, when this host serves a run: where `write_part`
+    /// puts bytes and `read_part` gets them.
+    mime: Option<Arc<leviath_tools::ToolMime>>,
+    /// The parts a script may name: what the runtime offered from the window
+    /// before the batch, plus what scripts in it wrote. Shared with the tool
+    /// state, which the runtime hands the offer to.
+    parts: Arc<StdMutex<Vec<Part>>>,
 }
 
 impl DaemonScriptHost {
@@ -127,7 +138,21 @@ impl DaemonScriptHost {
             allow_env_vars: Vec::new(),
             shell_env: leviath_tools::ShellEnvPolicy::default(),
             writes: None,
+            mime: None,
+            parts: Arc::new(StdMutex::new(Vec::new())),
         }
+    }
+
+    /// Give scripts the run's blob store and the parts they may name.
+    /// Consuming builder used at spawn.
+    pub(crate) fn with_mime(
+        mut self,
+        mime: Arc<leviath_tools::ToolMime>,
+        parts: Arc<StdMutex<Vec<Part>>>,
+    ) -> Self {
+        self.mime = Some(mime);
+        self.parts = parts;
+        self
     }
 
     /// Charge this run's write budget for what scripts write. Consuming
@@ -204,6 +229,112 @@ fn denied(func: &str) -> String {
 fn check_outbound(url: &str, allow_local: bool) -> Result<(), String> {
     let parsed = url::Url::parse(url).map_err(|e| format!("[denied] invalid URL '{url}': {e}"))?;
     leviath_net::check_url(&parsed, allow_local).map_err(|e| format!("[denied] {e}"))
+}
+
+/// A run's script host seen through a stage's `tool_accepts` for one tool:
+/// the stored parts outside the tool's list are not there, and asking for
+/// one by name says why. Everything else passes through to the host.
+pub(crate) struct LimitedHost {
+    inner: Arc<dyn ScriptHost>,
+    /// The parts the run offers, shared with the host underneath.
+    parts: Arc<StdMutex<Vec<Part>>>,
+    /// The tool the limit is for, for the refusal.
+    tool: String,
+    /// The mime type patterns the tool may be handed.
+    allowed: Vec<String>,
+}
+
+impl LimitedHost {
+    pub(crate) fn new(
+        inner: Arc<dyn ScriptHost>,
+        parts: Arc<StdMutex<Vec<Part>>>,
+        tool: &str,
+        allowed: Vec<String>,
+    ) -> Self {
+        Self {
+            inner,
+            parts,
+            tool: tool.to_string(),
+            allowed,
+        }
+    }
+
+    /// Whether the tool may be handed `part`: inline text always, a stored
+    /// part when its type matches the list.
+    fn within(&self, part: &Part) -> bool {
+        part.blob()
+            .is_none_or(|b| b.mime_type.matches_any(&self.allowed))
+    }
+}
+
+impl ScriptHost for LimitedHost {
+    fn http_get(&self, url: &str, headers: BTreeMap<String, String>) -> Result<String, String> {
+        self.inner.http_get(url, headers)
+    }
+
+    fn http_post(
+        &self,
+        url: &str,
+        body: &str,
+        headers: BTreeMap<String, String>,
+    ) -> Result<String, String> {
+        self.inner.http_post(url, body, headers)
+    }
+
+    fn shell(&self, command: &str) -> Result<String, String> {
+        self.inner.shell(command)
+    }
+
+    fn read_file(&self, path: &str) -> Result<String, String> {
+        self.inner.read_file(path)
+    }
+
+    fn write_file(&self, path: &str, content: &str) -> Result<String, String> {
+        self.inner.write_file(path, content)
+    }
+
+    fn env_var(&self, name: &str) -> Result<String, String> {
+        self.inner.env_var(name)
+    }
+
+    fn read_part(&self, wanted: &str) -> Result<Vec<u8>, String> {
+        let outside = leviath_core::sync::lock(&self.parts)
+            .iter()
+            .rev()
+            .find(|p| part_matches(p, wanted))
+            .filter(|p| !self.within(p))
+            .cloned();
+        if let Some(part) = outside {
+            return Err(format!(
+                "'{wanted}' is {}; at this stage {} may be handed only {}",
+                part.mime_type,
+                self.tool,
+                self.allowed.join(", ")
+            ));
+        }
+        self.inner.read_part(wanted)
+    }
+
+    fn write_part(
+        &self,
+        bytes: Vec<u8>,
+        mime_type: Option<&str>,
+        name: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
+        self.inner.write_part(bytes, mime_type, name)
+    }
+
+    fn list_parts(&self) -> Vec<serde_json::Value> {
+        leviath_core::sync::lock(&self.parts)
+            .iter()
+            .filter(|p| p.is_stored() && self.within(p))
+            .map(part_summary)
+            .collect()
+    }
+
+    fn part(&self, sha256: &str) -> Option<Part> {
+        self.inner.part(sha256)
+    }
 }
 
 impl ScriptHost for DaemonScriptHost {
@@ -307,6 +438,74 @@ impl ScriptHost for DaemonScriptHost {
             writes.record(bytes);
         }
         out
+    }
+
+    fn read_part(&self, wanted: &str) -> Result<Vec<u8>, String> {
+        let Some(mime) = &self.mime else {
+            return Err("this run has no blob store, so it holds no parts".to_string());
+        };
+        let part = leviath_core::sync::lock(&self.parts)
+            .iter()
+            .rev()
+            .find(|p| part_matches(p, wanted))
+            .cloned();
+        let Some(part) = part else {
+            return Err(format!(
+                "no stored part is named '{wanted}'; list_parts() shows what this run holds"
+            ));
+        };
+        let Some(blob) = part.blob() else {
+            return Err(format!("'{wanted}' is inline text, not a stored part"));
+        };
+        mime.store
+            .read(&mime.run_id, &blob.sha256)
+            .map(|bytes| bytes.to_vec())
+            .map_err(|e| format!("could not read the bytes of '{wanted}': {e}"))
+    }
+
+    fn write_part(
+        &self,
+        bytes: Vec<u8>,
+        mime_type: Option<&str>,
+        name: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
+        // Storing a part is writing the run, as `write_file` is.
+        if !self.allow.write_file {
+            return Err(denied("write_part"));
+        }
+        let Some(mime) = &self.mime else {
+            return Err("this run has no blob store to write a part into".to_string());
+        };
+        let mime_type = mime.type_of(mime_type, name, &bytes);
+        let name = match name {
+            Some(n) => n.to_string(),
+            None => {
+                let n = leviath_core::sync::lock(&self.parts).len() + 1;
+                mime.name_for(&format!("part-{n}"), &mime_type)
+            }
+        };
+        let size = bytes.len() as u64;
+        let part = mime.store(leviath_core::mime::Blob::new(mime_type, bytes).named(name))?;
+        if let Some(writes) = &self.writes {
+            writes.record(size);
+        }
+        leviath_core::sync::lock(&self.parts).push(part.clone());
+        Ok(part_summary(&part))
+    }
+
+    fn list_parts(&self) -> Vec<serde_json::Value> {
+        leviath_core::sync::lock(&self.parts)
+            .iter()
+            .filter(|p| p.is_stored())
+            .map(part_summary)
+            .collect()
+    }
+
+    fn part(&self, sha256: &str) -> Option<Part> {
+        leviath_core::sync::lock(&self.parts)
+            .iter()
+            .find(|p| p.blob().is_some_and(|b| b.sha256 == sha256))
+            .cloned()
     }
 
     fn env_var(&self, name: &str) -> Result<String, String> {
@@ -512,7 +711,7 @@ impl RealScriptIo {
     }
 }
 
-/// Media types that are never text, so decoding them would only produce noise.
+/// Mime types that are never text, so decoding them would only produce noise.
 ///
 /// The check is on the declared type, deliberately **not** on UTF-8 validity of
 /// the bytes: `Response::text` is charset-aware and decodes Shift-JIS,
@@ -2198,5 +2397,201 @@ mod tests {
         let capped = cap_script_io(s);
         // Valid UTF-8 (would panic on construction if a codepoint were split).
         assert!(capped.contains("[...truncated by leviath"));
+    }
+}
+
+#[cfg(test)]
+mod parts_tests {
+    use super::*;
+    use leviath_core::mime::{Blob, BlobStore, MemoryBlobStore, MimeType};
+
+    fn mime_and_store() -> (Arc<leviath_tools::ToolMime>, Arc<MemoryBlobStore>) {
+        let store = Arc::new(MemoryBlobStore::new());
+        let mime = Arc::new(leviath_tools::ToolMime {
+            store: store.clone(),
+            registry: Arc::new(leviath_core::mime::RegistryCell::default()),
+            run_id: "run-1".to_string(),
+            max_part_bytes: 64,
+        });
+        (mime, store)
+    }
+
+    fn all_allowed() -> ScriptAllow {
+        ScriptAllow {
+            http_get: true,
+            http_post: true,
+            shell: true,
+            read_file: true,
+            write_file: true,
+            env_var: true,
+        }
+    }
+
+    /// Through a stage's limit, a script sees only the parts the tool may
+    /// be handed; the rest of the host is untouched.
+    #[test]
+    fn a_limited_host_hides_the_parts_outside_the_tools_list() {
+        let (mime, store) = mime_and_store();
+        let parts = Arc::new(StdMutex::new(Vec::new()));
+        let host: Arc<dyn ScriptHost> = Arc::new(
+            DaemonScriptHost::new(all_allowed(), std::env::temp_dir())
+                .with_mime(mime.clone(), parts.clone()),
+        );
+        let png = store
+            .put(
+                "run-1",
+                &Blob::new(
+                    MimeType::parse("image/png").unwrap(),
+                    b"\x89PNG\r\n\x1a\nhero".to_vec(),
+                ),
+                &mime.registry.load(),
+            )
+            .unwrap();
+        let wav = store
+            .put(
+                "run-1",
+                &Blob::new(MimeType::parse("audio/wav").unwrap(), b"RIFFwav".to_vec()),
+                &mime.registry.load(),
+            )
+            .unwrap();
+        let sha = png.sha256.clone();
+        *parts.lock().unwrap() = vec![
+            Part::text("note").named("note"),
+            Part::stored(png).named("hero.png"),
+            Part::stored(wav).named("voice.wav"),
+        ];
+        let limited = LimitedHost::new(
+            host.clone(),
+            parts.clone(),
+            "peek",
+            vec!["image/*".to_string()],
+        );
+        let listed = limited.list_parts();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0]["name"], "hero.png");
+        assert_eq!(limited.read_part("hero.png").unwrap().len(), 12);
+        assert_eq!(
+            limited.read_part("voice.wav").unwrap_err(),
+            "'voice.wav' is audio/wav; at this stage peek may be handed only image/*"
+        );
+        // Text is never hidden, and a name nothing answers to is the host's
+        // own refusal.
+        assert!(
+            limited
+                .read_part("note")
+                .unwrap_err()
+                .contains("inline text")
+        );
+        assert!(
+            limited
+                .read_part("ghost")
+                .unwrap_err()
+                .contains("list_parts()")
+        );
+        assert!(limited.part(&sha).is_some());
+        // The rest passes straight through.
+        let written = limited
+            .write_part(b"\x89PNG\r\n\x1a\ncopy".to_vec(), None, None)
+            .unwrap();
+        assert_eq!(written["mime_type"], "image/png");
+        assert!(limited.read_file("../nope").is_err());
+        assert!(limited.write_file("../nope", "x").is_err());
+        assert!(limited.env_var("ANTHROPIC_API_KEY").is_err());
+        assert!(limited.http_get("not a url", BTreeMap::new()).is_err());
+        assert!(limited.http_post("not a url", "", BTreeMap::new()).is_err());
+        assert!(limited.shell("").is_err());
+    }
+
+    #[test]
+    fn parts_are_read_written_listed_and_resolved() {
+        let (mime, store) = mime_and_store();
+        let parts = Arc::new(StdMutex::new(Vec::new()));
+        let writes = Arc::new(crate::daemon::tool_service::WriteBudget::new(
+            leviath_core::write_limits::WriteLimits::default(),
+        ));
+        let host = DaemonScriptHost::new(all_allowed(), std::env::temp_dir())
+            .with_mime(mime.clone(), parts.clone())
+            .with_write_budget(writes.clone());
+        // An offered part, as the runtime hands it over.
+        let blob = Blob::new(
+            MimeType::parse("image/png").unwrap(),
+            b"\x89PNG\r\n\x1a\nhero".to_vec(),
+        )
+        .named("hero.png");
+        let r = store.put("run-1", &blob, &mime.registry.load()).unwrap();
+        let sha = r.sha256.clone();
+        parts
+            .lock()
+            .unwrap()
+            .push(Part::stored(r).named("hero.png"));
+        parts.lock().unwrap().push(Part::text("note").named("note"));
+
+        assert_eq!(host.read_part("hero.png").unwrap().len(), 12);
+        let prefix: String = sha.chars().take(10).collect();
+        assert_eq!(host.read_part(&prefix).unwrap().len(), 12);
+        let err = host.read_part("note").unwrap_err();
+        assert!(err.contains("inline text"), "{err}");
+        let err = host.read_part("ghost.png").unwrap_err();
+        assert!(err.contains("list_parts()"), "{err}");
+
+        let written = host
+            .write_part(b"\x89PNG\r\n\x1a\ncopy".to_vec(), None, None)
+            .unwrap();
+        assert_eq!(written["name"], "part-3.png");
+        assert_eq!(written["mime_type"], "image/png");
+        let named = host
+            .write_part(vec![1, 2, 3], Some("audio/wav"), Some("beep.wav"))
+            .unwrap();
+        assert_eq!(named["name"], "beep.wav");
+        assert_eq!(named["mime_type"], "audio/wav");
+        assert_eq!(writes.written(), 15);
+        assert_eq!(host.list_parts().len(), 3, "the inline note is not listed");
+        assert!(host.part(&sha).is_some());
+        assert!(host.part("nope").is_none());
+        let err = host.write_part(vec![0; 100], None, None).unwrap_err();
+        assert!(err.contains("ceiling"), "{err}");
+
+        // Bytes the store no longer has.
+        parts.lock().unwrap().push(
+            Part::stored(leviath_core::mime::BlobRef {
+                sha256: "f".repeat(64),
+                mime_type: MimeType::parse("image/png").unwrap(),
+                size: 1,
+                width: None,
+                height: None,
+                duration_ms: None,
+                tokens: 1,
+                stand_in: String::new(),
+            })
+            .named("lost.png"),
+        );
+        let err = host.read_part("lost.png").unwrap_err();
+        assert!(err.contains("could not read the bytes"), "{err}");
+    }
+
+    #[test]
+    fn without_a_store_or_a_grant_parts_are_refused() {
+        let host = DaemonScriptHost::new(all_allowed(), std::env::temp_dir());
+        assert!(host.read_part("x").unwrap_err().contains("no blob store"));
+        assert!(
+            host.write_part(vec![1], None, None)
+                .unwrap_err()
+                .contains("no blob store")
+        );
+        let (mime, _) = mime_and_store();
+        let mut allow = all_allowed();
+        allow.write_file = false;
+        let host = DaemonScriptHost::new(allow, std::env::temp_dir())
+            .with_mime(mime, Arc::new(StdMutex::new(Vec::new())));
+        let err = host.write_part(vec![1], None, None).unwrap_err();
+        assert!(
+            err.contains("[denied]") && err.contains("write_part"),
+            "{err}"
+        );
+        // Without a budget the write is still stored.
+        let (mime, _) = mime_and_store();
+        let host = DaemonScriptHost::new(all_allowed(), std::env::temp_dir())
+            .with_mime(mime, Arc::new(StdMutex::new(Vec::new())));
+        assert!(host.write_part(vec![1], None, Some("a.bin")).is_ok());
     }
 }

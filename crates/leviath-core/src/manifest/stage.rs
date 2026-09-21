@@ -3,6 +3,9 @@
 
 use super::*;
 
+/// The keys of a `[stages.<name>.input]` table.
+const INPUT_KEYS: &[&str] = &["accepts", "as_text"];
+
 /// Every key `parse_stage` reads off a `[stages.<name>]` table.
 ///
 /// Kept beside the parser because it is only true of the parser: a key added
@@ -20,11 +23,13 @@ pub(super) const STAGE_KEYS: &[&str] = &[
     "context",
     "description",
     "hooks",
+    "input",
     "interaction_points",
     "items_region",
     "max_attempts",
     "max_items",
     "max_iterations",
+    "soft_iteration_cap",
     "max_revisits",
     "max_workers",
     "merge_stage",
@@ -33,6 +38,7 @@ pub(super) const STAGE_KEYS: &[&str] = &[
     "nudge",
     "on_worker_failure",
     "output",
+    "output_routing",
     "require_output",
     "required_tools",
     "requires_children",
@@ -42,6 +48,7 @@ pub(super) const STAGE_KEYS: &[&str] = &[
     "shell_hint",
     "split_prompt",
     "system_prompt",
+    "tool_accepts",
     "tool_permissions",
     "tool_routing",
     "transition_prompt",
@@ -58,7 +65,7 @@ pub(super) const STAGE_KEYS: &[&str] = &[
 /// regions from an otherwise inherited one. Either way what is left out is
 /// hidden rather than destroyed. An author who guesses any other key hears
 /// about it instead of quietly carrying the region they meant to drop.
-pub(super) const CONTEXT_KEYS: &[&str] = &["regions", "hide"];
+pub(super) const CONTEXT_KEYS: &[&str] = &["regions", "hide", "reset"];
 
 /// The hooks this build implements, in the order the refusal names them.
 /// `parse_stage_hooks` matches on each, and the schema guard in `tests.rs`
@@ -262,8 +269,7 @@ pub(super) fn parse_stage(stage_name: &str, stage_value: &toml::Value) -> Result
     let mut stage = Stage::new(stage_name.to_string(), model_config);
 
     stage = apply_stage_mode(stage, stage_name, stage_value)?;
-    if stage_value.get("items_region").is_some()
-        && !matches!(stage.mode, StageMode::FanOut { .. })
+    if stage_value.get("items_region").is_some() && !matches!(stage.mode, StageMode::FanOut { .. })
     {
         return Err(Error::Other(format!(
             "stage '{stage_name}': items_region is only valid with mode = \"fan_out\""
@@ -273,6 +279,9 @@ pub(super) fn parse_stage(stage_name: &str, stage_value: &toml::Value) -> Result
     let where_ = format!("stage '{stage_name}'");
     if let Some(max_iter) = count_of(stage_value, &where_, "max_iterations")? {
         stage.max_iterations = Some(max_iter);
+    }
+    if let Some(soft_iter) = count_of(stage_value, &where_, "soft_iteration_cap")? {
+        stage.soft_iteration_cap = Some(soft_iter);
     }
 
     if let Some(tools_arr) = array_of(stage_value, "available_tools") {
@@ -398,6 +407,30 @@ pub(super) fn parse_stage(stage_name: &str, stage_value: &toml::Value) -> Result
         }
 
         stage.tool_result_routing = Some(routing);
+    }
+
+    // `[stages.<name>.output_routing]`: where the model's produced parts go by
+    // mime type. Each key is a mime pattern and each value a region name. The
+    // pattern is validated here (shape only); that the region exists is checked
+    // in `Blueprint::validate`, once every layout is known.
+    if let Some(routing_table) = table_of(stage_value, "output_routing") {
+        for (pattern, region_val) in routing_table {
+            crate::mime::MimeType::parse(pattern).map_err(|_| {
+                Error::Other(format!(
+                    "stage '{stage_name}': output_routing key '{pattern}' is not a mime type \
+                     or pattern, e.g. \"image/*\" or \"application/pdf\""
+                ))
+            })?;
+            let region = region_val.as_str().ok_or_else(|| {
+                Error::Other(format!(
+                    "stage '{stage_name}': output_routing.\"{pattern}\" must be a region name, \
+                     e.g. \"{pattern}\" = \"artwork\""
+                ))
+            })?;
+            stage
+                .output_routing
+                .insert(pattern.clone(), region.to_string());
+        }
     }
 
     // Parse requires_children flag
@@ -530,6 +563,45 @@ pub(super) fn parse_stage(stage_name: &str, stage_value: &toml::Value) -> Result
         )?);
     }
 
+    // `[stages.<name>.input]`: what the stage takes as parts, when the
+    // regions it sees do not already say, and which types reach its model
+    // as text whatever the model takes.
+    if let Some(input_table) = table_of(stage_value, "input") {
+        reject_unknown_keys(
+            &format!("stage '{stage_name}': input"),
+            input_table,
+            INPUT_KEYS,
+        )?;
+        let where_ = format!("stage '{stage_name}': input");
+        stage.input_accepts =
+            super::regions::parse_pattern_list(&where_, "accepts", input_table.get("accepts"))?;
+        stage.input_as_text =
+            super::regions::parse_pattern_list(&where_, "as_text", input_table.get("as_text"))?;
+    }
+
+    // `[stages.<name>.tool_accepts]`: what each tool may be handed here. A
+    // limit that lists nothing would hide every part, which is never what
+    // was meant; dropping the key is how a limit is lifted.
+    if let Some(value) = stage_value.field("tool_accepts") {
+        let Some(limits) = value.as_table() else {
+            return Err(Error::Other(format!(
+                "stage '{stage_name}': tool_accepts must be a table of tool = [mime types], \
+                 e.g. spawn_agent = [\"image/*\"]"
+            )));
+        };
+        for (tool, list) in limits {
+            let where_ = format!("stage '{stage_name}': tool_accepts");
+            let patterns = super::regions::parse_pattern_list(&where_, tool, Some(list))?;
+            if patterns.is_empty() {
+                return Err(Error::Other(format!(
+                    "stage '{stage_name}': tool_accepts.{tool} must list at least one mime \
+                     type; drop the key to lift the limit"
+                )));
+            }
+            stage.tool_accepts.insert(tool.clone(), patterns);
+        }
+    }
+
     // Parse accepts_messages flag: whether mid-run user messages are
     // injected into context between inference calls. Defaults to true
     // (via the Stage constructor); set false for stages that shouldn't
@@ -591,6 +663,26 @@ pub(super) fn parse_stage(stage_name: &str, stage_value: &toml::Value) -> Result
                     ))
                 })?;
             stage.context_hide = names;
+        }
+        // `reset = ["conversation"]`: the regions this stage empties on entry.
+        // Names are checked against the blueprint in `Blueprint::validate`;
+        // here only the shape is.
+        if let Some(reset) = context_table.get("reset") {
+            let names = reset
+                .as_array()
+                .and_then(|items| {
+                    items
+                        .iter()
+                        .map(|v| v.as_str().map(str::to_string))
+                        .collect::<Option<Vec<_>>>()
+                })
+                .ok_or_else(|| {
+                    Error::Other(format!(
+                        "stage '{stage_name}': context.reset must be a list of region names, \
+                         e.g. reset = [\"conversation\"]"
+                    ))
+                })?;
+            stage.context_reset = names;
         }
     }
 

@@ -32,7 +32,8 @@ where you look up the exact name, type, and default. The same contract ships mac
 
 ```toml
 default_provider     = "anthropic"   # provider used when a blueprint names none
-default_model        = "claude-sonnet-4-5"   # bare model id on default_provider, no "anthropic/" prefix
+override_model       = "claude-sonnet-4-5"   # every stage starts on this; unset lets each blueprint decide
+fallback_model       = "claude-haiku-4-5"    # only for a stage none of whose own models is configured
 agent_paths          = ["~/projects/my-agents"]   # extra directories scanned for blueprints
 openrouter_api_key   = "sk-or-..."   # env fallback: OPENROUTER_API_KEY
 ollama_base_url      = "http://localhost:11434"   # env fallback: OLLAMA_HOST
@@ -46,7 +47,8 @@ update_check         = true          # ask whether a newer release exists
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `default_provider` | string | `"anthropic"` | |
-| `default_model` | string | unset | A bare model id on `default_provider`, not `provider/model`. A leading `<default_provider>/` is dropped and named at load, so `"ollama/qwen3.8:latest"` under `default_provider = "ollama"` still works. Unset is usually the better state; over the API, `PUT /api/config` with `"default_model": null` writes it away. See [which entry a stage starts on](/docs/providers#which-entry-a-stage-starts-on) |
+| `override_model` | string | unset | One model every stage that allows a user default starts on, ahead of the models its blueprint names. A bare model id on `default_provider`, not `provider/model`; a leading `<default_provider>/` is dropped and named at load, so `"ollama/qwen3.8:latest"` under `default_provider = "ollama"` still works. Unset is usually the better state; over the API, `PUT /api/config` with `"override_model": null` writes it away. Was `default_model` before 0.6. See [which entry a stage starts on](/docs/providers#which-entry-a-stage-starts-on) |
+| `fallback_model` | string | unset | The model a stage falls back to when none of the models it names is configured here, tried after all of them and before `[providers] fallback_order`. Same bare-id shape as `override_model`. Never moves a stage off a model its blueprint names. A `default_model` from before 0.6 loads as this, with a notice; `lev update` rewrites the key |
 | `agent_paths` | array of paths | `[]` | Searched in addition to `~/.leviath/agents` |
 | `openrouter_api_key` | string | unset | Falls back to `OPENROUTER_API_KEY` |
 | `ollama_base_url` | string | unset | Falls back to `OLLAMA_HOST`, then `http://localhost:11434`. Setting it also counts as choosing Ollama, so an install that configured it before `[providers] ollama_enabled` existed keeps working |
@@ -413,6 +415,7 @@ allow_env_vars             = ["MY_PROVIDER_KEY"]
 allow_blueprint_read_paths = false
 allow_blueprint_safe_commands = false
 allow_blueprint_permissions   = false
+lock_permission_files      = true    # a run may not write config.toml, yolo.toml, mime_types.toml, or the script dirs
 shell_env                  = "filtered"   # filtered | strict | custom | inherit
 shell_env_withhold         = []          # names withheld under shell_env = "custom"
 read_paths                 = ["~/.leviath/runs", "glob:~/design-docs/**"]
@@ -428,12 +431,23 @@ credential_store           = "file"   # file | keychain
 | `allow_blueprint_read_paths` | `false` | Honors every blueprint's `[read_paths]` as written. Prefer a per-agent grant for anything you did not author |
 | `allow_blueprint_safe_commands` | `false` | Honors every blueprint's `[safe_commands]` as written. Off, an installed agent cannot pre-approve its own shell |
 | `allow_blueprint_permissions` | `false` | Honors every blueprint's `[tool_permissions]`, even above the built-in default. See below |
+| `lock_permission_files` | `true` | Refuses any tool call that would write the files that decide what agents may do. See below |
 | `shell_env` | `"filtered"` | Which of the daemon's environment variables a shell command inherits. See below |
 | `shell_env_withhold` | `[]` | The names `shell_env = "custom"` withholds. Ignored under every other mode |
 | `read_paths` | `[]` | Machine-wide read grants, which apply only where a blueprint declares the path too. See below |
 | `credential_store` | `"file"` | `keychain` moves secrets to the OS credential store. Run `lev auth migrate` after changing it |
 
-Five of those need more than a table cell.
+Six of those need more than a table cell.
+
+**`lock_permission_files`** keeps a run's tools out of `config.toml`, `yolo.toml`, `mime_types.toml`, the taint
+gate's `policy.toml` and `rules/`, and the `providers/` and `tools/` script directories. Those are
+where permissions are granted and where code every later run executes lives, so an agent that
+could write them from inside a run could widen what its next spawn is allowed to do. With the lock
+on, `write_file`, `edit_file`, and a `shell` line that names one of them are refused before any
+policy is consulted, `--yolo` or not; a seed at spawn is held to the same rule. A shell line is
+refused for reads too, because the shell does not say which a program does; `read_file` and
+`list_dir` are untouched. This closes the tool surfaces, not every way to the disk: a
+[sandbox](/docs/containers) is the boundary for an agent you do not trust.
 
 **`allowed_workdirs`** silences the confirm prompt for everything under a listed path. Left empty,
 `lev run` asks only about the alarming cases: a home directory, or a filesystem root.
@@ -468,6 +482,7 @@ switches a limit off. See [Limits](/docs/api#limits) for what a client sees.
 [serve]
 max_concurrent_requests = 64   # in flight at once; the next is answered 503
 request_timeout_secs    = 30   # per request; over it the client gets 408
+max_upload_bytes        = 33554432   # one request body; bounds a multipart upload
 ```
 
 The websocket routes are outside both limits. Neither is a ceiling on the runs behind the API:
@@ -792,10 +807,24 @@ supports_tools       = true
 supports_system_prompt = true
 max_context_tokens   = 32768
 max_output_tokens    = 4096
+input_types          = ["text/*", "image/*"]   # what it takes in a request
+output_types         = ["text/*"]              # what it can hand back
 ```
+
+`input_types` and `output_types` are mime type patterns, and they replace the provider's
+list rather than adding to it, so name `text/*` too. They are how a local vision model gets
+sent an image instead of a one-line stand-in for it. [Typed mime](/docs/mime) explains what a
+model does with each type.
+
+`supports_tools = false` is more than "do not offer tools": such a model's provider refuses any
+request that carries a function call, the history included. A stage on that model gets whatever
+tools ran earlier in the run as prose (what was called, what came back) and is advertised no
+tool at all, whatever the stage grants; the run log notes the tools it left out. That is what
+lets an image model sit in a graph beside stages that use tools.
 
 `lev models show <model>` prints the values a run will actually use, with any correction already
 applied, and says whether they came from the provider's own listing or this build's table.
+
 `GET /api/models` carries the same numbers plus a `limits_source` of `api`, `builtin` or
 `override`, so a client can tell a figure the provider reported from one this build matched off the
 model's name. The two are not worth the same and they look identical once printed.
@@ -856,6 +885,34 @@ the line that fixes it.
 > table names, so Leviath warns once per model when it falls back to a conservative window and tells
 > you the line to add here.
 
+## `[mime]`
+
+Ceilings on typed mime parts: the images, audio, video, documents and models that
+[typed mime](/docs/mime) moves through regions, tools and outputs. Defaults shown.
+
+```toml
+[mime]
+max_part_bytes = 33554432               # one part, at every ingress (32 MiB)
+inline_text_bytes = 1048576             # text kept inside the entry before it is stored by hash
+max_media_bytes_per_request = 67108864  # bytes of stored media one model request carries (64 MiB)
+```
+
+A part over `max_part_bytes` is refused where it arrives, whether that is an upload, a tool
+result or a model reply. Text longer than `inline_text_bytes` is stored by hash like any other
+part and read back as text when a request is built. `max_media_bytes_per_request` is a backstop
+for the vendor request-size limits a token budget cannot see: an image's token estimate is the
+same whatever its byte size, so a request can sit inside its context window and still be
+megabytes of media on the wire. Past it, the oldest stored parts are sent as their stand-ins
+instead, with a warning in the run's log.
+
+<a id="mime_typestypesubtype"></a>
+
+## `[mime_types."type/subtype"]`
+
+Rows added to the mime registry. They belong in [`mime_types.toml`](#mime_typestoml) beside
+this file, which is where `lev mime init` puts them; a table here still loads, and the file's
+rows layer over it. The row keys are the same in both places.
+
 <a id="model_providersname"></a>
 
 ## `[model_providers.<name>]`
@@ -901,7 +958,7 @@ entry, or straight into the file.
 
 ```toml
 default_provider = "llama-cpp"
-default_model    = "qwen3-8b"
+override_model   = "qwen3-8b"
 
 [providers]
 anthropic_api_key = "sk-ant-..."
@@ -1082,6 +1139,8 @@ Everything persistent sits under the data root, `<home>/.leviath`, which `LEVIAT
 | Path | Holds |
 |---|---|
 | `config.toml` | This file, created `0600` |
+| `yolo.toml` | The named profiles behind `lev run --yolo=<name>`. See [below](#yolotoml) |
+| `mime_types.toml` | Your rows in the mime registry: what a type is. See [below](#mime_typestoml) |
 | `mcp-auth.json` | MCP OAuth tokens, created `0600` |
 | `runs/` | One directory per run: `meta.json`, `context.json`, `stages.json`, the `run.lvr` journal, per-stage logs |
 | `agents/` | Blueprints installed by `lev add` |
@@ -1132,6 +1191,141 @@ would not fail cleanly, it would produce nonsense. An older version reads normal
 **A torn tail is tolerated.** A crash mid-append leaves a partial final frame, and readers stop
 there and keep everything before it - so an interrupted run still recovers to its last intact
 point.
+
+<a id="mime_typestoml"></a>
+
+## `mime_types.toml`
+
+Your rows in the mime registry, which says what each [mime type](/docs/mime) is, live in
+`mime_types.toml` beside `config.toml` (so under the data root, and wherever
+`LEVIATH_CONFIG_PATH` points when that is set). A key is a `type/subtype` or a `type/*`
+pattern; name only what you change, and every other field resolves from the built-in table (the
+exact type, then `type/*`, then `*/*`). `lev mime init` writes this example to start from; the
+[live copy](/schema/mime_types.example.toml) is the one the tests check, `lev mime add` and
+`lev mime remove` edit rows in place, and `lev mime list` prints the table the file makes with
+each row's source. An edit reaches the next run at once and every run already under way within
+the daemon's housekeeping interval of thirty seconds, with nothing restarted.
+
+```toml
+["model/obj"]
+extensions = ["obj"]
+text = true                      # UTF-8 under the hood: may reach a text model as text
+
+["application/x-acme-scene"]
+family = "model"
+extensions = ["scene"]
+magic = "41434D45"
+tokens = { per_byte = 0.1 }
+stand_in = "[{type} {size}] {name}"
+```
+
+| Key | Meaning |
+|---|---|
+| `family` | What providers key their encoders on: `text`, `image`, `audio`, `video`, `document`, `model`, `binary`, or a name of your own |
+| `text` | The bytes are UTF-8 and may travel inline and reach any text model as text |
+| `tokens` | Exactly one of `{ per_byte = 0.25 }`, `{ per_pixel = 750, max = 1600 }`, `{ per_second = 32 }`, `{ fixed = 1000 }` |
+| `extensions` | Extensions, without the dot, that imply this type |
+| `magic` | A hex prefix that identifies the bytes |
+| `stand_in` | What a consumer that cannot take the type sees; `{type}` `{name}` `{size}` `{dims}` `{duration}` |
+| `check` | A [Rhai script](/docs/rhai-mime-checks), relative to this file's directory, whose `check(bytes, mime_type)` refuses bytes that are not what they claim; `""` lifts a check a broader row put on the type |
+
+A misspelled key inside a row is refused, a `check` that cannot be read or compiled is refused
+with its row named, and a file that will not load is skipped by the daemon and reported by
+`lev doctor`, named by path. A `[mime_types]` block cut out of an
+older `config.toml` loads as it was, wrapper and all. A run's tools may not write the file
+(`lock_permission_files`), since what a file is typed as decides what a model is shown.
+
+## `yolo.toml`
+
+The named profiles behind `lev run --yolo=<name>` live in `yolo.toml`, beside `config.toml`
+(so under the data root, and wherever `LEVIATH_CONFIG_PATH` points when that is set). Bare
+`--yolo` is one bit: every tool call the config does not deny runs, the model's questions are
+answered for it, and every stage checkpoint approves itself. A profile is that bit taken apart.
+Each table is a name you can pass, and says which calls run unprompted, which still go through
+the ordinary approval prompt (the one you would see without `--yolo`), and which are refused,
+down to individual shell commands and the paths they may touch. `lev yolo init` writes this
+example to start from; the [live copy](/schema/yolo.example.toml) is the one the tests check.
+
+```toml
+[careful]
+default     = "ask"     # allow | ask: a call no rule below names, when the config would ask
+questions   = "ask"     # ask | auto: ask_user_*, present_for_review, edit_document
+checkpoints = "ask"     # ask | auto: stage checkpoints
+gate        = "auto"    # ask | auto: taint-gate prompts, where taint tracking is on
+
+[careful.tools]
+allow = ["@builtin"]                 # names in any spelling, globs over MCP names, or @groups
+ask   = ["web_fetch", "install_tool"]
+deny  = []
+
+[[careful.shell.allow]]
+command = "cargo *"                  # leading words, one glob per word
+
+[[careful.shell.allow]]
+command = "rm -r*"
+args    = ["target/**", "-*"]        # every remaining word must match one of these
+
+[[careful.shell.ask]]
+command = "git push*"
+
+[[careful.shell.deny]]
+command = "curl"
+```
+
+**`default`** is the yolo waiver, and only that. It decides a call no list names *when the
+config would ask*: `allow` runs it, which is what bare `--yolo` does, and `ask` leaves the
+ordinary prompt in place. A tool the config already allows (`read_file`) stays allowed under
+`default = "ask"`; a tool the config denies stays denied under everything, as it does under bare
+`--yolo`. There is no `deny` default on purpose. A profile that refused everything it did not
+list would be a denylist by omission; a call you want refused goes in a `deny` list where it can
+be read.
+
+**`tools`** lists tighten as well as loosen. `deny` wins over `ask`, `ask` over `allow`, and an
+`ask` or `deny` entry applies even to a tool the config allows. An entry is a tool name in any of
+its spellings (`bash` covers `shell`), a glob over an MCP name (`github__*`), or one of the groups
+`@builtin`, `@subagent`, `@scripts`, `@mcp` and `@all`. A tool named by `--allow` on the command
+line keeps its allow through an `ask` list, because the launch flag is the most specific thing
+you said, but not through a `deny`.
+
+**`shell`** rules refine the `shell` tool. `command` is the leading words of the line, one glob
+per word, so `rm -r*` covers `rm -rf` and `cargo *` covers every cargo subcommand. `args`, when
+present, is a list of globs every remaining word must satisfy; leave it off to accept any
+remaining words, or set it to `[]` to accept none. A word that starts with `-` is matched as
+text. Any other word is a path, and is matched only as the path it really names: `~` expanded,
+joined to the run's workdir, `..` folded, and symlinks followed as far as the path exists, so
+`~/scratch/../.ssh` and a link out of `~/scratch` do not pass `~/scratch/**`. A relative pattern
+means "under the workdir" (`target/**`); an absolute one means what it says (`/**` is anywhere).
+
+A line is judged one command at a time, and takes the verdict of its strictest command, so
+`cargo test && curl x` is only as free as `curl`. A command no rule names takes the tool-level
+verdict for `shell`. A command that redirects to a file also answers to what the profile says
+about `write_file`. Some lines cannot be matched by an `allow` rule at all: one whose word is an
+expansion (`rm -r $DIR`), one that binds a variable in front of its program (`PATH=x cargo`), one
+using `trap`, `alias` or `function`, and one the reader cannot parse (a backtick, an unbalanced
+quote). Those take the tool-level `shell` verdict when the profile has no shell rules, and ask
+when it has any, because the rules cannot be checked and a person can.
+
+**`questions`, `checkpoints` and `gate`** are the human-in-the-loop knobs, and default to
+`auto`. `questions = "ask"` keeps the tools that wait on a person (`ask_user_*`,
+`present_for_review`, `edit_document`) advertised, and their calls come to you; `auto` is bare
+`--yolo`, where they are not offered and a stray call is answered for it. `checkpoints = "ask"`
+opens every stage checkpoint; `auto` approves them, apart from any the blueprint marks
+`unattended = "ask"`, which hold under every profile. `gate` is the same choice for taint-gate
+prompts. A blueprint's own `required_tools` and `unattended = "ask"` hold whatever the profile
+says: a profile adds holds, it never removes the blueprint's.
+
+A profile is read when a run spawns under its name and again when that run resumes, never
+mid-batch, so an edit reaches the next `lev run` and a parked run you `lev resume`, and a rule
+an agent somehow changed never applies to the run that changed it. `questions`, `checkpoints`
+and `gate` are decided when the run is built and reach the next run only. A name the file does
+not have fails the spawn before the daemon is asked, listing the names it does have. `default`
+is reserved: bare `--yolo` is not configurable, and a profile named that is refused. Names are
+letters, digits, `_` and `-`.
+
+`lev yolo list` shows what is here, `lev yolo show <name>` prints one, and `lev yolo test <name>
+--tool shell --command "rm -r target"` says what it would decide and which rule decided it. The
+same four questions are on the [API](/docs/api#yolo-profiles). With `[security]
+lock_permission_files` on (the default), no run's tools may write this file.
 
 ## `policy.toml`
 

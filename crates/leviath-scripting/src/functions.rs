@@ -354,10 +354,7 @@ mod tests {
         let result: String = e
             .eval(r##"to_json(parse_json("{\"items\":[1,true,null],\"text\":\"é\\n\"}"))"##)
             .unwrap();
-        assert_eq!(
-            result,
-            r#"{"items":[1,true,null],"text":"é\n"}"#
-        );
+        assert_eq!(result, r#"{"items":[1,true,null],"text":"é\n"}"#);
         let parsed: serde_json::Value = serde_json::from_str(&result).expect("strict JSON");
         assert_eq!(parsed["items"][1], true);
         assert_eq!(parsed["text"], "é\n");

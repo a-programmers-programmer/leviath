@@ -59,6 +59,7 @@ fn a_submission_is_recorded_verbatim_and_mirrored_into_the_region() {
             stage: "summary",
             stage_names: &[],
             workdir: None,
+            sink: None,
         },
         1234,
         &mut w,
@@ -90,6 +91,7 @@ fn an_unrecognized_format_is_carried_through_without_inspection() {
             stage: "summary",
             stage_names: &[],
             workdir: None,
+            sink: None,
         },
         0,
         &mut w,
@@ -112,6 +114,7 @@ fn a_format_with_no_schema_never_parses_the_content() {
             stage: "summary",
             stage_names: &[],
             workdir: None,
+            sink: None,
         },
         0,
         &mut w,
@@ -137,6 +140,7 @@ fn a_format_checks_well_formedness_but_not_shape() {
             stage: "summary",
             stage_names: &[],
             workdir: None,
+            sink: None,
         },
         0,
         &mut w,
@@ -152,6 +156,7 @@ fn a_format_checks_well_formedness_but_not_shape() {
             stage: "summary",
             stage_names: &[],
             workdir: None,
+            sink: None,
         },
         0,
         &mut w,
@@ -171,6 +176,7 @@ fn no_spec_at_all_still_records_an_answer() {
             stage: "summary",
             stage_names: &[],
             workdir: None,
+            sink: None,
         },
         0,
         &mut w,
@@ -196,6 +202,7 @@ fn a_submission_matching_its_schema_is_accepted() {
             stage: "summary",
             stage_names: &[],
             workdir: None,
+            sink: None,
         },
         0,
         &mut w,
@@ -219,6 +226,7 @@ fn a_submission_violating_its_schema_is_refused_and_records_nothing() {
             stage: "summary",
             stage_names: &[],
             workdir: None,
+            sink: None,
         },
         0,
         &mut w,
@@ -245,6 +253,7 @@ fn content_that_is_not_json_fails_a_schema_check_with_a_readable_reason() {
             stage: "summary",
             stage_names: &[],
             workdir: None,
+            sink: None,
         },
         0,
         &mut w,
@@ -268,6 +277,7 @@ fn an_uncompilable_schema_records_the_submission_unchecked() {
             stage: "summary",
             stage_names: &[],
             workdir: None,
+            sink: None,
         },
         0,
         &mut w,
@@ -286,6 +296,7 @@ fn a_missing_content_argument_is_refused() {
             stage: "summary",
             stage_names: &[],
             workdir: None,
+            sink: None,
         },
         0,
         &mut w,
@@ -307,6 +318,7 @@ fn a_blank_submission_is_refused() {
                 stage: "summary",
                 stage_names: &[],
                 workdir: None,
+                sink: None,
             },
             0,
             &mut w,
@@ -328,6 +340,7 @@ fn an_oversized_submission_is_truncated_and_the_model_is_told() {
             stage: "summary",
             stage_names: &[],
             workdir: None,
+            sink: None,
         },
         0,
         &mut w,
@@ -354,6 +367,7 @@ fn a_second_submission_replaces_the_first() {
             stage: "summary",
             stage_names: &[],
             workdir: None,
+            sink: None,
         },
         1,
         &mut w,
@@ -367,6 +381,7 @@ fn a_second_submission_replaces_the_first() {
             stage: "summary",
             stage_names: &[],
             workdir: None,
+            sink: None,
         },
         2,
         &mut w,
@@ -389,6 +404,7 @@ fn a_window_without_the_region_still_records_the_output() {
             stage: "summary",
             stage_names: &[],
             workdir: None,
+            sink: None,
         },
         0,
         &mut bare,
@@ -405,6 +421,8 @@ fn a_window_without_the_region_still_records_the_output() {
 fn artifacts_inside_the_workdir_are_recorded() {
     let dir = tempfile::tempdir().expect("temp dir");
     std::fs::write(dir.path().join("results.csv"), "a,b\n1,2\n").expect("write");
+    std::fs::create_dir_all(dir.path().join("notes")).expect("mkdir");
+    std::fs::write(dir.path().join("notes/summary.md"), "# done").expect("write");
     let mut w = win();
     let (_, output) = handle_output_tool(
         &json!({
@@ -417,14 +435,17 @@ fn artifacts_inside_the_workdir_are_recorded() {
             stage: "present",
             stage_names: &[],
             workdir: Some(dir.path()),
+            sink: None,
         },
         0,
         &mut w,
     );
     let output = output.expect("accepted");
-    // A file that does not exist yet is fine: the check is where a path lands,
-    // not whether the agent has finished writing it.
-    assert_eq!(output.artifacts, vec!["results.csv", "notes/summary.md"]);
+    let paths: Vec<&str> = output.artifacts.iter().map(|a| a.path.as_str()).collect();
+    assert_eq!(paths, ["results.csv", "notes/summary.md"]);
+    assert_eq!(output.artifacts[0].name, "results.csv");
+    assert_eq!(output.artifacts[0].mime_type.as_str(), "text/csv");
+    assert_eq!(output.artifacts[1].mime_type.as_str(), "text/markdown");
 }
 
 /// A path that escapes the workdir is refused outright rather than dropped from
@@ -442,6 +463,7 @@ fn an_artifact_outside_the_workdir_refuses_the_whole_submission() {
             stage: "present",
             stage_names: &[],
             workdir: Some(dir.path()),
+            sink: None,
         },
         0,
         &mut w,
@@ -463,6 +485,7 @@ fn no_artifacts_argument_records_an_empty_list() {
             stage: "present",
             stage_names: &[],
             workdir: Some(dir.path()),
+            sink: None,
         },
         0,
         &mut w,
@@ -483,6 +506,7 @@ fn artifacts_with_no_workdir_are_refused() {
             stage: "present",
             stage_names: &[],
             workdir: None,
+            sink: None,
         },
         0,
         &mut w,
@@ -507,6 +531,7 @@ fn a_long_answer_is_mirrored_as_a_bounded_preview() {
             stage: "summary",
             stage_names: &[],
             workdir: None,
+            sink: None,
         },
         0,
         &mut w,
@@ -541,6 +566,7 @@ fn a_submission_that_is_not_the_format_it_claims_is_refused() {
             stage: "summary",
             stage_names: &[],
             workdir: None,
+            sink: None,
         },
         0,
         &mut w,
@@ -560,6 +586,7 @@ fn a_well_formed_submission_in_a_known_format_is_accepted() {
             stage: "summary",
             stage_names: &[],
             workdir: None,
+            sink: None,
         },
         0,
         &mut w,
@@ -580,6 +607,7 @@ fn an_unknown_format_is_still_never_inspected() {
             stage: "summary",
             stage_names: &[],
             workdir: None,
+            sink: None,
         },
         0,
         &mut w,
@@ -603,6 +631,7 @@ fn the_format_check_reports_before_the_schema_check() {
             stage: "summary",
             stage_names: &[],
             workdir: None,
+            sink: None,
         },
         0,
         &mut w,
@@ -660,6 +689,7 @@ fn an_agent_supplied_validator_rejects_a_bad_answer() {
             stage: "summary",
             stage_names: &[],
             workdir: None,
+            sink: None,
         },
         0,
         &mut w,
@@ -688,6 +718,7 @@ fn an_agent_supplied_validator_accepts_a_good_answer() {
             stage: "summary",
             stage_names: &[],
             workdir: None,
+            sink: None,
         },
         0,
         &mut w,
@@ -711,6 +742,7 @@ fn a_throwing_validator_rejects_the_submission_by_default() {
             stage: "summary",
             stage_names: &[],
             workdir: None,
+            sink: None,
         },
         0,
         &mut w,
@@ -743,6 +775,7 @@ fn an_accept_policy_records_the_submission_unchecked() {
             stage: "summary",
             stage_names: &[],
             workdir: None,
+            sink: None,
         },
         0,
         &mut w,
@@ -776,6 +809,7 @@ fn a_broken_validator_is_recorded_once_however_often_it_is_hit() {
                 stage: "summary",
                 stage_names: &[],
                 workdir: None,
+                sink: None,
             },
             0,
             &mut w,
@@ -801,6 +835,7 @@ fn a_working_validator_records_nothing() {
             stage: "summary",
             stage_names: &[],
             workdir: None,
+            sink: None,
         },
         0,
         &mut w,
@@ -821,6 +856,7 @@ fn a_named_validator_with_nothing_compiled_is_skipped() {
             stage: "summary",
             stage_names: &[],
             workdir: None,
+            sink: None,
         },
         0,
         &mut w,
@@ -861,6 +897,7 @@ fn ctx<'a>(stage: &'a str, stage_names: &'a [String]) -> OutputContext<'a> {
         stage,
         stage_names,
         workdir: None,
+        sink: None,
     }
 }
 
@@ -956,4 +993,344 @@ fn without_stage_names_a_submission_is_accepted_as_before() {
         &mut w,
     );
     assert_eq!(output.expect("accepted").content, "analyze");
+}
+
+/// With a store behind it, an accepted artifact is stored and mirrored beside
+/// the answer as its own entry, and the ack lists it.
+#[test]
+fn stored_artifacts_are_mirrored_beside_the_answer() {
+    use leviath_core::mime::{BlobStore, MemoryBlobStore, MimeRegistry};
+    let dir = tempfile::tempdir().expect("temp dir");
+    std::fs::write(dir.path().join("cut.mp4"), b"\x00\x00\x00\x18ftypmp42").expect("write");
+    let store = MemoryBlobStore::new();
+    let registry = MimeRegistry::builtin();
+    let sink = crate::context_setup::PartSink {
+        store: &store,
+        registry: &registry,
+        run_id: "run-1",
+        max_part_bytes: 1024,
+    };
+    let mut w = win();
+    let (ack, output) = handle_output_tool(
+        &json!({
+            "content": "the cut is done",
+            "artifacts": [{"name": "final", "path": "cut.mp4"}],
+        }),
+        &OutputContext {
+            spec: None,
+            validators: None,
+            stage: "present",
+            stage_names: &[],
+            workdir: Some(dir.path()),
+            sink: Some(&sink),
+        },
+        0,
+        &mut w,
+    );
+    let output = output.expect("accepted");
+    assert!(ack.contains("Artifacts: final (video/mp4, 12 B)."), "{ack}");
+    assert!(store.has("run-1", &output.artifacts[0].sha256));
+    let region = w.get_region(FINAL_OUTPUT_REGION).expect("region");
+    assert_eq!(region.content.len(), 2);
+    assert_eq!(region.content[0].content, "the cut is done");
+    assert_eq!(region.stored_count(), 1);
+    assert!(
+        region.content[1]
+            .content
+            .as_str()
+            .starts_with("artifact 'final':")
+    );
+}
+
+/// An image a model produced lives in the store, not the workdir. Naming it as
+/// an artifact writes it to the named path (a real file for the user and any
+/// later stage) and records it beside the answer.
+#[test]
+fn a_produced_part_named_as_an_artifact_is_written_to_disk() {
+    use leviath_core::mime::{Blob, BlobStore, MemoryBlobStore, MimeRegistry, MimeType, Part};
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = MemoryBlobStore::new();
+    let registry = MimeRegistry::builtin();
+    // A produced image, stored but never written to disk.
+    let bytes = b"\x89PNG\r\n\x1a\n produced pixels".to_vec();
+    let blob = Blob::new(MimeType::parse("image/png").unwrap(), bytes).named("image-1.png");
+    let reference = store.put("run-1", &blob, &registry).expect("stored");
+    let part = Part::stored(reference).named("image-1.png");
+
+    let mut w = win();
+    w.add_region(Region::new(
+        "artwork".to_string(),
+        RegionKind::Pinned,
+        100_000,
+    ));
+    let content = leviath_core::region::EntryContent::from_parts(vec![part]);
+    let tokens = content.tokens_hint();
+    w.add_assistant_turn_content(
+        "artwork",
+        leviath_core::EntryKind::Text,
+        content,
+        tokens,
+        None,
+    )
+    .expect("stored in artwork");
+
+    let sink = crate::context_setup::PartSink {
+        store: &store,
+        registry: &registry,
+        run_id: "run-1",
+        max_part_bytes: 1024,
+    };
+    assert!(
+        !dir.path().join("image-1.png").exists(),
+        "precondition: the file is not on disk"
+    );
+    let (ack, output) = handle_output_tool(
+        &json!({
+            "content": "a pelican on a bike",
+            "artifacts": [{"name": "image", "path": "image-1.png"}],
+        }),
+        &OutputContext {
+            spec: None,
+            validators: None,
+            stage: "describe",
+            stage_names: &[],
+            workdir: Some(dir.path()),
+            sink: Some(&sink),
+        },
+        0,
+        &mut w,
+    );
+    let output = output.expect("accepted");
+    assert!(
+        dir.path().join("image-1.png").exists(),
+        "the produced part was written to the workdir"
+    );
+    assert_eq!(output.artifacts.len(), 1);
+    assert_eq!(output.artifacts[0].name, "image");
+    assert!(ack.contains("image"), "{ack}");
+}
+
+/// Naming an artifact that is neither on disk nor a produced part is refused
+/// with a message that says both places were checked.
+#[test]
+fn an_artifact_that_is_neither_a_file_nor_a_produced_part_is_refused() {
+    use leviath_core::mime::{MemoryBlobStore, MimeRegistry};
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = MemoryBlobStore::new();
+    let registry = MimeRegistry::builtin();
+    let sink = crate::context_setup::PartSink {
+        store: &store,
+        registry: &registry,
+        run_id: "run-1",
+        max_part_bytes: 1024,
+    };
+    let mut w = win();
+    let (message, output) = handle_output_tool(
+        &json!({
+            "content": "done",
+            "artifacts": [{"name": "image", "path": "ghost.png"}],
+        }),
+        &OutputContext {
+            spec: None,
+            validators: None,
+            stage: "describe",
+            stage_names: &[],
+            workdir: Some(dir.path()),
+            sink: Some(&sink),
+        },
+        0,
+        &mut w,
+    );
+    assert!(output.is_none());
+    assert!(message.contains("neither a file"), "{message}");
+    assert!(message.contains("ghost.png"), "{message}");
+}
+
+/// A produced part in the window with a store behind it, for the resolution
+/// tests below. Returns the window (with the part in `artwork`), the store and
+/// the registry so the caller can build a sink.
+fn window_with_produced_png(
+    name: &str,
+) -> (
+    ContextWindow,
+    leviath_core::mime::MemoryBlobStore,
+    leviath_core::mime::MimeRegistry,
+    leviath_core::mime::BlobRef,
+) {
+    use leviath_core::mime::{Blob, BlobStore, MemoryBlobStore, MimeRegistry, MimeType, Part};
+    let store = MemoryBlobStore::new();
+    let registry = MimeRegistry::builtin();
+    let bytes = b"\x89PNG\r\n\x1a\n produced pixels".to_vec();
+    let blob = Blob::new(MimeType::parse("image/png").unwrap(), bytes).named(name);
+    let reference = store.put("run-1", &blob, &registry).expect("stored");
+    let mut w = win();
+    w.add_region(Region::new(
+        "artwork".to_string(),
+        RegionKind::Pinned,
+        100_000,
+    ));
+    let content = leviath_core::region::EntryContent::from_parts(vec![
+        Part::stored(reference.clone()).named(name),
+    ]);
+    let tokens = content.tokens_hint();
+    w.add_assistant_turn_content(
+        "artwork",
+        leviath_core::EntryKind::Text,
+        content,
+        tokens,
+        None,
+    )
+    .expect("stored in artwork");
+    (w, store, registry, reference)
+}
+
+/// The part name need not match the artifact path exactly: the path's file name
+/// resolves it, so `./image-1.png` finds the part named `image-1.png`.
+#[test]
+fn a_produced_part_resolves_by_its_file_name() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (mut w, store, registry, _) = window_with_produced_png("image-1.png");
+    let sink = crate::context_setup::PartSink {
+        store: &store,
+        registry: &registry,
+        run_id: "run-1",
+        max_part_bytes: 1024,
+    };
+    let (_, output) = handle_output_tool(
+        &json!({
+            "content": "described",
+            "artifacts": [{"name": "image", "path": "./image-1.png"}],
+        }),
+        &OutputContext {
+            spec: None,
+            validators: None,
+            stage: "describe",
+            stage_names: &[],
+            workdir: Some(dir.path()),
+            sink: Some(&sink),
+        },
+        0,
+        &mut w,
+    );
+    assert!(output.is_some(), "the file name resolved the part");
+    assert!(dir.path().join("image-1.png").exists());
+}
+
+/// A part can also be named by a prefix of its sha256, for when the model was
+/// shown the hash rather than a file name.
+#[test]
+fn a_produced_part_resolves_by_sha_prefix() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (mut w, store, registry, reference) = window_with_produced_png("unnamed.png");
+    let sink = crate::context_setup::PartSink {
+        store: &store,
+        registry: &registry,
+        run_id: "run-1",
+        max_part_bytes: 1024,
+    };
+    let prefix = reference
+        .sha256
+        .get(..16)
+        .expect("a sha256 is 64 hex chars");
+    let (_, output) = handle_output_tool(
+        &json!({
+            "content": "described",
+            "artifacts": [{"name": "image", "path": prefix}],
+        }),
+        &OutputContext {
+            spec: None,
+            validators: None,
+            stage: "describe",
+            stage_names: &[],
+            workdir: Some(dir.path()),
+            sink: Some(&sink),
+        },
+        0,
+        &mut w,
+    );
+    assert!(output.is_some(), "the sha prefix resolved the part");
+    assert!(dir.path().join(prefix).exists());
+}
+
+/// A store that cannot read the part's bytes refuses the submission, saying so.
+#[test]
+fn a_produced_part_whose_store_read_fails_is_refused() {
+    use leviath_core::mime::{Blob, BlobRef, BlobStore, MimeRegistry};
+    struct Broken;
+    impl BlobStore for Broken {
+        fn put(&self, _: &str, _: &Blob, _: &MimeRegistry) -> std::io::Result<BlobRef> {
+            Err(std::io::Error::other("no"))
+        }
+        fn read(&self, _: &str, _: &str) -> std::io::Result<std::sync::Arc<[u8]>> {
+            Err(std::io::Error::other("disk gone"))
+        }
+        fn copy(&self, _: &str, _: &str, _: &str) -> std::io::Result<()> {
+            Err(std::io::Error::other("no"))
+        }
+        fn list(&self, _: &str) -> std::io::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+    }
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (mut w, _store, registry, _) = window_with_produced_png("image-1.png");
+    let broken = Broken;
+    let sink = crate::context_setup::PartSink {
+        store: &broken,
+        registry: &registry,
+        run_id: "run-1",
+        max_part_bytes: 1024,
+    };
+    let (message, output) = handle_output_tool(
+        &json!({
+            "content": "described",
+            "artifacts": [{"name": "image", "path": "image-1.png"}],
+        }),
+        &OutputContext {
+            spec: None,
+            validators: None,
+            stage: "describe",
+            stage_names: &[],
+            workdir: Some(dir.path()),
+            sink: Some(&sink),
+        },
+        0,
+        &mut w,
+    );
+    assert!(output.is_none());
+    assert!(
+        message.contains("could not be read from the run's store"),
+        "{message}"
+    );
+}
+
+/// Writing a resolved part to a path whose directory does not exist fails with
+/// the reason rather than making the tree.
+#[test]
+fn a_produced_part_written_to_a_missing_directory_is_refused() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (mut w, store, registry, _) = window_with_produced_png("image-1.png");
+    let sink = crate::context_setup::PartSink {
+        store: &store,
+        registry: &registry,
+        run_id: "run-1",
+        max_part_bytes: 1024,
+    };
+    let (message, output) = handle_output_tool(
+        &json!({
+            "content": "described",
+            "artifacts": [{"name": "image", "path": "nope/image-1.png"}],
+        }),
+        &OutputContext {
+            spec: None,
+            validators: None,
+            stage: "describe",
+            stage_names: &[],
+            workdir: Some(dir.path()),
+            sink: Some(&sink),
+        },
+        0,
+        &mut w,
+    );
+    assert!(output.is_none());
+    assert!(message.contains("could not be written"), "{message}");
 }

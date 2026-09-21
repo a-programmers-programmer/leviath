@@ -358,12 +358,19 @@ impl PipelineWorld {
         // Retained so `flush_and_stop` can drain it on shutdown. Left to its own
         // devices otherwise: it exits when the world (and thus its PersistenceStage
         // sender) is dropped.
+        let blob_store = crate::blob_store::store_for(runs_dir.as_deref());
         let persist_task = runtime.spawn(persistence_worker(runs_dir, persist_rx));
         let ip_runtime = runtime.clone();
         let gp_runtime = runtime.clone();
 
         let mut world = World::new();
         world.insert_resource(OwnWorldId(id));
+        // Stored mime parts and the registry that types them. The registry
+        // starts as the compiled defaults; a host layers the operator's
+        // `[mime_types]` on by replacing the resource, as it does telemetry.
+        world.insert_resource(crate::blob_store::BlobStoreHandle(blob_store));
+        world.insert_resource(crate::blob_store::MimeRegistryHandle::default());
+        world.insert_resource(crate::blob_store::MimeLimits::default());
         world.insert_resource(Providers(providers));
         world.insert_resource(InferenceStage {
             // The wake goes into the pools, not just the bridges: freeing a slot
@@ -1248,6 +1255,7 @@ mod tests {
 
     fn text(content: &str) -> InferenceResponse {
         InferenceResponse {
+            parts: Vec::new(),
             content: content.to_string(),
             tool_calls: vec![],
             tokens_used: TokenUsage {
@@ -1284,12 +1292,7 @@ mod tests {
             _progress: crate::pipeline::ToolProgress,
         ) -> BoxedToolExec {
             Box::new(move || {
-                Box::pin(async move {
-                    calls
-                        .into_iter()
-                        .map(|c| (c.id, "ok".to_string()))
-                        .collect()
-                })
+                Box::pin(async move { calls.into_iter().map(|c| (c.id, "ok".into())).collect() })
             })
         }
     }
@@ -1355,11 +1358,13 @@ mod tests {
                 batch_tool_hint: false,
                 shell_hint: false,
                 request_timeout_secs: None,
+                as_text: Vec::new(),
             },
             routing: None,
             accepts_messages: true,
             context_layout: None,
             context_hide: Vec::new(),
+            context_reset: Vec::new(),
             system_prompt: None,
         }
     }
@@ -1883,6 +1888,7 @@ mod tests {
                 agent_id: "a".to_string(),
                 content: "hello".to_string(),
                 target_region: Some("conversation".to_string()),
+                parts: Vec::new(),
             })
             .unwrap();
         world.tick(); // deliver_messages runs
@@ -1941,6 +1947,7 @@ mod tests {
             agent_id: "a".to_string(),
             content: "x".to_string(),
             target_region: None,
+            parts: Vec::new(),
         });
         assert!(err.is_err());
     }
@@ -2273,6 +2280,7 @@ mod tests {
                     tools: vec![],
                     fallbacks: Vec::new(),
                     output: None,
+                    notes: Vec::new(),
                 }],
                 hints(true),
             )
@@ -2325,6 +2333,7 @@ mod tests {
                 title: None,
                 title_error: None,
                 unattended: false,
+                yolo_profile: None,
                 read_paths: None,
                 output_request: None,
                 model_override: None,
@@ -2417,6 +2426,7 @@ mod tests {
                 title: None,
                 title_error: None,
                 unattended: false,
+                yolo_profile: None,
                 read_paths: None,
                 output_request: None,
                 model_override: None,
@@ -2525,6 +2535,7 @@ mod tests {
                 title: None,
                 title_error: None,
                 unattended: false,
+                yolo_profile: None,
                 read_paths: None,
                 output_request: None,
                 model_override: None,
@@ -2649,6 +2660,7 @@ mod tests {
                 title: None,
                 title_error: None,
                 unattended: false,
+                yolo_profile: None,
                 read_paths: None,
                 output_request: None,
                 model_override: None,
@@ -2717,6 +2729,7 @@ mod tests {
                 title: None,
                 title_error: None,
                 unattended: false,
+                yolo_profile: None,
                 read_paths: None,
                 output_request: None,
                 model_override: None,
@@ -2776,7 +2789,7 @@ mod tests {
                 current_tokens: 4,
                 max_tokens: 10_000,
                 entries: vec![RegionEntrySnapshot {
-                    content: "restored turn".to_string(),
+                    content: "restored turn".into(),
                     tokens: 4,
                     kind: EntryKind::UserMessage,
                     metadata: None,
@@ -2845,6 +2858,7 @@ mod tests {
                 tools: vec![],
                 fallbacks: Vec::new(),
                 output: None,
+                notes: Vec::new(),
             }],
             hints(true),
         );

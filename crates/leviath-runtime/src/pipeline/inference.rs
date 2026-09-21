@@ -244,12 +244,47 @@ pub(crate) fn build_request(
         _ => serde_json::Value::Null,
     };
 
+    // A model that cannot call tools is refused by its provider for any
+    // function call in the request, the history included. Everything a tool
+    // did earlier in the run reaches it as prose instead, and nothing is
+    // advertised to it.
+    let (messages, filtered_tools) = if caps.supports_tools {
+        (assembled.messages, filtered_tools)
+    } else {
+        if !filtered_tools.is_empty() {
+            tracing::warn!(
+                model = %stage.model,
+                tools = filtered_tools.len(),
+                "the model cannot call tools; the stage's tools are not advertised to it"
+            );
+        }
+        (
+            leviath_providers::flatten_tool_turns(assembled.messages),
+            Vec::new(),
+        )
+    };
+
     let mut system = hint_blocks(config, &filtered_tools, std::env::consts::OS);
     system.extend(assembled.system_blocks);
 
+    // A model that does not read a system prompt has the stage's instruction
+    // folded into the user turn instead, or it is lost. It lands in the system
+    // blocks with a bare "Begin." user nudge (the convention that makes a text
+    // model act); a model that ignores the system prompt generates from the
+    // nudge - an image model's "Begin." becomes generic "start of a journey"
+    // scenery, never the asked subject. The capability says whether the model
+    // reads the system prompt; `ignores_system_prompt` is the one-off for a
+    // model no catalogue distinguishes (`gemini-2.5-flash-image`).
+    let mut messages = messages;
+    let reads_system = caps.supports_system_prompt
+        && !leviath_providers::capabilities::ignores_system_prompt(&stage.model);
+    if !reads_system {
+        fold_system_into_user(&mut system, &mut messages);
+    }
+
     let request = InferenceRequest {
         system,
-        messages: assembled.messages,
+        messages,
         model: stage.model.clone(),
         max_tokens,
         temperature,
@@ -258,6 +293,46 @@ pub(crate) fn build_request(
         request_timeout_secs: config.and_then(|c| c.request_timeout_secs),
     };
     (request, system_hash, block_hashes)
+}
+
+/// Fold the system blocks into the first user turn and clear them, for a model
+/// that does not read a system prompt. Done into the *first* user message, once,
+/// so a multi-turn conversation keeps its shape: the bare "Begin." nudge is
+/// replaced outright, a real text turn is prefixed, and a turn that carries
+/// blocks (an input image) gains the text ahead of them. With no user turn at
+/// all the folded system becomes one.
+pub(crate) fn fold_system_into_user(
+    system: &mut Vec<leviath_providers::SystemBlock>,
+    messages: &mut Vec<leviath_providers::Message>,
+) {
+    let text = system
+        .iter()
+        .map(|block| block.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if text.is_empty() {
+        return;
+    }
+    system.clear();
+    match messages.iter_mut().find(|m| m.role == "user") {
+        Some(first) => match &mut first.content {
+            leviath_providers::MessageContent::Text(existing) => {
+                *existing = match existing.trim() == "Begin." {
+                    true => text,
+                    false => format!("{text}\n\n{existing}"),
+                };
+            }
+            leviath_providers::MessageContent::Blocks(blocks) => {
+                blocks.insert(0, leviath_providers::ContentBlock::Text { text });
+            }
+        },
+        None => messages.push(leviath_providers::Message {
+            role: "user".to_string(),
+            content: leviath_providers::MessageContent::Text(text),
+            cache_breakpoint: false,
+            reasoning: None,
+        }),
+    }
 }
 
 /// Build the [`RetryPolicy`] for a job from the operator's `[limits]` retry
@@ -364,6 +439,22 @@ pub(crate) struct SystemPrefixHash(pub u64);
 #[derive(Component, Debug, Clone, Default)]
 pub(crate) struct SystemBlockHashes(pub Vec<u64>);
 
+/// The optional resources dispatch reads, as one parameter: the operator's
+/// circuit and retry settings, and the mime store, registry and limits. Every
+/// one is optional because a world assembled by hand in a test installs none
+/// of them, and each has a built-in answer for that case.
+#[derive(bevy_ecs::system::SystemParam)]
+pub(crate) struct DispatchTuning<'w, 's> {
+    /// Which providers' circuits are open.
+    pub circuits: Option<Res<'w, ProviderCircuits>>,
+    /// When a circuit opens and how long it stays open.
+    pub policy: Option<Res<'w, CircuitPolicy>>,
+    /// The retry schedule.
+    pub retry: Option<Res<'w, InferenceRetryTuning>>,
+    /// The mime store, registry and limits.
+    pub mime: crate::blob_store::MimeParams<'w, 's>,
+}
+
 /// Inference-dispatch system: for every `ReadyToInfer` agent, resolve its
 /// provider and, **if a per-model permit is free**, build the request, spawn the
 /// inference job, and move it to `AwaitingInference`. If its provider is missing
@@ -373,11 +464,15 @@ pub(crate) fn dispatch_inference(
     agents: Query<InferenceQuery, With<ReadyToInfer>>,
     stage: Res<InferenceStage>,
     providers: Res<Providers>,
-    circuits: Option<Res<ProviderCircuits>>,
-    policy: Option<Res<CircuitPolicy>>,
-    retry: Option<Res<InferenceRetryTuning>>,
+    tuning: DispatchTuning,
     par_commands: ParallelCommands,
 ) {
+    let DispatchTuning {
+        circuits,
+        policy,
+        retry,
+        mime,
+    } = tuning;
     // Fan out across ready agents: request assembly (`build_request`) is the
     // per-agent CPU cost and is independent, so it runs in parallel on the
     // compute pool. Permit acquisition (an atomic semaphore) and the tokio spawn
@@ -495,6 +590,21 @@ pub(crate) fn dispatch_inference(
                 // asking anyway would pay for the fold and gain nothing.
                 let stream =
                     stage.stream_inference && provider.capabilities(&si.model).supports_streaming;
+                // The bytes of the request's stored parts are read in the
+                // job, off this thread, against what this model takes, typed
+                // by this run's registry. Every `PipelineWorld` installs the
+                // store; a world assembled by hand in a test may not, and
+                // then stored parts go out as their stand-ins.
+                let (mime_resources, max_media_bytes) = mime.hydration_inputs(entity);
+                let hydration =
+                    mime_resources.map(|(store, registry)| crate::inference_bridge::JobHydration {
+                        store,
+                        run_id: state.agent_id.clone(),
+                        registry,
+                        mime: provider.mime(&si.model),
+                        max_media_bytes,
+                        as_text: config.map(|c| c.as_text.clone()).unwrap_or_default(),
+                    });
                 let job = InferenceJob {
                     entity,
                     provider,
@@ -502,6 +612,7 @@ pub(crate) fn dispatch_inference(
                     permit,
                     calibration: calibration.copied(),
                     stream,
+                    hydration,
                 };
                 let cancel = crate::cancel::CancelToken::new();
                 // Supervised: this agent is about to become `AwaitingInference`,

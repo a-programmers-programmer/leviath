@@ -41,6 +41,11 @@ pub struct SpawnArgs {
     /// keeps older requests (which never sent this) deserializing to an empty map.
     #[serde(default)]
     pub regions: HashMap<String, String>,
+    /// Files the caller attached: each lands in its region (or the task
+    /// region) as a stored part, beside the text it came with. Bytes ride
+    /// base64 here; the run's blob store holds them from spawn on.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parts: Vec<leviath_core::mime::InboundPart>,
     /// Optional model override (`provider/model` or `model`).
     #[serde(default)]
     pub model: Option<String>,
@@ -67,6 +72,13 @@ pub struct SpawnArgs {
     /// outside that `Waiting` is indistinguishable from a hang.
     #[serde(default)]
     pub yolo: bool,
+    /// The named yolo profile (`--yolo=<name>`) that says which parts of
+    /// `yolo` a person still wants: the profile's own tool and shell rules,
+    /// and whether questions, checkpoints and the taint gate still reach
+    /// someone. `None` with `yolo` set is the bare flag. Meaningless without
+    /// `yolo`.
+    #[serde(default)]
+    pub yolo_profile: Option<String>,
     /// Refuse this run's `seed = { command = ... }` regions (the
     /// `--no-seed-commands` launch override). Command seeds execute at spawn,
     /// before any approval prompt, so this is the per-run counterpart to the
@@ -120,6 +132,7 @@ impl std::fmt::Debug for SpawnArgs {
                 },
             )
             .field("yolo", &self.yolo)
+            .field("yolo_profile", &self.yolo_profile)
             .field("no_seed_commands", &self.no_seed_commands)
             .field("allow", &self.allow)
             .field("max_depth", &self.max_depth)
@@ -195,6 +208,10 @@ pub struct RunListEntry {
     /// be sitting on a prompt; if it is, something dropped the flag.
     #[serde(default)]
     pub unattended: bool,
+    /// The yolo profile the run was launched under, when it named one.
+    /// Omitted by a daemon older than profiles, and for the bare flag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yolo_profile: Option<String>,
     /// Whether this run finished having modified nothing, when its blueprint
     /// gave it a way to. Only ever true for a run that has stopped.
     ///
@@ -341,6 +358,15 @@ pub type Reaper = Box<dyn FnMut(&mut PipelineWorld, Entity) + Send>;
 /// started on; this fires only at the boundary. Installed with
 /// [`super::WorldHost::set_resumer`]; a no-op when none is set.
 pub type Resumer = Box<dyn FnMut(&mut PipelineWorld, Entity) + Send>;
+
+/// The daemon-installed hook run on every safety re-drive, whether or not
+/// anything woke the host: the place for work that has to happen while the
+/// daemon is otherwise idle. The daemon uses it to notice an edited
+/// `config.toml` or `mime_types.toml` and re-apply the settings that reach
+/// runs already under way, so an edit lands within one re-drive interval
+/// rather than at the next spawn. Installed with
+/// [`super::WorldHost::set_housekeeper`]; a no-op when none is set.
+pub type Housekeeper = Box<dyn FnMut(&mut PipelineWorld) + Send>;
 
 /// An async hook the host awaits *before* servicing a top-level `Spawn` control
 /// op, so the daemon can do async preparation the sync spawner can't - e.g.
@@ -489,6 +515,8 @@ pub enum ControlOp {
         content: String,
         /// Optional target region (defaults to the conversation region).
         target_region: Option<String>,
+        /// Files sent with the message, written beside it as stored parts.
+        parts: Vec<leviath_core::mime::InboundPart>,
         /// Reply channel.
         reply: oneshot::Sender<bool>,
     },

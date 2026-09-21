@@ -16,8 +16,12 @@ use leviath_runtime::control_socket::{ControlClient, ControlRequest, ControlResp
 pub struct MsgArgs {
     /// The target agent id.
     pub agent_id: String,
-    /// The message to deliver.
+    /// The message to deliver. A `@path` inside it attaches that file.
     pub content: String,
+    /// Attach a file to the message: `path[:region][:type][:text]`, as on
+    /// `lev run --attach`. Repeatable.
+    #[arg(long, value_name = "PATH[:REGION][:TYPE][:text]")]
+    pub attach: Vec<String>,
 }
 
 /// Arguments for `lev cancel`.
@@ -80,6 +84,11 @@ pub struct RespondArgs {
     /// This is how an unattended caller finds the questions it has to answer.
     #[arg(long)]
     pub json: bool,
+    /// Attach a file to a text answer: `path[:region][:type][:text]`, as on
+    /// `lev run --attach`. Repeatable. A `@path` inside the answer attaches
+    /// that file too.
+    #[arg(long, value_name = "PATH[:REGION][:TYPE][:text]")]
+    pub attach: Vec<String>,
 }
 
 /// One open interaction in `lev respond --json`.
@@ -117,17 +126,35 @@ async fn send_bool(
 
 /// `lev msg`: deliver a message to a running agent.
 pub async fn send_message(client: &ControlClient, args: &MsgArgs) -> anyhow::Result<()> {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let (content, parts) = message_parts(&args.content, &args.attach, &cwd)?;
     send_bool(
         client,
         ControlRequest::Message {
             agent_id: args.agent_id.clone(),
-            content: args.content.clone(),
+            content,
             target_region: None,
+            parts,
         },
         "message delivered",
         "no agent accepted the message",
     )
     .await
+}
+
+/// The message text and the parts it carries: every `--attach` file, then
+/// every `@path` the text names. A token that names no file stays text and
+/// is reported on stderr.
+pub(crate) fn message_parts(
+    text: &str,
+    attach: &[String],
+    cwd: &std::path::Path,
+) -> anyhow::Result<(String, Vec<leviath_core::mime::InboundPart>)> {
+    let mut parts = crate::commands::run::attach::attach_all(attach, cwd)?;
+    let (text, named, unresolved) = crate::commands::run::attach::inline_parts(text, None, cwd)?;
+    parts.extend(named);
+    crate::commands::run::attach::warn_unresolved(&unresolved);
+    Ok((text, parts))
 }
 
 /// `lev pause`: park a run. The daemon refuses (`ok: false`) when the run does
@@ -281,6 +308,29 @@ fn build_response(request_id: &str, args: &RespondArgs) -> InteractionResponse {
     }
 }
 
+/// Put the files a text answer names on the answer: every `--attach`, then
+/// every `@path` in the value. A choice or an approval has no text for a
+/// file to sit beside, so `--attach` on one is refused rather than dropped.
+fn attach_answer(
+    mut response: InteractionResponse,
+    attach: &[String],
+    cwd: &std::path::Path,
+) -> anyhow::Result<InteractionResponse> {
+    let Some(value) = response.value.as_deref() else {
+        if !attach.is_empty() {
+            bail!(
+                "--attach goes with a text answer; a choice or an approval has no text for a \
+                 file to sit beside"
+            );
+        }
+        return Ok(response);
+    };
+    let (text, parts) = message_parts(value, attach, cwd)?;
+    response.value = Some(text);
+    response.parts = parts;
+    Ok(response)
+}
+
 /// `--feedback` is a deny's message and nothing else. clap's `requires`
 /// catches it on its own; beside `--approve` the parser lets it through, and
 /// a redirect silently dropped on a grant is the one outcome nobody asked for.
@@ -339,11 +389,11 @@ pub async fn respond(client: &ControlClient, args: &RespondArgs) -> anyhow::Resu
                 }
                 false => "answered".to_string(),
             };
+            let cwd = std::env::current_dir().unwrap_or_default();
+            let response = attach_answer(build_response(request_id, args), &args.attach, &cwd)?;
             send_bool(
                 client,
-                ControlRequest::AnswerInteraction {
-                    response: build_response(request_id, args),
-                },
+                ControlRequest::AnswerInteraction { response },
                 &applied,
                 "no such open interaction",
             )
@@ -400,7 +450,42 @@ mod tests {
         MsgArgs {
             agent_id: "a".to_string(),
             content: "hi".to_string(),
+            attach: Vec::new(),
         }
+    }
+
+    #[test]
+    fn message_parts_take_attachments_and_named_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.png"), b"\x89PNG\r\n\x1a\n").unwrap();
+        std::fs::write(dir.path().join("b.txt"), b"notes").unwrap();
+        let (text, parts) = message_parts(
+            "see @a.png and @gone.png",
+            &["b.txt:notes".into()],
+            dir.path(),
+        )
+        .unwrap();
+        assert_eq!(text, "see @a.png and @gone.png");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].name, "b.txt");
+        assert_eq!(parts[0].region.as_deref(), Some("notes"));
+        assert_eq!(parts[1].name, "a.png");
+        assert!(message_parts("x", &["missing.bin".into()], dir.path()).is_err());
+        std::fs::write(dir.path().join("empty.png"), b"").unwrap();
+        let err = message_parts("see @empty.png", &[], dir.path()).unwrap_err();
+        assert!(err.to_string().contains("nothing to attach"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn message_with_an_unreadable_attachment_never_dials() {
+        // No daemon behind this id: the attachment fails first, so nothing
+        // is ever dialled, and a daemon that never hears from us is right.
+        let dir = tempfile::tempdir().unwrap();
+        let client = ControlClient::new(control_id(&dir.path().join("no-daemon")));
+        let mut args = msg_args();
+        args.attach = vec!["/no/such/file.png".to_string()];
+        let err = send_message(&client, &args).await.unwrap_err();
+        assert!(err.to_string().contains("could not read"), "{err}");
     }
 
     #[tokio::test]
@@ -707,7 +792,65 @@ mod tests {
             session: false,
             stage: false,
             json: false,
+            attach: Vec::new(),
         }
+    }
+
+    /// A text answer takes its files from `--attach` and from `@path` in
+    /// the words; anything else refuses `--attach` outright.
+    #[test]
+    fn a_text_answer_carries_its_files_and_a_choice_refuses_them() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("mark.png"), b"\x89PNG\r\n\x1a\nmark").unwrap();
+        std::fs::write(dir.path().join("notes.md"), "# n").unwrap();
+        let attach = vec!["notes.md:brief".to_string()];
+        let answered = attach_answer(
+            InteractionResponse::text("q1", "the arm is wrong, see @mark.png"),
+            &attach,
+            dir.path(),
+        )
+        .unwrap();
+        assert_eq!(
+            answered.value.as_deref(),
+            Some("the arm is wrong, see @mark.png")
+        );
+        assert_eq!(answered.parts.len(), 2);
+        assert_eq!(answered.parts[0].name, "notes.md");
+        assert_eq!(answered.parts[0].region.as_deref(), Some("brief"));
+        assert_eq!(answered.parts[1].name, "mark.png");
+        assert!(answered.parts[1].region.is_none());
+
+        let bare = attach_answer(InteractionResponse::choice("q1", 1), &[], dir.path()).unwrap();
+        assert!(bare.parts.is_empty());
+        let err =
+            attach_answer(InteractionResponse::choice("q1", 1), &attach, dir.path()).unwrap_err();
+        assert!(err.to_string().contains("text answer"), "{err}");
+        let err = attach_answer(
+            InteractionResponse::text("q1", "x"),
+            &["/no/such/file.png".to_string()],
+            dir.path(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("file.png"), "{err}");
+    }
+
+    /// An attachment that cannot be read fails the answer before any daemon
+    /// is dialled: there is none behind this id, and the error is the file's.
+    #[tokio::test]
+    async fn respond_refuses_a_bad_attachment_before_contacting_the_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = ControlClient::new(control_id(dir.path()));
+        let err = respond(
+            &client,
+            &RespondArgs {
+                value: Some("here".to_string()),
+                attach: vec!["/no/such/file.png".to_string()],
+                ..respond_args()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("file.png"), "{err}");
     }
 
     /// `lev respond <id> --deny --feedback TEXT` is a deny carrying the text;

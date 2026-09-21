@@ -381,7 +381,7 @@ mod tests {
     #[test]
     fn oracle_protocol_compiles_and_round_trips_json_through_hooks() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../leviath-cli/agents/oracle/hooks/protocol.rhai");
+            .join("../leviath-cli/agents/oracle-workflow/hooks/protocol.rhai");
         let source = std::fs::read_to_string(&path).expect("oracle protocol hook");
         let script = compile(
             path.to_str().expect("utf-8 hook path"),

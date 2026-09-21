@@ -4,7 +4,10 @@
 //! HTTP. No web UI - the frontend lives in a separate repo.
 
 mod agents;
+mod artifact_types;
 mod auth;
+mod blobs;
+mod blueprint_types;
 mod blueprints;
 mod config;
 mod config_health;
@@ -15,11 +18,13 @@ mod events;
 mod fs;
 mod interactions;
 mod mcp;
+mod mime;
 mod polling;
 mod providers;
 mod request_limits;
 mod runs;
 mod scripts;
+mod scripts_mime;
 mod search;
 #[cfg(test)]
 mod testutil;
@@ -30,7 +35,9 @@ mod types;
 mod update;
 mod update_cache;
 mod update_job;
+mod upload;
 mod websocket;
+mod yolo;
 
 #[cfg(test)]
 #[path = "event_seam_tests.rs"]
@@ -38,6 +45,7 @@ mod event_seam_tests;
 
 pub(crate) use config::list_model_ids;
 pub(crate) use events::ServerEvent;
+pub(crate) use mcp::list_mcp_tools;
 pub(crate) use types::AppState;
 pub use types::ServeArgs;
 use types::ServeLimits;
@@ -130,6 +138,9 @@ fn api_router() -> Router<AppState> {
             get(agents::agent_context_history),
         )
         .route("/api/agents/{id}/files", get(agents::agent_file))
+        .route("/api/agents/{id}/files/raw", get(blobs::raw_file))
+        .route("/api/agents/{id}/blobs", get(blobs::list_blobs))
+        .route("/api/agents/{id}/blobs/{sha256}", get(blobs::get_blob))
         .route("/api/agents/{id}/logs", get(agents::agent_logs))
         .route("/api/agents/{id}/result", get(agents::agent_result))
         .route("/api/agents/{id}/stages", get(agents::agent_stages))
@@ -152,6 +163,14 @@ fn api_router() -> Router<AppState> {
         // Doctor - the offline half of the checks `lev doctor` runs, returned
         // as data. The billed half is behind `--allow-admin` too.
         .route("/api/doctor", get(doctor::run_doctor))
+        // Yolo profiles - what `--yolo=<name>` can name, and what each would
+        // decide. Reads only; the write is mounted under `--allow-admin`.
+        .route("/api/yolo", get(yolo::list_profiles))
+        .route("/api/yolo/test", post(yolo::test_profile))
+        .route("/api/yolo/{name}", get(yolo::get_profile))
+        // The effective mime registry, so a console can name a type's
+        // family and extensions the way the daemon will.
+        .route("/api/mime", get(blobs::list_mime))
         // Update - how this copy was installed, and what upgrades it. The
         // console has no other way to know, and printed a macOS-only command
         // to everyone because of it.
@@ -485,6 +504,17 @@ async fn execute_with_shutdown(
             // Config-write persists provider secrets to disk, so it is gated the
             // same way as MCP admin: unmounted (404) unless --allow-admin.
             .route("/api/config", put(config::put_config))
+            // A yolo profile is a grant of permissions, so writing the file is
+            // the same category of act as writing the config.
+            .route("/api/yolo", put(yolo::put_profiles))
+            // Writing a mime row rewrites `mime_types.toml` beside the config,
+            // the same category of act, and gated the same way: the read half
+            // (`GET /api/mime`) is always mounted, these writes need
+            // `--allow-admin`, and a client learns that from the capability.
+            .route(
+                "/api/mime",
+                put(mime::put_mime_row).delete(mime::delete_mime_row),
+            )
             // The probe makes this host open a connection to any address the
             // caller names, the same act as testing an MCP server, and it
             // exists to precede the write above. Gated with it; there is no
@@ -509,7 +539,15 @@ async fn execute_with_shutdown(
         false => app,
     };
 
+    // How large a body any route takes: the multipart spawn and message
+    // routes carry files, and the default 2 MiB would refuse a modest image.
+    // One ceiling for every route, since a limit that varied per route would
+    // be one more thing `GET /api/config` had to explain.
+    let body_limit = axum::extract::DefaultBodyLimit::max(
+        usize::try_from(request_limits.max_upload_bytes).unwrap_or(usize::MAX),
+    );
     let app = app
+        .layer(body_limit)
         // Require a valid token on every route; CORS stays outermost so browser
         // preflight (OPTIONS) is answered before the auth check.
         .layer(axum::middleware::from_fn_with_state(
@@ -817,12 +855,14 @@ mod tests {
     /// The production half of every module that owns a handler, by name.
     const HANDLER_SOURCES: &[(&str, &str)] = &[
         ("agents", include_str!("agents.rs")),
+        ("blobs", include_str!("blobs.rs")),
         ("blueprints", include_str!("blueprints.rs")),
         ("config", include_str!("config.rs")),
         ("doctor", include_str!("doctor.rs")),
         ("fs", include_str!("fs.rs")),
         ("interactions", include_str!("interactions.rs")),
         ("mcp", include_str!("mcp.rs")),
+        ("mime", include_str!("mime.rs")),
         ("providers", include_str!("providers.rs")),
         ("runs", include_str!("runs.rs")),
         ("scripts", include_str!("scripts.rs")),
@@ -830,6 +870,7 @@ mod tests {
         ("tree", include_str!("tree.rs")),
         ("update", include_str!("update.rs")),
         ("websocket", include_str!("websocket.rs")),
+        ("yolo", include_str!("yolo.rs")),
     ];
 
     /// The `StatusCode::` constants a handler can name, as numbers. A

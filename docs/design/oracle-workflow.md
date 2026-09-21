@@ -9,7 +9,7 @@ Install the bundled blueprints, then run it from the Git working tree:
 
 ```sh
 lev setup --install-agents
-lev run oracle --task "Add request validation to the users endpoint"
+lev run oracle-workflow --task "Add request validation to the users endpoint"
 ```
 
 The kernel requires Python 3, `git`, and a POSIX shell. macOS, Linux, and WSL

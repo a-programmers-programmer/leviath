@@ -63,6 +63,11 @@ pub struct RunMetadata {
     /// hardcode "attended", which stranded unattended runs on prompts no one was
     /// there to answer.
     pub unattended: bool,
+    /// The named yolo profile the run was launched under (`--yolo=<name>`),
+    /// carried beside `unattended` for the same two readers: a child of a
+    /// profiled run is spawned under the same profile, not under bare
+    /// `--yolo`, and a daemon restart resumes it under the same rules.
+    pub yolo_profile: Option<String>,
     /// How much of the blueprint's `[read_paths]` the config granted, resolved
     /// once at spawn (see [`ReadPathGrantCounts`]). `None` when the blueprint
     /// declares none, which is nearly every agent.
@@ -169,6 +174,9 @@ pub struct FinalOutput(pub leviath_core::output::FinalOutput);
 ///
 /// [`MODIFYING_TOOLS`]: leviath_core::blueprint::MODIFYING_TOOLS
 fn stage_can_modify(stage: &leviath_core::Stage) -> bool {
+    if stage.grants_all_builtins() {
+        return true;
+    }
     stage.available_tools.iter().any(|t| {
         let canonical = leviath_tools::canonical_tool_name(t);
         leviath_core::blueprint::MODIFYING_TOOLS.contains(&canonical)
@@ -462,6 +470,7 @@ pub(crate) fn build_run_meta(sources: RunMetaSources<'_>, at: RunPosition) -> Ru
         max_child_depth,
         flags,
         yolo: md.unattended,
+        yolo_profile: md.yolo_profile.clone(),
         read_paths: md.read_paths,
         final_output: final_output.map(|o| o.0.descriptor()),
         // Paused counts as parked here, not just Waiting: a run held until the
@@ -513,6 +522,7 @@ mod tests {
             title: Some("Do It".to_string()),
             title_error: None,
             unattended: false,
+            yolo_profile: None,
             read_paths: None,
             output_request: None,
             model_override: None,
@@ -578,6 +588,9 @@ mod tests {
         // leaves no record, so silence from it stays suspicious rather than
         // excused. The alias resolves, so `bash` is judged as `shell`.
         assert!(no_output_tools(vec![stage_with(&["bash"], None)]));
+        // A built-in group carries `write_file` and `edit_file` unnamed.
+        assert!(!no_output_tools(vec![stage_with(&["@builtin"], None)]));
+        assert!(no_output_tools(vec![stage_with(&["@scripts"], None)]));
         // A built-in modifying tool, under either name.
         assert!(!no_output_tools(vec![stage_with(&["write_file"], None)]));
         assert!(!no_output_tools(vec![stage_with(&["edit_file"], None)]));

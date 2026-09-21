@@ -351,16 +351,13 @@ pub(crate) fn prepare_authoritative_fanouts(
 pub(crate) fn start_authoritative_fanouts(world: &mut World) {
     crate::tick_scope::clear();
     let candidates: Vec<Entity> = {
-        let mut query = world.query_filtered::<
-            (
-                Entity,
-                &AgentBlueprint,
-                &StageCursor,
-                &AgentState,
-                &ContextWindow,
-            ),
-            With<AuthoritativeFanOutPending>,
-        >();
+        let mut query = world.query_filtered::<(
+            Entity,
+            &AgentBlueprint,
+            &StageCursor,
+            &AgentState,
+            &ContextWindow,
+        ), With<AuthoritativeFanOutPending>>();
         query
             .iter(world)
             .filter_map(|(entity, _, _, state, _)| {
@@ -382,7 +379,9 @@ pub(crate) fn start_authoritative_fanouts(world: &mut World) {
             let items = authoritative_items(window, region, config.max_items);
             Some((config.clone(), items))
         })() else {
-            world.entity_mut(entity).remove::<AuthoritativeFanOutPending>();
+            world
+                .entity_mut(entity)
+                .remove::<AuthoritativeFanOutPending>();
             continue;
         };
         world
@@ -422,6 +421,11 @@ pub(crate) fn start_authoritative_fanouts(world: &mut World) {
                 tokens_used: 0,
                 cut_off_at: None,
                 reasoning: None,
+                // Upstream added `parts` to InferenceResult (the mime the model
+                // produced, already in the run's store). This synthesised result
+                // comes from the fan-out path, not a model reply, so it produces
+                // no parts. Dropped by the upstream sync merge; restored here.
+                parts: Vec::new(),
             },
             crate::pipeline::ReadyForTools,
         ));
@@ -553,9 +557,9 @@ fn authoritative_items(
     }
     let value: serde_json::Value = serde_json::from_str(&region.content[0].content)
         .map_err(|e| format!("fan_out items_region '{region_name}' is not valid JSON: {e}"))?;
-    let array = value.as_array().ok_or_else(|| {
-        format!("fan_out items_region '{region_name}' must contain a JSON array")
-    })?;
+    let array = value
+        .as_array()
+        .ok_or_else(|| format!("fan_out items_region '{region_name}' must contain a JSON array"))?;
     if let Some(cap) = max_items.filter(|cap| array.len() > *cap) {
         return Err(format!(
             "fan_out items_region '{region_name}' contains {} items, over max_items {cap}",
@@ -567,9 +571,7 @@ fn authoritative_items(
     let mut items = Vec::with_capacity(array.len());
     for (index, value) in array.iter().enumerate() {
         let object = value.as_object().ok_or_else(|| {
-            format!(
-                "fan_out items_region '{region_name}' item {index} must be an object"
-            )
+            format!("fan_out items_region '{region_name}' item {index} must be an object")
         })?;
         if object.len() != 2 || !object.contains_key("id") || !object.contains_key("context") {
             return Err(format!(
@@ -596,10 +598,7 @@ fn authoritative_items(
         }
         items.push(WorkItem {
             id: id.to_string(),
-            context: object
-                .get("context")
-                .expect("validated above")
-                .clone(),
+            context: object.get("context").expect("validated above").clone(),
         });
     }
     Ok(items)
@@ -767,9 +766,7 @@ pub(crate) fn start_pending_fan_outs(world: &mut World) {
             // The model may request the deterministic split with `items = []`,
             // but it cannot smuggle in a second inventory or replace the
             // blueprint-owned worker/cap settings through tool arguments.
-            if !request.items.is_empty()
-                || request.agent.is_some()
-                || request.max_workers.is_some()
+            if !request.items.is_empty() || request.agent.is_some() || request.max_workers.is_some()
             {
                 crate::pipeline::fail_stage_world(
                     world,
@@ -1107,7 +1104,7 @@ fn finish_tool_fan_out(world: &mut World, parent: Entity, w: &FanOutWaiting, cal
             &mut window,
             leviath_core::blueprint::FAN_OUT_TOOL,
             call_id,
-            report,
+            report.into(),
             routing.as_ref(),
             sensitivities.as_ref(),
         );
@@ -1226,6 +1223,52 @@ fn start_worker(
     Ok(child)
 }
 
+/// The one way a finished child's answer is read out of the world.
+///
+/// Precedence, unchanged since this was inline in [`worker_terminal_result`]:
+/// the child's explicit `submit_output` ([`FinalOutput`](crate::persistence::FinalOutput))
+/// always wins; failing that, its last non-empty `conversation` entry (a real
+/// assistant/analysis message on tool-call-ending runs); failing that, its last
+/// [`InferenceResult`]'s response. `None` only when the child holds none of the
+/// three.
+///
+/// Shared with the host's sub-agent `Check` op so a child run answers its parent
+/// the same way however it was started. That divergence was the bug: the fan-out
+/// collector resolved this chain while the host read `FinalOutput` alone, so a
+/// `spawn_agent` child that did its work in text - or whose submission never
+/// landed as a component - handed its parent nothing at all, and the parent
+/// reported an empty result over a child that had in fact finished.
+///
+/// Deliberately status-agnostic: callers decide whether a child is finished
+/// enough to be read (`worker_terminal_result` only asks on `Complete`).
+pub(crate) fn child_output_content(world: &World, child: Entity) -> Option<String> {
+    // Explicit submit_output always wins.
+    if let Some(content) = world
+        .get::<crate::persistence::FinalOutput>(child)
+        .map(|o| o.0.content.clone())
+    {
+        return Some(content);
+    }
+
+    // No explicit submit_output: fall back to the child's last non-empty
+    // conversation text (a real assistant/analysis message on tool-call-ending
+    // runs), then to InferenceResult.response.
+    world
+        .get::<ContextWindow>(child)
+        .and_then(|w| w.get_region("conversation"))
+        .and_then(|region| {
+            region.content.iter().rev().find_map(|entry| {
+                let text = entry.content.trim();
+                (!text.is_empty()).then(|| text.to_owned())
+            })
+        })
+        .or_else(|| {
+            world
+                .get::<InferenceResult>(child)
+                .map(|r| r.response.clone())
+        })
+}
+
 /// A worker's terminal result: `Some(Ok(deliverable))` if complete,
 /// `Some(Err(reason))` if it errored/was cancelled/vanished, `None` if still
 /// running.
@@ -1252,19 +1295,23 @@ fn worker_terminal_result(world: &World, worker: Entity) -> Option<Result<String
     match agent_status(world, worker) {
         None => Some(Err("worker vanished".to_string())),
         Some(AgentStatus::Complete) => {
-            match world
-                .get::<crate::persistence::FinalOutput>(worker)
-                .map(|o| o.0.content.clone())
-            {
-                Some(content) => Some(Ok(content)),
-                None if worker_requires_output(world, worker) => Some(Err(
+            // The shared resolution: submit_output, else last conversation text,
+            // else the last inference response.
+            let fallback = child_output_content(world, worker).unwrap_or_default();
+
+            // If the stage requires an output and even the fallback is empty,
+            // that is a real failure: the worker had nothing to say.  But a
+            // worker that produced real content (just never called
+            // submit_output) still relays it — the require_output guard catches
+            // genuinely-empty workers, not workers that used the wrong delivery
+            // channel.
+            if worker_requires_output(world, worker) && fallback.is_empty() {
+                return Some(Err(
                     "worker finished without the final output its stage requires".to_string(),
-                )),
-                None => Some(Ok(world
-                    .get::<InferenceResult>(worker)
-                    .map(|r| r.response.clone())
-                    .unwrap_or_default())),
+                ));
             }
+
+            Some(Ok(fallback))
         }
         Some(AgentStatus::Error { message }) => Some(Err(message)),
         Some(AgentStatus::Cancelled) => Some(Err("worker cancelled".to_string())),
@@ -1371,6 +1418,7 @@ mod tests {
                         title: None,
                         title_error: None,
                         unattended: false,
+                        yolo_profile: None,
                         read_paths: None,
                         output_request: None,
                         model_override: None,
@@ -1426,11 +1474,13 @@ mod tests {
                 batch_tool_hint: false,
                 shell_hint: false,
                 request_timeout_secs: None,
+                as_text: Vec::new(),
             },
             routing: None,
             accepts_messages: true,
             context_layout: None,
             context_hide: Vec::new(),
+            context_reset: Vec::new(),
             system_prompt: None,
         }
     }
@@ -1488,6 +1538,7 @@ mod tests {
                     tokens_used: 0,
                     cut_off_at: None,
                     reasoning: None,
+                    parts: Vec::new(),
                 },
                 ProcessResponse,
             ))
@@ -1578,6 +1629,7 @@ mod tests {
             tokens_used: 0,
             cut_off_at: None,
             reasoning: None,
+            parts: Vec::new(),
         });
     }
 
@@ -1759,8 +1811,7 @@ mod tests {
         let mut items = Region::new("items".to_string(), RegionKind::Pinned, 10_000);
         items
             .add_entry(
-                r#"[{"id":"b","context":{"n":2}},{"id":"a","context":null}]"#
-                    .to_string(),
+                r#"[{"id":"b","context":{"n":2}},{"id":"a","context":null}]"#.to_string(),
                 20,
             )
             .expect("fits");
@@ -1783,8 +1834,7 @@ mod tests {
         let mut items = Region::new("items".to_string(), RegionKind::Pinned, 10_000);
         items
             .add_entry(
-                r#"[{"id":"same","context":1},{"id":"same","context":2}]"#
-                    .to_string(),
+                r#"[{"id":"same","context":1},{"id":"same","context":2}]"#.to_string(),
                 20,
             )
             .expect("fits");
@@ -1798,10 +1848,7 @@ mod tests {
         let mut window = window();
         let mut items = Region::new("items".to_string(), RegionKind::Pinned, 10_000);
         items
-            .add_entry(
-                r#"[{"id":"a","context":{},"extra":true}]"#.to_string(),
-                20,
-            )
+            .add_entry(r#"[{"id":"a","context":{},"extra":true}]"#.to_string(), 20)
             .expect("fits");
         window.add_region(items);
         let error = authoritative_items(&window, "items", Some(1)).unwrap_err();
@@ -1813,10 +1860,7 @@ mod tests {
         let mut window = window();
         let mut items = Region::new("items".to_string(), RegionKind::Pinned, 10_000);
         items
-            .add_entry(
-                r#"[{"id":" a ","context":{}}]"#.to_string(),
-                20,
-            )
+            .add_entry(r#"[{"id":" a ","context":{}}]"#.to_string(), 20)
             .expect("fits");
         window.add_region(items);
         let error = authoritative_items(&window, "items", Some(1)).unwrap_err();
@@ -1966,36 +2010,32 @@ mod tests {
         world
             .get_mut::<ContextWindow>(entity)
             .expect("parent window")
-            .add_region(Region::new(
-                "items".to_string(),
-                RegionKind::Pinned,
-                10_000,
-            ));
+            .add_region(Region::new("items".to_string(), RegionKind::Pinned, 10_000));
         world
             .get_mut::<ContextWindow>(entity)
             .expect("parent window")
             .get_region_mut("items")
             .expect("items region")
-            .add_entry(
-                r#"[{"id":"a","context":{"task":"read"}}]"#.to_string(),
-                20,
-            )
+            .add_entry(r#"[{"id":"a","context":{"task":"read"}}]"#.to_string(), 20)
             .expect("items fit");
-        world.entity_mut(entity).remove::<ProcessResponse>().insert((
-            AuthoritativeFanOutPending,
-            crate::pipeline::StageInference {
-                provider_name: "script".to_string(),
-                model: "m".to_string(),
-                tools: vec![leviath_providers::Tool {
-                    name: leviath_core::blueprint::FAN_OUT_TOOL.to_string(),
-                    description: String::new(),
-                    parameters: serde_json::json!({}),
-                }],
-                tool_filter: None,
-                fallbacks: Vec::new(),
-                output: None,
-            },
-        ));
+        world
+            .entity_mut(entity)
+            .remove::<ProcessResponse>()
+            .insert((
+                AuthoritativeFanOutPending,
+                crate::pipeline::StageInference {
+                    provider_name: "script".to_string(),
+                    model: "m".to_string(),
+                    tools: vec![leviath_providers::Tool {
+                        name: leviath_core::blueprint::FAN_OUT_TOOL.to_string(),
+                        description: String::new(),
+                        parameters: serde_json::json!({}),
+                    }],
+                    tool_filter: None,
+                    fallbacks: Vec::new(),
+                    output: None,
+                },
+            ));
 
         start_authoritative_fanouts(&mut world);
 
@@ -2004,14 +2044,24 @@ mod tests {
         assert!(world.get::<FanOutWaiting>(entity).is_none());
         assert!(matches!(status_of(&world, entity), AgentStatus::Active));
         assert!(world.get::<ProcessResponse>(entity).is_none());
-        assert!(world.get::<crate::pipeline::ReadyForTools>(entity).is_some());
+        assert!(
+            world
+                .get::<crate::pipeline::ReadyForTools>(entity)
+                .is_some()
+        );
         let result = world
             .get::<InferenceResult>(entity)
             .expect("synthetic tool result");
         assert_eq!(result.response, "");
         assert_eq!(result.tool_calls.len(), 1);
-        assert_eq!(result.tool_calls[0].name, leviath_core::blueprint::FAN_OUT_TOOL);
-        assert_eq!(result.tool_calls[0].arguments, serde_json::json!({"items": []}));
+        assert_eq!(
+            result.tool_calls[0].name,
+            leviath_core::blueprint::FAN_OUT_TOOL
+        );
+        assert_eq!(
+            result.tool_calls[0].arguments,
+            serde_json::json!({"items": []})
+        );
 
         // The synthetic call still has to pass the ordinary taint/consent
         // gate. A denied call must not park the parent or launch workers.
@@ -2034,22 +2084,24 @@ mod tests {
         let (jobs, _jobs_rx) = tokio::sync::mpsc::unbounded_channel();
         world.insert_resource(crate::pipeline::ToolServiceRes(Arc::new(NoopToolService)));
         world.insert_resource(crate::pipeline::ToolStage::detached(jobs));
-        world.entity_mut(entity).insert(crate::taint::TaintGate::new(
-            leviath_core::SecurityConfig {
+        world
+            .entity_mut(entity)
+            .insert(crate::taint::TaintGate::new(leviath_core::SecurityConfig {
                 taint_tracking: true,
-            },
-        ));
+            }));
         let mut schedule = Schedule::default();
         schedule.add_systems(crate::pipeline::dispatch_tools);
         schedule.run(&mut world);
         assert!(world.get::<FanOutWaiting>(entity).is_none());
         assert!(world.get::<crate::pipeline::ReadyToInfer>(entity).is_some());
         let expected_call_id = format!("authoritative-fan-out-{}", entity.to_bits());
-        assert!(world
-            .get::<crate::pipeline::ContextToolResults>(entity)
-            .is_some_and(|results| results.0.iter().any(|(id, text)| {
-                id == &expected_call_id && text.starts_with("[blocked]")
-            })));
+        assert!(
+            world
+                .get::<crate::pipeline::ContextToolResults>(entity)
+                .is_some_and(|results| results.0.iter().any(|(id, text)| {
+                    id == &expected_call_id && text.starts_with("[blocked]")
+                }))
+        );
     }
 
     /// `max_items` is a ceiling on the work, not just on concurrency.
@@ -3060,6 +3112,7 @@ mod tests {
                     tokens_used: 0,
                     cut_off_at: None,
                     reasoning: None,
+                    parts: Vec::new(),
                 },
                 crate::persistence::FinalOutput(leviath_core::output::FinalOutput::new(
                     "changed src/lib.rs; the failing test now passes",
@@ -3092,6 +3145,7 @@ mod tests {
                     tokens_used: 0,
                     cut_off_at: None,
                     reasoning: None,
+                    parts: Vec::new(),
                 },
             ))
             .id();
@@ -3230,6 +3284,7 @@ mod tests {
                     tokens_used: 0,
                     cut_off_at: None,
                     reasoning: None,
+                    parts: Vec::new(),
                 },
             ))
             .id();

@@ -157,6 +157,23 @@ pub fn builtin_catalog() -> Vec<CatalogEntry> {
     .collect()
 }
 
+/// Models that ignore the system prompt, so a request built for one folds its
+/// system blocks into the user turn instead of losing them.
+///
+/// No provider reports this - OpenRouter's catalogue does not distinguish a
+/// model that reads the system prompt from one that ignores it (measured:
+/// `gemini-2.5-flash-image` and `gemini-3-pro-image` carry identical
+/// `architecture` and `supported_parameters`, yet the first ignores a system
+/// prompt outright and the second honours it). So it is a hand-maintained
+/// one-off. Matched on the id's last segment, so `gemini-2.5-flash-image`
+/// reached through any route (`openrouter/google/…`, `google/…`, the bare id)
+/// is recognised. An operator can also declare it for any model with
+/// `[model_capabilities."<id>"] supports_system_prompt = false`.
+pub fn ignores_system_prompt(model: &str) -> bool {
+    let name = model.rsplit('/').next().unwrap_or(model);
+    name == "gemini-2.5-flash-image"
+}
+
 /// Capabilities supported by a model.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelCapabilities {
@@ -235,6 +252,83 @@ impl Default for ModelCapabilities {
     }
 }
 
+/// What mime a model takes and produces, as mime type patterns.
+///
+/// Kept beside [`ModelCapabilities`] rather than inside it so the compiled
+/// tables, which build that struct in `const` context, stay as they are and a
+/// provider answers this the same three-layered way: its table, then what its
+/// listing said, then the operator's `[model_capabilities]` row.
+///
+/// A pattern is `type/subtype` or `type/*`. `text/*` is listed explicitly,
+/// because text is not assumed: a text-to-speech or image model may take no
+/// text at all, and a listing that omits it is saying so.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelMime {
+    /// Patterns the model accepts in a request.
+    pub input: Vec<String>,
+    /// Patterns the model can hand back in a reply.
+    pub output: Vec<String>,
+}
+
+impl Default for ModelMime {
+    fn default() -> Self {
+        Self::text_only()
+    }
+}
+
+impl ModelMime {
+    /// Text in, text out: the answer for a model nothing has described.
+    pub fn text_only() -> Self {
+        Self::new(&["text/*"], &["text/*"])
+    }
+
+    /// From two pattern lists.
+    pub fn new(input: &[&str], output: &[&str]) -> Self {
+        Self {
+            input: input.iter().map(|s| s.to_string()).collect(),
+            output: output.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// Whether a part of `mime_type` may go to the model.
+    pub fn accepts(&self, mime_type: &leviath_core::mime::MimeType) -> bool {
+        mime_type.matches_any(&self.input)
+    }
+
+    /// Whether the model may hand back a part of `mime_type`.
+    pub fn produces(&self, mime_type: &leviath_core::mime::MimeType) -> bool {
+        mime_type.matches_any(&self.output)
+    }
+
+    /// Whether every pattern in `wanted` is covered by an input pattern.
+    ///
+    /// `image/png` is covered by `image/png`, `image/*` or `*/*`; `image/*`
+    /// only by `image/*` or `*/*`.
+    pub fn covers(&self, wanted: &[String]) -> bool {
+        wanted
+            .iter()
+            .all(|w| self.input.iter().any(|have| pattern_covers(have, w)))
+    }
+
+    /// Whether the model takes anything beyond text.
+    pub fn takes_mime(&self) -> bool {
+        self.input.iter().any(|p| !p.starts_with("text/"))
+    }
+}
+
+/// Whether the pattern `have` covers everything `want` matches.
+pub fn pattern_covers(have: &str, want: &str) -> bool {
+    let have = have.trim().to_ascii_lowercase();
+    let want = want.trim().to_ascii_lowercase();
+    if have == "*/*" || have == want {
+        return true;
+    }
+    match (have.split_once('/'), want.split_once('/')) {
+        (Some((hk, "*")), Some((wk, _))) => hk == wk,
+        _ => false,
+    }
+}
+
 /// A `[model_capabilities]` entry: the fields an operator chose to change.
 ///
 /// Every field is optional and unset means "leave it alone", so an entry names
@@ -279,9 +373,25 @@ pub struct ModelCapabilityOverride {
     /// USD per million output tokens.
     #[serde(default)]
     pub output_per_mtok: Option<f64>,
+
+    /// Mime type patterns the model accepts, replacing what the provider
+    /// reports: `["text/*", "image/*"]` for a local vision model.
+    #[serde(default)]
+    pub input_types: Option<Vec<String>>,
+    /// Mime type patterns the model can hand back.
+    #[serde(default)]
+    pub output_types: Option<Vec<String>>,
 }
 
 impl ModelCapabilityOverride {
+    /// `base` mime lists with the ones this entry names replaced.
+    pub fn apply_mime(&self, base: ModelMime) -> ModelMime {
+        ModelMime {
+            input: self.input_types.clone().unwrap_or(base.input),
+            output: self.output_types.clone().unwrap_or(base.output),
+        }
+    }
+
     /// `base` with every field this entry names replaced.
     pub fn apply_to(&self, base: ModelCapabilities) -> ModelCapabilities {
         ModelCapabilities {
@@ -328,7 +438,88 @@ impl From<ModelCapabilities> for ModelCapabilityOverride {
             cached_input_per_mtok: None,
             cache_write_per_mtok: None,
             output_per_mtok: None,
+            // Nor what mime it takes; that is a separate answer.
+            input_types: None,
+            output_types: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod mime_tests {
+    use super::*;
+    use leviath_core::mime::MimeType;
+
+    fn mt(s: &str) -> MimeType {
+        MimeType::parse(s).unwrap()
+    }
+
+    #[test]
+    fn text_only_is_the_default_and_takes_no_mime() {
+        let m = ModelMime::default();
+        assert_eq!(m, ModelMime::text_only());
+        assert!(m.accepts(&mt("text/markdown")));
+        assert!(!m.accepts(&mt("image/png")));
+        assert!(m.produces(&mt("text/plain")));
+        assert!(!m.produces(&mt("image/png")));
+        assert!(!m.takes_mime());
+        assert!(ModelMime::new(&["text/*", "image/*"], &["text/*"]).takes_mime());
+    }
+
+    #[test]
+    fn the_system_prompt_one_off_is_matched_by_the_id_last_segment() {
+        // Reached through any route, and the bare id.
+        assert!(ignores_system_prompt("gemini-2.5-flash-image"));
+        assert!(ignores_system_prompt("google/gemini-2.5-flash-image"));
+        assert!(ignores_system_prompt(
+            "openrouter/google/gemini-2.5-flash-image"
+        ));
+        // A model not on the list, and a near miss, are not folded.
+        assert!(!ignores_system_prompt("google/gemini-3-pro-image"));
+        assert!(!ignores_system_prompt("claude-sonnet-5"));
+    }
+
+    #[test]
+    fn covers_compares_patterns_not_only_types() {
+        let vision = ModelMime::new(&["text/*", "image/*"], &["text/*"]);
+        assert!(vision.covers(&["image/png".to_string()]));
+        assert!(vision.covers(&["image/*".to_string(), "text/plain".to_string()]));
+        assert!(!vision.covers(&["audio/*".to_string()]));
+        assert!(!vision.covers(&["application/pdf".to_string()]));
+        let exact = ModelMime::new(&["image/png"], &[]);
+        assert!(exact.covers(&["image/png".to_string()]));
+        assert!(!exact.covers(&["image/*".to_string()]));
+        let any = ModelMime::new(&["*/*"], &[]);
+        assert!(any.covers(&["video/mp4".to_string(), "audio/*".to_string()]));
+        assert!(any.covers(&[]));
+        assert!(pattern_covers("Image/*", "image/PNG"));
+        assert!(!pattern_covers("image", "image/png"));
+        assert!(!pattern_covers("image/png", "image/jpeg"));
+    }
+
+    #[test]
+    fn an_override_replaces_only_the_lists_it_names() {
+        let base = ModelMime::new(&["text/*"], &["text/*"]);
+        let none = ModelCapabilityOverride::default();
+        assert_eq!(none.apply_mime(base.clone()), base);
+        let input_only = ModelCapabilityOverride {
+            input_types: Some(vec!["text/*".into(), "image/*".into()]),
+            ..Default::default()
+        };
+        let merged = input_only.apply_mime(base.clone());
+        assert!(merged.accepts(&mt("image/png")));
+        assert_eq!(merged.output, base.output);
+        let output_only = ModelCapabilityOverride {
+            output_types: Some(vec!["image/*".into()]),
+            ..Default::default()
+        };
+        let merged = output_only.apply_mime(base.clone());
+        assert_eq!(merged.input, base.input);
+        assert!(merged.produces(&mt("image/png")));
+        let from_caps: ModelCapabilityOverride = ModelCapabilities::default().into();
+        assert!(from_caps.input_types.is_none() && from_caps.output_types.is_none());
+        let json = serde_json::to_string(&merged).unwrap();
+        assert!(json.contains("\"output\":[\"image/*\"]"));
     }
 }
 

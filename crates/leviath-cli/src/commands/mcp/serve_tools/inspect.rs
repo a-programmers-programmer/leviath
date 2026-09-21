@@ -297,3 +297,71 @@ pub(crate) fn list_agents(shared: &Shared) -> CallOutcome {
         None,
     )
 }
+
+pub(crate) async fn daemon_status(shared: &Shared) -> CallOutcome {
+    let status = match shared.daemon_ready().await {
+        Ok(()) => {
+            let request = ControlRequest::List;
+            match shared.control.request(&request).await {
+                Ok(ControlResponse::List { runs, finished, .. }) => {
+                    format!(
+                        "daemon online, {} active runs, {} recently finished",
+                        runs.len(),
+                        finished.len()
+                    )
+                }
+                Ok(other) => format!("daemon online (response: {other:?})"),
+                Err(e) => format!("daemon unreachable: {e}"),
+            }
+        }
+        Err(e) => format!("daemon offline/unreachable: {e}"),
+    };
+    ok(
+        status.clone(),
+        json!({
+            "status": status,
+            "runs_dir": shared.env.runs_dir,
+        }),
+        None,
+    )
+}
+
+pub(crate) fn validate_blueprint(args: &Args) -> CallOutcome {
+    let path_str = str_arg(args, "path").unwrap_or_default();
+    let path = Path::new(&path_str);
+    if !path.exists() {
+        return fail(
+            format!("blueprint file does not exist: '{path_str}'"),
+            json!({ "path": path_str, "valid": false }),
+        );
+    }
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) => {
+            return fail(
+                format!("failed to read blueprint file '{path_str}': {e}"),
+                json!({ "path": path_str, "valid": false }),
+            );
+        }
+    };
+    match leviath_core::manifest::parse_manifest(&content) {
+        Ok(bp) => {
+            let stage_names: Vec<String> = bp.stages.iter().map(|s| s.name.clone()).collect();
+            ok(
+                format!("✓ Blueprint '{}' (v{}) is valid", bp.name, bp.version),
+                json!({
+                    "path": path_str,
+                    "valid": true,
+                    "name": bp.name,
+                    "version": bp.version,
+                    "stages": stage_names,
+                }),
+                None,
+            )
+        }
+        Err(e) => fail(
+            format!("✗ Blueprint '{path_str}' invalid: {e}"),
+            json!({ "path": path_str, "valid": false, "error": e.to_string() }),
+        ),
+    }
+}

@@ -47,6 +47,7 @@ a test, so a client generator or an agent can consume the contract directly.
   | Without `--allow-admin` | Response |
   |---|---|
   | `PUT /api/config` | 405, because `GET /api/config` is mounted |
+  | `PUT /api/mime` · `DELETE /api/mime` | 405, because `GET /api/mime` is mounted |
   | `POST /api/mcp/servers` | 405, because `GET /api/mcp/servers` is mounted |
   | `DELETE /api/mcp/servers/{name}` | 404, because nothing else is mounted on that path |
   | `POST /api/update` | 405, because `GET /api/update` is mounted |
@@ -72,6 +73,7 @@ off. A flag wins over the config file, and the config file over the default.
 |---|---|---|---|---|
 | Requests in flight | 64 | `--max-concurrent-requests <N>` | `[serve] max_concurrent_requests` | 503 at once, not queued |
 | Seconds per request | 30 | `--request-timeout-secs <SECS>` | `[serve] request_timeout_secs` | 408, and the handler is dropped |
+| Bytes per request body | 32 MiB | none | `[serve] max_upload_bytes` | 413; this is what bounds a multipart upload |
 
 Both answers carry the usual `{"error": "..."}` body. The websocket routes (`/ws` and
 `/ws/agents/{id}`) are outside both: a subscription is meant to stay open, and it is the only
@@ -212,24 +214,40 @@ handle that on all of them rather than on a few. The body is a line of plain tex
 | `GET /api/agents/{id}/context/history` | How the context window changed over the run, paginated |
 | `GET /api/agents/{id}/stages` | The per-stage ledger: what each stage spent in tokens and dollars, per visit as well as in total, which regions it carried, and whether it ran at all. See [below](#where-a-runs-cost-went) |
 | `GET /api/agents/{id}/files` | List a run's files, or read one with `?path=`. `offset` pages a large one. See [below](#a-runs-files) |
+| `GET /api/agents/{id}/files/raw?path=` | A workdir file's bytes under its own content type, for an `<img>` or a download. See [below](#a-runs-parts) |
+| `GET /api/agents/{id}/blobs` · `/blobs/{sha256}` | The stored parts a run holds, and one part's bytes. See [below](#a-runs-parts) |
 | `GET /api/agents/tree` · `/{id}/tree-status` · `/{id}/children` | Sub-agent tree + token roll-ups |
 | `POST /api/agents/{id}/pause` · `/resume` | Pause a run · resume it |
-| `POST /api/agents/{id}/message` | Steer a running agent |
+| `POST /api/agents/{id}/message` | Steer a running agent. Takes files too; see [attaching files](#attaching-files) |
 | `GET/POST /api/agents/{id}/interaction` | Read / answer a pending question. See [below](#answering-a-question) |
 | `GET/POST/PUT/DELETE /api/blueprints[/{name}]` · `/validate` | Blueprint CRUD + validation. The listing is paginated and takes `q`; the detail carries the manifest, the regions and the [fan-out limits](#fan-out-limits) |
-| `GET /api/config` · `PUT /api/config` *(admin)* · `POST /api/config/validate` | Read redacted config · write keys · validate a key. A `PUT` that changes a provider key, a gateway, `default_provider` or [`default_model`](#the-default-model) applies to the next run spawned, with no daemon restart |
+| `GET /api/config` · `PUT /api/config` *(admin)* · `POST /api/config/validate` | Read redacted config · write keys · validate a key. A `PUT` that changes a provider key, a gateway, `default_provider`, [`override_model` or `fallback_model`](#override-and-fallback-models) applies to the next run spawned, with no daemon restart |
 | `GET /api/models?provider=` | Enumerate models, with each one's token limits and where they came from. An OpenAI-compatible gateway's detected models are listed under the gateway's name. `provider` narrows the listing to one - see [below](#two-providers-one-model-id) |
 | `POST /api/models/probe` *(admin)* | Ask an OpenAI-compatible server what it serves before writing a gateway for it: `{"base_url", "api_key"?, "headers"?}` → `{"models": [ids]}`, or 502 carrying the server's own error text. See [below](#gateways) |
 | `GET /api/providers` · `POST …/{name}/login` *(admin)* · `/logout` *(admin)* · `/check` *(admin)* | The providers that sign in with a browser instead of taking a key, and the sign-in itself. See [below](#signing-in-to-a-subscription-provider) |
 | `GET /api/tools?agent=` | What an agent here can actually call. See [below](#tools-and-scripts) |
-| `GET /api/scripts?agent=&include=` · `GET/PUT/DELETE /api/scripts/{kind}/{name}` · `POST /api/scripts/validate` | Read and write the machine's Rhai: the agent's tools, hooks and validators, and the global model providers. `include=candidates` also lists the files nothing declares yet. Writes need admin. See [below](#tools-and-scripts) |
+| `GET /api/mime` · `PUT /api/mime` *(admin)* · `DELETE /api/mime` *(admin)* | Read the effective [mime registry](/docs/mime#the-registry), and write to it: `PUT` adds or updates a row in `mime_types.toml` (`{"mime_type", "family"?, "text"?, "tokens"?, "extensions"?, "magic"?, "stand_in"?, "check"?}`, only the fields sent are changed, a bad type or rule is a 400), `DELETE ?mime_type=` takes one out (404 if there is no such row). The writes need admin. See [below](#writing-a-mime-row) |
+| `GET /api/scripts?agent=&include=` · `GET/PUT/DELETE /api/scripts/{kind}/{name}` · `POST /api/scripts/validate` | Read and write the machine's Rhai: the agent's tools, hooks, validators and mime checks, and the global model providers and mime checks. `include=candidates` also lists the files nothing declares yet. Writes need admin. See [below](#tools-and-scripts) |
 | `GET /api/mcp/servers` · `POST …` *(admin)* · `DELETE …/{name}` *(admin)* · `GET …/{name}/status` · `POST …/{name}/login` *(admin)* · `POST …/{name}/test` *(admin)* | List, add, remove, check, log in, test. The writes need admin. A server added or removed here reaches the next run, with no daemon restart |
 | `GET /api/doctor` · `POST /api/doctor/live` *(admin)* | The checks `lev doctor` runs, as data. `GET` is `lev doctor --offline`: config, search and resolve, nothing billed. `POST .../live` runs the whole chain (two billed calls and a throwaway run) and answers 409 while one is already going. A failing check is `ok: false` inside a 200, never an HTTP error |
+| `GET /api/yolo` · `GET /api/yolo/{name}` · `POST /api/yolo/test` · `PUT /api/yolo` *(admin)* | The profiles behind `--yolo=<name>`: list them, read one, ask what one would decide for a call, replace the file. See [below](#yolo-profiles) |
 | `GET /api/update` | Whether anything newer exists, how this copy was installed, and the command that upgrades it. See [below](#asking-how-to-upgrade) |
 | `POST /api/update` *(admin)* · `GET /api/update/jobs/{id}` | Carry that plan out, and read where it got to. See [below](#pressing-the-button) |
 | `GET /api/fs/dirs?path=&hidden=` | One directory level of subdirectory names, for a folder picker. Absolute paths only, fenced by `--workdir-root`; `hidden=true` includes dot-prefixed names |
 | `POST /api/fs/dirs` | Make one directory: `{"path": "<absolute parent>", "name": "<one segment>"}` → `201 {"path", "parent"}`. The same fence as the `GET`; `409` if it already exists. Announced as `fs.mkdir` |
 | `GET /ws` · `GET /ws/agents/{id}` | Live event stream (all agents / one run) |
+
+### Spawning under a yolo profile
+
+`POST /api/agents` takes `"yolo": true` for a plain unattended run, and `"yolo_profile":
+"<name>"` to run under a named profile from [`yolo.toml`](/docs/configuration#yolotoml) instead.
+A profile implies `yolo`, so the two need not both be sent. A name the file does not have fails
+the spawn with a 400 that lists the profiles it does have. Under `--no-remote-yolo` a profile is
+refused with `yolo` and `allow`: the operator's flag says nothing about which one.
+
+The run listing and `GET /api/agents/{id}` carry the name back as `yolo_profile` beside
+`unattended`, so a console can show that a run is unattended *under* something rather than
+unattended outright.
 
 ### Answering a question
 
@@ -622,6 +640,57 @@ stage into its stays, and `--json` is this shape read straight off disk.
 > `status`: a stage recorded `complete` with tokens against its name ran,
 > whatever `entered` says on an old run.
 
+## Attaching files
+
+A run takes files three ways, and all three end as typed [parts](/docs/mime) on the region they
+were aimed at, exactly as `lev run --attach` sends them.
+
+`multipart/form-data` on `POST /api/agents` and `POST /api/agents/{id}/message` carries the bytes
+themselves. A `request` field holds the JSON the route takes as a plain body, then any number of
+file fields named `part` (bound for the task region, or the message's region) or `part:<region>`,
+each with a `filename` and a `Content-Type`:
+
+```bash
+curl -X POST http://localhost:3000/api/agents -H "Authorization: Bearer $TOKEN" \
+  -F 'request={"blueprint":"storyteller","task":"a 30 second trailer"}' \
+  -F 'part:voice_samples=@voice.wav;type=audio/wav' \
+  -F 'part:storyboard=@frame1.png'
+```
+
+`POST /api/agents/{id}/interaction` takes both forms too, for a text answer: the files land beside
+the words in the tool result, and a choice or an approval with files is refused with 400.
+
+A JSON body instead names files already inside the run's working directory under `parts`, each
+`{ path, region?, name?, mime_type?, deliver?, caption? }`. And a `@path` token inside `task`, a
+region's text, or a message names a workdir file the same way; the text keeps the token, so the
+model reads the same name the part carries. A path that escapes the working directory is refused
+with 403, a missing or empty file with 400, and a file over `[serve] max_upload_bytes` with 413.
+The daemon types every part with its registry, so `Content-Type` and `mime_type` only need to be
+right when the bytes and the name do not say. A part aimed at a region whose `accepts` excludes it
+refuses the spawn with the region's list, and drops from a message with the text still delivered.
+
+## A run's parts
+
+`GET /api/agents/{id}/blobs` lists every stored part the run's context holds: a user's attachment,
+a file `read_file` stored, an image an MCP tool returned, an artifact the run submitted. Each item
+carries `sha256`, `mime_type`, `name`, `size`, `width`, `height`, `duration_ms`, `tokens`, the
+`regions` carrying it, and `stored`, which is false for a part the context names but the run
+directory no longer holds. `GET /api/agents/{id}/blobs/{sha256}` serves one part's bytes under its
+own `Content-Type`, so an `<img src=...>` pointed at it renders, and `?download=1` adds a
+`Content-Disposition: attachment` carrying the part's name.
+
+Both byte routes advertise `Accept-Ranges: bytes` and honour a single-range `Range` request, so a
+player can scrub a video or a client can resume a download. `Range: bytes=1024-2047` is answered
+`206 Partial Content` with a `Content-Range: bytes 1024-2047/<total>` header and just those bytes;
+an open end (`bytes=1024-`) or a suffix (`bytes=-4096`, the last 4 KiB) works too. A range that
+starts past the end is `416 Range Not Satisfiable` with `Content-Range: bytes */<total>`. A
+malformed or multi-range header is ignored and the whole body served.
+
+`GET /api/agents/{id}/files/raw?path=` does the same for any file inside the working directory,
+typed by the registry from its bytes and name, where the JSON `files` route wraps text. The answer's
+`artifacts` carry each file's `path` and, when the run could store it, its `sha256`, so a client can
+fetch an artifact either way.
+
 ## A run's files
 
 `GET /api/agents/{id}/files` answers two different questions, and neither substitutes for the other.
@@ -638,6 +707,13 @@ enumerated in one response, so walk it the way a file tree does.
 > `modifying_tool_calls` counts modifying tool *calls*, not files. A run that edits one file three
 > times records three. Do not subtract it from the entry count to get "how many more files";
 > that number is meaningless. Use `modified_files_truncated`, or `source=workdir` for ground truth.
+
+Every listing entry carries `name`, `path`, `is_dir`, `size`, `exists`, `outside_workdir`, and
+`mime_type`. The last is what the run's registry makes of the file from its name, so a client can
+decide whether to render an image, or offer a file to a region that `accepts` a type, without a
+request per row or a guess of its own. It is typed by extension only, not sniffed, and is empty for
+a directory. `GET .../files/raw` types the same bytes, sniffing them, when an exact answer is
+needed.
 
 With `?path=<file>` the response is the file's contents, unchanged from earlier versions. A listing
 carries `"kind": "listing"`, so check that field rather than guessing from the shape.
@@ -699,6 +775,108 @@ Changing a cap is a manifest write: `PUT /api/blueprints/{name}` with the manife
 which are errors rather than quiet fallbacks. The workers still share the daemon's inference pool
 (`[limits] max_concurrent_inferences`, 8 by default), so an unlimited fan-out queues at the model
 rather than running away.
+
+### Stage routing
+
+`GET /api/blueprints/{name}` also carries `stage_routing`: one entry per stage that routes the
+model's produced parts to a region by mime type (`output_routing`), or empties a region when it is
+entered (`context.reset`), so a console shows or checks them without parsing the manifest.
+
+```json
+{
+  "stage_routing": [
+    {
+      "stage": "draw",
+      "output_routing": [{ "pattern": "image/*", "region": "artwork" }]
+    },
+    {
+      "stage": "describe",
+      "context_reset": ["conversation"]
+    }
+  ]
+}
+```
+
+`output_routing` is ordered by pattern, and a part goes to the most specific match's region. Only
+stages that do one or the other appear; a stage that does neither is left out, and a blueprint that
+does neither has an empty list. Changing either is a manifest write through `PUT
+/api/blueprints/{name}`. `blueprints.stage_routing` in the `capabilities` list on `GET /api/config`
+says the daemon reports this.
+
+## Yolo profiles
+
+The profiles a run can be launched under with `--yolo=<name>` live in
+[`yolo.toml`](/docs/configuration#yolotoml) beside the config, and these four routes are `lev
+yolo` over HTTP. Every one of them reads the file as it stands at that moment, the same way a
+spawn does, so what they report is what the next run gets.
+
+`GET /api/yolo` lists what is there:
+
+```json
+{
+  "path": "/home/you/.leviath/yolo.toml",
+  "exists": true,
+  "profiles": [
+    {
+      "name": "careful",
+      "default": "ask",
+      "questions": "ask",
+      "checkpoints": "ask",
+      "gate": "auto",
+      "tool_rules": [1, 2, 0],
+      "shell_rules": [3, 1, 1]
+    }
+  ]
+}
+```
+
+`tool_rules` and `shell_rules` are `[allow, ask, deny]` counts. A file that does not load comes
+back with `exists: true`, an `error` naming the line, and no profiles, because that is what a
+spawn naming one would be refused with. A missing file is `exists: false` with no error.
+
+`GET /api/yolo/{name}` is one profile in full: `{"name", "spec", "holds"}`, where `spec` is the
+profile as parsed (the same keys the file has) and `holds` is the list of things this profile
+still puts to a person, as `lev run` prints before a run starts. `404` for a name the file does
+not have, and for no file at all; `422` when the file does not load.
+
+`POST /api/yolo/test` asks what a profile would decide for one call, without running anything:
+
+```json
+{
+  "profile": "careful",
+  "tool": "shell",
+  "command": "rm -r target/debug",
+  "workdir": "/home/you/project"
+}
+```
+
+`command` is for the shell; any other tool takes its `arguments` as an object. `workdir` is where
+relative paths in the command resolve, defaulting to the server's own. `configured` (`allow`,
+`ask` or `deny`) stands in for what the config layers resolve the tool to, otherwise that is read
+from the config in force; `kind` (`builtin`, `subagent`, `script`, `mcp`) says where the tool
+comes from for `@group` rules, otherwise it is guessed from the name; `allowed: true` decides as
+if `--allow <tool>` had been passed. The answer:
+
+```json
+{
+  "profile": "careful",
+  "tool": "shell",
+  "configured": "ask",
+  "policy": "allow",
+  "reason": "shell allow rule \"rm -r*\""
+}
+```
+
+`policy` is what the run would do: `allow` runs it without a prompt, `ask` opens the ordinary
+approval prompt, `deny` refuses it. `reason` names the rule, the config, or the profile's default
+that decided it. This is the same code path the daemon runs on a real call, so a decision here is
+the decision a run would make. `400` for a `kind` or `configured` word that is not one of the
+listed values, or `arguments` that are not an object.
+
+`PUT /api/yolo` replaces the whole file: `{"text": "<the file, as TOML>"}`. The text is parsed
+first, and a save that would not load is refused with `400` and the same message a spawn would
+give, leaving the file on disk as it was. It answers with the listing `GET` returns. Admin only,
+for the reason `PUT /api/config` is: a profile is a grant of permissions.
 
 ## Asking how to upgrade
 
@@ -869,17 +1047,25 @@ with the reason each was passed over, so a file with a syntax error is told apar
 nobody wrote. MCP tools are not here: they depend on a server being reachable rather than on
 anything installed, and `/api/mcp/servers/{name}` already answers for them.
 
-`GET /api/scripts` is the same ground from the editor's side, over the five kinds of Rhai a machine
-can carry: `tool`, `region_hook`, `stage_hook`, `output_validator` and `provider`. Only tools have a
-directory an agent owns (`<agent>/tools/`, plus the global one); the hooks and the validator are
-named by path in the manifest and resolved against the agent's own directory, so the listing derives
-them from what the manifest declares and the read and write routes address them at
+`GET /api/scripts` is the same ground from the editor's side, over the six kinds of Rhai a machine
+can carry: `tool`, `region_hook`, `stage_hook`, `output_validator`, `mime_check` and `provider`.
+Only tools have a directory an agent owns (`<agent>/tools/`, plus the global one); the hooks and the
+validator are named by path in the manifest and resolved against the agent's own directory, so the
+listing derives them from what the manifest declares and the read and write routes address them at
 `<agent>/<name>.rhai`.
+
+A [mime check](/docs/rhai-mime-checks) is named by a mime row's `check`, and rows live in two
+places, so the kind is listed from both: the operator's rows (`mime_types.toml` and
+`[mime_types]` in the config) put their checks in the global half, resolved against the config's
+directory, and a blueprint's own `[mime_types]` puts its checks beside the agent's hooks. Address
+one with `?agent=<name>` for the blueprint's, or without for the operator's. Check
+`scripts.mime_checks` in the `capabilities` list before offering the kind.
 
 Every entry carries a `declared` flag, and an agent-scoped one also carries `relative_path`: where
 the file sits relative to the agent's own directory, `validators/a2ui.rhai`, which is the spelling
-that goes into a manifest. A machine-wide script has no `relative_path`, since no blueprint contains
-it.
+that goes into a manifest. A global mime check carries it too, relative to the config's directory,
+since that is the spelling that goes into the row. A global tool or a provider has no
+`relative_path`, since nothing names either by path.
 
 `GET/PUT/DELETE /api/scripts/{kind}/{name}` reads and writes one file, scoped by `?agent=<name>` or,
 with no `agent`, the machine's own directory for that kind. `{name}` is the file without its `.rhai`
@@ -1187,31 +1373,35 @@ omits the field whether or not the file loads, so its absence proves nothing the
 cannot be the thing that breaks the file: a body that would produce a config this build refuses to
 read back answers **400** and the file is left byte for byte as it was.
 
-## The default model
+## Override and fallback models
 
-`default_model` on `GET /api/config` is the model every stage runs on while it is set, as a bare
-model id on `default_provider`. It is always sent, `null` included, and that is the point: a server
-that omits the key predates the field, which is a different answer from "nothing is pinned". Read
-the absence as "cannot say" and show that, rather than showing an empty picker over a machine that
-has a model pinned.
+`override_model` on `GET /api/config` is the model every stage that allows a user default starts on
+while it is set, ahead of what its blueprint names; `fallback_model` is the model a stage falls back
+to when none of the models it names is configured on that machine, never ahead of them. Both are
+bare model ids on `default_provider`. Both are always sent, `null` included, and that is the point:
+a server that omits a key predates the field, which is a different answer from "nothing is set".
+Read the absence as "cannot say" and show that, rather than showing an empty picker over a machine
+that has a model pinned. Servers before 0.6 sent `default_model` instead, which behaved as
+`override_model` does.
 
-On `PUT /api/config` the same key has three states, which no other field in that body has:
+On `PUT /api/config` each key has three states, which the other fields in that body do not have:
 
-| Body                        | What happens                                       |
-|-----------------------------|----------------------------------------------------|
-| no `default_model` key      | the setting is left exactly as it was              |
-| `"default_model": null`     | the setting is written away                        |
-| `"default_model": "gpt-5"`  | the setting is pinned to `gpt-5`                   |
+| Body                          | What happens                                       |
+|-------------------------------|----------------------------------------------------|
+| no `override_model` key       | the setting is left exactly as it was              |
+| `"override_model": null`      | the setting is written away                        |
+| `"override_model": "gpt-5"`   | the setting is pinned to `gpt-5`                   |
 
-Clearing it matters as much as setting it. A pinned model runs every stage of every blueprint on
-that one model, and the cheap stages then pay a top-tier price, so unset is the state most machines
-want: see [which entry a stage starts on](/docs/providers#which-entry-a-stage-starts-on). Sending
-`null` is the only way to get back there through this API, in the same way `remove_gateways` is the
-only way to delete a gateway.
+`fallback_model` reads the same way. Clearing `override_model` matters as much as setting it. A
+pinned model runs every stage of every blueprint on that one model, and the cheap stages then pay a
+top-tier price, so unset is the state most machines want: see
+[which entry a stage starts on](/docs/providers#which-entry-a-stage-starts-on). Sending `null` is
+the only way to get back there through this API, in the same way `remove_gateways` is the only way
+to delete a gateway.
 
-`"default_model": ""` is a **400**, not a clear. An empty string is not a model id, and a form that
-posts its empty box should be told rather than quietly lose the setting. Nothing is written when it
-is refused.
+`"override_model": ""` (or `"fallback_model": ""`) is a **400**, not a clear. An empty string is not
+a model id, and a form that posts its empty box should be told rather than quietly lose the
+setting. Nothing is written when it is refused.
 
 `default_provider` takes no `null`. It is not optional in `config.toml` - a machine always has one,
 defaulting to `anthropic` - so there is no unset state to write, and sending a different name is the
@@ -1247,7 +1437,11 @@ it. Beside it: `supports_temperature` and `supports_tools`; `learned`, true when
 listing described the model and false for a row from this build's table; and, when the listing
 carries them, `released` (Unix seconds), `retires` (the date the provider published) and `pricing`
 (USD per million tokens: `input_per_mtok`, `cached_input_per_mtok`, `cache_write_per_mtok`,
-`output_per_mtok`), each `null` otherwise. Which providers can report what, and from where, is in
+`output_per_mtok`), each `null` otherwise. Two lists say what the model takes and hands back:
+`input_types` and `output_types`, mime type patterns such as `text/*`, `image/*` or
+`application/pdf`, from this build's table corrected by the provider's listing and by
+`[model_capabilities]`. A stage holding an image picks a model whose `input_types` cover it; see
+[typed mime](/docs/mime). Which providers can report what, and from where, is in
 [where a model's capabilities come from](/docs/configuration#where-a-models-capabilities-come-from).
 That is what lets a console show the catalog without fetching and re-parsing every script. No other
 kind carries the key at all.
@@ -1298,6 +1492,15 @@ than that feature, not broken.
 | `runs.parent` | `parent=none` / `parent=<run_id>`. See [listing by place in the tree](#listing-by-place-in-the-tree) |
 | `runs.files.listing` | `GET /api/agents/{id}/files`, the run's own record of what it changed |
 | `runs.files.workdir` | `source=workdir` on that route, reading the filesystem a directory at a time |
+| `runs.files.mime_type` | `mime_type` on every file-listing entry, typed by the run's registry from the file's name |
+| `models.mime_types` | `input_types` and `output_types` on every `GET /api/models` entry: the mime type patterns a model takes and hands back |
+| `spawn.parts` | `parts` and `multipart/form-data` on `POST /api/agents`, and `@path` tokens in `task` and region text resolved inside the working directory. See [attaching files](#attaching-files) |
+| `messages.parts` | The same on `POST /api/agents/{id}/message` |
+| `runs.blobs` | `GET /api/agents/{id}/blobs` and `/blobs/{sha256}`: the stored parts a run holds and their bytes. See [a run's parts](#a-runs-parts) |
+| `runs.files.raw` | `GET /api/agents/{id}/files/raw?path=`, a workdir file's bytes under its own content type |
+| `runs.result.artifacts` | `artifacts` on a run's answer as `{ name, path, mime_type, size, sha256 }` objects rather than paths |
+| `mime.registry` | `GET /api/mime`, the effective mime registry with each row's source |
+| `mime.write` | `PUT /api/mime` and `DELETE /api/mime`, admin-gated, write a row into `mime_types.toml` or take one out |
 | `runs.stages` | `GET /api/agents/{id}/stages`, the per-stage ledger |
 | `runs.stages.cost` | `cost_usd`, `unpriced_calls` and `cost_is_exact` on each stage record, and the `visits` split beneath them. Without it a stage record carries tokens and no price, and the missing field is not a zero |
 | `runs.waiting_on` | `wait_reason` on a run, saying what a parked run is parked on |
@@ -1319,6 +1522,7 @@ than that feature, not broken.
 | `blueprints.manifest` | The manifest itself on the blueprint detail route |
 | `blueprints.validate.name` | `POST /api/blueprints/validate` accepting an installed name, not only a body |
 | `blueprints.fan_outs` | `fan_outs` on the detail route. See [fan-out limits](#fan-out-limits) |
+| `blueprints.stage_routing` | `stage_routing` on the detail route: `output_routing` and `context.reset` per stage. See [stage routing](#stage-routing) |
 | `tools.list` | `GET /api/tools?agent=`, what an agent here can actually call |
 | `update.plan` | `GET /api/update`, how this copy was installed and the command that upgrades it. See [asking how to upgrade](#asking-how-to-upgrade) |
 | `update.apply` | `POST /api/update` and `GET /api/update/jobs/{id}`, carrying that plan out. Says this build serves them; whether *this* daemon mounts them is `--allow-admin`, which you find out by calling one. See [pressing the button](#pressing-the-button) |
@@ -1326,6 +1530,7 @@ than that feature, not broken.
 | `scripts.write` | That this build serves the write half. Whether *this* daemon mounts it is `--allow-admin`, which you find out by calling one and reading the status |
 | `scripts.providers` | `provider` as a fifth script `kind`, the machine's drop-in model providers |
 | `scripts.candidates` | `?include=candidates` on the script listing, plus `relative_path` and `declared` on every entry |
+| `scripts.mime_checks` | `mime_check` as a sixth script `kind`: the byte checks mime rows name, beside the config for the operator's rows and beside the agent for a blueprint's |
 | `config.gateways` | `gateways` on `GET /api/config`, the custom providers this machine has |
 | `config.gateways.kinds` | `kind`, `header_names` and `models` on each gateway, and `kind`, `headers` and `models` accepted by `PUT /api/config`: a gateway can be an OpenAI-compatible endpoint rather than a script |
 | `models.probe` | `POST /api/models/probe`, which asks an OpenAI-compatible server what it serves before a gateway for it is written; admin only |
@@ -1333,6 +1538,43 @@ than that feature, not broken.
 | `interaction.feedback` | `feedback` beside `approved: false` on `POST /api/agents/{id}/interaction`, and the "Deny with feedback" option on a tool approval. An older daemon drops the field without a word, so a console should only offer the box where this is announced. See [answering a question](#answering-a-question) |
 | `providers.signin` | `GET /api/providers` and the three admin routes under it: the browser sign-in for a provider that has no API key. Without it a console can write `codex_enabled` and has no way to complete the sign-in, which leaves the user enabled and unable to run anything. See [signing in to a subscription provider](#signing-in-to-a-subscription-provider) |
 | `config.health` | `config_error` and `config_mtime` on `GET /api/config`, and the `config_health` frame on the socket. Without it a missing `config_error` means nothing, so a console cannot tell a file that loads from a daemon that would not say. See [when the config file will not load](#when-the-config-file-will-not-load) |
+
+## Writing a mime row
+
+A [custom mime type](/docs/mime#the-registry) is where the registry earns its keep: a family, a
+token rule, extensions, a magic prefix and a byte check turn a format Leviath has never heard of
+into one it types, sizes and validates rather than one that behaves like
+`application/octet-stream`. `GET /api/mime` shows what is there; these two writes change it,
+without leaving the browser for the config file.
+
+`PUT /api/mime` adds a row or updates the one already there, writing `mime_types.toml` beside the
+config, the same file `lev mime add` writes and the operator's own rows live in:
+
+```jsonc
+PUT /api/mime
+{
+  "mime_type": "application/x-acme-scene",
+  "family": "model",
+  "text": false,
+  "tokens": { "per_pixel": 750, "max": 1600 },
+  "extensions": ["scene"],
+  "magic": "41434D45",
+  "stand_in": "[{type} {size}] {name}",
+  "check": "checks/scene.rhai"
+}
+```
+
+Every field but `mime_type` is optional, and only the fields sent are changed, so a later `PUT`
+that carries just `{"mime_type": "...", "extensions": [...]}` adds an extension and leaves the
+rest. `tokens` is one of `{ per_byte }`, `{ per_pixel, max? }`, `{ per_second }` or `{ fixed }`.
+The answer is `{"mime_type", "created"}`, where `created` is false when the row was already there.
+The row is validated the way `lev mime add` validates it before anything is written: a type that
+is not `type/subtype`, a token rule that names none or more than one rate, a `magic` that is not
+hex, or a `check` script that will not compile is a 400, and the file is untouched.
+
+`DELETE /api/mime?mime_type=<type>` takes a row out; a type with no row of its own there is a 404.
+Both need `--allow-admin`, and both are announced as `mime.write`, so a console offers "New
+type…" where it will land and hands over the TOML to paste where it will not.
 
 ## Live updates over WebSocket
 

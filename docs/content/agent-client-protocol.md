@@ -3,7 +3,7 @@ title: Agent Client Protocol
 description: Serve an agent over the Agent Client Protocol on stdio, so an editor or orchestrator can drive it as a child process.
 group: Reference
 group_order: 3
-order: 13
+order: 14
 ---
 
 # Agent Client Protocol (editor integration)
@@ -84,6 +84,25 @@ it as the agent's conclusion rather than more log text.
 
 A run that submits nothing adds nothing. Ask for a shape with `--output-format`, since the protocol
 carries no field for it.
+
+The files a run produced follow the answer, one `resource_link` block per artifact with its name,
+its mime type and a `file://` URI into the session's working directory, so a host can open or
+show them itself. Nothing is inlined: the host asked for a link it can follow, and a video does not
+belong in a chat stream.
+
+## Files in a prompt
+
+`initialize` advertises `image` and `audio` prompt capabilities. An `image` or `audio` block's
+bytes, and a `resource` block carrying a `blob`, become typed [parts](/docs/mime) on the task
+region, exactly as `lev run --attach` sends them: the daemon stores each one and the model sees it
+natively when the model takes the type, or as a stand-in otherwise. An image or audio block has no
+name in the protocol, so it is named for its kind and position (`image-1.png`); a resource keeps the
+last segment of its URI. A prompt that is only files gets a line naming them as its text. A
+`resource_link` whose `file://` URI points inside the session's working directory is read there and
+rides the prompt as a part too, named as the host named it, and the text marks it as attached under
+its URI. Any other link (another scheme, a path outside the working directory, an empty file or one
+over the part ceiling) is named in the text and marked as not fetched, since the agent has no other
+way to read a host's file by reference. On a later prompt the same blocks ride the message.
 
 ## Permission handling
 

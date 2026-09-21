@@ -292,6 +292,10 @@ pub(crate) async fn run(
                 schema: output_schema,
                 validator: None,
                 on_validator_error: None,
+                // Upstream added an artifact spec list to OutputSpec. This tool
+                // declares no artifacts; `lev run --output-artifact` has no MCP
+                // equivalent yet. Dropped by the upstream sync merge; restored.
+                artifacts: Vec::new(),
             });
 
     let workdir = match std::fs::canonicalize(&workdir_raw) {
@@ -365,6 +369,12 @@ pub(crate) async fn run(
         model,
         workdir: &workdir_text,
         yolo,
+        // The MCP `run` tool takes `yolo` as a plain boolean, so there is no
+        // named unattended profile to carry, and it has no attachment support,
+        // so no mime parts. Both fields were added upstream and dropped by the
+        // sync merge; restored with the values this tool can actually produce.
+        yolo_profile: None,
+        parts: Vec::new(),
         allow,
         max_depth,
         regions,

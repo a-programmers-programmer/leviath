@@ -24,12 +24,8 @@ impl WorldHost {
             SubAgentOp::Check { run_id, reply } => {
                 let report = self.live_entity(&run_id).and_then(|agent| {
                     self.world.agent_status(agent).map(|status| SubAgentReport {
+                        final_output: self.reported_output(agent.entity(), &status),
                         status,
-                        final_output: self
-                            .world
-                            .world()
-                            .get::<crate::persistence::FinalOutput>(agent.entity())
-                            .map(|o| o.0.clone()),
                     })
                 });
                 let _ = reply.send(report);
@@ -53,6 +49,8 @@ impl WorldHost {
                         agent_id: run_id,
                         content,
                         target_region,
+                        // A sub-agent's `send_message` carries text only.
+                        parts: Vec::new(),
                     })
                     .is_ok();
                 let _ = reply.send(ok);
@@ -66,6 +64,65 @@ impl WorldHost {
                 let _ = reply.send(within && self.cancel_tree(&run_id));
             }
         }
+    }
+
+    /// What a parent is handed back when it checks on a child: the child's own
+    /// submitted answer, or - when it finished without submitting one - the same
+    /// fallback the fan-out collector uses, so one child run answers its parent
+    /// identically however it was started.
+    ///
+    /// This is the fix for a child's work vanishing on the internal spawn path.
+    /// `check_agent` / `wait_for_agent` / `spawn_agent(wait=true)` all read the
+    /// child through here, and it used to read *only* the
+    /// [`FinalOutput`](crate::persistence::FinalOutput) component: a child that
+    /// did its work and answered in text - or whose `submit_output` was refused
+    /// by a hook or a validator - had no such component, so the parent was told
+    /// "no final output" over a child that had in fact finished with an answer
+    /// sitting in its context. `worker_terminal_result` never had that hole,
+    /// which is why the direct/MCP run relayed child output and this one did not.
+    ///
+    /// Resolution is [`child_output_content`](crate::fanout::child_output_content)
+    /// - the fan-out collector's own chain, not a copy of it: `FinalOutput` →
+    ///   last non-empty `conversation` entry → `InferenceResult.response`.
+    ///
+    /// Scoped to a `Complete` child, exactly as the collector scopes it: an
+    /// errored or cancelled child reports its failure through `status`, and
+    /// dressing its last words up as an answer would hide that. A submitted
+    /// output is returned verbatim at any status, as before - it is the child's
+    /// own record of what it produced.
+    fn reported_output(
+        &self,
+        child: Entity,
+        status: &AgentStatus,
+    ) -> Option<leviath_core::output::FinalOutput> {
+        let world = self.world.world();
+        // The child's own submission always wins, and keeps its format, stage
+        // and artifact list - the fallback below has none of those to give.
+        if let Some(submitted) = world.get::<crate::persistence::FinalOutput>(child) {
+            return Some(submitted.0.clone());
+        }
+        if !matches!(status, AgentStatus::Complete) {
+            return None;
+        }
+        let content = crate::fanout::child_output_content(world, child)?;
+        if content.trim().is_empty() {
+            return None;
+        }
+        // Wrapped as a `FinalOutput` because that is the shape the report (and
+        // every consumer of it) already speaks. The stage is the child's own
+        // current one and the timestamp is now: this is a recovery of what the
+        // child said, not a submission it made, and nothing downstream treats
+        // those fields as evidence of one.
+        let stage = world
+            .get::<AgentState>(child)
+            .map(|s| s.current_stage.clone())
+            .unwrap_or_default();
+        Some(leviath_core::output::FinalOutput::new(
+            &content,
+            None,
+            stage,
+            chrono::Utc::now().timestamp(),
+        ))
     }
 
     /// Spawn a child agent under `parent_run_id`, linking `ParentRef` /
