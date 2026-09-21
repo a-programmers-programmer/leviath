@@ -1,0 +1,80 @@
+{
+  "task": "T01M2NCFG6TMW3VFDYM0N4MKVTS",
+  "run": "R01M2NCFR2BCB88RW5M1C8H5M6R",
+  "title": "GQL-24-C: reconcile REST/MCP/CLI with the old LifeOps GraphQL PoC (no hand-written parser copy)",
+  "status": "complete",
+  "date": "2026-09-16",
+  "claim": "The old LifeOps GraphQL PoC schema can be served by a real GraphQL engine (async-graphql 7.2.1) with no hand-written parser. The repo lockfile does NOT already have it; the crates are available offline in the local cargo registry cache.",
+  "commands": [
+    {
+      "cmd": "CARGO_TARGET_DIR=/tmp/gqlprobe/target cargo run --offline --manifest-path probe/Cargo.toml",
+      "rc": 0,
+      "artifact": "probe_out.txt",
+      "result": "POC_QUERY_OK (357 B of data), INTROSPECTION_OK=true, MUTATION_OK, ERROR_OK all present"
+    },
+    {
+      "cmd": "python3 /data/fleet/fleet/harness.py precheck --db /data/fleet/graph.db --task T01M2NCFG6TMW3VFDYM0N4MKVTS --workdir $PWD",
+      "rc": 0,
+      "artifact": null,
+      "result": "CHECK_PASS {\"type\": \"test\", \"detail\": \"rc=0 want=0\", \"rc\": 0}"
+    }
+  ],
+  "evidence": [
+    {
+      "id": "E1",
+      "claim": "The repo lockfile does NOT contain async-graphql. This corrects an earlier wrong claim.",
+      "path": "repo/Cargo.lock",
+      "detail": "Cargo.lock is 147,774 bytes; `grep -c async-graphql Cargo.lock` returns 0. The repo does not already depend on a GraphQL crate."
+    },
+    {
+      "id": "E2",
+      "claim": "A real GraphQL engine is available offline in the local cargo registry cache, so no network is needed.",
+      "path": "/data/rust/cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/",
+      "detail": "async-graphql-7.2.1.crate (335,797 B), async-graphql-derive-7.2.1.crate, async-graphql-parser-7.2.1.crate, async-graphql-value-7.2.1.crate, pest 2.9.1 (the parser backend). Extracted sources exist under registry/src/. Vendoring is unnecessary."
+    },
+    {
+      "id": "E3",
+      "claim": "The PoC's own query parses and resolves on the real engine, with zero hand-written parser code.",
+      "path": "probe_out.txt",
+      "detail": "POC_QUERY_OK returns runs[] with run_id/status/stage/tool_calls/iteration, recentRun, and context(run_id). 357 bytes of data. probe/src/main.rs is 6,194 bytes and imports only async_graphql."
+    },
+    {
+      "id": "E4",
+      "claim": "The schema is self-discoverable by introspection.",
+      "path": "probe_out.txt",
+      "detail": "INTROSPECTION_OK=true; __schema exposes queryType=Query and mutationType=Mutation."
+    },
+    {
+      "id": "E5",
+      "claim": "Mutations round-trip (spawnRun, submitProposal) with all PoC fields.",
+      "path": "probe_out.txt",
+      "detail": "MUTATION_OK returns spawnRun{run_id,status} and submitProposal{proposal_id,run_id,status,created_at} as one JSON data object."
+    },
+    {
+      "id": "E6",
+      "claim": "Bad queries yield GraphQL errors, not crashes (proper semantics).",
+      "path": "probe_out.txt",
+      "detail": "ERROR_OK = {\"data\":null,\"errors\":[{\"message\":\"Unknown field \\\"nope\\\" on type \\\"Query\\\".\",\"locations\":[{\"line\":1,\"column\":3}]}]}"
+    },
+    {
+      "id": "E7",
+      "claim": "The REST surface is a fixed route table that a GraphQL layer must sit beside, not replace.",
+      "path": "repo/crates/leviath-cli/src/commands/serve/mod.rs",
+      "detail": "api_router() mounts 66 .route(...) calls over 54 distinct paths (blueprints, runs, agents, interactions, mcp, tools, scripts, config, /ws)."
+    },
+    {
+      "id": "E8",
+      "claim": "The MCP surface is a fixed tool table over the same daemon core.",
+      "path": "repo/crates/leviath-cli/src/commands/mcp/serve_tools/mod.rs",
+      "detail": "tool_table() lists 16 tools: run, wait, status, result, cancel, message, respond, list_runs, list_agents, install_tool, list_tools, ps, pause, resume, daemon_status, validate. call_tool has 15 match arms (ps reuses list_runs). Both REST and MCP bridge to the same ControlRequest / run-record core."
+    },
+    {
+      "id": "E9",
+      "claim": "The repo has no existing GraphQL server; the only 'graphql' hits are a file-format label.",
+      "path": "repo/crates/leviath-tools/src/validate/format.rs",
+      "detail": "grep for graphql across crates/*.rs finds only validate/format.rs and validate/format/tests.rs. This matches the PoC's Step 1 recon."
+    }
+  ],
+  "artifacts": ["REPORT.md", "EVIDENCE.json", "probe/src/main.rs", "probe/Cargo.toml", "probe/Cargo.lock", "probe_out.txt", "probe_raw.txt"],
+  "notes": "Probe source lives in probe/ inside the workdir. It reuses the warm cargo target dir at /tmp/gqlprobe/target (~613 MB) to avoid a large rebuild. probe_raw.txt holds the first failed attempt (camelCase default field names); probe_out.txt is the passing run after explicit #[graphql(name=...)] snake_case attributes."
+}
