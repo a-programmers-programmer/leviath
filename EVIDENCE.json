@@ -1,0 +1,60 @@
+{
+  "base_commit": "15dc182e0bc6c28dfa93f4b8dd3c423372808f61",
+  "commands": [
+    {
+      "cmd": "python3 -m pytest leviath_typed_ls/tests/test_roundtrip.py -q",
+      "cwd": "repo/python",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "PYTHONPATH=$PWD python3 leviath_typed_ls/fixtures/probe_dod.py",
+      "cwd": "repo/python",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "PYTHONPATH=$PWD python3 leviath_typed_ls/fixtures/probe_server.py",
+      "cwd": "repo/python",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "python3 -c \"import leviath_typed_ls as m; assert m.__version__ == '0.1.0'; print(m.__version__)\"",
+      "cwd": "repo/python",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "python3 -m leviath_typed_ls serve < /dev/null",
+      "cwd": "repo/python",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "python3 -m leviath_typed_ls >/dev/null 2>&1; test $? -eq 2",
+      "cwd": "repo/python",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "! grep -nE '^[[:space:]]*(import|from)[[:space:]]+(importlib|subprocess|types)([[:space:].]|$)' leviath_typed_ls/__init__.py leviath_typed_ls/__main__.py leviath_typed_ls/gate.py leviath_typed_ls/projection.py leviath_typed_ls/schema_reader.py leviath_typed_ls/typed_code_adapter.py leviath_typed_ls/codegen.py",
+      "cwd": "repo/python",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "! grep -nE '(^|[^\"[:alnum:]_.])(exec|eval|compile|__import__)\\(|import_module\\(' leviath_typed_ls/__init__.py leviath_typed_ls/__main__.py leviath_typed_ls/gate.py leviath_typed_ls/projection.py leviath_typed_ls/schema_reader.py leviath_typed_ls/typed_code_adapter.py leviath_typed_ls/codegen.py",
+      "cwd": "repo/python",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "git -C /data/work/graphql-realization/gql-04/repo merge-base --is-ancestor 15dc182e0bc6c28dfa93f4b8dd3c423372808f61 HEAD",
+      "cwd": ".",
+      "expect_rc": 0
+    }
+  ],
+  "artifacts": [
+    "REPORT.md",
+    "EVIDENCE.json",
+    "evidence/probe_dod.txt",
+    "evidence/probe_server.txt",
+    "evidence/probe_roundtrip.txt",
+    "evidence/red.txt",
+    "evidence/green.txt",
+    "evidence/commands.log"
+  ]
+}
