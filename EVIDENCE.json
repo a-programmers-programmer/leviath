@@ -1,0 +1,98 @@
+{
+  "base_commit": "7b6e050e89e6aea7b51453e633fbe9209c50a844",
+  "commands": [
+    {
+      "cmd": "npm test",
+      "cwd": "integrations/typed-ls-ts",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "npm test 2>&1 | grep -q '# pass 30'",
+      "cwd": "integrations/typed-ls-ts",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "npm test 2>&1 | grep -q 'the editor session runs both protocol servers side by side'",
+      "cwd": "integrations/typed-ls-ts",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "npm test 2>&1 | grep -q 'diagnostics for a TypeScript document come from the code server'",
+      "cwd": "integrations/typed-ls-ts",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "npm test 2>&1 | grep -q 'diagnostics for a GraphQL document come from the schema server'",
+      "cwd": "integrations/typed-ls-ts",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "npm test 2>&1 | grep -q 'cross-file navigation works in both languages'",
+      "cwd": "integrations/typed-ls-ts",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "npm test 2>&1 | grep -q 'a divergent rename is reported as a conflict, never silently resolved'",
+      "cwd": "integrations/typed-ls-ts",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "npm test 2>&1 | grep -q 'an agreed rename raises no conflict'",
+      "cwd": "integrations/typed-ls-ts",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "npm test 2>&1 | grep -q 'restarting either server preserves the reconciliation baseline'",
+      "cwd": "integrations/typed-ls-ts",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "npm test 2>&1 | grep -q 'committing a baseline at a stale revision is refused, not overwritten'",
+      "cwd": "integrations/typed-ls-ts",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "npm test 2>&1 | grep -q 'a stale document version is refused by the code server'",
+      "cwd": "integrations/typed-ls-ts",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "node py/probe_editor_session.mjs",
+      "cwd": "integrations/typed-ls-ts",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "node py/probe_nav.mjs",
+      "cwd": "integrations/typed-ls-ts",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "grep -q 'extractTyped' src/code-server.ts && grep -q 'leviath-typed-code-ls-ts' src/code-server.ts",
+      "cwd": "integrations/typed-ls-ts",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "test \"$(find /data/work/graphql-realization/gql-05/repo/python -name '__pycache__' -o -name '*.pyc' | wc -l)\" -eq 0",
+      "cwd": ".",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "test \"$(cd /data/work/graphql-realization/gql-05/repo && git status --porcelain | grep -c '^.M')\" -eq 0",
+      "cwd": ".",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "test \"$(cd /data/work/graphql-realization/gql-05/repo && git rev-parse HEAD)\" = '7b6e050e89e6aea7b51453e633fbe9209c50a844'",
+      "cwd": ".",
+      "expect_rc": 0
+    }
+  ],
+  "artifacts": [
+    "REPORT.md",
+    "integrations/typed-ls-ts/src/protocol.ts",
+    "integrations/typed-ls-ts/src/code-server.ts",
+    "integrations/typed-ls-ts/src/editor-session.ts",
+    "integrations/typed-ls-ts/src/editor-session.test.ts",
+    "integrations/typed-ls-ts/py/probe_editor_session.mjs"
+  ]
+}
