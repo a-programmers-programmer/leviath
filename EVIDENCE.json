@@ -1,0 +1,161 @@
+{
+  "task": "T01M2NM76EAKVAXNQA8QNMYNZGK",
+  "run": "R01M2NM7J837PKR0BWACE8Q353H",
+  "status": "complete",
+  "base_commit": "15dc182e0bc6c28dfa93f4b8dd3c423372808f61",
+  "base_branch": "fleet/gql-11",
+  "repo_root": "/data/wt/T01M2KX1Z7Y15Y2E6VCKPKZNB5D-a2/repo",
+  "workdir": "/data/wt/T01M2NM76EAKVAXNQA8QNMYNZGK-a1",
+  "transcript": "tmp/runbook_check.out",
+  "driver": "tmp/runbook_check.sh",
+  "notes": [
+    "All commands below are tracked-file only. No model, no network, no provider.",
+    "expect_rc is the exit code the RUNBOOK.md sequence expects.",
+    "The two rc=1 entries are deliberate refusals, not failures.",
+    "A filled review template is a mechanics fixture, NOT a model review."
+  ],
+  "commands": [
+    {
+      "step": "S0 dependency import",
+      "cmd": "python3 -c 'import graphql; print(\"graphql-core\", graphql.version)'",
+      "cwd": "<repo_root>",
+      "expect_rc": 0
+    },
+    {
+      "step": "S1 brief -> working contract",
+      "cmd": "cp -r $BP/examples/task-board $WORK/graphql-contract",
+      "cwd": "<repo_root>",
+      "expect_rc": 0
+    },
+    {
+      "step": "S2 gate check -> checked + fingerprint",
+      "cmd": "python3 $BP/scripts/gate.py check --root $WORK/graphql-contract",
+      "cwd": "<repo_root>",
+      "expect_rc": 0,
+      "observed": "status checked, fingerprint 8d0e63943e584388cdd154c33a07a0551679558c38f9f88f49e1612f24a05b9a"
+    },
+    {
+      "step": "S3b accept -> sealed receipt",
+      "cmd": "python3 $BP/scripts/gate.py accept --root $WORK/graphql-contract --review $WORK/review.json",
+      "cwd": "<repo_root>",
+      "expect_rc": 0,
+      "observed": "status accepted; accepted.json written by the gate"
+    },
+    {
+      "step": "S3c verify -> accepted",
+      "cmd": "python3 $BP/scripts/gate.py verify --root $WORK/graphql-contract",
+      "cwd": "<repo_root>",
+      "expect_rc": 0,
+      "observed": "status accepted"
+    },
+    {
+      "step": "S4a implementer proposes an additive change; verify must refuse",
+      "cmd": "python3 $BP/scripts/gate.py verify --root $WORK/graphql-contract",
+      "cwd": "<repo_root>",
+      "expect_rc": 1,
+      "observed": "ValueError: Contract changed after acceptance; rerun the workflow"
+    },
+    {
+      "step": "S4b re-check after the proposal",
+      "cmd": "python3 $BP/scripts/gate.py check --root $WORK/graphql-contract",
+      "cwd": "<repo_root>",
+      "expect_rc": 0,
+      "observed": "status checked; fingerprint changed to a58d798980e10624801ab1a866c5b0e73065c0c55bb880a795c7590c08dd727b"
+    },
+    {
+      "step": "S4c re-accept the proposal with a fresh review",
+      "cmd": "python3 $BP/scripts/gate.py accept --root $WORK/graphql-contract --review $WORK/review2.json",
+      "cwd": "<repo_root>",
+      "expect_rc": 0
+    },
+    {
+      "step": "S4c verify the re-sealed contract",
+      "cmd": "python3 $BP/scripts/gate.py verify --root $WORK/graphql-contract",
+      "cwd": "<repo_root>",
+      "expect_rc": 0
+    },
+    {
+      "step": "S4d restore the pristine seed and re-accept",
+      "cmd": "python3 $BP/scripts/gate.py accept --root $WORK/graphql-contract --review $WORK/review.json",
+      "cwd": "<repo_root>",
+      "expect_rc": 0
+    },
+    {
+      "step": "S5 generated interfaces: list tracked generator scripts (NULL step)",
+      "cmd": "git ls-files crates/leviath-cli/agents/graphql-schema/scripts",
+      "cwd": "<repo_root>",
+      "expect_rc": 0,
+      "observed": "gate.py, generate_tool.py, run_stage.py; none emits client.ts or manifest.json"
+    },
+    {
+      "step": "S5 the only tracked generator embeds the checker",
+      "cmd": "python3 $BP/scripts/generate_tool.py",
+      "cwd": "<repo_root>",
+      "expect_rc": 0,
+      "observed": "rewrites tools/graphql_contract_gate.rhai and tools/graphql_contract_guide.rhai; no client interfaces"
+    },
+    {
+      "step": "S6a blueprint validation for workflow execution",
+      "cmd": "lev validate $BP",
+      "cwd": "<repo_root>",
+      "expect_rc": 0,
+      "observed": "Blueprint 'graphql-schema' is valid; 10 stages"
+    },
+    {
+      "step": "S7a confirmation with the parent pipeline pin",
+      "cmd": "python3 $BP/scripts/gate.py verify --root $WORK/graphql-contract --expected-fingerprint $FP",
+      "cwd": "<repo_root>",
+      "expect_rc": 0,
+      "observed": "status accepted"
+    },
+    {
+      "step": "S7b the pin rejects a different contract",
+      "cmd": "python3 $BP/scripts/gate.py verify --root $WORK/graphql-contract --expected-fingerprint 0000000000000000000000000000000000000000000000000000000000000000",
+      "cwd": "<repo_root>",
+      "expect_rc": 1,
+      "observed": "ValueError: Contract differs from the parent pipeline expected fingerprint"
+    },
+    {
+      "step": "S8 committed tests",
+      "cmd": "python3 -m unittest discover -s crates/leviath-cli/agents/graphql-schema/tests",
+      "cwd": "<repo_root>",
+      "expect_rc": 0,
+      "observed": "Ran 24 tests; OK"
+    },
+    {
+      "step": "orchestration: read the task record",
+      "cmd": "PYTHONPATH=/data/fleet python3 -c \"from fleet.store import Store;s=Store('/data/fleet/graph.db');t=s.get('T01M2NM76EAKVAXNQA8QNMYNZGK');print(t['id'],t['kind'],t['status'],[k for k in ('artifacts','attempt','check','current_run') if k in t])\"",
+      "cwd": "<repo_root>",
+      "expect_rc": 0
+    }
+  ],
+  "null_steps": [
+    {
+      "step": "generated interfaces (client.ts, manifest.json)",
+      "reason": "No tracked command emits them. scripts/generate_tool.py only embeds the checker into the Rhai tool.",
+      "status": "not implemented"
+    },
+    {
+      "step": "live model workflow execution with a permitted model",
+      "reason": "The tracked agent.leviath names gemini-3.5-flash and claude-opus-5, which fleet policy forbids. No permitted pinned blueprint is tracked.",
+      "status": "not implemented"
+    }
+  ],
+  "artifacts": [
+    "REPORT.md",
+    "EVIDENCE.json",
+    "RUNBOOK.md",
+    "fixtures/gql-11/BRIEF.md",
+    "fixtures/gql-11/README.md",
+    "fixtures/gql-11/review.template.json",
+    "fixtures/gql-11/contract/requirements.md",
+    "fixtures/gql-11/contract/design.md",
+    "fixtures/gql-11/contract/schema.graphql",
+    "fixtures/gql-11/contract/contract.json",
+    "fixtures/gql-11/contract/variables.json",
+    "fixtures/gql-11/contract/handoff.md",
+    "fixtures/gql-11/contract/operations/tasks.graphql",
+    "tmp/runbook_check.sh",
+    "tmp/runbook_check.out"
+  ]
+}

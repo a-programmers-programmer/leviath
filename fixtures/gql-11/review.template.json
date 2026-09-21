@@ -1,0 +1,27 @@
+{
+  "fingerprint": "REPLACE_WITH_THE_CHECKED_FINGERPRINT",
+  "verdict": "approve",
+  "blocking_findings": [],
+  "rubric": {
+    "domain": {
+      "pass": true,
+      "evidence": "TEMPLATE ONLY. Replace with evidence that names actual files and coordinates."
+    },
+    "client": {
+      "pass": true,
+      "evidence": "TEMPLATE ONLY. Replace with evidence that names actual operations and result branches."
+    },
+    "authorization": {
+      "pass": true,
+      "evidence": "TEMPLATE ONLY. Replace with evidence that names the tenant rules and denial scenarios."
+    },
+    "performance": {
+      "pass": true,
+      "evidence": "TEMPLATE ONLY. Replace with evidence that names the cursor, batching and demand controls."
+    },
+    "evolution": {
+      "pass": true,
+      "evidence": "TEMPLATE ONLY. Replace with evidence that names the baseline and the migration reasoning."
+    }
+  }
+}
