@@ -1,0 +1,121 @@
+{
+  "work_order": "GQL-09",
+  "base_commit": "15dc182e0bc6c28dfa93f4b8dd3c423372808f61",
+  "landed_commit": "cb261862c3a8adf0b1fafdb2d2ac21d7ceeb4578",
+  "branch": "fleet/gql-09",
+  "commands": [
+    {
+      "cmd": "python3 test_merge_decisions.py",
+      "cwd": "repo/crates/leviath-cli/agents/bake-off/scripts",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "python3 test_portability.py",
+      "cwd": "repo/crates/leviath-cli/agents/bake-off/scripts",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "python3 test_two_lane_merge.py",
+      "cwd": "repo/crates/leviath-cli/agents/bake-off/scripts",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "python3 test_lane_dispatch.py",
+      "cwd": "repo/crates/leviath-cli/agents/bake-off/scripts",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "python3 generate_tools.py --check",
+      "cwd": "repo/crates/leviath-cli/agents/bake-off/scripts",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "python3 -m py_compile merge_decisions.py harnessql_driver.py harnessql_paths.py generate_tools.py graphql_diff.py run_bakeoff3.py",
+      "cwd": "repo/crates/leviath-cli/agents/bake-off/scripts",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "grep -q 'allow = \\[\\]' crates/leviath-cli/agents/bake-merge/agent.leviath",
+      "cwd": "repo",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "grep -q 'available_tools = \\[\"merge_decision_format\", \"submit_output\"\\]' crates/leviath-cli/agents/bake-merge/agent.leviath",
+      "cwd": "repo",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "grep -q 'no read_file' crates/leviath-cli/agents/bake-merge/agent.leviath && grep -q 'no write_file' crates/leviath-cli/agents/bake-merge/agent.leviath",
+      "cwd": "repo",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "/data/bin/lev validate crates/leviath-cli/agents/bake-merge",
+      "cwd": "repo",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "/data/bin/lev validate crates/leviath-cli/agents/bake-off",
+      "cwd": "repo",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "git rev-parse --verify cb261862c3a8adf0b1fafdb2d2ac21d7ceeb4578",
+      "cwd": "repo",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "git diff --name-only 15dc182e0bc6c28dfa93f4b8dd3c423372808f61 cb261862c3a8adf0b1fafdb2d2ac21d7ceeb4578 | wc -l",
+      "cwd": "repo",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "python3 -c \"import json; d=json.load(open('evidence/lane-dispatch.json')); r=d['leviath_run_ids']; assert len(r)==2 and r[0]!=r[1], r; assert d['independence']['independent'] is True; assert d['restricted_reviewer_limits_intact']['no_read_file'] and d['restricted_reviewer_limits_intact']['no_write_file']; assert d['restricted_reviewer_limits_intact']['read_paths_allow']==[]; print('dispatch evidence OK', r)\"",
+      "cwd": ".",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "python3 -c \"import json; d=json.load(open('evidence/live/live-result.json')); r=[e['run_id'] for e in d['provenance']]; assert len(r)==2 and r[0]!=r[1], r; assert d['merged_sha256'][0]==d['merged_sha256'][1], d['merged_sha256']; assert d['convergence']['independent'] is True, d['convergence']; assert d['candidate_sha256']['a']!=d['candidate_sha256']['b']; print('lane evidence OK', r)\"",
+      "cwd": ".",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "python3 -c \"import json,hashlib,os; ix=json.load(open('evidence/INDEX.json'))['files']; bad=[k for k,v in ix.items() if hashlib.sha256(open(os.path.join('evidence',k),'rb').read()).hexdigest()!=v['sha256']]; assert not bad, bad; print(len(ix),'evidence files hash-verified')\"",
+      "cwd": ".",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "python3 -c \"import json; d=json.load(open('evidence/run-identity.json')); assert d['bead_id'] is None; assert d['leviath_run_id'].startswith('bake-merge-'); print('run identity:', d['bead_id'], d['leviath_run_id'])\"",
+      "cwd": ".",
+      "expect_rc": 0
+    }
+  ],
+  "artifacts": [
+    "REPORT.md",
+    "EVIDENCE.json",
+    "evidence/INDEX.json",
+    "evidence/artifacts.json",
+    "evidence/base-commit.txt",
+    "evidence/commands.log",
+    "evidence/lane-dispatch.json",
+    "evidence/run-identity.json",
+    "evidence/spend.json",
+    "evidence/states.json",
+    "evidence/live/live-result.json",
+    "evidence/live/live.log",
+    "evidence/live/cands/cand_a.graphql",
+    "evidence/live/cands/cand_b.graphql",
+    "evidence/live/work/v1_diff.txt",
+    "evidence/live/work/v1_decisions_lane0.json",
+    "evidence/live/work/v1_decisions_lane1.json",
+    "evidence/live/work/v1_merged_lane0.graphql",
+    "evidence/live/work/v1_merged_lane1.graphql"
+  ],
+  "notes": [
+    "Every command above exits 0 right now in this working directory.",
+    "The two lane run ids are real Leviath runs recorded from `lev run --json`, not invented.",
+    "bead_id is null on purpose: no Bead exists for GQL-09, so none is reported.",
+    "Provider spend is 0.0, measured; this box bills no provider for these lanes.",
+    "Committed on branch fleet/gql-09 as cb261862; nothing was pushed and no PR was opened."
+  ]
+}
