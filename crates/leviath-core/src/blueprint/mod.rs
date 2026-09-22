@@ -572,6 +572,40 @@ impl Blueprint {
     }
 
     /// Validate that the blueprint is well-formed.
+
+    /// Load any region `schema = "<file>.json"` paths relative to the blueprint
+    /// directory into [`crate::region::RegionSchema::content_schema`].
+    ///
+    /// Call after [`crate::manifest::parse_manifest`] whenever the manifest was
+    /// read from disk. Inline schemas need no resolution. A missing or
+    /// uncompilable file is a hard error (same bar as custom region scripts).
+    pub fn resolve_region_content_schemas(
+        &mut self,
+        manifest_path: &std::path::Path,
+    ) -> crate::error::Result<()> {
+        let base = manifest_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let layouts = std::iter::once(&mut self.context_layout).chain(
+            self.stages
+                .iter_mut()
+                .filter_map(|s| s.context_layout.as_mut()),
+        );
+        for layout in layouts {
+            for region in &mut layout.regions {
+                if let Some(schema) = region.schema.as_mut() {
+                    schema.resolve_schema_path(base).map_err(|e| {
+                        crate::error::Error::ValidationFailed(format!(
+                            "region '{}': {e}",
+                            region.name
+                        ))
+                    })?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> std::result::Result<(), ValidationError> {
         // Validate context layout
         self.context_layout.validate()?;

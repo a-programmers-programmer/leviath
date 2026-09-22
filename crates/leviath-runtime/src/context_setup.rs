@@ -39,6 +39,7 @@ pub(crate) fn init_window_seeded(
         region.accepts = region_def.accepts.clone();
         region.description = region_def.description.clone();
         region.describe_in_prompt = region_def.describe_in_prompt;
+        region.schema = region_def.schema.clone();
         window.add_region(region);
     }
 
@@ -180,6 +181,7 @@ pub(crate) fn apply_layout(window: &mut ContextWindow, layout: &ContextLayout) {
         new_region.accepts = region_def.accepts.clone();
         new_region.description = region_def.description.clone();
         new_region.describe_in_prompt = region_def.describe_in_prompt;
+        new_region.schema = region_def.schema.clone();
 
         if let Some(existing) = window.get_region(&region_def.name) {
             // Carry entries verbatim - kind, metadata, key, timestamp survive

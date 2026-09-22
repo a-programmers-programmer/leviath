@@ -13,7 +13,9 @@ use std::path::{Path, PathBuf};
 /// and a warning must never be why a spawn fails.
 pub(crate) fn blueprint_at(path: &Path) -> Option<leviath_core::Blueprint> {
     let content = std::fs::read_to_string(path).ok()?;
-    leviath_core::manifest::parse_manifest(&content).ok()
+    let mut bp = leviath_core::manifest::parse_manifest(&content).ok()?;
+    bp.resolve_region_content_schemas(path).ok()?;
+    Some(bp)
 }
 
 /// The "this output format retires your checks" warning for the blueprint at

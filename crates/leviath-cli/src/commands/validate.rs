@@ -285,8 +285,12 @@ fn check_manifest(path: &std::path::Path) -> Result<CheckedManifest, ManifestChe
         ))
     })?;
 
-    let blueprint = leviath_core::manifest::parse_manifest(&content)
+    let mut blueprint = leviath_core::manifest::parse_manifest(&content)
         .map_err(|e| ManifestCheckError::Parse(e.to_string()))?;
+
+    blueprint
+        .resolve_region_content_schemas(&manifest_path)
+        .map_err(|e| ManifestCheckError::Validation(e.to_string()))?;
 
     blueprint
         .validate()

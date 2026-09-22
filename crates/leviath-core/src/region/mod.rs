@@ -865,6 +865,28 @@ impl Region {
         content: EntryContent,
         tokens: usize,
     ) -> Result<(), String> {
+        // Same checks `push_entry` runs before admitting text: a hashmap write
+        // used to skip schema validation entirely, so blueprint content schemas
+        // could never reject a bad `context_write`.
+        if let Some(schema) = &self.schema {
+            if content.has_stored() {
+                return Err(format!(
+                    "region '{}' validates its entries and cannot hold a stored part",
+                    self.name
+                ));
+            }
+            schema
+                .validate(content.as_str())
+                .map_err(|e| e.to_string())?;
+        }
+        if let Err(mime_type) = self.accepts_content(&content) {
+            return Err(format!(
+                "region '{}' takes {} and this write carries {mime_type}",
+                self.name,
+                self.accepts.join(", ")
+            ));
+        }
+
         // If key exists, update in place
         if let Some(pos) = self
             .content
@@ -1859,6 +1881,57 @@ mod tests {
     fn test_needs_compaction_false_for_non_compacting_kind() {
         let region = Region::new("data".to_string(), RegionKind::Temporary, 1000);
         assert!(!region.needs_compaction());
+    }
+
+    // ─── hashmap upsert enforces content schema ────────────────────────────
+
+    #[test]
+    fn upsert_by_key_rejects_json_failing_content_schema() {
+        let schema = RegionSchema::new(ContentFormat::Json).with_content_schema(serde_json::json!({
+            "type": "object",
+            "required": ["steps", "current_step_id"],
+            "properties": {
+                "steps": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "required": ["id", "title", "status"],
+                        "properties": {
+                            "id": { "type": "string" },
+                            "title": { "type": "string" },
+                            "status": {
+                                "type": "string",
+                                "enum": ["pending", "active", "done", "skipped"]
+                            }
+                        }
+                    }
+                },
+                "current_step_id": { "type": "string" }
+            }
+        }));
+        let mut region = Region::new(
+            "task_plans".to_string(),
+            RegionKind::HashMap { max_entries: Some(40) },
+            5000,
+        )
+        .with_schema(schema);
+
+        let invalid = r#"{"steps":[{"id":"s1","title":"Bad","status":"nope"}]}"#;
+        let err = region
+            .upsert_by_key("1-bad", invalid.to_string(), 20)
+            .expect_err("invalid plan must be rejected");
+        assert!(
+            err.contains("JSON Schema") || err.contains("content failed"),
+            "unexpected err: {err}"
+        );
+        assert!(region.get_by_key("1-bad").is_none());
+
+        let valid = r#"{"steps":[{"id":"s1","title":"Ok","status":"pending"}],"current_step_id":"s1"}"#;
+        region
+            .upsert_by_key("1", valid.to_string(), 30)
+            .expect("valid plan must be accepted");
+        assert!(region.get_by_key("1").is_some());
     }
 
     // ─── RegionSchema::with_custom_script ──────────────────────────────────

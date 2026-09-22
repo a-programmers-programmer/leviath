@@ -15,6 +15,9 @@ readme = "README.md"
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Draft JSON Schema validation for region content schemas
+# (hashmap context_write / RegionSchema::content_schema).
+jsonschema = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }

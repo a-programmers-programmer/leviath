@@ -2778,6 +2778,7 @@ dependencies = [
  "chrono",
  "dirs",
  "glob",
+ "jsonschema",
  "leviath-testkit",
  "regex",
  "serde",

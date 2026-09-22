@@ -172,6 +172,9 @@ fn load_blueprint(
     let mut blueprint = leviath_core::manifest::parse_manifest(&content)
         .map_err(|e| format!("parse manifest: {e}{}", stale()))?;
     blueprint
+        .resolve_region_content_schemas(path)
+        .map_err(|e| format!("invalid blueprint: {e}{}", stale()))?;
+    blueprint
         .validate()
         .map_err(|e| format!("invalid blueprint: {e}{}", stale()))?;
     // What `lev validate` would have said, in the daemon log. Nothing here
