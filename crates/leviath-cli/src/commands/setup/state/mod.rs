@@ -21,8 +21,13 @@ use crate::config::Config;
 // Sections of the former single-file wizard state. Glob re-exported so every
 // existing `state::Wizard` path keeps working.
 mod endpoints;
+mod modal;
+mod models;
 mod priority;
+mod retention;
 pub(crate) use endpoints::*;
+pub(crate) use modal::ProviderModal;
+pub(in crate::commands::setup) mod checks;
 mod lanes;
 mod limits;
 use limits::*;
@@ -39,8 +44,8 @@ pub struct Wizard {
     pub providers: Vec<ProviderRow>,
     /// The OpenAI-compatible endpoints, under whichever preset row each sits.
     pub endpoints: Vec<EndpointRow>,
-    /// Which selected provider the credential screen is showing.
-    pub detail: usize,
+    /// A provider's setup modal, while one is open over the Providers screen.
+    pub(crate) modal: Option<ProviderModal>,
     /// The Defaults screen's settings.
     pub defaults: Vec<Field>,
     /// The Limits screen's settings.
@@ -76,6 +81,11 @@ pub struct Wizard {
     pub base: Config,
     /// Credentials present only in the environment. Shown, never written.
     pub env_only: HashMap<&'static str, String>,
+    /// The AWS region the environment names (`AWS_REGION`, else
+    /// `AWS_DEFAULT_REGION`), which is what Bedrock is called in when the
+    /// config says nothing. Shown as the region field's starting value and,
+    /// like a credential from the environment, never written back.
+    pub region_from_env: Option<String>,
     /// Opens a provider's signup page. Injected rather than called directly:
     /// `lev dash` once had a unit test launch a real browser, and this is the
     /// same shape of hazard.
@@ -111,14 +121,21 @@ pub struct Wizard {
     /// How far the help overlay is scrolled. See the dashboard's field for
     /// why it is a `Cell`.
     pub help_scroll: std::cell::Cell<usize>,
-    /// The open chooser for a Defaults value, if one is open.
+    /// The open chooser, if one is open: a Defaults value, or a level of the
+    /// add-a-provider flow.
     pub(crate) picker: Option<Picker>,
-    /// Which Defaults field the open chooser is choosing for.
-    pub(crate) picker_field: usize,
+    /// What the open chooser is choosing, so its answer can be routed.
+    pub(crate) picker_purpose: PickerPurpose,
     /// The open reorder modal for the provider priority, if one is open.
     pub(crate) reorder: Option<crate::tui::widgets::reorder::Reorder>,
     /// Which Defaults field the open reorder modal is arranging.
     pub(crate) reorder_field: usize,
+    /// Where provider checks are recorded for other surfaces to read (the
+    /// capability cache). `None` reads and writes nothing, which is what
+    /// every test gets. See [`checks`].
+    pub(crate) check_store: Option<std::path::PathBuf>,
+    /// The key checks are fingerprinted with, beside `check_store`.
+    pub(crate) check_key: Option<crate::provider_checks::CheckKey>,
 }
 
 /// The environment variables the wizard reports as already-supplying a
@@ -145,7 +162,7 @@ fn env_credentials(lookup: &dyn Fn(&str) -> Option<String>) -> HashMap<&'static 
 /// signed in" because a claim was missing would offer a second sign-in that
 /// replaces a working one.
 fn signed_in_as(path: Option<&std::path::Path>, provider: &str) -> Option<String> {
-    let grant = leviath_providers::codex::ProviderAuthStore::load(path?)
+    let grant = leviath_providers::oauth::ProviderAuthStore::load(path?)
         .ok()?
         .get(provider)
         .cloned()?;
@@ -171,6 +188,10 @@ impl Wizard {
         remembered: crate::ui_state::SetupUi,
     ) -> Self {
         let env_only = env_credentials(env_lookup);
+        let region_from_env = env_lookup("AWS_REGION")
+            .or_else(|| env_lookup("AWS_DEFAULT_REGION"))
+            .map(|r| r.trim().to_string())
+            .filter(|r| !r.is_empty());
 
         let providers = catalog::providers()
             .into_iter()
@@ -181,7 +202,7 @@ impl Wizard {
                     .filter(|v| stored.is_none() && env_only.contains_key(v));
                 let signed_in = match provider.credential {
                     catalog::Credential::Signin => signed_in_as(
-                        leviath_providers::codex::ProviderAuthStore::default_path().as_deref(),
+                        leviath_providers::oauth::ProviderAuthStore::default_path().as_deref(),
                         provider.id,
                     ),
                     _ => None,
@@ -192,6 +213,7 @@ impl Wizard {
                     from_env,
                     outcome: Outcome::Skipped,
                     checking: false,
+                    checked_at: None,
                     signed_in,
                     signing_in: false,
                     authorize_url: None,
@@ -254,7 +276,7 @@ impl Wizard {
             cursor: 0,
             providers,
             endpoints,
-            detail: 0,
+            modal: None,
             defaults: Vec::new(),
             limits: limits_fields(&base),
             agents,
@@ -270,6 +292,7 @@ impl Wizard {
             message: None,
             base,
             env_only,
+            region_from_env,
             opener,
             verify_tx,
             verify_rx: Some(verify_rx),
@@ -284,9 +307,11 @@ impl Wizard {
             show_advanced: false,
             help_scroll: std::cell::Cell::new(0),
             picker: None,
-            picker_field: 0,
+            picker_purpose: PickerPurpose::Field(0),
             reorder: None,
             reorder_field: 0,
+            check_store: None,
+            check_key: None,
         };
         wizard.rebuild_defaults();
         wizard
@@ -328,9 +353,9 @@ impl Wizard {
             .collect()
     }
 
-    /// The provider row the credential screen is currently showing.
+    /// The provider row whose setup modal is open, if one is.
     pub(crate) fn detail_row(&self) -> Option<usize> {
-        self.selected_providers().get(self.detail).copied()
+        self.modal_index()
     }
 
     /// The fields the current step edits, if it edits fields.
@@ -350,16 +375,18 @@ impl Wizard {
         }
     }
 
-    /// The credential screen's action rows, after the credential itself.
+    /// The setup modal's action rows, after the credential itself and before
+    /// its buttons.
     ///
     /// They exist as rows rather than as shortcut keys alone because that is
     /// how they become discoverable: a row can be seen, moved onto, and
-    /// clicked, and `o` and `v` still work for anyone who knows them.
+    /// clicked, and `o` still works for anyone who knows it. Checking the
+    /// credential is the modal's own "Verify and use" button.
     pub(crate) fn detail_actions(&self) -> Vec<DetailAction> {
         let Some(index) = self.detail_row() else {
             return Vec::new();
         };
-        // An endpoint preset's screen is its entries' own rows, each with its
+        // An endpoint preset's card is its entries' own rows, each with its
         // check and remove buttons; see `endpoint_row_count`.
         if self.is_endpoint_preset(index) {
             return Vec::new();
@@ -372,7 +399,6 @@ impl Wizard {
         if row.provider.signup_url.is_some() {
             actions.push(DetailAction::OpenSignup);
         }
-        actions.push(DetailAction::Verify);
         actions
     }
 
@@ -385,16 +411,9 @@ impl Wizard {
     /// while there is none and the check once there is. Sign out and the plans
     /// page are both further down because neither is why anyone is here.
     ///
-    /// Sign out is offered only when there is something to forget, and the
-    /// check only when there is something to check: an unsigned-in row would
-    /// answer "no credential" to a question the line above it already
-    /// answered.
+    /// Sign out is offered only when there is something to forget.
     fn signin_actions(row: &ProviderRow) -> Vec<DetailAction> {
-        let mut actions = Vec::new();
-        if row.signed_in.is_some() {
-            actions.push(DetailAction::Verify);
-        }
-        actions.push(DetailAction::SignIn);
+        let mut actions = vec![DetailAction::SignIn];
         if row.signed_in.is_some() {
             actions.push(DetailAction::SignOut);
         }
@@ -403,7 +422,7 @@ impl Wizard {
         actions
     }
 
-    /// Whether the credential screen's first row is the credential itself.
+    /// Whether the setup modal's first card row is the credential itself.
     ///
     /// It is for everything typed or defaulted. A browser sign-in has nothing
     /// to type, so its status is a line rather than a row and the buttons
@@ -422,18 +441,16 @@ impl Wizard {
             .copied()
     }
 
-    /// How many selectable rows the current step has.
+    /// How many selectable rows the current step has, or, while a provider's
+    /// setup modal is open, how many its card has above its buttons.
     pub(crate) fn row_count(&self) -> usize {
+        if self.modal.is_some() {
+            return self.modal_card_rows();
+        }
         match self.step {
             Step::Welcome | Step::Review => 0,
-            Step::Providers => self.providers.len(),
-            Step::ProviderDetail => match self.detail_row() {
-                Some(index) if self.is_endpoint_preset(index) => self.endpoint_row_count(index),
-                Some(index) => {
-                    usize::from(self.detail_has_credential_row(index)) + self.detail_actions().len()
-                }
-                None => 0,
-            },
+            // The providers this install has, then the "Add a provider" row.
+            Step::Providers => self.visible_providers().len() + 1,
             Step::Defaults => self.defaults.len(),
             Step::Limits => self.limits.len(),
             Step::Agents => self.agents.len(),
@@ -441,16 +458,21 @@ impl Wizard {
         }
     }
 
-    /// How many cursor positions the current step has: its rows plus the
-    /// Continue/action button that every step ends with.
+    /// How many cursor positions there are: the step's rows plus the
+    /// Continue/action button every step ends with, or the modal's card rows
+    /// plus its three buttons.
     pub(crate) fn nav_rows(&self) -> usize {
-        self.row_count() + 1
+        match self.modal.is_some() {
+            true => self.row_count() + ModalButton::ALL.len(),
+            false => self.row_count() + 1,
+        }
     }
 
     /// Whether the cursor sits on the step's Continue/action button (the
-    /// virtual row after the last real one).
+    /// virtual row after the last real one). Never while a modal is open:
+    /// its buttons are its own.
     pub(crate) fn on_continue(&self) -> bool {
-        self.cursor == self.row_count()
+        self.modal.is_none() && self.cursor == self.row_count()
     }
 
     /// The label of the current step's Continue/action button. It carries
@@ -463,16 +485,9 @@ impl Wizard {
             Step::Providers => {
                 let count = self.selected_providers().len();
                 if count == 0 {
-                    "Continue (no providers selected)".to_string()
+                    "Continue (add a provider first)".to_string()
                 } else {
-                    format!("Continue: {} ({count} selected)", self.next_step_title())
-                }
-            }
-            Step::ProviderDetail => {
-                let selected = self.selected_providers();
-                match selected.get(self.detail + 1) {
-                    Some(&next) => format!("Next: {}", self.providers[next].provider.display),
-                    None => format!("Continue: {}", self.next_step_title()),
+                    format!("Continue: {} ({count} configured)", self.next_step_title())
                 }
             }
             Step::Defaults | Step::Limits | Step::Agents | Step::Mcp => {
@@ -535,9 +550,7 @@ impl Wizard {
         self.scroll = usize::MAX;
     }
 
-    /// Advance to the next step, skipping ones with nothing to show. Skipping
-    /// the credential screen is announced rather than silent: it looks exactly
-    /// like a bug when a screen the breadcrumb promises never appears.
+    /// Advance to the next step, skipping ones with nothing to show.
     pub(crate) fn next_step(&mut self) {
         let mut index = self.step.index();
         while index + 1 < Step::ALL.len() {
@@ -546,10 +559,6 @@ impl Wizard {
             if !self.is_empty_step(step) {
                 self.enter(step);
                 return;
-            }
-            if step == Step::ProviderDetail {
-                self.message =
-                    Some("Skipped Credentials: no selected provider needs setup.".to_string());
             }
         }
         // Past the last step: the Review screen's action is to save.
@@ -571,12 +580,11 @@ impl Wizard {
 
     /// Whether a step has nothing worth showing, and should be skipped.
     ///
-    /// Only the two discovery-driven screens can be empty: nobody should have
-    /// to press Enter through "no MCP servers found" on a clean machine.
+    /// Only the discovery-driven screen can be empty: nobody should have to
+    /// press Enter through "no MCP servers found" on a clean machine.
     fn is_empty_step(&self, step: Step) -> bool {
         match step {
             Step::Mcp => self.mcp.is_empty() && self.mcp_scan_errors.is_empty(),
-            Step::ProviderDetail => self.detail_row().is_none(),
             // Not empty so much as not asked for. Routing it through the same
             // predicate keeps `next_step`, `prev_step` and the Continue
             // button's own label agreeing about what comes next, which they
@@ -593,92 +601,14 @@ impl Wizard {
         self.scroll = 0;
         self.edit = None;
         if step == Step::Defaults {
-            // The model picker is populated by verification, which may have
-            // finished since the last visit.
+            // The provider priority is populated by verification, which may
+            // have finished since the last visit.
             self.rebuild_defaults();
         }
-    }
-
-    /// Within the credential screen, move to the next selected provider;
-    /// returns false when there is no next one.
-    pub(crate) fn next_detail(&mut self) -> bool {
-        if self.detail + 1 < self.selected_providers().len() {
-            self.detail += 1;
-            self.cursor = 0;
-            self.edit = None;
-            return true;
+        if step == Step::Limits {
+            // Same for the two model choices at the end of the tuning screen.
+            self.rebuild_advanced_models();
         }
-        false
-    }
-
-    /// The reverse of [`Self::next_detail`].
-    pub(crate) fn prev_detail(&mut self) -> bool {
-        if self.detail > 0 {
-            self.detail -= 1;
-            self.cursor = 0;
-            self.edit = None;
-            return true;
-        }
-        false
-    }
-
-    /// What choosing one of these values actually decides.
-    ///
-    /// Written against `leviath_runtime::pipeline::resolve`, which is the code
-    /// that reads them. The line about a blueprint winning is the one worth
-    /// having: a user who sets a default and then watches an agent run on
-    /// something else has been told, by every other tool, that a default is a
-    /// default.
-    fn precedence_explanation(provider: bool) -> Vec<&'static str> {
-        if provider {
-            vec![
-                "Where your runs go by default. A stage that lists this provider among",
-                "its models is served by it first, ahead of the blueprint's own order.",
-                "",
-                "This field does nothing on its own. Until you also set a default model",
-                "below, the only thing it can do is reorder a list that already names",
-                "this provider, so on a machine keyed for one provider that no blueprint",
-                "mentions, every stage still goes somewhere else.",
-                "",
-                "It never overrides a blueprint that pins its provider: a stage with",
-                "allow_user_default = false ignores this, and so does a provider you",
-                "have not given a credential.",
-            ]
-        } else {
-            vec![
-                "The model your default provider is asked for. The two travel together:",
-                "this name is never sent to a different provider, so an OpenAI model is",
-                "never asked of Anthropic.",
-                "",
-                "Setting it is what makes the default provider above take effect. The",
-                "pair is offered to every stage that allows a user default, and moves to",
-                "the front of the models that stage lists.",
-                "",
-                "Leaving it unset does not mean your provider picks a model. It means",
-                "each blueprint uses the models it names, and a stage that names none",
-                "falls back to a model built into Leviath, whoever you configured.",
-            ]
-        }
-    }
-
-    /// Every model id any provider reported, deduplicated, for the picker.
-    pub(crate) fn discovered_models(&self) -> Vec<String> {
-        let mut models: Vec<String> = self
-            .providers
-            .iter()
-            .filter(|r| r.selected)
-            .flat_map(|r| r.outcome.models().iter().cloned())
-            .collect();
-        let selected = self.selected_endpoint_names();
-        models.extend(
-            self.endpoints
-                .iter()
-                .filter(|e| selected.contains(&e.name))
-                .flat_map(|e| e.model_choices()),
-        );
-        models.sort();
-        models.dedup();
-        models
     }
 
     // ── Forms ───────────────────────────────────────────────────────────────
@@ -687,20 +617,7 @@ impl Wizard {
     /// list and the discovered models can change between visits.
     pub(crate) fn rebuild_defaults(&mut self) {
         let chosen = self.current_default_provider();
-        // The built-ins by id, and an endpoint preset by each entry under it:
-        // the entry's name is what `default_provider` has to hold.
-        let providers: Vec<String> = self
-            .selected_providers()
-            .iter()
-            .flat_map(|&i| match self.is_endpoint_preset(i) {
-                true => self
-                    .endpoints_under(self.providers[i].provider.id)
-                    .into_iter()
-                    .map(|e| self.endpoints[e].name.clone())
-                    .collect(),
-                false => vec![self.providers[i].provider.id.to_string()],
-            })
-            .collect();
+        let providers = self.configured_provider_names();
         // Fall back to whatever is configured when nothing is selected, so the
         // field is never empty.
         let providers = if providers.is_empty() {
@@ -708,11 +625,15 @@ impl Wizard {
         } else {
             providers
         };
-        // The provider field is an ordered priority now, its head the default
+        // The provider field is an ordered priority, its head the default
         // provider. Preserve whatever arrangement the form (or the config it
-        // loaded) already holds for still-configured providers, append any that
-        // are newly configured, and on a first build lead with the chosen
-        // default so nothing about the single-default behavior is lost.
+        // loaded) already holds for still-configured providers. A provider
+        // configured since is NOT added on its own: being in the priority is
+        // a choice made in the reorder modal, and a provider left out of it
+        // still runs any stage that names it. The list is never left empty
+        // while something is configured, because its head is the default
+        // provider: on a first build it is the chosen default, else the first
+        // configured provider.
         let prior = match self.current_provider_order().is_empty() {
             false => self.current_provider_order(),
             true => self.base.providers.provider_order.clone(),
@@ -721,51 +642,28 @@ impl Wizard {
             .into_iter()
             .filter(|p| providers.contains(p))
             .collect();
-        let seeded = order.is_empty();
-        for p in &providers {
-            if !order.contains(p) {
-                order.push(p.clone());
-            }
+        if order.is_empty() {
+            let head = match providers.contains(&chosen) {
+                true => chosen.clone(),
+                false => providers[0].clone(),
+            };
+            order.push(head);
         }
-        if seeded && let Some(at) = order.iter().position(|p| *p == chosen) {
-            let head = order.remove(at);
-            order.insert(0, head);
-        }
-
-        let mut models = vec![Self::NO_DEFAULT_MODEL.to_string()];
-        models.extend(self.discovered_models());
-        // An endpoint entry at the head of the priority brings the model picked
-        // on its own screen, unless a model was already chosen here.
-        let chosen_provider = order.first().cloned().unwrap_or_default();
-        let current_model = self
-            .current_default_model()
-            .filter(|m| m != Self::NO_DEFAULT_MODEL)
-            .or_else(|| self.endpoint_default_model(&chosen_provider))
-            .unwrap_or_else(|| Self::NO_DEFAULT_MODEL.to_string());
-        if !models.contains(&current_model) {
-            models.push(current_model.clone());
-        }
-        let model_index = models
-            .iter()
-            .position(|m| *m == current_model)
-            .unwrap_or_default();
 
         let timeout = self.current_request_timeout();
+        let region = self.current_bedrock_region();
+        // Read off the form before it is replaced, like the two above.
+        let zero = self.current_zero_retention();
+        let agreements = self.current_agreements();
+        let uploads = self.current_file_uploads();
         self.defaults = vec![
             Field {
                 label: "Provider priority",
-                help: "The order a bare model name prefers, best first. Its head is your default \
-                       provider. Enter opens a modal to drag the order.",
+                help: "The providers a bare model name may run on, best first. Its head is your \
+                       default provider. Enter opens a modal to drag the order and to add or \
+                       drop configured providers; one left out is never chosen for a bare \
+                       model name, and still runs any stage that names it as provider/model.",
                 value: FieldValue::Order(order),
-            },
-            Field {
-                label: "Default model",
-                help: "Offered to every stage that allows a user default, paired with the \
-                       provider above. Listed from what your providers reported.",
-                value: FieldValue::Choice {
-                    options: models,
-                    index: model_index,
-                },
             },
             Field {
                 label: "Request timeout (seconds)",
@@ -774,11 +672,36 @@ impl Wizard {
             },
             Field {
                 label: "Show advanced tuning",
-                help: "Adds a screen of concurrency, retry and context limits. Every one of \
-                       them already has a default that works.",
+                help: "Adds a screen of concurrency, retry and context limits, and the two \
+                       model settings that override or back up what a blueprint names. \
+                       Every one of them already has a default that works.",
                 value: FieldValue::Bool(self.show_advanced),
             },
         ];
+        // Bedrock's hosts are regional, so a chosen Bedrock gets a region
+        // field; nobody else has one, and the retention rows below follow it.
+        if self.bedrock_selected() {
+            let current =
+                region.unwrap_or_else(|| leviath_providers::bedrock::DEFAULT_REGION.to_string());
+            let mut options: Vec<String> = Self::BEDROCK_REGIONS
+                .iter()
+                .map(|r| r.to_string())
+                .collect();
+            if !options.contains(&current) {
+                options.insert(0, current.clone());
+            }
+            let index = options.iter().position(|r| *r == current).unwrap_or(0);
+            self.defaults.push(Field {
+                label: "AWS Bedrock region",
+                help: "The region whose Bedrock endpoints are called. Starts from AWS_REGION \
+                       when that is exported; written to the config only when it differs.",
+                value: FieldValue::Choice { options, index },
+            });
+        }
+        // The zero data retention switch and the agreement rows, read off
+        // the previous form above (their rows move when Bedrock is picked
+        // or dropped, so they are found by label; see `retention`).
+        self.push_retention_fields(zero, &agreements, uploads);
         // Re-pick the concurrency default now that the provider choice is
         // settled. Doing this only on an arrow press missed the commonest
         // Ollama case entirely: when it is the *only* provider selected it is
@@ -790,8 +713,44 @@ impl Wizard {
     /// Where the provider choice sits on the Defaults screen.
     pub const PROVIDER_FIELD: usize = 0;
 
+    /// Where the request timeout sits on the Defaults screen.
+    pub const TIMEOUT_FIELD: usize = 1;
+
     /// Where the advanced-tuning toggle sits on the Defaults screen.
-    pub const ADVANCED_FIELD: usize = 3;
+    pub const ADVANCED_FIELD: usize = 2;
+
+    /// Where the Bedrock region sits on the Defaults screen, when Bedrock is
+    /// selected; the form has no fourth row otherwise.
+    pub const REGION_FIELD: usize = 3;
+
+    /// The regions the region field cycles: the commercial regions Bedrock
+    /// serves models in. One the environment or the config names that is not
+    /// here is offered first rather than refused.
+    pub const BEDROCK_REGIONS: &'static [&'static str] = &[
+        "us-east-1",
+        "us-east-2",
+        "us-west-2",
+        "ca-central-1",
+        "sa-east-1",
+        "eu-west-1",
+        "eu-west-2",
+        "eu-west-3",
+        "eu-central-1",
+        "eu-north-1",
+        "ap-northeast-1",
+        "ap-northeast-2",
+        "ap-south-1",
+        "ap-southeast-1",
+        "ap-southeast-2",
+    ];
+
+    /// Where the override model sits on the advanced screen: after every
+    /// tuning limit, so the limits keep the indices `apply_limits_fields`
+    /// matches on.
+    pub const OVERRIDE_FIELD: usize = LIMITS_FIXED;
+
+    /// Where the fallback model sits on the advanced screen.
+    pub const FALLBACK_FIELD: usize = LIMITS_FIXED + 1;
 
     /// The model field's "no default" option.
     ///
@@ -801,102 +760,32 @@ impl Wizard {
     /// Leviath, not to anything the provider chose.
     pub const NO_DEFAULT_MODEL: &'static str = "(each blueprint decides)";
 
-    /// Open the chooser for the Defaults field the cursor is on.
-    ///
-    /// The options come from the caller because it has already matched on the
-    /// field's kind: re-reading them here would add a shape this cannot be in.
-    pub(super) fn open_picker(&mut self, title: &'static str, options: Vec<String>, index: usize) {
-        let field = self.cursor;
-        let options = options
-            .into_iter()
-            .map(|value| {
-                let detail = if field == Self::PROVIDER_FIELD {
-                    self.provider_detail(&value)
-                } else {
-                    self.model_detail(&value)
-                };
-                PickerOption { value, detail }
-            })
-            .collect();
-        self.picker_field = field;
-        // Opening on the current value rather than at the top: the list is
-        // long, and "where am I now" is the first thing you look for.
-        self.picker = Some(Picker::new(
-            title,
-            Self::precedence_explanation(field == Self::PROVIDER_FIELD)
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
-            options,
-            index,
-        ));
-    }
-
-    /// What a provider id is, for the chooser's second column.
-    fn provider_detail(&self, id: &str) -> String {
-        // Entries before rows: an entry is named after its preset by default,
-        // and the preset row is never itself a choice here.
-        if let Some(entry) = self.endpoints.iter().find(|e| e.name == id) {
-            let preset = self
-                .providers
-                .iter()
-                .find(|r| r.provider.id == entry.preset)
-                .map_or(entry.preset, |r| r.provider.display);
-            return format!("{preset} at {}", entry.base_url);
-        }
-        if let Some(row) = self.providers.iter().find(|r| r.provider.id == id) {
-            return row.provider.display.to_string();
-        }
-        // A provider that is configured but not in the catalog: it came
-        // from the config file, so it is still a legitimate choice.
-        "from your config".to_string()
-    }
-
-    /// Which providers reported a model, so the row says where it came from.
-    fn model_detail(&self, model: &str) -> String {
-        // The first row is the absence of a model, not a model, so the
-        // question "who reported it" does not apply to it.
-        if model == Self::NO_DEFAULT_MODEL {
-            return "no default; every blueprint uses the models it names".to_string();
-        }
-        let reported: Vec<&str> = self
-            .providers
-            .iter()
-            .filter(|r| r.selected && r.outcome.models().iter().any(|m| m == model))
-            .map(|r| r.provider.display)
-            .collect();
-        if reported.is_empty() {
-            return "not reported by a provider you selected".to_string();
-        }
-        format!("reported by {}", reported.join(", "))
-    }
-
-    /// Take the chooser's answer (an index into its options), writing it
-    /// back into the field it came from.
-    pub(super) fn commit_picker(&mut self, chosen: usize) {
-        // The chooser's options were built from this field's, one for one and
-        // in order, so the option index *is* the field's index. Indexing rather
-        // than looking up: the field is where it was when the chooser opened,
-        // and nothing rebuilds the form while one is on screen.
-        self.defaults[self.picker_field].value.set_index(chosen);
-        self.dirty = true;
-        // The provider field is an ordered priority now and opens the reorder
-        // modal, not the chooser, so the only field this commits is the default
-        // model - the concurrency-follows-provider adjustment lives in
-        // `commit_reorder`.
-    }
-
-    fn current_default_model(&self) -> Option<String> {
-        match self.defaults.get(1).map(|f| &f.value) {
-            Some(FieldValue::Choice { options, index }) => options.get(*index).cloned(),
-            _ => self.base.default_model.clone(),
-        }
-    }
-
     fn current_request_timeout(&self) -> Option<u64> {
-        match self.defaults.get(2).map(|f| &f.value) {
+        match self.defaults.get(Self::TIMEOUT_FIELD).map(|f| &f.value) {
             Some(FieldValue::Number(n)) => *n,
             _ => self.base.request_timeout_secs,
+        }
+    }
+
+    /// Whether the Bedrock row is selected.
+    fn bedrock_selected(&self) -> bool {
+        self.providers
+            .iter()
+            .any(|row| row.selected && row.provider.id == leviath_providers::bedrock::PROVIDER_NAME)
+    }
+
+    /// The Bedrock region in force: the field's pick while the form holds
+    /// one, else what the config file says, else what the environment says.
+    /// `None` is the provider's own default.
+    pub(crate) fn current_bedrock_region(&self) -> Option<String> {
+        match self.defaults.get(Self::REGION_FIELD).map(|f| &f.value) {
+            Some(FieldValue::Choice { options, index }) => options.get(*index).cloned(),
+            _ => self
+                .base
+                .providers
+                .bedrock_region
+                .clone()
+                .or_else(|| self.region_from_env.clone()),
         }
     }
 
@@ -928,38 +817,50 @@ impl Wizard {
 
     // ── Confirmations ───────────────────────────────────────────────────────
 
-    /// `q`/Ctrl-C with unsaved choices: ask before discarding them.
+    /// How many of the pending changes the quit dialog lists before it says
+    /// "and N more": the dialog is half the window tall, and a list that ran
+    /// off its bottom would hide the buttons.
+    pub(in crate::commands::setup) const QUIT_CHANGES_SHOWN: usize = 8;
+
+    /// `q`/Ctrl-C with unsaved choices: ask before discarding them, and say
+    /// what they are, so what is about to be lost is on screen rather than
+    /// a guess.
     pub(crate) fn open_quit_confirm(&mut self) {
-        use ratatui::text::Line;
+        use ratatui::style::Style;
+        use ratatui::text::{Line, Span};
+        let changes = super::plan::changes(&self.base, &self.build_plan());
+        if changes.is_empty() {
+            self.confirm = Some(PendingConfirm {
+                purpose: ConfirmPurpose::QuitDiscard,
+                dialog: crate::tui::widgets::confirm::Confirm::new(
+                    "Quit setup?",
+                    vec![Line::from(
+                        "Nothing has been written yet, and nothing would change.",
+                    )],
+                    "Quit",
+                    "Stay",
+                ),
+            });
+            return;
+        }
+        let mut body = vec![Line::from(
+            "Nothing has been written yet. Quitting discards these choices:",
+        )];
+        for change in changes.iter().take(Self::QUIT_CHANGES_SHOWN) {
+            body.push(Line::from(Span::styled(
+                format!("  {change}"),
+                Style::default().fg(crate::tui::theme::C_MUTED),
+            )));
+        }
+        if changes.len() > Self::QUIT_CHANGES_SHOWN {
+            body.push(Line::from(Span::styled(
+                format!("  and {} more", changes.len() - Self::QUIT_CHANGES_SHOWN),
+                Style::default().fg(crate::tui::theme::C_DIM),
+            )));
+        }
         self.confirm = Some(PendingConfirm {
             purpose: ConfirmPurpose::QuitDiscard,
-            dialog: crate::tui::widgets::confirm::Confirm::new(
-                "Quit setup?",
-                vec![Line::from(
-                    "Nothing has been written yet. Your choices so far will be discarded.",
-                )],
-                "Quit",
-                "Stay",
-            ),
-        });
-    }
-
-    /// Leaving the Providers screen with nothing selected: Leviath cannot run
-    /// an agent without a provider, so this is almost always a slip.
-    pub(crate) fn open_no_providers_confirm(&mut self) {
-        use ratatui::text::Line;
-        self.confirm = Some(PendingConfirm {
-            purpose: ConfirmPurpose::NoProviders,
-            dialog: crate::tui::widgets::confirm::Confirm::new(
-                "No providers selected",
-                vec![
-                    Line::from("Without a provider, Leviath cannot run any agent."),
-                    Line::from("Select one with Space or Enter, or continue anyway to"),
-                    Line::from("configure providers later."),
-                ],
-                "Continue anyway",
-                "Go back",
-            ),
+            dialog: crate::tui::widgets::confirm::Confirm::new("Quit setup?", body, "Quit", "Stay"),
         });
     }
 
@@ -1021,11 +922,10 @@ impl Wizard {
                 // A key left blank is a credential the user did not give -
                 // usually because it is in their environment on purpose, and
                 // `Config::load` reads it back from there. This is the only
-                // kind that rule holds for, and it used to be written as "any
-                // empty value", which caught the kinds that never have one: a
-                // browser sign-in types nothing, so every finished Codex
-                // sign-in was switched back off the moment the plan was
-                // applied.
+                // kind that rule holds for: written as "any empty value" it
+                // would catch the kinds that never have one, and a finished
+                // browser sign-in, which types nothing, would be switched back
+                // off the moment the plan was applied.
                 Credential::ApiKey if row.value.is_empty() => {
                     catalog::set_credential(&mut config, row.provider.id, None)
                 }
@@ -1057,10 +957,37 @@ impl Wizard {
             .cloned()
             .unwrap_or_else(|| self.current_default_provider());
         config.providers.provider_order = if order.len() > 1 { order } else { Vec::new() };
-        config.default_model = self
-            .current_default_model()
-            .filter(|m| m != Self::NO_DEFAULT_MODEL);
+        // The two model settings live on the advanced screen. Until it has
+        // been visited the override keeps what the config holds, or what an
+        // endpoint entry at the head of the priority picked for itself; a
+        // visit that chose "(each blueprint decides)" is a real answer and is
+        // not overridden by that pick.
+        let head = config.default_provider.clone();
+        config.override_model = self.chosen_model(Self::OVERRIDE_FIELD).unwrap_or_else(|| {
+            self.base
+                .override_model
+                .clone()
+                .or_else(|| self.endpoint_default_model(&head))
+        });
+        config.fallback_model = self
+            .chosen_model(Self::FALLBACK_FIELD)
+            .unwrap_or_else(|| self.base.fallback_model.clone());
         config.request_timeout_secs = self.current_request_timeout();
+        // The region is written only when Bedrock is chosen and the pick
+        // says something the environment and the provider's default do not:
+        // `Config::load` folds `AWS_REGION` into `base`, and writing that
+        // back would pin a machine's environment into its config file, the
+        // same mistake the credential rows avoid.
+        config.providers.bedrock_region = match self.bedrock_selected() {
+            true => self
+                .current_bedrock_region()
+                .filter(|r| r != leviath_providers::bedrock::DEFAULT_REGION)
+                .filter(|r| Some(r) != self.region_from_env.as_ref()),
+            false => None,
+        };
+        config.providers.zero_retention = self.current_zero_retention();
+        config.providers.zero_retention_agreements = self.current_agreements();
+        config.providers.file_uploads = self.current_file_uploads();
 
         apply_limits_fields(&mut config, &self.limits);
 
@@ -1185,6 +1112,255 @@ pub(super) mod tests {
             std::sync::Arc::new(|_| true),
             Default::default(),
         )
+    }
+
+    // ─── the Bedrock region ───────────────────────────────────────────────
+
+    fn bedrock_row(wizard: &Wizard) -> usize {
+        wizard
+            .providers
+            .iter()
+            .position(|r| r.provider.id == "bedrock")
+            .expect("the catalog offers Bedrock")
+    }
+
+    #[test]
+    fn the_region_field_appears_only_when_bedrock_is_chosen() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wizard = test_wizard(dir.path());
+        wizard.providers[0].selected = true;
+        wizard.enter(Step::Defaults);
+        // Three fixed rows, the retention switch, the first provider's
+        // agreement row, and the upload switch.
+        assert_eq!(wizard.defaults.len(), 6);
+        assert_eq!(wizard.current_bedrock_region(), None);
+
+        let bedrock = bedrock_row(&wizard);
+        wizard.providers[bedrock].selected = true;
+        wizard.enter(Step::Defaults);
+        assert_eq!(wizard.defaults.len(), 7);
+        let field = &wizard.defaults[Wizard::REGION_FIELD];
+        assert_eq!(field.label, "AWS Bedrock region");
+        assert_eq!(field.value.display(), "us-east-1");
+        assert_eq!(
+            wizard.current_bedrock_region().as_deref(),
+            Some("us-east-1")
+        );
+        // The default region is not written; a pick is; deselecting clears.
+        assert_eq!(wizard.build_config().providers.bedrock_region, None);
+        let eu = Wizard::BEDROCK_REGIONS
+            .iter()
+            .position(|r| *r == "eu-west-1")
+            .unwrap();
+        wizard.defaults[Wizard::REGION_FIELD].value.set_index(eu);
+        assert_eq!(
+            wizard.build_config().providers.bedrock_region.as_deref(),
+            Some("eu-west-1")
+        );
+        // Rebuilding the form keeps the pick.
+        wizard.rebuild_defaults();
+        assert_eq!(
+            wizard.defaults[Wizard::REGION_FIELD].value.display(),
+            "eu-west-1"
+        );
+        wizard.providers[bedrock].selected = false;
+        wizard.rebuild_defaults();
+        assert_eq!(wizard.defaults.len(), 6);
+        assert_eq!(wizard.build_config().providers.bedrock_region, None);
+    }
+
+    /// The retention switch follows the region row, keeps its value across a
+    /// rebuild that moves it, and writes `zero_retention`; an agreement row
+    /// appears for each chosen contract provider and writes the list, while
+    /// a name the wizard does not offer stays as the config wrote it.
+    #[test]
+    fn the_retention_rows_follow_the_region_and_write_the_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wizard = test_wizard(dir.path());
+        wizard.base.providers.zero_retention_agreements =
+            vec!["groq".to_string(), "openai".to_string()];
+        let anthropic = wizard
+            .providers
+            .iter()
+            .position(|r| r.provider.id == "anthropic")
+            .expect("the catalog offers Anthropic");
+        wizard.providers[anthropic].selected = true;
+        wizard.enter(Step::Defaults);
+
+        // No region row, so the switch is fourth.
+        let zero = Wizard::REGION_FIELD;
+        assert_eq!(wizard.defaults[zero].label, Wizard::ZERO_RETENTION_LABEL);
+        assert_eq!(wizard.defaults[zero].value.display(), "no");
+        assert!(
+            wizard.defaults[zero]
+                .help
+                .contains("zero data retention, ZDR"),
+            "the help spells the term out"
+        );
+        assert_eq!(
+            wizard.defaults[zero + 1].label,
+            "ZDR agreement with Anthropic"
+        );
+        assert_eq!(
+            wizard.defaults[zero + 2].label,
+            Wizard::FILE_UPLOADS_LABEL,
+            "OpenAI is not chosen, so no row before the upload switch"
+        );
+        assert_eq!(wizard.defaults.len(), zero + 3);
+        assert!(wizard.current_file_uploads(), "uploads are on by default");
+        assert!(
+            wizard.defaults[zero + 2]
+                .help
+                .contains("Zero data retention turns uploads off")
+        );
+        assert!(!wizard.current_zero_retention());
+        assert_eq!(
+            wizard.current_agreements(),
+            vec!["groq".to_string(), "openai".to_string()],
+            "the config's names stand until a row says otherwise"
+        );
+
+        wizard.defaults[zero].value = FieldValue::Bool(true);
+        wizard.defaults[zero + 1].value = FieldValue::Bool(true);
+        wizard.defaults[zero + 2].value = FieldValue::Bool(false);
+        let config = wizard.build_config();
+        assert!(!config.providers.file_uploads);
+        assert!(config.providers.zero_retention);
+        assert_eq!(
+            config.providers.zero_retention_agreements,
+            vec![
+                "groq".to_string(),
+                "anthropic".to_string(),
+                "openai".to_string()
+            ]
+        );
+
+        // Bedrock moves the switch down one; the values ride along.
+        let bedrock = bedrock_row(&wizard);
+        wizard.providers[bedrock].selected = true;
+        wizard.rebuild_defaults();
+        assert_eq!(wizard.defaults[4].label, Wizard::ZERO_RETENTION_LABEL);
+        assert_eq!(wizard.defaults[4].value.display(), "yes");
+        assert_eq!(wizard.defaults[5].value.display(), "yes");
+        assert!(wizard.build_config().providers.zero_retention);
+
+        // An OpenAI row appears once OpenAI is chosen, holding the config's
+        // answer; turning it off drops the name.
+        let openai = wizard
+            .providers
+            .iter()
+            .position(|r| r.provider.id == "openai")
+            .expect("the catalog offers OpenAI");
+        wizard.providers[openai].selected = true;
+        wizard.rebuild_defaults();
+        assert_eq!(wizard.defaults[6].label, "ZDR agreement with OpenAI");
+        assert_eq!(wizard.defaults[6].value.display(), "yes");
+        wizard.defaults[6].value = FieldValue::Bool(false);
+        assert_eq!(
+            wizard.build_config().providers.zero_retention_agreements,
+            vec!["groq".to_string(), "anthropic".to_string()]
+        );
+    }
+
+    #[test]
+    fn the_region_starts_from_the_file_then_the_environment_and_never_writes_the_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let lookup = |name: &str| match name {
+            "AWS_REGION" => Some(" ap-south-1 ".to_string()),
+            "AWS_BEARER_TOKEN_BEDROCK" => Some("ABSK-env".to_string()),
+            _ => None,
+        };
+        let mut wizard = Wizard::new(
+            Config::default(),
+            &lookup,
+            Vec::new(),
+            Vec::new(),
+            dir.path(),
+            std::sync::Arc::new(|_| true),
+            Default::default(),
+        );
+        assert_eq!(wizard.region_from_env.as_deref(), Some("ap-south-1"));
+        let bedrock = bedrock_row(&wizard);
+        assert!(
+            wizard.providers[bedrock].selected,
+            "a key in the environment selects the row"
+        );
+        wizard.enter(Step::Defaults);
+        assert_eq!(
+            wizard.defaults[Wizard::REGION_FIELD].value.display(),
+            "ap-south-1"
+        );
+        // The environment's region is left to the environment.
+        assert_eq!(wizard.build_config().providers.bedrock_region, None);
+
+        // A region the list does not carry is offered first, not refused.
+        let mut base = Config::default();
+        base.providers.bedrock_api_key = Some("ABSK".to_string());
+        base.providers.bedrock_region = Some("mx-central-1".to_string());
+        let mut wizard = Wizard::new(
+            base,
+            &lookup,
+            Vec::new(),
+            Vec::new(),
+            dir.path(),
+            std::sync::Arc::new(|_| true),
+            Default::default(),
+        );
+        assert_eq!(
+            wizard.current_bedrock_region().as_deref(),
+            Some("mx-central-1")
+        );
+        wizard.enter(Step::Defaults);
+        let field = &wizard.defaults[Wizard::REGION_FIELD];
+        assert_eq!(field.value.display(), "mx-central-1");
+        assert_eq!(
+            field.value.options().first().map(String::as_str),
+            Some("mx-central-1")
+        );
+        assert_eq!(
+            wizard.build_config().providers.bedrock_region.as_deref(),
+            Some("mx-central-1")
+        );
+        // The default-region variable is the second choice.
+        let fallback = |name: &str| match name {
+            "AWS_DEFAULT_REGION" => Some("eu-north-1".to_string()),
+            _ => None,
+        };
+        let wizard = Wizard::new(
+            Config::default(),
+            &fallback,
+            Vec::new(),
+            Vec::new(),
+            dir.path(),
+            std::sync::Arc::new(|_| true),
+            Default::default(),
+        );
+        assert_eq!(wizard.region_from_env.as_deref(), Some("eu-north-1"));
+    }
+
+    #[test]
+    fn a_bedrock_check_carries_the_region_a_run_would_use() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wizard = test_wizard(dir.path());
+        let (mut requests, _replies) = wizard.take_verify_ends().expect("first take");
+        let bedrock = bedrock_row(&wizard);
+        wizard.providers[bedrock].selected = true;
+        wizard.providers[bedrock].value = "ABSK-typed".to_string();
+        wizard.base.providers.bedrock_region = Some("eu-west-2".to_string());
+        wizard.request_verification(bedrock);
+        let request = requests.try_recv().expect("a check was requested");
+        assert_eq!(request.provider_id, "bedrock");
+        assert_eq!(request.creds.api_key.as_deref(), Some("ABSK-typed"));
+        assert_eq!(
+            request.creds.options.get("region").map(String::as_str),
+            Some("eu-west-2")
+        );
+        // No region anywhere: none is carried, and the provider's default
+        // applies to the check as it would to a run.
+        wizard.base.providers.bedrock_region = None;
+        wizard.request_verification(bedrock);
+        let request = requests.try_recv().expect("a second check");
+        assert!(!request.creds.options.contains_key("region"));
     }
 
     // ─── remembering what was turned down ─────────────────────────────────
@@ -1593,21 +1769,42 @@ pub(super) mod tests {
 
     // ─── navigation ─────────────────────────────────────────────────────────
 
+    /// The Providers screen's rows are the configured providers, then the
+    /// add row, then the button; the cursor never leaves them.
     #[test]
     fn the_cursor_stays_inside_the_current_step() {
         let dir = tempfile::tempdir().unwrap();
         let mut wizard = test_wizard(dir.path());
+        wizard.providers[0].selected = true;
         wizard.enter(Step::Providers);
+        assert_eq!(wizard.visible_providers(), vec![0]);
+        assert_eq!(wizard.cursor_provider(), Some(0));
+        assert!(!wizard.on_add_provider());
 
         wizard.move_cursor(-5);
         assert_eq!(wizard.cursor, 0);
         wizard.move_cursor(100);
         assert_eq!(
-            wizard.cursor,
-            wizard.providers.len(),
-            "clamped to the Continue button after the last row"
+            wizard.cursor, 2,
+            "clamped to the Continue button after the provider and the add row"
         );
         assert!(wizard.on_continue());
+        assert_eq!(wizard.cursor_provider(), None);
+        wizard.move_cursor(-1);
+        assert!(wizard.on_add_provider());
+        assert_eq!(wizard.cursor_provider(), None);
+        assert!(!wizard.on_continue());
+
+        // Only the add row and the button with nothing configured.
+        wizard.providers[0].selected = false;
+        wizard.enter(Step::Providers);
+        assert_eq!(wizard.row_count(), 1);
+        assert!(wizard.on_add_provider());
+        wizard.move_cursor(1);
+        assert!(wizard.on_continue());
+        // The add row is the Providers screen's alone.
+        wizard.enter(Step::Agents);
+        assert!(!wizard.on_add_provider());
     }
 
     #[test]
@@ -1632,22 +1829,10 @@ pub(super) mod tests {
         assert_eq!(wizard.continue_label(), "Get started");
 
         wizard.enter(Step::Providers);
-        assert_eq!(wizard.continue_label(), "Continue (no providers selected)");
+        assert_eq!(wizard.continue_label(), "Continue (add a provider first)");
         wizard.providers[0].selected = true;
         wizard.providers[1].selected = true;
-        assert_eq!(
-            wizard.continue_label(),
-            "Continue: Credentials (2 selected)"
-        );
-
-        // On the credential walk: the next selected provider, then the next step.
-        wizard.enter(Step::ProviderDetail);
-        assert_eq!(
-            wizard.continue_label(),
-            format!("Next: {}", wizard.providers[1].provider.display)
-        );
-        wizard.detail = 1;
-        assert_eq!(wizard.continue_label(), "Continue: Defaults");
+        assert_eq!(wizard.continue_label(), "Continue: Defaults (2 configured)");
 
         wizard.enter(Step::Limits);
         assert_eq!(wizard.continue_label(), "Continue: Agents");
@@ -1667,15 +1852,18 @@ pub(super) mod tests {
     #[test]
     fn empty_discovery_steps_are_skipped_in_both_directions() {
         // Nobody should have to press Enter through "no MCP servers found" on a
-        // clean machine, or through a credentials screen with no providers
-        // picked.
+        // clean machine, or through the tuning screen they did not ask for.
         let dir = tempfile::tempdir().unwrap();
         let mut wizard = test_wizard(dir.path());
         assert!(wizard.mcp.is_empty());
 
         wizard.enter(Step::Providers);
         wizard.next_step();
-        assert_eq!(wizard.step, Step::Defaults, "credentials screen was empty");
+        assert_eq!(
+            wizard.step,
+            Step::Defaults,
+            "the tuning screen is off by default"
+        );
 
         wizard.enter(Step::Agents);
         wizard.next_step();
@@ -1746,30 +1934,803 @@ pub(super) mod tests {
         assert_eq!(wizard.step, Step::Review);
     }
 
+    // ─── the setup modal ────────────────────────────────────────────────────
+
+    /// The modal takes over the cursor while it is open: its card's rows,
+    /// then its three buttons, and the step's Continue button is never on
+    /// offer underneath it.
     #[test]
-    fn the_credential_screen_walks_the_selected_providers() {
+    fn opening_the_modal_hands_the_cursor_to_its_card_and_buttons() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wizard = test_wizard(dir.path());
+        wizard.enter(Step::Providers);
+        assert_eq!(wizard.modal_index(), None);
+        assert_eq!(wizard.detail_row(), None);
+        assert!(wizard.detail_actions().is_empty());
+        assert_eq!(wizard.modal_card_rows(), 0);
+        assert_eq!(wizard.modal_button_at(0), None);
+
+        wizard.cursor = 1;
+        wizard.scroll = 3;
+        wizard.message = Some("stale".to_string());
+        wizard.open_provider_modal(0);
+        assert_eq!(wizard.modal_index(), Some(0));
+        assert_eq!(wizard.detail_row(), Some(0));
+        assert_eq!(wizard.cursor, 0, "the card starts on its first row");
+        assert_eq!(wizard.scroll, 0);
+        assert_eq!(wizard.message, None);
+        // The key row and the key-page button, then the three buttons.
+        assert_eq!(wizard.modal_card_rows(), 2);
+        assert_eq!(wizard.row_count(), 2);
+        assert_eq!(wizard.nav_rows(), 5);
+        assert_eq!(wizard.modal_button_at(1), None);
+        assert_eq!(wizard.modal_button_at(2), Some(ModalButton::VerifyUse));
+        assert_eq!(wizard.modal_button_at(3), Some(ModalButton::SkipUse));
+        assert_eq!(wizard.modal_button_at(4), Some(ModalButton::Cancel));
+        assert_eq!(wizard.modal_button_at(5), None);
+        wizard.move_cursor(100);
+        assert_eq!(wizard.cursor, 4, "clamped to the last button");
+        assert!(!wizard.on_continue(), "the modal's buttons are its own");
+        assert_eq!(
+            ModalButton::ALL.map(ModalButton::label),
+            ["Verify and use", "Skip verification and use", "Cancel"]
+        );
+
+        // A row that does not exist opens nothing.
+        let mut wizard = test_wizard(dir.path());
+        wizard.open_provider_modal(999);
+        assert_eq!(wizard.modal_index(), None);
+    }
+
+    /// "Skip verification and use" keeps the provider as it stands, once it
+    /// has enough to keep: a key where one is typed, an entry where entries
+    /// are, and nothing more for the kinds that carry nothing.
+    #[test]
+    fn accepting_the_modal_keeps_the_provider_and_refuses_an_empty_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wizard = test_wizard(dir.path());
+        wizard.enter(Step::Providers);
+        wizard.accept_modal();
+        assert!(!wizard.dirty, "nothing open, nothing to accept");
+
+        wizard.open_provider_modal(0);
+        wizard.accept_modal();
+        assert_eq!(
+            wizard.message.as_deref(),
+            Some("Enter an API key first, or cancel.")
+        );
+        assert_eq!(wizard.modal_index(), Some(0), "still open");
+        assert!(!wizard.providers[0].selected);
+        assert!(!wizard.dirty);
+
+        wizard.providers[0].value = "sk-ant-x".to_string();
+        wizard.accept_modal();
+        assert_eq!(wizard.modal_index(), None);
+        assert!(wizard.providers[0].selected);
+        assert!(wizard.dirty);
+        assert_eq!(wizard.message.as_deref(), Some("Anthropic is set up."));
+        assert_eq!(wizard.step, Step::Providers);
+        assert_eq!(
+            wizard.cursor, 0,
+            "the cursor lands on the provider just set up"
+        );
+
+        // A key from the environment is a key.
+        let openai = wizard
+            .providers
+            .iter()
+            .position(|r| r.provider.id == "openai")
+            .expect("the catalog offers OpenAI");
+        wizard.providers[openai].from_env = Some("OPENAI_API_KEY");
+        wizard.open_provider_modal(openai);
+        wizard.accept_modal();
+        assert!(wizard.providers[openai].selected);
+        assert_eq!(wizard.cursor, 1, "second in the list now");
+
+        // Choosing Ollama is the whole configuration.
+        let ollama = wizard
+            .providers
+            .iter()
+            .position(|r| r.provider.id == "ollama")
+            .expect("ollama is offered");
+        wizard.open_provider_modal(ollama);
+        wizard.accept_modal();
+        assert!(wizard.providers[ollama].selected);
+        assert_eq!(wizard.message.as_deref(), Some("Ollama is set up."));
+
+        // An endpoint preset needs an entry under it.
+        let llama = wizard
+            .providers
+            .iter()
+            .position(|r| r.provider.id == "llama-cpp")
+            .expect("the catalog offers llama.cpp");
+        wizard.open_provider_modal(llama);
+        assert_eq!(
+            wizard.endpoints_under("llama-cpp").len(),
+            1,
+            "opened with a fresh entry"
+        );
+        wizard.remove_endpoint(0);
+        wizard.accept_modal();
+        assert_eq!(
+            wizard.message.as_deref(),
+            Some("Add an endpoint first, or cancel.")
+        );
+        assert_eq!(wizard.modal_index(), Some(llama));
+        wizard.add_endpoint(llama);
+        wizard.accept_modal();
+        assert_eq!(wizard.modal_index(), None);
+        assert!(wizard.providers[llama].selected);
+        assert_eq!(wizard.message.as_deref(), Some("llama.cpp is set up."));
+    }
+
+    /// Cancel puts the row, its entries and the Providers screen's cursor
+    /// back exactly as the modal found them.
+    #[test]
+    fn cancelling_the_modal_restores_the_row_its_entries_and_the_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wizard = test_wizard(dir.path());
+        wizard.cancel_modal();
+        assert_eq!(wizard.message, None, "nothing open, nothing to cancel");
+
+        wizard.providers[0].selected = true;
+        wizard.providers[0].value = "sk-ant-old".to_string();
+        wizard.enter(Step::Providers);
+        wizard.cursor = 1;
+        wizard.scroll = 2;
+        wizard.open_provider_modal(0);
+        wizard.providers[0].value = "sk-ant-new".to_string();
+        wizard.providers[0].outcome = Outcome::Reachable {
+            models: vec!["m".to_string()],
+        };
+        wizard.edit = Some(Edit {
+            target: EditTarget::Credential(0),
+            line: crate::tui::widgets::line_edit::LineEdit::new("typing".to_string(), true),
+        });
+        wizard.cancel_modal();
+        assert_eq!(wizard.modal_index(), None);
+        assert_eq!(wizard.providers[0].value, "sk-ant-old");
+        assert_eq!(wizard.providers[0].outcome, Outcome::Skipped);
+        assert!(wizard.providers[0].selected, "still configured, as it was");
+        assert!(wizard.edit.is_none());
+        assert_eq!(wizard.cursor, 1);
+        assert_eq!(wizard.scroll, 2);
+        assert_eq!(
+            wizard.message.as_deref(),
+            Some("Cancelled; nothing changed.")
+        );
+        assert!(!wizard.dirty);
+
+        // An endpoint preset opened with no entry gets one to edit, and
+        // Cancel takes it away again.
+        let llama = wizard
+            .providers
+            .iter()
+            .position(|r| r.provider.id == "llama-cpp")
+            .expect("the catalog offers llama.cpp");
+        wizard.open_provider_modal(llama);
+        assert_eq!(wizard.endpoints_under("llama-cpp").len(), 1);
+        assert!(wizard.providers[llama].selected);
+        wizard.cancel_modal();
+        assert!(wizard.endpoints.is_empty());
+        assert!(!wizard.providers[llama].selected);
+
+        // One that had an entry keeps it, as it was, and loses the one
+        // added meanwhile.
+        wizard.add_endpoint(llama);
+        wizard.open_provider_modal(llama);
+        assert_eq!(
+            wizard.endpoints.len(),
+            1,
+            "no second entry for one that has one"
+        );
+        wizard.endpoints[0].base_url = "http://changed:1/v1".to_string();
+        wizard.add_endpoint(llama);
+        wizard.cancel_modal();
+        assert_eq!(wizard.endpoints.len(), 1);
+        assert_eq!(wizard.endpoints[0].base_url, catalog::LLAMA_CPP_URL);
+        assert!(wizard.providers[llama].selected);
+    }
+
+    /// The two buttons that need no verifier: one keeps, one cancels.
+    #[test]
+    fn the_skip_and_cancel_buttons_accept_and_cancel() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wizard = test_wizard(dir.path());
+        wizard.activate_modal_button(ModalButton::SkipUse);
+        assert!(!wizard.dirty, "nothing open, nothing pressed");
+
+        wizard.providers[0].value = "sk-ant-x".to_string();
+        wizard.enter(Step::Providers);
+        wizard.open_provider_modal(0);
+        wizard.activate_modal_button(ModalButton::SkipUse);
+        assert_eq!(wizard.modal_index(), None);
+        assert!(wizard.providers[0].selected);
+
+        wizard.open_provider_modal(1);
+        wizard.providers[1].value = "sk-typed-then-abandoned".to_string();
+        wizard.activate_modal_button(ModalButton::Cancel);
+        assert_eq!(wizard.modal_index(), None);
+        assert!(!wizard.providers[1].selected);
+        assert!(wizard.providers[1].value.is_empty());
+        assert_eq!(
+            wizard.message.as_deref(),
+            Some("Cancelled; nothing changed.")
+        );
+    }
+
+    /// `d` on the Providers screen: the provider is deselected, its
+    /// credential and check forgotten, a preset's entries taken with it; one
+    /// the environment supplies is refused, since the variable would put it
+    /// straight back.
+    #[test]
+    fn removing_a_provider_clears_it_and_refuses_one_from_the_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wizard = test_wizard(dir.path());
+        wizard.providers[0].selected = true;
+        wizard.providers[0].value = "sk-ant-x".to_string();
+        wizard.providers[0].outcome = Outcome::Reachable {
+            models: vec!["m".to_string()],
+        };
+        wizard.providers[1].selected = true;
+        wizard.providers[1].value = "sk-oai".to_string();
+        wizard.enter(Step::Providers);
+        wizard.cursor = 2; // the add row, after two providers
+
+        wizard.remove_provider(1);
+        assert!(!wizard.providers[1].selected);
+        assert!(wizard.providers[1].value.is_empty());
+        assert_eq!(wizard.providers[1].outcome, Outcome::Skipped);
+        assert!(wizard.dirty);
+        assert_eq!(
+            wizard.message.as_deref(),
+            Some("OpenAI removed; its credential is cleared when you finish.")
+        );
+        assert_eq!(wizard.cursor, 1, "one row fewer: the add row moved up");
+        assert!(wizard.on_add_provider());
+        assert!(!wizard.on_continue());
+        assert!(!catalog::is_configured(&wizard.build_config(), "openai"));
+
+        // The environment's key stays: the row is refused with a message.
+        wizard.providers[0].from_env = Some("ANTHROPIC_API_KEY");
+        wizard.dirty = false;
+        wizard.remove_provider(0);
+        assert!(wizard.providers[0].selected);
+        assert_eq!(wizard.providers[0].value, "sk-ant-x");
+        assert!(!wizard.dirty);
+        assert_eq!(
+            wizard.message.as_deref(),
+            Some(
+                "Anthropic is supplied by $ANTHROPIC_API_KEY; unset the variable to stop using it."
+            )
+        );
+
+        // A preset goes with its entries.
+        let llama = wizard
+            .providers
+            .iter()
+            .position(|r| r.provider.id == "llama-cpp")
+            .expect("the catalog offers llama.cpp");
+        wizard.add_endpoint(llama);
+        wizard.add_endpoint(llama);
+        wizard.remove_provider(llama);
+        assert!(wizard.endpoints.is_empty());
+        assert!(!wizard.providers[llama].selected);
+
+        // An index no row has is a no-op.
+        wizard.message = None;
+        wizard.remove_provider(999);
+        assert_eq!(wizard.message, None);
+    }
+
+    /// "Verify and use" asks the verifier and waits: a pass keeps the
+    /// provider and closes the modal, a failure leaves it open with the
+    /// answer on screen.
+    #[tokio::test]
+    async fn verify_and_use_accepts_on_a_pass_and_stays_open_on_a_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wizard = test_wizard(dir.path());
+        let (mut requests, replies) = wizard.take_verify_ends().expect("first take");
+        wizard.activate_modal_button(ModalButton::VerifyUse);
+        assert!(requests.try_recv().is_err(), "nothing open, nothing asked");
+
+        wizard.enter(Step::Providers);
+        wizard.open_provider_modal(0);
+        wizard.providers[0].value = "sk-ant-x".to_string();
+        wizard.activate_modal_button(ModalButton::VerifyUse);
+        assert!(wizard.providers[0].checking);
+        assert!(wizard.modal.as_ref().is_some_and(|m| m.awaiting_verify));
+        assert_eq!(wizard.message.as_deref(), Some("Checking…"));
+        assert_eq!(requests.try_recv().expect("asked").provider_id, "anthropic");
+
+        replies
+            .send(VerifyReply {
+                provider_id: "anthropic".to_string(),
+                outcome: Outcome::Failed {
+                    message: "rejected - check the key".to_string(),
+                },
+            })
+            .unwrap();
+        wizard.drain_verifications();
+        assert_eq!(
+            wizard.modal_index(),
+            Some(0),
+            "a failure keeps the modal open"
+        );
+        assert!(!wizard.modal.as_ref().is_some_and(|m| m.awaiting_verify));
+        assert!(!wizard.providers[0].selected);
+        assert_eq!(wizard.message.as_deref(), Some("rejected - check the key"));
+
+        wizard.activate_modal_button(ModalButton::VerifyUse);
+        replies
+            .send(VerifyReply {
+                provider_id: "anthropic".to_string(),
+                outcome: Outcome::Reachable {
+                    models: vec!["claude-opus-5".to_string()],
+                },
+            })
+            .unwrap();
+        wizard.drain_verifications();
+        assert_eq!(wizard.modal_index(), None);
+        assert!(wizard.providers[0].selected);
+        assert!(wizard.dirty);
+        assert_eq!(wizard.message.as_deref(), Some("Anthropic is set up."));
+    }
+
+    /// With nothing to check the button says so rather than waiting for an
+    /// answer that will never come; a reply that lands while nobody is
+    /// waiting is the row's business, not the modal's; and a wait with
+    /// nothing in flight and no answer is told to use it unverified.
+    #[tokio::test]
+    async fn verify_and_use_with_nothing_to_check_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wizard = test_wizard(dir.path());
+        let (mut requests, replies) = wizard.take_verify_ends().expect("first take");
+        wizard.enter(Step::Providers);
+        wizard.open_provider_modal(0);
+        wizard.activate_modal_button(ModalButton::VerifyUse);
+        assert!(requests.try_recv().is_err());
+        assert!(!wizard.modal.as_ref().is_some_and(|m| m.awaiting_verify));
+        assert_eq!(
+            wizard.message.as_deref(),
+            Some("Nothing to check yet: enter a credential, or use it unverified.")
+        );
+
+        replies
+            .send(VerifyReply {
+                provider_id: "anthropic".to_string(),
+                outcome: Outcome::Reachable {
+                    models: vec!["m".to_string()],
+                },
+            })
+            .unwrap();
+        wizard.drain_verifications();
+        assert_eq!(
+            wizard.modal_index(),
+            Some(0),
+            "not waiting, so not accepted"
+        );
+        assert!(!wizard.providers[0].selected);
+
+        wizard.providers[0].outcome = Outcome::Skipped;
+        wizard.modal.as_mut().expect("open").awaiting_verify = true;
+        wizard.settle_modal_verification();
+        assert!(!wizard.modal.as_ref().is_some_and(|m| m.awaiting_verify));
+        assert_eq!(
+            wizard.message.as_deref(),
+            Some("Not checked: nothing to verify yet. Use it unverified, or cancel.")
+        );
+
+        // Still in flight: nothing is decided yet.
+        wizard.providers[0].checking = true;
+        wizard.modal.as_mut().expect("open").awaiting_verify = true;
+        wizard.settle_modal_verification();
+        assert!(wizard.modal.as_ref().is_some_and(|m| m.awaiting_verify));
+        assert_eq!(wizard.modal_index(), Some(0));
+
+        // Nothing open: nothing to settle.
+        wizard.cancel_modal();
+        wizard.settle_modal_verification();
+        assert_eq!(wizard.modal_index(), None);
+    }
+
+    /// An endpoint preset's "Verify and use" checks every entry under it
+    /// and waits for all of them: one failure names the entry, and the
+    /// modal accepts only once every entry has answered yes.
+    #[tokio::test]
+    async fn verify_and_use_on_a_preset_waits_for_every_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wizard = test_wizard(dir.path());
+        let (mut requests, replies) = wizard.take_verify_ends().expect("first take");
+        let llama = wizard
+            .providers
+            .iter()
+            .position(|r| r.provider.id == "llama-cpp")
+            .expect("the catalog offers llama.cpp");
+        wizard.enter(Step::Providers);
+        wizard.open_provider_modal(llama);
+        wizard.add_endpoint(llama);
+        let names: Vec<&str> = wizard.endpoints.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["llama-cpp", "llama-cpp-2"]);
+
+        wizard.activate_modal_button(ModalButton::VerifyUse);
+        assert!(wizard.endpoints.iter().all(|e| e.checking));
+        assert!(wizard.modal.as_ref().is_some_and(|m| m.awaiting_verify));
+        let mut asked = Vec::new();
+        while let Ok(request) = requests.try_recv() {
+            asked.push(request.provider_id);
+        }
+        assert_eq!(asked, ["llama-cpp", "llama-cpp-2"]);
+
+        // One answer in: still waiting on the other.
+        replies
+            .send(VerifyReply {
+                provider_id: "llama-cpp".to_string(),
+                outcome: Outcome::Reachable {
+                    models: vec!["a".to_string()],
+                },
+            })
+            .unwrap();
+        wizard.drain_verifications();
+        assert!(wizard.modal.as_ref().is_some_and(|m| m.awaiting_verify));
+
+        replies
+            .send(VerifyReply {
+                provider_id: "llama-cpp-2".to_string(),
+                outcome: Outcome::Failed {
+                    message: "unreachable".to_string(),
+                },
+            })
+            .unwrap();
+        wizard.drain_verifications();
+        assert_eq!(wizard.modal_index(), Some(llama));
+        assert!(!wizard.modal.as_ref().is_some_and(|m| m.awaiting_verify));
+        assert_eq!(
+            wizard.message.as_deref(),
+            Some("Check failed for llama-cpp-2.")
+        );
+
+        // Both pass the second time, and the preset is kept.
+        wizard.activate_modal_button(ModalButton::VerifyUse);
+        for name in ["llama-cpp", "llama-cpp-2"] {
+            replies
+                .send(VerifyReply {
+                    provider_id: name.to_string(),
+                    outcome: Outcome::Reachable {
+                        models: vec!["a".to_string()],
+                    },
+                })
+                .unwrap();
+        }
+        wizard.drain_verifications();
+        assert_eq!(wizard.modal_index(), None);
+        assert!(wizard.providers[llama].selected);
+        assert_eq!(wizard.message.as_deref(), Some("llama.cpp is set up."));
+
+        // An entry with no address is refused on the spot, so a preset
+        // whose only entry has none has nothing in flight.
+        let custom = wizard
+            .providers
+            .iter()
+            .position(|r| r.provider.id == "openai-compatible")
+            .expect("the catalog offers a custom endpoint");
+        wizard.open_provider_modal(custom);
+        wizard.activate_modal_button(ModalButton::VerifyUse);
+        assert!(!wizard.modal.as_ref().is_some_and(|m| m.awaiting_verify));
+        assert_eq!(
+            wizard.message.as_deref(),
+            Some("Nothing to check yet: enter a credential, or use it unverified.")
+        );
+    }
+
+    // ─── adding a provider ──────────────────────────────────────────────────
+
+    /// The chooser walks the catalog a level at a time: how the provider is
+    /// reached, what it makes, then which one. A choice at the last level
+    /// opens the modal, and a dismissal steps back one level.
+    #[test]
+    fn the_add_flow_walks_category_kind_and_provider_and_steps_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wizard = test_wizard(dir.path());
+        wizard.enter(Step::Providers);
+        assert_eq!(
+            wizard.provider_categories(),
+            ["API key", "Subscription logins", "Local and custom"]
+        );
+
+        wizard.open_add_provider();
+        assert_eq!(wizard.picker_purpose, PickerPurpose::Category);
+        let picker = wizard.picker.as_ref().expect("open");
+        assert_eq!(picker.title, "Add a provider");
+        let values: Vec<&str> = picker
+            .matches()
+            .into_iter()
+            .map(|i| picker.options[i].value.as_str())
+            .collect();
+        assert_eq!(
+            values,
+            ["API key", "Subscription logins", "Local and custom"]
+        );
+        assert_eq!(
+            picker.options.len(),
+            3 + wizard.providers.len(),
+            "every provider can be searched for"
+        );
+        assert!(picker.options[0].detail.contains("paste a key"));
+        assert!(picker.options[1].detail.contains("browser"));
+        assert!(picker.options[2].detail.contains("server you run"));
+
+        // A category: what its providers make, each naming them.
+        wizard.settle_picker_choice(0);
+        assert_eq!(
+            wizard.picker_purpose,
+            PickerPurpose::Kind {
+                category: "API key"
+            }
+        );
+        let picker = wizard.picker.as_ref().expect("open");
+        assert_eq!(picker.title, "Add a provider: API key");
+        let values: Vec<&str> = picker.options.iter().map(|o| o.value.as_str()).collect();
+        assert_eq!(
+            values,
+            [
+                "Text and images",
+                "Video",
+                "Speech and audio",
+                "3D models and textures"
+            ]
+        );
+        let detail = picker.options[0].detail.as_str();
+        assert!(detail.starts_with("Anthropic, OpenAI"), "{detail}");
+        assert_eq!(picker.options[1].detail, "OpenAI, Google, xAI");
+        assert_eq!(picker.options[2].detail, "OpenAI, Google, xAI, Meta");
+        assert_eq!(picker.options[3].detail, "Meshy");
+
+        // A kind: the providers themselves, one row of `providers` each.
+        wizard.settle_picker_choice(3);
+        let meshy = wizard
+            .providers
+            .iter()
+            .position(|r| r.provider.id == "meshy")
+            .expect("the catalog offers Meshy");
+        assert_eq!(
+            wizard.picker_purpose,
+            PickerPurpose::Provider {
+                category: "API key",
+                kind: "3D models and textures",
+                rows: vec![meshy],
+            }
+        );
+        let picker = wizard.picker.as_ref().expect("open");
+        assert_eq!(picker.title, "Add a provider: 3D models and textures");
+        let values: Vec<&str> = picker.options.iter().map(|o| o.value.as_str()).collect();
+        assert_eq!(values, ["Meshy"]);
+        assert_eq!(
+            picker.options[0].detail,
+            wizard.providers[meshy].provider.blurb
+        );
+
+        // Back a level, and back again; the top level stays put, open.
+        wizard.picker_back();
+        assert_eq!(
+            wizard.picker_purpose,
+            PickerPurpose::Kind {
+                category: "API key"
+            }
+        );
+        wizard.picker_back();
+        assert_eq!(wizard.picker_purpose, PickerPurpose::Category);
+        wizard.picker_back();
+        assert_eq!(wizard.picker_purpose, PickerPurpose::Category);
+        assert!(wizard.picker.is_some());
+
+        // Down to the provider: choosing it opens its modal and closes the
+        // chooser.
+        wizard.settle_picker_choice(0);
+        wizard.settle_picker_choice(3);
+        wizard.settle_picker_choice(0);
+        assert_eq!(wizard.modal_index(), Some(meshy));
+        assert!(wizard.picker.is_none());
+
+        // One already set up says so in the chooser.
+        wizard.providers[meshy].value = "msy_x".to_string();
+        wizard.accept_modal();
+        wizard.open_add_provider();
+        wizard.settle_picker_choice(0);
+        wizard.settle_picker_choice(3);
+        assert!(
+            wizard.picker.as_ref().expect("open").options[0]
+                .detail
+                .ends_with("(already set up)")
+        );
+
+        // A choice past the options at any level changes nothing.
+        wizard.picker_back();
+        wizard.picker_back();
+        wizard.settle_picker_choice(99);
+        assert_eq!(wizard.picker_purpose, PickerPurpose::Category);
+        wizard.settle_picker_choice(0);
+        wizard.settle_picker_choice(99);
+        assert_eq!(
+            wizard.picker_purpose,
+            PickerPurpose::Kind {
+                category: "API key"
+            }
+        );
+        wizard.settle_picker_choice(0);
+        wizard.settle_picker_choice(99);
+        let text_rows: Vec<usize> = wizard
+            .providers
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| {
+                r.provider.auth_kind() == "API key"
+                    && r.provider.kinds().contains(&"Text and images")
+            })
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(
+            wizard.picker_purpose,
+            PickerPurpose::Provider {
+                category: "API key",
+                kind: "Text and images",
+                rows: text_rows,
+            }
+        );
+        assert_eq!(wizard.modal_index(), None);
+
+        // A field's chooser is untouched by the back step.
+        wizard.picker_purpose = PickerPurpose::Field(0);
+        wizard.picker_back();
+        assert_eq!(wizard.picker_purpose, PickerPurpose::Field(0));
+    }
+
+    // ─── the provider priority ──────────────────────────────────────────────
+
+    /// Configuring a provider does not put it in the priority: the order
+    /// keeps what it had, filtered to what is still configured, and is only
+    /// ever seeded with one entry when it would otherwise be empty.
+    #[test]
+    fn rebuilding_the_defaults_never_adds_a_newly_configured_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wizard = test_wizard(dir.path());
+        wizard.providers[0].selected = true;
+        wizard.enter(Step::Defaults);
+        assert_eq!(wizard.current_provider_order(), ["anthropic".to_string()]);
+
+        wizard.providers[1].selected = true;
+        wizard.rebuild_defaults();
+        assert_eq!(
+            wizard.current_provider_order(),
+            ["anthropic".to_string()],
+            "OpenAI is configured, not chosen"
+        );
+        assert_eq!(
+            wizard.configured_provider_names(),
+            ["anthropic".to_string(), "openai".to_string()]
+        );
+
+        // Dropping the head leaves the order empty, so it is re-seeded from
+        // what is left.
+        wizard.providers[0].selected = false;
+        wizard.rebuild_defaults();
+        assert_eq!(wizard.current_provider_order(), ["openai".to_string()]);
+        let config = wizard.build_config();
+        assert_eq!(config.default_provider, "openai");
+        assert!(
+            config.providers.provider_order.is_empty(),
+            "a one-entry order is not written"
+        );
+
+        // The config's own order is the starting point, filtered to what is
+        // configured.
+        let mut base = Config::default();
+        base.providers.provider_order = vec![
+            "openai".to_string(),
+            "ollama".to_string(),
+            "anthropic".to_string(),
+        ];
+        catalog::set_credential(&mut base, "openai", Some("sk-oai".to_string()));
+        catalog::set_credential(&mut base, "anthropic", Some("sk-ant".to_string()));
+        let mut wizard = Wizard::new(
+            base,
+            &|_| None,
+            Vec::new(),
+            Vec::new(),
+            dir.path(),
+            std::sync::Arc::new(|_| true),
+            Default::default(),
+        );
+        wizard.enter(Step::Defaults);
+        assert_eq!(
+            wizard.current_provider_order(),
+            ["openai".to_string(), "anthropic".to_string()]
+        );
+        assert_eq!(
+            wizard.build_config().providers.provider_order,
+            vec!["openai".to_string(), "anthropic".to_string()]
+        );
+    }
+
+    /// The reorder modal is seeded with the order, then every other
+    /// configured provider left out so Space can bring one in; Enter keeps
+    /// the included rows only, and what it keeps is written back.
+    #[test]
+    fn open_reorder_seeds_the_order_and_the_left_out_providers() {
+        use crate::tui::widgets::reorder::ReorderOutcome;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let dir = tempfile::tempdir().unwrap();
         let mut wizard = test_wizard(dir.path());
         wizard.providers[0].selected = true;
         wizard.providers[1].selected = true;
+        let llama = wizard
+            .providers
+            .iter()
+            .position(|r| r.provider.id == "llama-cpp")
+            .expect("the catalog offers llama.cpp");
+        wizard.add_endpoint(llama);
+        wizard.enter(Step::Defaults);
+        wizard.cursor = Wizard::PROVIDER_FIELD;
+        wizard.open_reorder();
+        assert_eq!(wizard.reorder_field, Wizard::PROVIDER_FIELD);
+        let mut reorder = wizard.reorder.take().expect("open");
+        assert_eq!(
+            reorder.rows_for_test(),
+            vec![
+                ("anthropic".to_string(), "Anthropic".to_string()),
+                ("openai".to_string(), "OpenAI".to_string()),
+                (
+                    "llama-cpp".to_string(),
+                    "llama.cpp at http://localhost:8080/v1".to_string()
+                ),
+            ]
+        );
 
-        assert_eq!(wizard.detail_row(), Some(0));
-        assert!(wizard.next_detail());
-        assert_eq!(wizard.detail_row(), Some(1));
-        assert!(!wizard.next_detail(), "there is no third provider");
-        assert!(wizard.prev_detail());
-        assert_eq!(wizard.detail_row(), Some(0));
-        assert!(!wizard.prev_detail());
-    }
+        // Enter as seeded keeps the order alone: the others are shown, not
+        // in it.
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        assert_eq!(
+            reorder.handle_key(&key(KeyCode::Enter)),
+            ReorderOutcome::Confirmed(vec!["anthropic".to_string()])
+        );
+        // Space brings one in.
+        reorder.handle_key(&key(KeyCode::Down));
+        reorder.handle_key(&key(KeyCode::Char(' ')));
+        assert_eq!(
+            reorder.handle_key(&key(KeyCode::Enter)),
+            ReorderOutcome::Confirmed(vec!["anthropic".to_string(), "openai".to_string()])
+        );
 
-    #[test]
-    fn the_credential_screen_has_no_row_when_nothing_is_selected() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut wizard = test_wizard(dir.path());
-        wizard.enter(Step::ProviderDetail);
+        // What the modal confirms is written back, head first.
+        wizard.dirty = false;
+        wizard.commit_reorder(vec!["openai".to_string(), "anthropic".to_string()]);
+        assert!(wizard.dirty);
+        assert_eq!(
+            wizard.current_provider_order(),
+            ["openai".to_string(), "anthropic".to_string()]
+        );
+        let config = wizard.build_config();
+        assert_eq!(config.default_provider, "openai");
+        assert_eq!(
+            config.providers.provider_order,
+            vec!["openai".to_string(), "anthropic".to_string()]
+        );
 
-        assert!(wizard.detail_row().is_none());
-        assert_eq!(wizard.row_count(), 0);
+        // Reopened, the order comes first and what is left out follows; a
+        // rebuild keeps that choice rather than adding the rest back.
+        wizard.commit_reorder(vec!["openai".to_string()]);
+        wizard.open_reorder();
+        let values: Vec<String> = wizard
+            .reorder
+            .as_ref()
+            .expect("open")
+            .rows_for_test()
+            .into_iter()
+            .map(|(value, _)| value)
+            .collect();
+        assert_eq!(values, ["openai", "anthropic", "llama-cpp"]);
+        wizard.rebuild_defaults();
+        assert_eq!(wizard.current_provider_order(), ["openai".to_string()]);
     }
 
     // ─── verification ───────────────────────────────────────────────────────
@@ -1924,9 +2885,10 @@ pub(super) mod tests {
         let mut wizard = test_wizard(dir.path());
         let (_requests, replies) = wizard.take_verify_ends().expect("first take");
         wizard.providers[0].selected = true;
-        wizard.enter(Step::Defaults);
+        wizard.show_advanced = true;
+        wizard.enter(Step::Limits);
         assert_eq!(
-            wizard.defaults[1].value.options(),
+            wizard.limits[Wizard::OVERRIDE_FIELD].value.options(),
             [Wizard::NO_DEFAULT_MODEL.to_string()],
             "nothing has been reported yet"
         );
@@ -1942,12 +2904,62 @@ pub(super) mod tests {
         wizard.drain_verifications();
 
         assert!(
-            wizard.defaults[1]
+            wizard.limits[Wizard::OVERRIDE_FIELD]
                 .value
                 .options()
                 .contains(&"claude-opus-5".to_string()),
             "the picker should have refilled"
         );
+        assert!(
+            wizard.limits[Wizard::FALLBACK_FIELD]
+                .value
+                .options()
+                .contains(&"claude-opus-5".to_string()),
+            "both choosers share the list"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_late_reply_rebuilds_the_defaults_screen_too() {
+        // The Defaults screen's provider priority is built from the same
+        // replies, so a reply landing while it is open rebuilds it as well.
+        let dir = tempfile::tempdir().unwrap();
+        let mut wizard = test_wizard(dir.path());
+        let (_requests, replies) = wizard.take_verify_ends().expect("first take");
+        wizard.providers[0].selected = true;
+        wizard.enter(Step::Defaults);
+        let before = wizard.defaults.len();
+        replies
+            .send(VerifyReply {
+                provider_id: "anthropic".to_string(),
+                outcome: Outcome::Reachable {
+                    models: vec!["claude-opus-5".to_string()],
+                },
+            })
+            .unwrap();
+        wizard.drain_verifications();
+        assert_eq!(wizard.defaults.len(), before, "the form keeps its shape");
+        assert_eq!(wizard.step, Step::Defaults);
+    }
+
+    #[test]
+    fn commit_picker_off_a_form_step_changes_no_field() {
+        // The chooser only opens on a form step, but the commit is written
+        // against the step the wizard is on when it lands: a screen with no
+        // fields has nothing to write into and nothing to panic over.
+        let dir = tempfile::tempdir().unwrap();
+        let mut wizard = test_wizard(dir.path());
+        wizard.enter(Step::Providers);
+        wizard.picker_purpose = PickerPurpose::Field(0);
+        wizard.commit_picker(0);
+        assert!(wizard.dirty);
+        assert!(wizard.fields().is_empty());
+
+        // A chooser that is a level of the add flow has no field to write.
+        wizard.dirty = false;
+        wizard.picker_purpose = PickerPurpose::Category;
+        wizard.commit_picker(0);
+        assert!(!wizard.dirty);
     }
 
     #[tokio::test]
@@ -2033,7 +3045,7 @@ pub(super) mod tests {
     fn the_model_picker_is_filled_from_verification_and_keeps_a_stored_value() {
         let dir = tempfile::tempdir().unwrap();
         let base = Config {
-            default_model: Some("hand-typed".to_string()),
+            override_model: Some("hand-typed".to_string()),
             ..Config::default()
         };
         let mut wizard = Wizard::new(
@@ -2050,16 +3062,94 @@ pub(super) mod tests {
             models: vec!["claude-opus-5".to_string()],
         };
 
-        wizard.enter(Step::Defaults);
+        wizard.show_advanced = true;
+        wizard.enter(Step::Limits);
 
-        let options = wizard.defaults[1].value.options();
+        let options = wizard.limits[Wizard::OVERRIDE_FIELD].value.options();
         assert!(options.contains(&Wizard::NO_DEFAULT_MODEL.to_string()));
         assert!(options.contains(&"claude-opus-5".to_string()));
         assert_eq!(
-            wizard.defaults[1].value.display(),
+            wizard.limits[Wizard::OVERRIDE_FIELD].value.display(),
             "hand-typed",
             "a model already in the config must survive"
         );
+        assert_eq!(
+            wizard.limits[Wizard::FALLBACK_FIELD].value.display(),
+            Wizard::NO_DEFAULT_MODEL,
+            "nothing configured reads as the blueprints deciding"
+        );
+    }
+
+    /// A choice made on the advanced screen is what gets written, survives
+    /// leaving and re-entering the screen, and an explicit "(each blueprint
+    /// decides)" there beats the model an endpoint entry picked for itself.
+    #[test]
+    fn the_advanced_model_choices_are_written_back_and_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wizard = test_wizard(dir.path());
+        wizard.providers[0].selected = true;
+        wizard.providers[0].outcome = Outcome::Reachable {
+            models: vec!["m-1".to_string(), "m-2".to_string()],
+        };
+        wizard.show_advanced = true;
+        wizard.enter(Step::Defaults);
+        assert_eq!(wizard.build_config().override_model, None);
+        assert_eq!(wizard.build_config().fallback_model, None);
+
+        wizard.enter(Step::Limits);
+        wizard.cursor = Wizard::OVERRIDE_FIELD;
+        wizard.open_picker(
+            "Override model",
+            wizard.limits[Wizard::OVERRIDE_FIELD]
+                .value
+                .options()
+                .to_vec(),
+            0,
+        );
+        let pick = wizard.limits[Wizard::OVERRIDE_FIELD]
+            .value
+            .options()
+            .iter()
+            .position(|m| m == "m-2")
+            .expect("reported");
+        wizard.commit_picker(pick);
+        wizard.cursor = Wizard::FALLBACK_FIELD;
+        wizard.open_picker(
+            "Fallback model",
+            wizard.limits[Wizard::FALLBACK_FIELD]
+                .value
+                .options()
+                .to_vec(),
+            0,
+        );
+        let pick = wizard.limits[Wizard::FALLBACK_FIELD]
+            .value
+            .options()
+            .iter()
+            .position(|m| m == "m-1")
+            .expect("reported");
+        wizard.commit_picker(pick);
+        assert_eq!(wizard.build_config().override_model.as_deref(), Some("m-2"));
+        assert_eq!(wizard.build_config().fallback_model.as_deref(), Some("m-1"));
+
+        // Out and back in: the choices are still there.
+        wizard.enter(Step::Defaults);
+        wizard.enter(Step::Limits);
+        assert_eq!(wizard.limits[Wizard::OVERRIDE_FIELD].value.display(), "m-2");
+        assert_eq!(wizard.limits[Wizard::FALLBACK_FIELD].value.display(), "m-1");
+
+        // Choosing "(each blueprint decides)" is an answer, not an absence.
+        wizard.cursor = Wizard::OVERRIDE_FIELD;
+        wizard.open_picker(
+            "Override model",
+            wizard.limits[Wizard::OVERRIDE_FIELD]
+                .value
+                .options()
+                .to_vec(),
+            0,
+        );
+        wizard.commit_picker(0);
+        assert_eq!(wizard.build_config().override_model, None);
     }
 
     #[test]
@@ -2114,7 +3204,7 @@ pub(super) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut wizard = test_wizard(dir.path());
         wizard.enter(Step::Defaults);
-        wizard.cursor = 3; // the "Show advanced tuning" bool
+        wizard.cursor = Wizard::ADVANCED_FIELD; // the "Show advanced tuning" bool
         wizard.open_reorder();
         assert!(wizard.reorder.is_none());
     }
@@ -2423,12 +3513,12 @@ pub(super) mod tests {
         wizard.enter(Step::Defaults);
 
         wizard.edit = Some(Edit {
-            target: EditTarget::Field(2),
+            target: EditTarget::Field(1),
             line: crate::tui::widgets::line_edit::LineEdit::new("45".to_string(), false),
         });
         wizard.commit_edit();
 
-        assert_eq!(wizard.defaults[2].value, FieldValue::Number(Some(45)));
+        assert_eq!(wizard.defaults[1].value, FieldValue::Number(Some(45)));
         assert_eq!(wizard.build_config().request_timeout_secs, Some(45));
     }
 
@@ -2613,8 +3703,9 @@ pub(super) mod tests {
         wizard.providers[0].selected = true;
         wizard.enter(Step::Defaults);
 
-        // Index 0 of the model field is always the "no default" option.
-        assert!(wizard.build_config().default_model.is_none());
+        // Nothing chosen and nothing configured: both settings stay unset.
+        assert!(wizard.build_config().override_model.is_none());
+        assert!(wizard.build_config().fallback_model.is_none());
     }
 
     #[test]
@@ -2661,6 +3752,10 @@ pub(super) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut wizard = test_wizard(dir.path());
         wizard.enter(Step::Limits);
+        // The two model choosers past the tuning fields are read by
+        // `build_config` itself, not by `apply_limits_fields`.
+        assert_eq!(wizard.limits.len(), LIMITS_FIXED + 2);
+        wizard.limits.truncate(LIMITS_FIXED);
         let count = wizard.limits.len();
 
         let before = wizard.build_config();
@@ -2868,7 +3963,7 @@ pub(super) mod tests {
         let dir = tempfile::tempdir().unwrap();
         temp_env::with_var("LEVIATH_HOME", Some(dir.path()), || {
             let path =
-                leviath_providers::codex::ProviderAuthStore::default_path().expect("a home is set");
+                leviath_providers::oauth::ProviderAuthStore::default_path().expect("a home is set");
             std::fs::create_dir_all(path.parent().expect("a parent")).unwrap();
             // Nobody signed in, nowhere to look, and a file that will not parse
             // are all the same answer: nothing to report.
@@ -2876,7 +3971,7 @@ pub(super) mod tests {
             assert_eq!(signed_in_as(None, "codex"), None);
             std::fs::write(&path, "{ not json").unwrap();
             assert_eq!(signed_in_as(Some(&path), "codex"), None);
-            let mut store = leviath_providers::codex::ProviderAuthStore::default();
+            let mut store = leviath_providers::oauth::ProviderAuthStore::default();
             store.set(
                 "codex",
                 leviath_providers::ProviderGrant {
@@ -2894,7 +3989,7 @@ pub(super) mod tests {
             );
 
             // A grant with an account but no plan says the account alone.
-            let mut store = leviath_providers::codex::ProviderAuthStore::default();
+            let mut store = leviath_providers::oauth::ProviderAuthStore::default();
             store.set(
                 "codex",
                 leviath_providers::ProviderGrant {
@@ -2914,7 +4009,7 @@ pub(super) mod tests {
             // grant is what lets the provider answer, and reporting "not
             // signed in" over a missing claim would offer to replace a
             // working sign-in.
-            let mut store = leviath_providers::codex::ProviderAuthStore::default();
+            let mut store = leviath_providers::oauth::ProviderAuthStore::default();
             store.set(
                 "codex",
                 leviath_providers::ProviderGrant {
@@ -2956,19 +4051,22 @@ pub(super) mod tests {
         assert!(row.has_credential());
     }
 
-    /// With nothing selected the credential screen has no provider to show,
-    /// so it offers no buttons rather than the first row's.
+    /// With no modal open there is no provider card, so there are no action
+    /// rows rather than the first row's, and the Providers screen with
+    /// nothing configured is only its add row.
     #[test]
-    fn a_credential_screen_with_no_provider_offers_nothing() {
+    fn with_no_modal_open_there_are_no_detail_actions() {
         let dir = tempfile::tempdir().unwrap();
         let mut wizard = test_wizard(dir.path());
         for row in &mut wizard.providers {
             row.selected = false;
         }
-        wizard.step = Step::ProviderDetail;
+        wizard.enter(Step::Providers);
 
         assert!(wizard.detail_actions().is_empty());
-        assert_eq!(wizard.row_count(), 0);
+        assert_eq!(wizard.detail_row(), None);
+        assert_eq!(wizard.row_count(), 1, "the add row");
+        assert_eq!(wizard.modal_card_rows(), 0);
     }
 
     /// Every provider the wizard offers survives being chosen.
@@ -3028,13 +4126,12 @@ pub(super) mod tests {
     /// A base-URL provider left on its default is configured, and its
     /// address is still not written down.
     ///
-    /// Those used to be the same answer: the only record of the choice was
-    /// the URL, so keeping the default meant recording nothing, and choosing
-    /// Ollama left it out of `configured_providers` entirely - it could not
-    /// be picked as the default provider, and the wizard forgot it by the
-    /// next run. Storing the default instead would pin it and stop
-    /// `$OLLAMA_HOST` applying, so the choice and the address are now two
-    /// fields saying two different things.
+    /// The choice and the address are two fields saying two different
+    /// things. Were the URL the only record of the choice, keeping the
+    /// default would record nothing: the provider would be missing from
+    /// `configured_providers`, unpickable as the default and forgotten by
+    /// the wizard's next run. Storing the default address instead would pin
+    /// it and stop `$OLLAMA_HOST` applying.
     #[test]
     fn a_base_url_provider_left_on_its_default_is_still_chosen() {
         let dir = tempfile::tempdir().unwrap();
@@ -3072,8 +4169,8 @@ pub(super) mod tests {
         );
     }
 
-    /// The codex row at its index, on a wizard whose only selection it is and
-    /// which is signed in to nothing.
+    /// The codex row at its index, on a wizard whose only selection it is,
+    /// which is signed in to nothing, with its setup modal open.
     ///
     /// `signed_in` is cleared rather than trusted. `Wizard::new` reads the
     /// grant store under `$LEVIATH_HOME`, `temp_env` sets that for the whole
@@ -3092,12 +4189,13 @@ pub(super) mod tests {
             row.signed_in = None;
         }
         wizard.providers[index].selected = true;
-        wizard.step = Step::ProviderDetail;
+        wizard.enter(Step::Providers);
+        wizard.open_provider_modal(index);
         (wizard, index)
     }
 
-    /// The buttons on offer follow the sign-in, because two of the three do
-    /// nothing without one.
+    /// The buttons on offer follow the sign-in, because one of them does
+    /// nothing without one; the check is the modal's own "Verify and use".
     #[test]
     fn a_sign_in_row_offers_more_once_it_is_signed_in() {
         let dir = tempfile::tempdir().unwrap();
@@ -3107,27 +4205,30 @@ pub(super) mod tests {
             wizard.detail_actions(),
             vec![DetailAction::SignIn, DetailAction::OpenSignup]
         );
-        // No credential row, so the buttons are the whole screen, and the
-        // first is the one this screen exists for.
+        // No credential row, so the buttons are the whole card, and the
+        // first is the one this card exists for.
         assert!(!wizard.detail_has_credential_row(index));
         assert_eq!(wizard.row_count(), 2);
+        assert_eq!(wizard.nav_rows(), 5);
         assert_eq!(
             wizard.detail_action_at(index, 0),
             Some(DetailAction::SignIn)
         );
+        assert_eq!(wizard.modal_button_at(2), Some(ModalButton::VerifyUse));
 
         wizard.providers[index].signed_in = Some("a@b.c".to_string());
         assert_eq!(
             wizard.detail_actions(),
             vec![
-                DetailAction::Verify,
                 DetailAction::SignIn,
                 DetailAction::SignOut,
                 DetailAction::OpenSignup,
             ],
-            "once signed in, checking it is what somebody came here to do"
+            "once signed in, there is a sign-in to forget"
         );
-        assert_eq!(wizard.row_count(), 4);
+        assert_eq!(wizard.row_count(), 3);
+        assert_eq!(wizard.modal_button_at(2), None);
+        assert_eq!(wizard.modal_button_at(3), Some(ModalButton::VerifyUse));
     }
 
     /// A typed provider still has its credential above the buttons, so the
@@ -3145,7 +4246,8 @@ pub(super) mod tests {
             row.selected = false;
         }
         wizard.providers[index].selected = true;
-        wizard.step = Step::ProviderDetail;
+        wizard.enter(Step::Providers);
+        wizard.open_provider_modal(index);
 
         assert!(wizard.detail_has_credential_row(index));
         assert_eq!(wizard.detail_action_at(index, 0), None, "row 0 is the key");
@@ -3153,7 +4255,8 @@ pub(super) mod tests {
             wizard.detail_action_at(index, 1),
             Some(DetailAction::OpenSignup)
         );
-        assert_eq!(wizard.row_count(), 3);
+        assert_eq!(wizard.row_count(), 2);
+        assert_eq!(wizard.modal_button_at(2), Some(ModalButton::VerifyUse));
     }
 
     /// Asking to sign in puts the row into its waiting state at the key press

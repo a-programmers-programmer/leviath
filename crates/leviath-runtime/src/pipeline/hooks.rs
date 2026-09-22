@@ -67,10 +67,27 @@ fn stage_ctx(stage_name: &str, index: usize, window: &ContextWindow) -> serde_js
             (r.name.clone(), serde_json::Value::String(text))
         })
         .collect();
+    // The stored parts each region holds, by region, so a hook can see that
+    // `storyboard` carries three images without parsing stand-ins out of
+    // the text. Regions holding none are absent.
+    let parts: serde_json::Map<String, serde_json::Value> = window
+        .regions
+        .iter()
+        .filter_map(|r| {
+            let stored: Vec<serde_json::Value> = r
+                .content
+                .iter()
+                .flat_map(|e| e.content.stored())
+                .map(leviath_scripting::parts::part_summary)
+                .collect();
+            (!stored.is_empty()).then(|| (r.name.clone(), serde_json::Value::Array(stored)))
+        })
+        .collect();
     serde_json::json!({
         "stage": stage_name,
         "stage_index": index,
         "regions": regions,
+        "parts": parts,
     })
 }
 
@@ -92,6 +109,7 @@ fn apply_modify(window: &mut ContextWindow, value: &serde_json::Value) -> Result
                 "on_stage_enter: region '{name}' must be given a string, got: {content}"
             ));
         };
+        let before = window.begin_change(name);
         let Some(region) = window.get_region_mut(name) else {
             return Err(format!(
                 "on_stage_enter: no region '{name}' in this stage's layout"
@@ -106,6 +124,11 @@ fn apply_modify(window: &mut ContextWindow, value: &serde_json::Value) -> Result
                 .add_entry(text.to_string(), leviath_core::estimate_tokens(text))
                 .map_err(|e| format!("on_stage_enter: writing region '{name}': {e}"))?;
         }
+        window.commit_change(
+            leviath_core::ContextCause::Hook,
+            before,
+            crate::components::Pushed::Into(usize::from(!text.is_empty())),
+        );
     }
     Ok(())
 }
@@ -706,5 +729,43 @@ pub(crate) fn run_stage_exit_hooks(
                 commands.entity(entity).remove::<ResolveTransition>();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod ctx_tests {
+    use super::*;
+    use leviath_core::mime::{Blob, BlobStore, MemoryBlobStore, MimeRegistry, MimeType, Part};
+    use leviath_core::region::EntryContent;
+    use leviath_core::{Region, RegionKind};
+
+    #[test]
+    fn the_ctx_lists_each_regions_stored_parts_and_skips_the_rest() {
+        let mut window = ContextWindow::new(10_000);
+        window.add_region(Region::new("brief".into(), RegionKind::Pinned, 1_000));
+        window.add_region(Region::new("art".into(), RegionKind::Pinned, 5_000));
+        let reg = MimeRegistry::builtin();
+        let blob = Blob::new(
+            MimeType::parse("image/png").unwrap(),
+            b"\x89PNG\r\n\x1a\n".to_vec(),
+        )
+        .named("a.png");
+        let r = MemoryBlobStore::new().put("r", &blob, &reg).unwrap();
+        window
+            .add_to_region("brief", "words".to_string(), 1)
+            .unwrap();
+        window
+            .get_region_mut("art")
+            .unwrap()
+            .add_entry(
+                EntryContent::from_parts(vec![Part::text("cap"), Part::stored(r).named("a.png")]),
+                1_700,
+            )
+            .unwrap();
+        let ctx = stage_ctx("plan", 0, &window);
+        assert_eq!(ctx["regions"]["brief"], "words");
+        assert!(ctx["parts"].get("brief").is_none());
+        assert_eq!(ctx["parts"]["art"][0]["name"], "a.png");
+        assert_eq!(ctx["parts"]["art"][0]["mime_type"], "image/png");
     }
 }

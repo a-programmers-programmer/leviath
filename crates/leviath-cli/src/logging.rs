@@ -7,9 +7,11 @@
 //! that gap is what the reload slot is for: [`init`] installs the fmt layer
 //! plus an empty slot and parks the reload handle in a static;
 //! `set_otel_layer` fills the slot once the daemon has built its
-//! exporter. Everything stays on **stderr** - `lev agent-client` uses stdout
-//! as its JSON-RPC channel, and a stray log line there would corrupt the
-//! stream a host is parsing.
+//! exporter. Nothing goes to **stdout** - `lev agent-client` uses it as its
+//! JSON-RPC channel, and a stray log line there would corrupt the stream a
+//! host is parsing. Lines go to stderr, and in the daemon also to its own
+//! capped file (see [`attach_log_file`] and the `daemon_log` module); a
+//! daemon whose stderr is not a terminal writes the file alone.
 //!
 //! stderr is not safe either while a full-screen TUI is up, which is what
 //! [`hold_for_tui`] exists for. `lev setup` and `lev dash` own the alternate
@@ -26,12 +28,17 @@
 //! nothing lands on the screen while somebody is looking at it.
 
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock, PoisonError};
 
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer, Registry, reload};
+
+mod daemon_log;
+
+pub use daemon_log::{daemon_log_path, serve_log_path};
 
 /// What the reload slot holds: nothing, or the installed OTLP layer.
 type OtelSlot = Option<leviath_telemetry::LogLayer>;
@@ -41,6 +48,17 @@ static OTEL_HANDLE: OnceLock<reload::Handle<OtelSlot, Registry>> = OnceLock::new
 
 /// Whether a TUI currently owns the terminal.
 static TUI_HOLDS_TERMINAL: AtomicBool = AtomicBool::new(false);
+
+/// This process's log file, once [`attach_log_file`] has run: the daemon's
+/// `daemon.log`, a server's `serve-<name>.log`. Every other `lev` process
+/// leaves it empty, and the file writer then discards.
+static LOG_FILE: OnceLock<daemon_log::DaemonLog> = OnceLock::new();
+
+/// Whether the stderr writer still writes. Cleared by [`attach_log_file`]
+/// when stderr is not a terminal: a daemon started detached or by a
+/// supervisor has nobody reading it, and a supervisor that captures stderr
+/// would otherwise keep an uncapped copy of the file.
+static STDERR_MIRROR: AtomicBool = AtomicBool::new(true);
 
 /// Lines written while the terminal was held, waiting to be flushed.
 static PARKED: Mutex<Vec<u8>> = Mutex::new(Vec::new());
@@ -97,14 +115,83 @@ impl Write for TerminalAwareWriter {
             PARKED_DROPPED.fetch_add(dropped, Ordering::Relaxed);
             return Ok(buf.len());
         }
+        if !STDERR_MIRROR.load(Ordering::Relaxed) {
+            return Ok(buf.len());
+        }
         std::io::stderr().write(buf)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        if TUI_HOLDS_TERMINAL.load(Ordering::Relaxed) {
+        if TUI_HOLDS_TERMINAL.load(Ordering::Relaxed) || !STDERR_MIRROR.load(Ordering::Relaxed) {
             return Ok(());
         }
         std::io::stderr().flush()
+    }
+}
+
+/// The file layer's writer: appends to the attached log file, or discards
+/// when this process has none.
+struct DaemonLogWriter;
+
+impl Write for DaemonLogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if let Some(log) = LOG_FILE.get() {
+            log.append(buf)?;
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The file layer's writer factory; a named function for the reason
+/// [`writer`] gives.
+fn daemon_writer() -> DaemonLogWriter {
+    DaemonLogWriter
+}
+
+/// The layer that writes the process's log file: the same lines as stderr,
+/// with no colour codes. A function rather than a value inside [`init`] so a
+/// test can put the same layer on a thread-scoped subscriber.
+fn daemon_file_layer<S>(level: &str) -> impl Layer<S>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    tracing_subscriber::fmt::layer()
+        .with_ansi(false)
+        .with_writer(daemon_writer)
+        .with_filter(EnvFilter::new(level))
+}
+
+/// Start writing this process's log lines to the file at `path`:
+/// [`daemon_log_path`] in the daemon, [`serve_log_path`] in a server. The
+/// long-lived processes call it; every other command keeps stderr alone.
+///
+/// Returns `false` on a second call: the file is attached once for the life
+/// of the process. `mirror_stderr` is whether stderr is a terminal, decided
+/// by the caller; when it is not, the stderr copy stops here, so a detached
+/// process writes the file alone.
+pub fn attach_log_file(path: PathBuf, mirror_stderr: bool) -> bool {
+    let _ = path.parent().map(leviath_sys::create_private_dir_all);
+    let log = daemon_log::DaemonLog::new(path, leviath_core::config::DEFAULT_LOG_FILE_MAX_BYTES);
+    if LOG_FILE.set(log).is_err() {
+        return false;
+    }
+    STDERR_MIRROR.store(mirror_stderr, Ordering::Relaxed);
+    true
+}
+
+/// Apply `[observability] log_file_max_bytes`. `false` when no log file is
+/// attached, which is every process but the daemon and a server.
+pub fn set_log_file_cap(bytes: u64) -> bool {
+    match LOG_FILE.get() {
+        Some(log) => {
+            log.set_cap(bytes);
+            true
+        }
+        None => false,
     }
 }
 
@@ -147,7 +234,8 @@ pub fn release_from_tui() {
 }
 
 /// Install the process-wide subscriber: fmt → stderr at `info` (`debug` when
-/// verbose), plus the empty reloadable OTLP slot.
+/// verbose), the same lines into the daemon's file once one is attached, plus
+/// the empty reloadable OTLP slot.
 ///
 /// The filter is the literal `info`/`debug` directive for `--verbose`, not
 /// `RUST_LOG`: `EnvFilter::new` parses its argument and never reads the
@@ -163,11 +251,14 @@ pub fn release_from_tui() {
 pub fn init(verbose: bool) {
     let level = if verbose { "debug" } else { "info" };
     let (otel_layer, handle) = reload::Layer::new(None as OtelSlot);
-    let subscriber = tracing_subscriber::registry().with(otel_layer).with(
-        tracing_subscriber::fmt::layer()
-            .with_writer(writer)
-            .with_filter(EnvFilter::new(level)),
-    );
+    let subscriber = tracing_subscriber::registry()
+        .with(otel_layer)
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(writer)
+                .with_filter(EnvFilter::new(level)),
+        )
+        .with(daemon_file_layer(level));
     let _ = subscriber.try_init();
     let _ = OTEL_HANDLE.set(handle);
 }
@@ -262,10 +353,13 @@ mod tests {
     /// toggling it in parallel would park the first one's writes.
     #[test]
     fn holding_the_terminal_parks_output_until_it_is_released() {
-        // Released is the resting state, so a write goes straight out.
+        // Released is the resting state, so a write goes straight out. A real
+        // byte rather than an empty slice: `write_all` of nothing never calls
+        // `write`, and the pass-through then depended on some other test
+        // happening to log while nothing held the terminal.
         release_from_tui();
         assert!(!TUI_HOLDS_TERMINAL.load(Ordering::Relaxed));
-        writer().write_all(b"").expect("stderr accepts a write");
+        assert_eq!(writer().write(b"\n").expect("stderr accepts a write"), 1);
         writer().flush().expect("stderr accepts a flush");
 
         hold_for_tui();
@@ -285,6 +379,14 @@ mod tests {
             PARKED.lock().expect("uncontended").is_empty(),
             "release hands the buffer to stderr and empties it"
         );
+
+        // A daemon whose stderr is not a terminal writes its file alone: the
+        // stderr writer accepts and drops. Same test, same reason: the flag
+        // is process-wide.
+        STDERR_MIRROR.store(false, Ordering::Relaxed);
+        assert_eq!(writer().write(b"\n").expect("muted"), 1);
+        writer().flush().expect("a muted flush is a no-op");
+        STDERR_MIRROR.store(true, Ordering::Relaxed);
 
         // Past the cap the oldest bytes go, the count is kept for the release
         // to report, and the release clears it. Same test, same reason: the
@@ -306,6 +408,51 @@ mod tests {
         // with nothing parked it must stay quiet rather than write an empty
         // line.
         release_from_tui();
+    }
+
+    /// One test owns the daemon-log static, for the same reason the OTEL
+    /// handle has one: it is process-wide, and two tests attaching would race.
+    #[test]
+    fn attaching_the_log_file_routes_the_file_layer_into_it() {
+        // Before anything is attached: the cap has nowhere to go, and the file
+        // writer accepts a line and drops it.
+        assert!(!set_log_file_cap(1));
+        assert_eq!(daemon_writer().write(b"x").expect("discarded"), 1);
+        daemon_writer().flush().expect("nothing to flush");
+
+        // Attached as if stderr were a terminal, so the mirror flag stays as
+        // it is: the terminal-hold test owns that flag and exercises the
+        // muted arms itself.
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("logs").join("daemon.log");
+        assert!(attach_log_file(path.clone(), true), "the first attach wins");
+        assert!(
+            !attach_log_file(path.clone(), true),
+            "and the second is refused"
+        );
+        assert!(set_log_file_cap(1024 * 1024));
+
+        // The layer `init` installs, on a subscriber this thread controls.
+        let subscriber = tracing_subscriber::registry().with(daemon_file_layer("info"));
+        let _guard = tracing::subscriber::set_default(subscriber);
+        tracing::info!(target: "leviath::logging::test", "a line for the file");
+        tracing::debug!(target: "leviath::logging::test", "filtered out");
+        let written = std::fs::read_to_string(&path).expect("the file exists");
+        assert!(written.contains("a line for the file"), "{written}");
+        assert!(!written.contains("filtered out"), "{written}");
+        assert!(!written.contains('\u{1b}'), "no colour codes: {written}");
+
+        // A file that cannot be reopened is an error the layer swallows and
+        // the writer itself reports. The open handle would keep accepting
+        // writes to an unlinked file, so the cap forces a roll, which drops
+        // the handle and reopens where a file now sits in the directory's
+        // place.
+        drop(_guard);
+        std::fs::remove_dir_all(dir.path()).expect("gone");
+        std::fs::write(dir.path(), b"").expect("a file where the dir was");
+        assert!(set_log_file_cap(1));
+        assert!(daemon_writer().write(b"x").is_err());
+        let _ = std::fs::remove_file(dir.path());
     }
 
     /// The cap is a ring: dropping comes off the front of what is parked

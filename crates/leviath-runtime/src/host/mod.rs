@@ -50,6 +50,7 @@ pub struct WorldHost {
     force_terminator: Option<ForceTerminator>,
     reaper: Option<Reaper>,
     resumer: Option<Resumer>,
+    housekeeper: Option<Housekeeper>,
     events: broadcast::Sender<WorldEvent>,
     emitted: HashMap<String, Emitted>,
     /// The `[limits]` settings the host itself runs on: relief threshold,
@@ -174,6 +175,7 @@ impl WorldHost {
             force_terminator: None,
             reaper: None,
             resumer: None,
+            housekeeper: None,
             events,
             emitted: HashMap::new(),
             settings: HostSettings::default(),
@@ -376,6 +378,18 @@ impl WorldHost {
         self.resumer = Some(resumer);
     }
 
+    /// Install the hook run on every safety re-drive (see `Housekeeper`).
+    pub fn set_housekeeper(&mut self, housekeeper: Housekeeper) {
+        self.housekeeper = Some(housekeeper);
+    }
+
+    /// Run the housekeeping hook, if one is installed.
+    fn housekeep(&mut self) {
+        if let Some(hook) = self.housekeeper.as_mut() {
+            hook(&mut self.world);
+        }
+    }
+
     /// Run the resume hook for `entity`, if one is installed.
     ///
     /// The hook is moved out for the call so it does not borrow `self` while
@@ -487,6 +501,22 @@ impl WorldHost {
                     .map(|o| o.0.clone());
                 let _ = reply.send(output);
             }
+            ControlOp::Blob {
+                run_id,
+                sha256,
+                reply,
+            } => {
+                // The store is content-addressed per run and outlives the
+                // entity, so a finished run's artifact is still readable here
+                // after the daemon has unloaded it.
+                let bytes = self
+                    .world
+                    .world()
+                    .get_resource::<crate::blob_store::BlobStoreHandle>()
+                    .and_then(|store| store.0.read(&run_id, &sha256).ok())
+                    .map(|bytes| bytes.to_vec());
+                let _ = reply.send(bytes);
+            }
             ControlOp::Status { run_id, reply } => {
                 // A run the daemon has unloaded still has an answer for a
                 // while, so a caller that asks a moment too late learns how the
@@ -541,6 +571,7 @@ impl WorldHost {
                 agent_id,
                 content,
                 target_region,
+                parts,
                 reply,
             } => {
                 // Page the target in if it was unloaded, so delivery finds it.
@@ -551,6 +582,7 @@ impl WorldHost {
                         agent_id,
                         content,
                         target_region,
+                        parts,
                     })
                     .is_ok();
                 let _ = reply.send(ok);
@@ -616,7 +648,10 @@ impl WorldHost {
                 // park the daemon indefinitely with work left to do. Re-driving
                 // on a timer bounds that to one interval, and is where the lane
                 // heartbeat reports what the loop is actually waiting on.
-                _ = redrive.tick() => self.observe_redrive(),
+                _ = redrive.tick() => {
+                    self.observe_redrive();
+                    self.housekeep();
+                }
                 op = control_rx.recv() => {
                     match op {
                         // Await the spawn preprocessor (e.g. lazy MCP connect) before

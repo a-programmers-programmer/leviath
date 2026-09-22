@@ -46,7 +46,7 @@ pub(crate) fn admin_paths() -> AdminPaths {
     AdminPaths {
         config: Config::config_path(),
         store: AuthStore::default_path().unwrap_or_default(),
-        grants: leviath_providers::codex::ProviderAuthStore::default_path().unwrap_or_default(),
+        grants: leviath_providers::oauth::ProviderAuthStore::default_path().unwrap_or_default(),
     }
 }
 
@@ -99,28 +99,36 @@ impl Default for McpAdmin {
 /// A server, as reported by the list/status endpoints.
 #[derive(Serialize)]
 pub(super) struct McpServerInfo {
-    name: String,
-    transport: String,
-    endpoint: String,
-    auth: String,
+    pub(super) name: String,
+    pub(super) transport: String,
+    pub(super) endpoint: String,
+    pub(super) auth: String,
+    /// Why the configuration does not resolve to a transport, when it does not.
+    ///
+    /// `transport: "invalid"` on its own says a server is broken and nothing
+    /// about how to fix it, which leaves reading the config file by hand as the
+    /// only way to find out. Null for a server that resolves.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) config_error: Option<String>,
 }
 
 impl McpServerInfo {
     fn describe(server: &MCPServerConfig, store: &AuthStore, now: u64) -> Self {
-        let (transport, endpoint) = match server.resolve() {
+        let (transport, endpoint, config_error) = match server.resolve() {
             Ok(leviath_mcp::ResolvedTransport::Stdio { command, .. }) => {
-                ("stdio".to_string(), command.to_string())
+                ("stdio".to_string(), command.to_string(), None)
             }
             Ok(leviath_mcp::ResolvedTransport::Http { url, .. }) => {
-                ("http".to_string(), url.to_string())
+                ("http".to_string(), url.to_string(), None)
             }
-            Err(_) => ("invalid".to_string(), String::new()),
+            Err(e) => ("invalid".to_string(), String::new(), Some(e.to_string())),
         };
         Self {
             name: server.name.clone(),
             transport,
             endpoint,
             auth: auth_status(server, store, now),
+            config_error,
         }
     }
 }
@@ -147,20 +155,29 @@ fn auth_status(server: &MCPServerConfig, store: &AuthStore, now: u64) -> String 
 
 /// `GET /api/mcp/servers` - list configured servers with their auth status.
 pub(super) async fn list_servers(State(state): State<AppState>) -> impl IntoResponse {
-    let admin = &state.mcp;
+    match server_infos(&state) {
+        Ok(servers) => Json(servers).into_response(),
+        Err(e) => super::core::error::as_api_error(&e).into_response(),
+    }
+}
+
+/// Every MCP server the config declares, with its auth state. Both surfaces
+/// read the config file here rather than from `AppState`, because the admin
+/// routes write it and a stale copy would report a server that was just
+/// removed.
+pub(super) fn server_infos(
+    state: &AppState,
+) -> Result<Vec<McpServerInfo>, super::core::error::ServeError> {
     let paths = admin_paths();
-    let config = match Config::load_from_path_public(&paths.config) {
-        Ok(config) => config,
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    };
+    let config = Config::load_from_path_public(&paths.config)
+        .map_err(|e| super::core::error::ServeError::Internal(e.to_string()))?;
     let store = AuthStore::load(&paths.store).unwrap_or_default();
-    let now = (admin.clock)();
-    let servers: Vec<McpServerInfo> = config
+    let now = (state.mcp.clock)();
+    Ok(config
         .mcp_servers
         .iter()
-        .map(|s| McpServerInfo::describe(s, &store, now))
-        .collect();
-    Json(servers).into_response()
+        .map(|server| McpServerInfo::describe(server, &store, now))
+        .collect())
 }
 
 /// Body of `POST /api/mcp/servers`.
@@ -179,66 +196,91 @@ pub(super) struct AddServerRequest {
 
 /// `POST /api/mcp/servers` - add a server.
 pub(super) async fn add_server(Json(req): Json<AddServerRequest>) -> impl IntoResponse {
-    let paths = admin_paths();
-    let server = MCPServerConfig {
-        name: req.name,
-        command: req.command,
-        url: req.url,
-        args: req.args,
-        headers: req.headers,
-        ..Default::default()
-    };
-    if let Err(e) = server.validate() {
-        return err(StatusCode::BAD_REQUEST, e.to_string()).into_response();
-    }
-
-    let mut config = match Config::load_from_path_public(&paths.config) {
-        Ok(config) => config,
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    };
-    if config.mcp_servers.iter().any(|s| s.name == server.name) {
-        return err(
-            StatusCode::CONFLICT,
-            format!("an MCP server named '{}' already exists", server.name),
+    match install_server(req.name, req.command, req.url, req.args, req.headers) {
+        Ok(name) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({ "name": name })),
         )
-        .into_response();
+            .into_response(),
+        Err(e) => super::core::error::as_api_error(&e).into_response(),
     }
-    config.mcp_servers.push(server.clone());
-    if let Err(e) = config.save_to_path_public(&paths.config) {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-    }
-    (
-        StatusCode::CREATED,
-        Json(serde_json::json!({ "name": server.name })),
-    )
-        .into_response()
 }
 
-/// `DELETE /api/mcp/servers/{name}` - remove a server and its credentials.
-pub(super) async fn remove_server(AxumPath(name): AxumPath<String>) -> impl IntoResponse {
+/// Write an MCP server into the config.
+///
+/// Remote code execution by construction: the command written here is what
+/// Leviath spawns, for this run and every future one. Both surfaces gate the
+/// act behind `--allow-admin`; this is what the act itself is.
+pub(super) fn install_server(
+    name: String,
+    command: Option<String>,
+    url: Option<String>,
+    args: Vec<String>,
+    headers: std::collections::HashMap<String, String>,
+) -> Result<String, super::core::error::ServeError> {
+    use super::core::error::ServeError;
+
     let paths = admin_paths();
-    let mut config = match Config::load_from_path_public(&paths.config) {
-        Ok(config) => config,
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    let server = MCPServerConfig {
+        name,
+        command,
+        url,
+        args,
+        headers,
+        ..Default::default()
     };
+    server
+        .validate()
+        .map_err(|e| ServeError::BadRequest(e.to_string()))?;
+
+    let mut config = Config::load_from_path_public(&paths.config)
+        .map_err(|e| ServeError::Internal(e.to_string()))?;
+    if config.mcp_servers.iter().any(|s| s.name == server.name) {
+        return Err(ServeError::Conflict(format!(
+            "an MCP server named '{}' already exists",
+            server.name
+        )));
+    }
+    let name = server.name.clone();
+    config.mcp_servers.push(server);
+    config
+        .save_to_path_public(&paths.config)
+        .map_err(|e| ServeError::Internal(e.to_string()))?;
+    Ok(name)
+}
+
+pub(super) async fn remove_server(AxumPath(name): AxumPath<String>) -> impl IntoResponse {
+    match uninstall_server(&name) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => super::core::error::as_api_error(&e).into_response(),
+    }
+}
+
+/// Take an MCP server out of the config, and its stored credential with it.
+pub(super) fn uninstall_server(name: &str) -> Result<(), super::core::error::ServeError> {
+    use super::core::error::ServeError;
+
+    let paths = admin_paths();
+    let mut config = Config::load_from_path_public(&paths.config)
+        .map_err(|e| ServeError::Internal(e.to_string()))?;
     let before = config.mcp_servers.len();
-    config.mcp_servers.retain(|s| s.name != name);
+    config.mcp_servers.retain(|server| server.name != name);
     if config.mcp_servers.len() == before {
-        return err(
-            StatusCode::NOT_FOUND,
-            format!("no MCP server named '{name}'"),
-        )
-        .into_response();
+        return Err(ServeError::NotFound(format!(
+            "no MCP server named '{name}'"
+        )));
     }
-    if let Err(e) = config.save_to_path_public(&paths.config) {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-    }
+    config
+        .save_to_path_public(&paths.config)
+        .map_err(|e| ServeError::Internal(e.to_string()))?;
+    // The credential goes with the server it was for. Left behind, it would be
+    // silently reused by a later server that happened to take the same name.
     if let Ok(mut store) = AuthStore::load(&paths.store)
-        && store.remove(&name)
+        && store.remove(name)
     {
         let _ = store.save(&paths.store);
     }
-    StatusCode::NO_CONTENT.into_response()
+    Ok(())
 }
 
 /// `POST /api/mcp/servers/{name}/login` - run the OAuth browser flow.
@@ -249,33 +291,65 @@ pub(super) async fn login(
     State(state): State<AppState>,
     AxumPath(name): AxumPath<String>,
 ) -> impl IntoResponse {
+    match signed_in(&state, &name).await {
+        Ok(status) => {
+            Json(serde_json::json!({ "status": status.wire(), "server": name })).into_response()
+        }
+        Err(e) => super::core::error::as_api_error(&e).into_response(),
+    }
+}
+
+/// What a sign-in to an MCP server ended as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LoginStatus {
+    /// A grant was obtained and stored.
+    Authenticated,
+    /// The server wants no OAuth, so there was nothing to store. Not a failure:
+    /// the caller asked whether a login was needed, and the answer is no.
+    NotRequired,
+}
+
+impl LoginStatus {
+    /// The word this status goes out as.
+    pub(super) fn wire(self) -> &'static str {
+        match self {
+            Self::Authenticated => "authenticated",
+            Self::NotRequired => "not_required",
+        }
+    }
+}
+
+/// Sign in to one MCP server, for whichever surface asked.
+///
+/// Opens a browser on the host, which is why it is an act rather than a read: a
+/// server reached over SSH cannot do this, and the refusal says so.
+pub(super) async fn signed_in(
+    state: &AppState,
+    name: &str,
+) -> Result<LoginStatus, super::core::error::ServeError> {
+    use super::core::error::ServeError;
+
     let admin = &state.mcp;
     let paths = admin_paths();
-    let config = match Config::load_from_path_public(&paths.config) {
-        Ok(config) => config,
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    };
-    let Some(server) = config.mcp_servers.iter().find(|s| s.name == name) else {
-        return err(
-            StatusCode::NOT_FOUND,
-            format!("no MCP server named '{name}'"),
-        )
-        .into_response();
-    };
+    let config = Config::load_from_path_public(&paths.config)
+        .map_err(|e| ServeError::Internal(e.to_string()))?;
+    let server = config
+        .mcp_servers
+        .iter()
+        .find(|s| s.name == name)
+        .ok_or_else(|| ServeError::NotFound(format!("no MCP server named '{name}'")))?;
     let url = match server.resolve() {
         Ok(leviath_mcp::ResolvedTransport::Http { url, .. }) => url.to_string(),
         _ => {
-            return err(
-                StatusCode::BAD_REQUEST,
-                format!("server '{name}' does not use HTTP transport and cannot log in"),
-            )
-            .into_response();
+            return Err(ServeError::BadRequest(format!(
+                "server '{name}' does not use HTTP transport and cannot log in"
+            )));
         }
     };
 
     let mut store = AuthStore::load(&paths.store).unwrap_or_default();
-    let reuse = store.get(&name).map(|a| a.client_id.clone());
-    let outcome = match OAuthClient::new()
+    let reuse = store.get(name).map(|a| a.client_id.clone());
+    let outcome = OAuthClient::new()
         .login(
             &url,
             &server.headers,
@@ -285,22 +359,15 @@ pub(super) async fn login(
             reuse.as_deref(),
         )
         .await
-    {
-        Ok(outcome) => outcome,
-        Err(e) => return err(StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
-    };
-    // A server that answered the probe wants no OAuth, so there is nothing to
-    // store. Reporting it as an error would be wrong: the caller asked whether a
-    // login was needed, and the answer is no.
+        .map_err(|e| ServeError::Upstream(e.to_string()))?;
     let LoginOutcome::Authenticated(auth) = outcome else {
-        return Json(serde_json::json!({ "status": "not_required", "server": name }))
-            .into_response();
+        return Ok(LoginStatus::NotRequired);
     };
-    store.set(&name, *auth);
-    if let Err(e) = store.save(&paths.store) {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-    }
-    Json(serde_json::json!({ "status": "authenticated", "server": name })).into_response()
+    store.set(name, *auth);
+    store
+        .save(&paths.store)
+        .map_err(|e| ServeError::Internal(e.to_string()))?;
+    Ok(LoginStatus::Authenticated)
 }
 
 /// `GET /api/mcp/servers/{name}/status` - one server's transport and auth state.
@@ -330,31 +397,56 @@ pub(super) async fn test_server(
     State(state): State<AppState>,
     AxumPath(name): AxumPath<String>,
 ) -> impl IntoResponse {
+    match tools_of(&state, &name).await {
+        Ok(tools) => Json(serde_json::json!({ "server": name, "tools": tools })).into_response(),
+        Err(e) => super::core::error::as_api_error(&e).into_response(),
+    }
+}
+
+/// What one MCP server advertises, for whichever surface asked.
+///
+/// Connects and lists, which is the only honest answer to "does this server
+/// work": a config that parses proves nothing about a program that will not
+/// start.
+pub(super) async fn tools_of(
+    state: &AppState,
+    name: &str,
+) -> Result<Vec<String>, super::core::error::ServeError> {
+    use super::core::error::ServeError;
+
     let admin = &state.mcp;
     let paths = admin_paths();
-    let config = match Config::load_from_path_public(&paths.config) {
-        Ok(config) => config,
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    };
-    let Some(server) = config.mcp_servers.iter().find(|s| s.name == name) else {
-        return err(
-            StatusCode::NOT_FOUND,
-            format!("no MCP server named '{name}'"),
-        )
-        .into_response();
-    };
-    let auth_header = match OAuthClient::new()
-        .authorization_header(&name, &paths.store, (admin.clock)())
+    let config = Config::load_from_path_public(&paths.config)
+        .map_err(|e| ServeError::Internal(e.to_string()))?;
+    let server = config
+        .mcp_servers
+        .iter()
+        .find(|s| s.name == name)
+        .ok_or_else(|| ServeError::NotFound(format!("no MCP server named '{name}'")))?;
+    let auth_header = OAuthClient::new()
+        .authorization_header(name, &paths.store, (admin.clock)())
         .await
-    {
-        Ok(header) => header,
-        Err(e) => return err(StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
-    };
-    let result = connect_and_list(server, auth_header, &config.security.allow_env_vars).await;
-    match result {
-        Ok(tools) => Json(serde_json::json!({ "server": name, "tools": tools })).into_response(),
-        Err(e) => err(StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
-    }
+        .map_err(|e| ServeError::Upstream(e.to_string()))?;
+    connect_and_list(server, auth_header, &config.security.allow_env_vars)
+        .await
+        .map_err(|e| ServeError::Upstream(e.to_string()))
+}
+
+/// The tools `server` advertises, for a caller with no request to answer:
+/// the dashboard's agent editor asks this for every configured server, off
+/// its loop, so its tools chooser can offer them by name.
+pub(crate) async fn list_mcp_tools(
+    config: Config,
+    server: MCPServerConfig,
+) -> Result<Vec<String>, String> {
+    let paths = admin_paths();
+    let auth_header = OAuthClient::new()
+        .authorization_header(&server.name, &paths.store, system_now())
+        .await
+        .map_err(|e| e.to_string())?;
+    connect_and_list(&server, auth_header, &config.security.allow_env_vars)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Connect to `server` and return its tool names.
@@ -407,6 +499,8 @@ mod tests {
     fn state_at(opener: impl Fn(&str) -> bool + Send + Sync + 'static) -> AppState {
         let (tx, _) = broadcast::channel::<ServerEvent>(16);
         AppState {
+            caches: Default::default(),
+            signer: Default::default(),
             update_check: Default::default(),
             update_jobs: Default::default(),
             config: crate::commands::serve::testutil::fixed_config(Config::default()),
@@ -767,6 +861,49 @@ for line in sys.stdin:
         assert_eq!(body["tools"][0], "ping");
     }
 
+    /// The editor's listing reaches a stdio server and names its tools, and
+    /// says why when it cannot.
+    #[tokio::test]
+    async fn list_mcp_tools_answers_for_the_dashboard() {
+        let stub = r#"
+import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    req = json.loads(line); m = req.get("method",""); i = req.get("id")
+    if m == "initialize":
+        print(json.dumps({"jsonrpc":"2.0","id":i,"result":{"capabilities":{},"protocolVersion":"2024-11-05"}}), flush=True)
+    elif m == "tools/list":
+        print(json.dumps({"jsonrpc":"2.0","id":i,"result":{"tools":[{"name":"ping","inputSchema":{}}]}}), flush=True)
+"#;
+        let server = MCPServerConfig {
+            name: "local".to_string(),
+            command: Some("python3".to_string()),
+            args: vec!["-c".to_string(), stub.to_string()],
+            ..Default::default()
+        };
+        let tools = list_mcp_tools(Config::default(), server).await.unwrap();
+        assert_eq!(tools, vec!["ping"]);
+        let dead = MCPServerConfig {
+            name: "dead".to_string(),
+            command: Some("/nonexistent/mcp-server-binary".to_string()),
+            ..Default::default()
+        };
+        let err = list_mcp_tools(Config::default(), dead).await.unwrap_err();
+        assert!(!err.is_empty());
+        // A token store that will not load is the answer too, before any
+        // server is spoken to.
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths_in(dir.path());
+        std::fs::write(&paths.store, "not json").unwrap();
+        let broken = MCPServerConfig::http("remote", "https://example.invalid/mcp");
+        let err = TEST_PATHS
+            .scope(paths, list_mcp_tools(Config::default(), broken))
+            .await
+            .unwrap_err();
+        assert!(!err.is_empty());
+    }
+
     #[tokio::test]
     async fn test_endpoint_reports_a_bad_gateway_on_connect_failure() {
         let dir = tempfile::tempdir().unwrap();
@@ -819,6 +956,8 @@ for line in sys.stdin:
         std::fs::create_dir(&store).unwrap();
         let (tx, _) = broadcast::channel::<ServerEvent>(16);
         AppState {
+            caches: Default::default(),
+            signer: Default::default(),
             update_check: Default::default(),
             update_jobs: Default::default(),
             config: crate::commands::serve::testutil::fixed_config(Config::default()),
@@ -894,6 +1033,8 @@ for line in sys.stdin:
         std::fs::write(&file, b"x").unwrap();
         let (tx, _) = broadcast::channel::<ServerEvent>(16);
         let state = AppState {
+            caches: Default::default(),
+            signer: Default::default(),
             update_check: Default::default(),
             update_jobs: Default::default(),
             config: crate::commands::serve::testutil::fixed_config(Config::default()),

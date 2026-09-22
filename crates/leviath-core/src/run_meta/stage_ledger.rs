@@ -115,6 +115,16 @@ pub const MAX_STAGE_VISITS: usize = 128;
 /// new visit, while iterations within one stay do not.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StageVisitRecord {
+    /// This visit's own id, minted when the stage was entered.
+    ///
+    /// The correlation key for everything that happened during the stay: an
+    /// execution names the visit it ran in, and a visit named by its position in
+    /// this list would move under that reference as soon as the list was capped.
+    ///
+    /// Empty on a record written before visits had identity, where position was
+    /// all there was.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
     /// Unix seconds when the run entered the stage on this visit.
     pub entered_at: i64,
     /// Unix seconds when it left. `None` on the visit in progress, which is the
@@ -150,9 +160,11 @@ pub struct StageVisitRecord {
 }
 
 impl StageVisitRecord {
-    /// A visit that has just started and billed nothing.
-    pub fn opened_at(at: i64) -> Self {
+    /// A visit that has just started and billed nothing, under the id the run
+    /// entered the stage with.
+    pub fn opened_at(at: i64, id: String) -> Self {
         Self {
+            id,
             entered_at: at,
             left_at: None,
             prompt_tokens: 0,
@@ -195,6 +207,37 @@ impl StageVisitRecord {
         }
         crate::duration::between(self.entered_at, self.left_at.unwrap_or(now))
     }
+}
+
+/// One provider and model a stage ran an inference on.
+///
+/// The pair, and not either half alone: the same model is reached by more than
+/// one route (`gpt-5.5` on OpenAI is `openai/gpt-5.5` on OpenRouter), and the
+/// same provider serves more than one model, so neither string identifies what
+/// ran on its own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StageModelUse {
+    /// The registered provider that served the call.
+    pub provider: String,
+    /// The model the call named, spelled as that provider spells it.
+    pub model: String,
+}
+
+/// The distinct pairs every stage in `stages` ran on, in the order the run
+/// first reached each.
+///
+/// The run-level roll-up of [`StageRecord::models`], for
+/// [`RunMeta::stage_models`]. It answers which models a run touched and never
+/// which stage touched which: two stages on one model contribute one entry,
+/// and the entry names no stage.
+pub fn stage_models_of(stages: &[StageRecord]) -> Vec<StageModelUse> {
+    let mut out: Vec<StageModelUse> = Vec::new();
+    for used in stages.iter().flat_map(|stage| stage.models.iter()) {
+        if !out.contains(used) {
+            out.push(used.clone());
+        }
+    }
+    out
 }
 
 /// Metadata record for a single stage within a run.
@@ -259,6 +302,26 @@ pub struct StageRecord {
     /// does not restart this stage's accounting from zero.
     #[serde(default)]
     pub cost_priced_usd: f64,
+    /// Every provider and model this stage has run an inference on, in the
+    /// order it first reached each.
+    ///
+    /// A list rather than one pair because a stage that fails over runs on
+    /// more than one, and a single value would have to pick between the entry
+    /// it started on and the entry it ended on while showing a reader neither
+    /// the choice nor the move. The first entry is where the stage started,
+    /// the last is where it ended up, and a stage with one entry never moved.
+    ///
+    /// Each pair appears once however many calls it served, so this says what
+    /// ran and not how often; the journal's `InferenceUsage` records are the
+    /// call-by-call account. Every call billed to the stage counts, including
+    /// the compaction and routing calls made on its behalf.
+    ///
+    /// Empty when the stage has run no inference: a stage the run never
+    /// entered, a stage whose first call has not come back, a stage whose only
+    /// provider could not be reached - choosing a model is not running on one -
+    /// and every stage of a run recorded before Leviath kept this.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<StageModelUse>,
     /// Each contiguous stay in this stage, oldest first.
     ///
     /// The record above accumulates across revisits, which is the right total
@@ -358,6 +421,7 @@ impl StageRecord {
             unpriced_calls: 0,
             cost_is_exact: true,
             cost_priced_usd: 0.0,
+            models: Vec::new(),
             visits: Vec::new(),
             visit_count: 0,
             region_tokens: std::collections::BTreeMap::new(),
@@ -398,12 +462,42 @@ impl StageRecord {
         }
     }
 
+    /// Note that this stage ran an inference on `provider`'s `model`.
+    ///
+    /// Called where a call is billed rather than where a stage's model is
+    /// chosen, because those are different facts: a stage resolves its model
+    /// at entry and may never reach it, and it may move to a second entry
+    /// mid-stay. What lands here is what a provider actually answered.
+    ///
+    /// Kept once per pair, appended in the order the stage first reached each.
+    /// A repeat would turn [`models`](Self::models) into a call log that grows
+    /// with the run, in a file rewritten whole on every persist tick.
+    pub fn record_model(&mut self, provider: &str, model: &str) {
+        if self
+            .models
+            .iter()
+            .any(|used| used.provider == provider && used.model == model)
+        {
+            return;
+        }
+        self.models.push(StageModelUse {
+            provider: provider.to_string(),
+            model: model.to_string(),
+        });
+    }
+
     /// The visit in progress, starting one at `at` if the last has been closed
     /// or there is none.
     ///
     /// `None` once [`MAX_STAGE_VISITS`] have been recorded: the stage's own
     /// totals keep counting, and the per-visit split stops rather than growing
     /// a file that is rewritten whole on every tick.
+    ///
+    /// A visit opened here gets an id of its own, because the caller has none to
+    /// give: this is the path a call takes when it arrives with no visit open,
+    /// which is not how a stage is entered. Nothing correlates to such a visit,
+    /// and giving it the id the run is carrying would attach a stay's worth of
+    /// work to a stay the ledger never saw begin.
     pub fn open_visit(&mut self, at: i64) -> Option<&mut StageVisitRecord> {
         if matches!(self.visits.last(), Some(v) if v.left_at.is_none()) {
             return self.visits.last_mut();
@@ -414,27 +508,34 @@ impl StageRecord {
         if self.visits.len() >= MAX_STAGE_VISITS {
             return None;
         }
-        self.start_visit(at);
+        self.start_visit(at, crate::execution::mint_visit_id());
         self.visits.last_mut()
     }
 
-    /// Start a new visit at `at`, closing whatever was open first.
+    /// Start a new visit at `at`, under `id`, closing whatever was open first.
     ///
     /// Called when the run enters the stage, which is the only place the
     /// boundary is exact. A self-transition is an entry like any other and
     /// starts a new visit, matching the visit number the `stage_transition`
     /// event carries.
-    pub fn begin_visit(&mut self, at: i64) {
+    ///
+    /// The id is minted by the caller because the run carries it too: everything
+    /// that happens during the stay records the visit it happened in, and the two
+    /// have to be the same string. Past [`MAX_STAGE_VISITS`] no record is kept,
+    /// so that id names a stay this file cannot describe - which is what
+    /// [`visit_count`](Self::visit_count) being larger than
+    /// [`visits`](Self::visits) says.
+    pub fn begin_visit(&mut self, at: i64, id: String) {
         self.close_visit(at);
-        self.start_visit(at);
+        self.start_visit(at, id);
     }
 
     /// Count one entry into the stage, recording it in detail while there is
     /// room. The count runs past the cap; the list does not.
-    fn start_visit(&mut self, at: i64) {
+    fn start_visit(&mut self, at: i64, id: String) {
         self.visit_count += 1;
         if self.visits.len() < MAX_STAGE_VISITS {
-            self.visits.push(StageVisitRecord::opened_at(at));
+            self.visits.push(StageVisitRecord::opened_at(at, id));
         }
     }
 
@@ -564,11 +665,11 @@ mod tests {
     #[test]
     fn a_revisited_stage_splits_its_cost_by_visit() {
         let mut rec = StageRecord::new("gather".to_string(), 0);
-        rec.begin_visit(100);
+        rec.begin_visit(100, crate::execution::mint_visit_id());
         rec.record_call(&computed(0.25), 101);
         rec.close_visit(110);
 
-        rec.begin_visit(200);
+        rec.begin_visit(200, crate::execution::mint_visit_id());
         rec.record_call(&computed(0.75), 201);
 
         assert_eq!(rec.cost_usd, Some(1.0), "the stage is still the sum");
@@ -586,7 +687,7 @@ mod tests {
     #[test]
     fn closing_a_visit_is_idempotent_and_a_call_reopens_nothing() {
         let mut rec = StageRecord::new("gather".to_string(), 0);
-        rec.begin_visit(100);
+        rec.begin_visit(100, crate::execution::mint_visit_id());
         rec.close_visit(110);
         rec.close_visit(400);
         assert_eq!(rec.visits.len(), 1);
@@ -610,7 +711,7 @@ mod tests {
         let mut rec = StageRecord::new("loop".to_string(), 0);
         for i in 0..(MAX_STAGE_VISITS + 20) {
             let at = 100 + i as i64;
-            rec.begin_visit(at);
+            rec.begin_visit(at, crate::execution::mint_visit_id());
             rec.record_call(&computed(0.01), at);
             rec.close_visit(at + 1);
         }
@@ -633,7 +734,7 @@ mod tests {
     #[test]
     fn a_visits_clock_measures_work_rather_than_the_stay() {
         let mut rec = StageRecord::new("gather".to_string(), 0);
-        rec.begin_visit(100);
+        rec.begin_visit(100, crate::execution::mint_visit_id());
         rec.observe_visit(100, true);
         rec.observe_visit(130, false); // parked
         rec.observe_visit(500, true); // back to work
@@ -642,7 +743,7 @@ mod tests {
 
         // A record written before the clock existed falls back to the stay,
         // which is the only thing it recorded.
-        let mut old = StageVisitRecord::opened_at(100);
+        let mut old = StageVisitRecord::opened_at(100, crate::execution::mint_visit_id());
         old.left_at = Some(160);
         old.active = None;
         assert_eq!(old.active_runtime_secs(9_999), 60);
@@ -660,7 +761,7 @@ mod tests {
         assert!(never_entered.visits.is_empty());
 
         let mut left = StageRecord::new("gather".to_string(), 0);
-        left.begin_visit(100);
+        left.begin_visit(100, crate::execution::mint_visit_id());
         left.observe_visit(100, true);
         left.close_visit(140);
         left.observe_visit(9_000, true);
@@ -674,7 +775,7 @@ mod tests {
     #[test]
     fn a_stage_record_with_visits_survives_the_file_it_lives_in() {
         let mut rec = StageRecord::new("gather".to_string(), 1);
-        rec.begin_visit(100);
+        rec.begin_visit(100, crate::execution::mint_visit_id());
         rec.record_call(&computed(0.25), 101);
         let json = serde_json::to_string(&rec).unwrap();
         let back: StageRecord = serde_json::from_str(&json).unwrap();
@@ -690,5 +791,89 @@ mod tests {
         assert_eq!(back.cost_usd, None, "no field is not a zero");
         assert!(back.visits.is_empty());
         assert_eq!(back.visit_count, 0);
+    }
+
+    /// A record written before Leviath kept the models still loads, and says
+    /// nothing about what its stage ran on rather than guessing.
+    #[test]
+    fn a_record_from_an_older_build_reports_no_models() {
+        let old = r#"{"name":"plan","index":0,"status":"complete",
+            "prompt_tokens":900,"completion_tokens":120,
+            "started_at":10,"ended_at":40}"#;
+        let back: StageRecord = serde_json::from_str(old).unwrap();
+        assert_eq!(back.prompt_tokens, 900, "the rest of it still reads");
+        assert!(
+            back.models.is_empty(),
+            "a run that predates this has nothing to report"
+        );
+        // And a record with nothing to say writes no key, so an older reader
+        // sees the file it already knows.
+        let fresh = StageRecord::new("plan".to_string(), 0);
+        let json = serde_json::to_string(&fresh).unwrap();
+        assert!(!json.contains("models"), "{json}");
+    }
+
+    /// A stage that failed over says so: both entries, in the order it reached
+    /// them, and neither one repeated per call.
+    #[test]
+    fn a_stage_that_moved_providers_lists_both_in_order() {
+        let mut rec = StageRecord::new("plan".to_string(), 0);
+        rec.record_model("anthropic", "claude-opus-5");
+        rec.record_model("anthropic", "claude-opus-5");
+        rec.record_model("openrouter", "anthropic/claude-opus-5");
+        rec.record_model("anthropic", "claude-opus-5");
+        assert_eq!(
+            rec.models,
+            vec![
+                StageModelUse {
+                    provider: "anthropic".to_string(),
+                    model: "claude-opus-5".to_string(),
+                },
+                StageModelUse {
+                    provider: "openrouter".to_string(),
+                    model: "anthropic/claude-opus-5".to_string(),
+                },
+            ],
+        );
+
+        // One provider serving two models is two entries, so neither half of
+        // the pair is taken as the whole identity.
+        let mut two = StageRecord::new("plan".to_string(), 0);
+        two.record_model("openai", "gpt-5.5");
+        two.record_model("openai", "gpt-5.4");
+        assert_eq!(two.models.len(), 2);
+
+        let json = serde_json::to_string(&rec).unwrap();
+        let back: StageRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.models, rec.models);
+    }
+
+    /// The run-level roll-up is a set over the stages, in first-use order, and
+    /// it names no stage.
+    #[test]
+    fn the_run_level_rollup_is_every_pair_once() {
+        let mut plan = StageRecord::new("plan".to_string(), 0);
+        plan.record_model("anthropic", "claude-opus-5");
+        let mut code = StageRecord::new("code".to_string(), 1);
+        code.record_model("anthropic", "claude-opus-5");
+        code.record_model("openai", "gpt-5.5");
+        let never = StageRecord::new("review".to_string(), 2);
+
+        let rolled = stage_models_of(&[plan, code, never]);
+        assert_eq!(
+            rolled,
+            vec![
+                StageModelUse {
+                    provider: "anthropic".to_string(),
+                    model: "claude-opus-5".to_string(),
+                },
+                StageModelUse {
+                    provider: "openai".to_string(),
+                    model: "gpt-5.5".to_string(),
+                },
+            ],
+            "the pair two stages shared appears once"
+        );
+        assert!(stage_models_of(&[]).is_empty());
     }
 }

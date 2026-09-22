@@ -39,29 +39,59 @@ pub(crate) fn provider_creds_from_config(config: &Config) -> Vec<ProviderCreds> 
     // The third column is the host this provider is reached on, when it is not
     // the vendor's own. Per provider, because a gateway usually fronts one
     // family and pointing the others at it would break them.
+    // The fourth is the extra headers that host wants on every request: a
+    // gateway's own token, a tenant tag. Per provider for the same reason.
     let keyed = [
         (
             "anthropic",
             config.providers.anthropic_api_key.as_deref(),
             config.providers.anthropic_base_url.as_deref(),
+            &config.providers.anthropic_headers,
         ),
         (
             "openai",
             config.providers.openai_api_key.as_deref(),
             config.providers.openai_base_url.as_deref(),
+            &config.providers.openai_headers,
         ),
         (
             "google",
             config.providers.google_api_key.as_deref(),
             config.providers.google_base_url.as_deref(),
+            &config.providers.google_headers,
         ),
         (
             "openrouter",
             config.openrouter_api_key.as_deref(),
             config.providers.openrouter_base_url.as_deref(),
+            &config.providers.openrouter_headers,
+        ),
+        (
+            "meshy",
+            config.providers.meshy_api_key.as_deref(),
+            config.providers.meshy_base_url.as_deref(),
+            &config.providers.meshy_headers,
+        ),
+        (
+            leviath_providers::bedrock::PROVIDER_NAME,
+            config.providers.bedrock_api_key.as_deref(),
+            config.providers.bedrock_base_url.as_deref(),
+            &config.providers.bedrock_headers,
+        ),
+        (
+            leviath_providers::xai::PROVIDER_NAME,
+            config.providers.xai_api_key.as_deref(),
+            config.providers.xai_base_url.as_deref(),
+            &config.providers.xai_headers,
+        ),
+        (
+            leviath_providers::meta::PROVIDER_NAME,
+            config.providers.meta_api_key.as_deref(),
+            config.providers.meta_base_url.as_deref(),
+            &config.providers.meta_headers,
         ),
     ];
-    for (name, key, base_url) in keyed {
+    for (name, key, base_url, headers) in keyed {
         // A blank key is not a key: `lev setup` writes empty strings for
         // providers the user skipped, and registering one produces a provider
         // that authenticates as nobody and fails at the first call.
@@ -75,30 +105,51 @@ pub(crate) fn provider_creds_from_config(config: &Config) -> Vec<ProviderCreds> 
             {
                 options.insert("cache_ttl".to_string(), cache_ttl_key(ttl).to_string());
             }
-            creds.push(ProviderCreds {
-                name: name.to_string(),
-                api_key: Some(key.to_string()),
-                // Blank is not a URL, for the same reason blank is not a key:
-                // `lev setup` writes empty strings for what the user skipped.
-                base_url: base_url
+            // Only when set: the provider applies its own default otherwise,
+            // and not writing it keeps a config that says nothing comparing
+            // equal to itself on reload.
+            if name == leviath_providers::bedrock::PROVIDER_NAME
+                && let Some(region) = config
+                    .providers
+                    .bedrock_region
+                    .as_deref()
                     .map(str::trim)
-                    .filter(|u| !u.is_empty())
-                    .map(str::to_string),
-                model_capabilities: caps.clone(),
-                request_timeout_secs: timeout,
-                rate_limit: config.rate_limits.get(name).cloned(),
-                options,
-            });
+                    .filter(|r| !r.is_empty())
+            {
+                options.insert("region".to_string(), region.to_string());
+            }
+            creds.push(
+                ProviderCreds {
+                    name: name.to_string(),
+                    api_key: Some(key.to_string()),
+                    // Blank is not a URL, for the same reason blank is not a key:
+                    // `lev setup` writes empty strings for what the user skipped.
+                    base_url: base_url
+                        .map(str::trim)
+                        .filter(|u| !u.is_empty())
+                        .map(str::to_string),
+                    model_capabilities: caps.clone(),
+                    request_timeout_secs: timeout,
+                    rate_limit: config.rate_limits.get(name).cloned(),
+                    options,
+                }
+                .with_headers(
+                    headers
+                        .iter()
+                        .map(|(header, value)| (header.clone(), value.clone()))
+                        .collect(),
+                ),
+            );
         }
     }
 
-    // Ollama needs no key and answers on a well-known local port, so this
-    // used to register it on every machine whether or not anybody had asked.
-    // That made a bare model name in a blueprint resolvable against whatever
-    // happened to be running locally - a surprising place for a run to end
-    // up, and not one the user chose. Opt-in now, by the switch `lev setup`
-    // writes or by naming an address, which is what an install that
-    // configured it before the switch existed already has.
+    // Ollama is opt-in like every other provider, by the switch `lev setup`
+    // writes or by naming an address (an install that configured it before
+    // the switch existed has the address). Needing no key and answering on a
+    // well-known local port is not a reason to register it unasked: that
+    // makes a bare model name in a blueprint resolvable against whatever
+    // happens to be running locally, a place a run should end up only when
+    // the user chose it.
     if config.providers.ollama_enabled || config.ollama_base_url.is_some() {
         creds.push(ProviderCreds {
             name: "ollama".to_string(),
@@ -141,18 +192,41 @@ pub(crate) fn provider_creds_from_config(config: &Config) -> Vec<ProviderCreds> 
         else {
             continue;
         };
-        let mut cred = ProviderCreds::openai_compatible(
-            name.clone(),
-            base_url,
-            mp.api_key
-                .as_deref()
-                .map(str::trim)
-                .filter(|k| !k.is_empty())
-                .map(str::to_string),
-            mp.header_pairs(),
-            mp.models.clone(),
-            mp.serves.clone().unwrap_or_default(),
-        );
+        let api_key = mp
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+            .map(str::to_string);
+        let mut cred = match (mp.is_openai(), api_key) {
+            // OpenAI's own API at a host of its own. A deployment name does
+            // not look like an OpenAI model id, so `models` routes here the
+            // way `serves` does.
+            (true, Some(key)) => ProviderCreds::openai_host(
+                name.clone(),
+                base_url,
+                key,
+                mp.header_pairs(),
+                mp.serves
+                    .iter()
+                    .flatten()
+                    .chain(mp.models.iter().flatten())
+                    .cloned()
+                    .collect(),
+            ),
+            // Refused at load; one built by hand is skipped rather than
+            // registered with nothing to authenticate with.
+            (true, None) => continue,
+            (false, api_key) => ProviderCreds::openai_compatible(
+                name.clone(),
+                base_url,
+                api_key,
+                mp.header_pairs(),
+                mp.models.clone(),
+                mp.serves.clone().unwrap_or_default(),
+            ),
+        }
+        .with_auth_header(mp.auth_header());
         cred.model_capabilities = caps.clone();
         cred.request_timeout_secs = timeout;
         cred.rate_limit = mp.rate_limit.clone();
@@ -209,7 +283,81 @@ pub(crate) fn provider_creds_from_config(config: &Config) -> Vec<ProviderCreds> 
         });
     }
 
+    // Grok billed to a subscription: the xAI API over a browser sign-in, so it
+    // takes xAI's host and headers, and the grant location a run reads.
+    if config.providers.grok_enabled {
+        creds.push(
+            ProviderCreds {
+                name: leviath_providers::grok::PROVIDER_NAME.to_string(),
+                api_key: None,
+                base_url: config
+                    .providers
+                    .xai_base_url
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|u| !u.is_empty())
+                    .map(str::to_string),
+                model_capabilities: caps.clone(),
+                request_timeout_secs: config.request_timeout_secs,
+                rate_limit: config
+                    .rate_limits
+                    .get(leviath_providers::grok::PROVIDER_NAME)
+                    .cloned(),
+                options: grok_options(config),
+            }
+            .with_headers(
+                config
+                    .providers
+                    .xai_headers
+                    .iter()
+                    .map(|(header, value)| (header.clone(), value.clone()))
+                    .collect(),
+            ),
+        );
+    }
+
     creds
+}
+
+/// The `options` a browser sign-in provider's [`ProviderCreds`] carries, by
+/// provider id: Codex's own, Grok's, or none for anything else.
+///
+/// Shared with `lev setup` and `lev serve`, whose credential checks have to
+/// build the provider the same way a run does.
+pub(crate) fn signin_options(
+    config: &Config,
+    id: &str,
+) -> std::collections::HashMap<String, String> {
+    match id {
+        "codex" => codex_options(config),
+        "grok" => grok_options(config),
+        _ => std::collections::HashMap::new(),
+    }
+}
+
+/// What every sign-in provider's options carry: where the grant is, and
+/// whether it is in the OS credential store.
+fn grant_options(config: &Config) -> std::collections::HashMap<String, String> {
+    let mut options = std::collections::HashMap::new();
+    // Extended from an `Option` rather than branched on: with no home
+    // there is no path, the option is simply absent, and the registry
+    // skips the provider - which it is tested to do.
+    options.extend(
+        leviath_providers::oauth::ProviderAuthStore::default_path()
+            .map(|path| ("auth_store_path".to_string(), path.display().to_string())),
+    );
+    // The runtime has no view of `[security]`, and a grant only the CLI
+    // could read would leave the keychain backend silently signing the
+    // daemon out.
+    if config.security.credential_store == leviath_core::CredentialStoreKind::Keychain {
+        options.insert("credential_store".to_string(), "keychain".to_string());
+    }
+    options
+}
+
+/// The `options` a Grok [`ProviderCreds`] carries.
+fn grok_options(config: &Config) -> std::collections::HashMap<String, String> {
+    grant_options(config)
 }
 
 /// The `options` a Codex [`ProviderCreds`] carries.
@@ -218,14 +366,7 @@ pub(crate) fn provider_creds_from_config(config: &Config) -> Vec<ProviderCreds> 
 /// the same way this does. It reads the grant from disk, so a wizard that
 /// pointed somewhere else would be checking a sign-in no run would ever use.
 pub(crate) fn codex_options(config: &Config) -> std::collections::HashMap<String, String> {
-    let mut options = std::collections::HashMap::new();
-    // Extended from an `Option` rather than branched on: with no home
-    // there is no path, the option is simply absent, and the registry
-    // skips the provider - which it is tested to do.
-    options.extend(
-        leviath_providers::codex::ProviderAuthStore::default_path()
-            .map(|path| ("auth_store_path".to_string(), path.display().to_string())),
-    );
+    let mut options = grant_options(config);
     options.extend(
         config
             .providers
@@ -251,12 +392,6 @@ pub(crate) fn codex_options(config: &Config) -> std::collections::HashMap<String
         "replay_reasoning".to_string(),
         config.providers.codex_replay_reasoning.to_string(),
     );
-    // The runtime has no view of `[security]`, and a grant only the CLI
-    // could read would leave the keychain backend silently signing the
-    // daemon out.
-    if config.security.credential_store == leviath_core::CredentialStoreKind::Keychain {
-        options.insert("credential_store".to_string(), "keychain".to_string());
-    }
     options
 }
 
@@ -311,11 +446,66 @@ pub(crate) fn build_provider_registry_from_config_probing(
         build_client,
         reachable,
     )?;
-    Ok(attach_script_layer(
-        registry,
-        crate::config::providers_dir(),
-        config,
-    ))
+    Ok(
+        attach_script_layer(registry, crate::config::providers_dir(), config)
+            .with_retention(retention_settings(config)),
+    )
+}
+
+/// The data retention settings `config.toml` carries, in the registry's
+/// form: the request for zero retention, the declared agreements, and the
+/// `retention` keys on `[model_capabilities]` and `[model_providers]`
+/// entries. A `[model_providers]` entry spells it as any other key (they are
+/// forwarded to a script verbatim), so a word that is not a retention is
+/// warned about and ignored rather than failing the load.
+pub(crate) fn retention_settings(
+    config: &Config,
+) -> leviath_providers::retention::RetentionSettings {
+    let provider_declarations = config
+        .model_providers
+        .iter()
+        .filter_map(|(name, entry)| {
+            let word = entry.extra.get("retention")?.as_str()?;
+            match leviath_providers::retention::Retention::parse(word) {
+                Ok(retention) => Some((name.clone(), retention)),
+                Err(e) => {
+                    tracing::warn!(provider = %name, "ignoring [model_providers] retention: {e}");
+                    None
+                }
+            }
+        })
+        .collect();
+    // Which built-in's per-request fields an endpoint takes. Only names the
+    // table has fields for mean anything; another is a typo, said once.
+    let request_knob_aliases = config
+        .model_providers
+        .iter()
+        .filter_map(|(name, entry)| {
+            let target = entry.extra.get("zero_retention_request")?.as_str()?;
+            if leviath_providers::retention::request_knobs(target).is_none() {
+                tracing::warn!(
+                    provider = %name,
+                    "ignoring [model_providers] zero_retention_request = \"{target}\": no \
+                     built-in provider of that name takes a per-request field (openai, \
+                     openrouter)"
+                );
+                return None;
+            }
+            Some((name.clone(), target.to_string()))
+        })
+        .collect();
+    leviath_providers::retention::RetentionSettings {
+        zero_requested: config.providers.zero_retention,
+        agreements: config.providers.zero_retention_agreements.clone(),
+        model_overrides: config
+            .model_capabilities
+            .iter()
+            .filter_map(|(model, caps)| caps.retention.map(|r| (model.clone(), r)))
+            .collect(),
+        provider_declarations,
+        request_knob_aliases,
+        file_uploads: config.providers.file_uploads,
+    }
 }
 
 /// [`build_provider_registry_from_config_with`], with the script-provider
@@ -334,12 +524,10 @@ pub(crate) fn build_provider_registry_live(
         &provider_creds_from_config(config),
         build_client,
     )?;
-    Ok(attach_live_script_layer(
-        registry,
-        crate::config::providers_dir(),
-        config,
-        reloader,
-    ))
+    Ok(
+        attach_live_script_layer(registry, crate::config::providers_dir(), config, reloader)
+            .with_retention(retention_settings(config)),
+    )
 }
 
 /// [`attach_script_layer`], with the layer reading `reloader` on every load.
@@ -766,8 +954,44 @@ mod tests {
                 ..Default::default()
             },
         );
+        // OpenAI's own API at another host, with a key: registered as that,
+        // routing both its `serves` and its `models`. One with no key is
+        // skipped (a loaded config cannot hold one either).
+        config.model_providers.insert(
+            "azure".to_string(),
+            crate::config::ModelProviderConfig {
+                kind: Some(crate::config::ModelProviderKind::Openai),
+                base_url: Some("https://r.openai.azure.com/openai/v1".to_string()),
+                api_key: Some("az".to_string()),
+                serves: Some(vec!["prod".to_string()]),
+                models: Some(vec!["stage".to_string()]),
+                extra: [(
+                    "auth_header".to_string(),
+                    toml::Value::String("api-key".to_string()),
+                )]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            },
+        );
+        config.model_providers.insert(
+            "azure-keyless".to_string(),
+            crate::config::ModelProviderConfig {
+                kind: Some(crate::config::ModelProviderKind::Openai),
+                base_url: Some("https://r.openai.azure.com/openai/v1".to_string()),
+                ..Default::default()
+            },
+        );
 
         let creds = provider_creds_from_config(&config);
+        let azure = creds.iter().find(|c| c.name == "azure").expect("azure");
+        let host = leviath_runtime::provider_creds::OpenaiHostSpec::from_creds(azure)
+            .expect("decodes")
+            .expect("an openai host");
+        assert_eq!(host.serves, ["prod", "stage"]);
+        assert_eq!(host.auth_header.as_deref(), Some("api-key"));
+        assert!(!creds.iter().any(|c| c.name == "azure-keyless"));
+        let creds: Vec<_> = creds.into_iter().filter(|c| c.name != "azure").collect();
         let names: Vec<&str> = creds
             .iter()
             .filter(|c| c.options.contains_key("kind"))
@@ -956,6 +1180,142 @@ mod tests {
         assert!(!creds[0].options.contains_key("cache_ttl"));
     }
 
+    /// The region rides in the options map only when the config names one:
+    /// the provider applies its own default otherwise, and a config that says
+    /// nothing must compare equal to itself on reload.
+    #[test]
+    fn provider_creds_carry_the_bedrock_region_only_when_set() {
+        let mut config = Config::default();
+        config.providers.bedrock_api_key = Some("ABSK".to_string());
+        config.providers.bedrock_base_url = Some(" https://gw/bedrock ".to_string());
+        config.providers.bedrock_region = Some(" eu-west-1 ".to_string());
+        config.rate_limits.insert(
+            "bedrock".to_string(),
+            leviath_providers::RateLimitConfig {
+                requests_per_minute: 3,
+                tokens_per_minute: 30,
+            },
+        );
+        let creds = provider_creds_from_config(&config);
+        let bedrock = creds
+            .iter()
+            .find(|c| c.name == "bedrock")
+            .expect("bedrock is registered");
+        assert_eq!(bedrock.api_key.as_deref(), Some("ABSK"));
+        assert_eq!(bedrock.base_url.as_deref(), Some("https://gw/bedrock"));
+        assert_eq!(
+            bedrock.options.get("region").map(String::as_str),
+            Some("eu-west-1")
+        );
+        assert_eq!(
+            bedrock.rate_limit.as_ref().map(|r| r.requests_per_minute),
+            Some(3)
+        );
+
+        for region in [None, Some("   ".to_string())] {
+            config.providers.bedrock_region = region;
+            let creds = provider_creds_from_config(&config);
+            let bedrock = creds.iter().find(|c| c.name == "bedrock").unwrap();
+            assert!(!bedrock.options.contains_key("region"));
+        }
+
+        // A blank key registers nothing, as for every keyed provider. A
+        // second provider keeps the list non-empty, so the check below looks
+        // at something.
+        config.providers.openai_api_key = Some("k".to_string());
+        config.providers.bedrock_api_key = Some(String::new());
+        assert!(
+            !provider_creds_from_config(&config)
+                .iter()
+                .any(|c| c.name == "bedrock")
+        );
+    }
+
+    /// The switch, the agreements, and both kinds of `retention` key reach
+    /// the registry's settings; a `[model_providers]` word that is not a
+    /// retention is dropped with a warning rather than failing the load.
+    #[test]
+    fn retention_settings_carry_the_switch_the_agreements_and_the_keys() {
+        use leviath_providers::retention::Retention;
+        let mut config = Config::default();
+        assert_eq!(
+            retention_settings(&config),
+            leviath_providers::retention::RetentionSettings {
+                file_uploads: true,
+                ..Default::default()
+            },
+            "uploads are on unless the config turns them off"
+        );
+        config.providers.zero_retention = true;
+        config.providers.zero_retention_agreements = vec!["openai".to_string()];
+        config.model_capabilities.insert(
+            "gpt-5.5".to_string(),
+            leviath_providers::ModelCapabilityOverride {
+                retention: Some(Retention::Indefinite),
+                ..Default::default()
+            },
+        );
+        config.model_capabilities.insert(
+            "no-say".to_string(),
+            leviath_providers::ModelCapabilityOverride::default(),
+        );
+        config.model_providers.insert(
+            "cerebras".to_string(),
+            toml::from_str("api_key = \"k\"\nretention = \"zero\"").unwrap(),
+        );
+        config.model_providers.insert(
+            "vague".to_string(),
+            toml::from_str("api_key = \"k\"\nretention = \"sometimes\"").unwrap(),
+        );
+        config.model_providers.insert(
+            "silent".to_string(),
+            toml::from_str("api_key = \"k\"\nretention = 3").unwrap(),
+        );
+        // An endpoint names whose request fields it takes; a name the table
+        // has no fields for is dropped with a warning.
+        config.model_providers.insert(
+            "azure".to_string(),
+            toml::from_str(
+                "kind = \"openai-compatible\"\nbase_url = \"http://127.0.0.1:1/v1\"\n\
+                 zero_retention_request = \"openai\"",
+            )
+            .unwrap(),
+        );
+        config.model_providers.insert(
+            "odd".to_string(),
+            toml::from_str("api_key = \"k\"\nzero_retention_request = \"groq\"").unwrap(),
+        );
+        config.model_providers.insert(
+            "numeric".to_string(),
+            toml::from_str("api_key = \"k\"\nzero_retention_request = 3").unwrap(),
+        );
+        let settings = retention_settings(&config);
+        assert_eq!(
+            settings.request_knob_aliases.get("azure"),
+            Some(&"openai".to_string())
+        );
+        assert!(!settings.request_knob_aliases.contains_key("odd"));
+        assert!(!settings.request_knob_aliases.contains_key("numeric"));
+        assert_eq!(settings.knob_provider("azure"), "openai");
+        assert_eq!(settings.knob_provider("odd"), "odd");
+        assert!(settings.zero_requested);
+        assert_eq!(settings.agreements, vec!["openai".to_string()]);
+        assert_eq!(
+            settings.model_overrides.get("gpt-5.5"),
+            Some(&Retention::Indefinite)
+        );
+        assert!(!settings.model_overrides.contains_key("no-say"));
+        assert_eq!(
+            settings.provider_declarations.get("cerebras"),
+            Some(&Retention::Zero)
+        );
+        assert!(!settings.provider_declarations.contains_key("vague"));
+        assert!(!settings.provider_declarations.contains_key("silent"));
+        // And the built registry carries them.
+        let registry = build_provider_registry_from_config(&config).unwrap();
+        assert_eq!(registry.retention_settings(), &settings);
+    }
+
     #[test]
     fn provider_creds_from_config_includes_defaults_and_keyed() {
         let config = Config {
@@ -987,6 +1347,23 @@ mod tests {
     /// authenticates as nobody and fails at the first call, and it crowded out
     /// the provider the user actually configured.
     #[test]
+    fn grok_creds_carry_the_xai_gateway_and_the_sign_in_options_follow_the_id() {
+        let mut config = Config::default();
+        config.providers.grok_enabled = true;
+        config.providers.xai_base_url = Some(" https://gw.example/v1 ".to_string());
+        config
+            .providers
+            .xai_headers
+            .insert("X-Tenant".to_string(), "t".to_string());
+        let creds = provider_creds_from_config(&config);
+        let grok = creds.iter().find(|c| c.name == "grok").expect("grok");
+        assert_eq!(grok.base_url.as_deref(), Some("https://gw.example/v1"));
+        assert!(grok.options.keys().any(|k| k.contains("X-Tenant")));
+        let _ = signin_options(&config, "grok");
+        assert!(signin_options(&config, "anthropic").is_empty());
+    }
+
+    #[test]
     fn provider_creds_from_config_ignores_blank_keys() {
         let config = Config {
             providers: crate::config::ProviderConfig {
@@ -1008,6 +1385,35 @@ mod tests {
             !names.contains(&"openai"),
             "whitespace-only key must not register"
         );
+    }
+
+    /// A provider's extra headers ride its credentials in the config's
+    /// order, and a provider with none carries none.
+    #[test]
+    fn provider_creds_from_config_carries_extra_headers() {
+        let config = Config {
+            providers: crate::config::ProviderConfig {
+                anthropic_api_key: Some("sk-ant".to_string()),
+                anthropic_headers: std::collections::BTreeMap::from([
+                    ("X-Gateway-Token".to_string(), "t-1".to_string()),
+                    ("X-Org".to_string(), "research".to_string()),
+                ]),
+                openai_api_key: Some("sk-oa".to_string()),
+                ..Config::default().providers
+            },
+            ..Config::default()
+        };
+        let creds = provider_creds_from_config(&config);
+        let anthropic = creds.iter().find(|c| c.name == "anthropic").unwrap();
+        assert_eq!(
+            anthropic.headers().unwrap(),
+            vec![
+                ("X-Gateway-Token".to_string(), "t-1".to_string()),
+                ("X-Org".to_string(), "research".to_string()),
+            ]
+        );
+        let openai = creds.iter().find(|c| c.name == "openai").unwrap();
+        assert!(openai.headers().unwrap().is_empty());
     }
 
     #[test]
@@ -1049,10 +1455,10 @@ mod tests {
             &|_| true,
         )
         .expect("an HTTPS client builds in tests");
-        // Every provider is opt-in, Ollama included. It needs no key and
-        // answers on a well-known local port, which used to be reason enough
-        // to register it everywhere - and made a bare model name resolvable
-        // against whatever happened to be running on the machine.
+        // Every provider is opt-in, Ollama included: needing no key and
+        // answering on a well-known local port is not a reason to register it
+        // unasked, since that makes a bare model name resolvable against
+        // whatever happens to be running on the machine.
         assert!(!registry.has("ollama"));
         assert!(!registry.has("claude-code"));
     }

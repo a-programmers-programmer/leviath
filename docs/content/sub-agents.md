@@ -3,7 +3,7 @@ title: Sub-agents & fan-out
 description: Start child agents and fan work out across them, so many small jobs run at once.
 group: Concepts
 group_order: 2
-order: 9
+order: 10
 ---
 
 # Sub-agents and fan-out
@@ -15,12 +15,10 @@ full of items one through eight.
 A **sub-agent** is a child agent started by another one. Give each item its own sub-agent and they
 run at the same time, each with a clean context, and the parent gets the results back.
 
-Seven bundled agents work this way: `data-analyst` gathers one slice of a subject per worker,
-`reviewer` takes a file or hunk group each, `log-analyzer` a log file or time window,
-`orchestrator` hands each work item to a whole `coder` run, `deep-researcher` and
-`wide-researcher` hand each sub-question to a whole `researcher` run, and `oracle`
-executes bounded reader, coder, and verifier workers. See the
-[agent catalog](/docs/agent-catalog) for all seven.
+Five bundled agents work this way. `data-analyst` gathers one slice of a subject per worker,
+`reviewer` takes a file or hunk group each, and `log-analyzer` takes a log file or time window.
+`deep-researcher` and `wide-researcher` hand each sub-question to a whole `researcher` run. See the
+[agent catalog](/docs/agent-catalog) for all five.
 
 Sub-agents cost very little here. They are more entities in the same [world](/docs/engine), so there
 are no extra processes to start and nothing has to be serialized between a parent and its children.
@@ -40,7 +38,7 @@ are no extra processes to start and nothing has to be serialized between a paren
 
 Both are ordinary tools: a stage grants them in `available_tools` and the agent calls them when it
 decides it needs help. `fan_out` is also what a `mode = "fan_out"` stage runs, which is covered
-below - the stage is sugar over the same tool, not a separate mechanism.
+below. The stage is sugar over the same tool, not a separate mechanism.
 
 ## One sub-agent
 
@@ -59,11 +57,32 @@ With `wait: false` you get the child's id straight back and check on it yourself
 Waiting does not hold a slot on the tool lane, so a parent waiting on a child cannot starve the
 child of the capacity it needs to finish.
 
-`seed_context` injects starting material into the child's first pinned region, and
+`seed_context` injects starting material into the child's first pinned region, `parts` hands
+it files this run holds as stored [parts](/docs/mime), and
 `output_format` / `output_instructions` ask it for a particular shape of answer, overriding its
-blueprint's. Override with care: an `output_format` that differs from what the child's blueprint
+blueprint's.
+
+```jsonc
+spawn_agent({
+  "blueprint": "sprite-editor",
+  "task": "make the arm longer on @hero.png",
+  "parts": ["hero.png"]        // by name, or by six or more characters of the sha256
+})
+```
+
+A stage can say what a child may be handed: `[stages.<name>.tool_accepts] spawn_agent =
+["image/*"]` refuses a `parts` entry of any other type by name. See
+[What a tool may be handed](/docs/mime#what-a-tool-may-be-handed).
+
+Each named part is read from this run's store and lands in the child's task region as a typed
+part, delivered the way it was here. So a worker sees the image its parent was asked about, rather
+than a stand-in. A name that matches nothing, or bytes the store no longer holds, refuses the spawn
+by name. A child started without the file its parent meant to hand it would work from a stand-in
+and never know.
+
+Override with care. An `output_format` that differs from what the child's blueprint
 declares retires any Rhai validator and JSON schema it declared, since a check written for one
-shape cannot judge another, and the only warning goes to the daemon log.
+shape cannot judge another. The only warning goes to the daemon log.
 
 ## Fan-out
 
@@ -86,16 +105,16 @@ reaches nobody.
 
 **Put all the work in one call.** The engine paces the concurrency itself (`max_workers`, default
 30), so a hundred items in one call is fine and a second call would only wait for the first. One
-`fan_out` call per turn is the rule - it has to be the only tool call in its turn, because it waits
+`fan_out` call per turn is the rule. It has to be the only tool call in its turn, because it waits
 for its workers.
 
 **An empty `items` array is a real answer.** It means there is nothing to hand out, and the run
 moves on. That matters most in a stage a run enters more than once, where the honest answer the
 second time is often that the work is already done.
 
-The result is routed like any other tool result, so `[stages.<name>.tool_routing]` decides where it
-lands - a region of its own, the conversation, or a cheap drop for a blueprint whose workers write
-files and whose parent does not need their prose:
+The result is routed like any other tool result, so `[stages.<name>.tool_routing]` decides where
+it lands. It can go to a region of its own, to the conversation, or to a cheap drop for a blueprint
+whose workers write files and whose parent does not need their prose.
 
 ```toml
 [stages.investigate.tool_routing.overrides]
@@ -105,8 +124,8 @@ fan_out = "sub_findings"
 ## The fan-out stage
 
 `mode = "fan_out"` is a stage whose whole job is one `fan_out` call. It grants the tool
-automatically, takes its worker and caps from the blueprint rather than from the call, and moves to
-`merge_stage` once the workers are done:
+automatically. It takes its worker and caps from the blueprint rather than from the call, and
+moves to `merge_stage` once the workers are done:
 
 ```mermaid
 flowchart TB
@@ -145,8 +164,11 @@ Those keys sit directly on the stage next to `mode = "fan_out"`, not in a sub-ta
 | `max_items` | unset | Most work items the split may produce. `0` or unset means however many it produces |
 | `max_workers` | `30` | How many workers run at once. `0` means unlimited |
 | `on_worker_failure` | `"continue"` | `continue` merges what succeeded. `fail_all` fails the whole fan-out if any worker fails |
-| `split_prompt` | `""` | Added to the stage's system prompt. It says what to split the work into; the stage answers with a `fan_out` call |
-| `max_attempts` | `3` | How many times the stage is asked again if it ends without calling `fan_out`. `0` lets it through on the first refusal |
+| `split_prompt` | `""` | Added to the stage's system prompt. It says what to split the work into |
+| `max_attempts` | `3` | How many times the stage is asked again if it ends without calling `fan_out` |
+
+The stage answers a `split_prompt` with a `fan_out` call. `max_attempts = 0` lets the stage through
+on the first refusal.
 
 Set exactly one of `worker_agent`, `worker_stage`, or `worker_query`. `lev validate` checks that,
 and checks that a named `worker_stage` exists and has opted in with `allow_as_worker`.
@@ -154,10 +176,11 @@ and checks that a named `worker_stage` exists and has opted in with `allow_as_wo
 ### If the stage never fans out
 
 The one thing a fan-out stage owes is a `fan_out` call. A model that answers in prose instead is
-asked again - three times by default, or however many `max_attempts` says - and then let through. A
+asked again, three times by default or however many `max_attempts` says, and then let through. A
 run is never stranded over a thing the model would not do. What it is not allowed to do is pass for
-success: the stage's `splits_degraded` count goes up, a note goes into `error_report` so the merge
-stage knows it is working from nothing, and `lev ps` renders the run as `complete (fan-out empty)`.
+success. The stage's `splits_degraded` count goes up, and a note goes into `error_report` so the
+merge stage knows it is working from nothing. `lev ps` renders the run as
+`complete (fan-out empty)`.
 
 ```toml
 [stages.investigate]
@@ -165,16 +188,17 @@ max_attempts = 5   # a small local model may need more than a nudge
 # max_attempts = 0 # or none at all, when an empty fan-out is an acceptable outcome
 ```
 
-The budget is deliberately separate from `max_revisits`. Those answer different questions - "how
+The budget is deliberately separate from `max_revisits`. Those answer different questions: "how
 many times may the graph re-enter this stage" and "how many times do we ask a model that has not
-done what the stage is for" - and each retry re-sends the whole stage context, so borrowing the
-first for the second is how a routing setting quietly multiplies an inference bill.
+done what the stage is for". Each retry re-sends the whole stage context, so borrowing the first
+for the second is how a routing setting quietly multiplies an inference bill.
 
 `max_attempts` is also the *only* thing bounding those asks: **`max_iterations` does not apply to a
-fan-out stage**. It once did, and the two budgets fought - a run that spent three of its four
-iterations being asked, then called `fan_out` on the fourth, was already at its cap when the workers
-came back, and thirteen minutes of finished research was discarded. Setting `max_iterations` on a
-fan-out stage is harmless and does nothing.
+fan-out stage**. It once did, and the two budgets fought.
+
+A run spent three of its four iterations being asked, then called `fan_out` on the fourth. It was
+already at its cap when the workers came back, and thirteen minutes of finished research was
+discarded. Setting `max_iterations` on a fan-out stage is harmless and does nothing.
 
 That count is worth watching in a batch. A merge stage running on nothing and one running on a
 genuinely empty fan-out look identical from the far side, and this is the only thing that tells
@@ -183,12 +207,20 @@ them apart.
 ### Entering the same stage twice
 
 A stage a run comes back to is told so. On its second and later entries the split is given the
-round number and the ids the previous round already handed out, and asked for only what is still
-unanswered - with an empty `items` array available if that is nothing.
+round number and the ids the previous round already handed out. It is asked for only what is still
+unanswered. An empty `items` array is available if that is nothing.
 
 Without it the model sees a prompt it has already answered, over a context holding the findings it
 answered with, and reasonably reports that the work is done. That is not a hypothetical: it is what
 ended a `deep-researcher` run whose four workers had already finished.
+
+A `worker_stage` worker is spawned with its work item as its task, the way `lev run --task` hands
+one in. So the blueprint needs a region seeded from the task to receive it. `lev validate` reports
+`fanout-worker-task-unheld` when there is none.
+
+The caller inputs the blueprint requires of a run started from the outside, a `--diff` say, are not
+demanded of the worker. The parent met that contract, and the worker's share of the diff travels
+inside its work item.
 
 ### A worker that is a whole other agent
 
@@ -204,22 +236,24 @@ max_workers = 30
 ```
 
 That is what the bundled `deep-researcher` and `wide-researcher` do. The difference is not only who
-does the work: a `worker_agent` worker is a run of its own, so it brings its own stages, its own
+does the work. A `worker_agent` worker is a run of its own, so it brings its own stages, its own
 tools, and its own clean context window, rather than a share of the parent's.
 
 It also brings its own ability to fan out. The bundled `researcher` grants the `fan_out` tool to its
-gathering stage, so a worker that finds its slice is really several independent subjects hands them
-out in parallel rather than working through them one at a time. `max_child_depth` bounds how far that
-can go. Note the distinction: a `mode = "fan_out"` STAGE is only entered when the current stage ends,
-which for a gathering stage means after the gathering is done, so a split meant to parallelise work
-would arrive too late to save any. Granting the tool is what lets the decision happen while it still
+gathering stage. A worker that finds its slice is really several independent subjects hands them
+out in parallel, rather than working through them one at a time. `max_child_depth` bounds how far
+that can go.
+
+Note the distinction. A `mode = "fan_out"` STAGE is only entered when the current stage ends, which
+for a gathering stage means after the gathering is done. A split meant to parallelise work would
+arrive too late to save any. Granting the tool is what lets the decision happen while it still
 matters.
 
 A worker's bibliography merges back into its parent's `sources_index`, deduplicated by URL. Merged
 entries name the worker they came from and carry no `[n]` marker, because numbering is per agent and
 renumbering would repoint the citations already in the merged findings.
 
-The cost is a dependency. The named blueprint has to be installed, and `lev validate` cannot check
+The cost is a dependency. The named blueprint has to be installed. `lev validate` cannot check
 that for you the way it checks a `worker_stage`, because what is installed is a property of the
 machine rather than of the blueprint. A missing one fails per item, so with the default
 `on_worker_failure = "continue"` the run reports it rather than dying. `lev setup` installs the
@@ -279,6 +313,14 @@ Name a `results_region` when the results are bulky. The default is `conversation
 carrying the message history, so a large report competes with the turns around it. A region of its
 own has a budget of its own, and that budget is what the shares divide.
 
+A worker that hands back files (its `artifacts`) hands them up too. Each one is stored again under
+the parent's run, and rides on the report's entry as a part named `<item>/<artifact>`. So a merge
+stage whose model takes images or meshes sees the files themselves, not each worker's description
+of them. A text-only model sees the usual stand-in line.
+
+A file the store no longer holds, or one over `[mime] max_part_bytes`, is left out with a warning
+in the parent's log.
+
 `max_items` caps how many work items the split may produce. This is not `max_workers`, which caps how
 many run at the same time:
 
@@ -293,8 +335,8 @@ whatever the split produces is what runs.
 
 Both caps take `0` to mean no cap. `max_workers = 0` starts every work item the moment the split
 has produced it; `max_items = 0` is the same as leaving the key out. A negative value, or a value
-that is not a whole number, is a validation error rather than a quiet fallback, so a typo shows up
-in `lev validate` and not as a fan-out wider than the manifest appeared to allow.
+that is not a whole number, is a validation error rather than a quiet fallback. So a typo shows up
+in `lev validate`, not as a fan-out wider than the manifest appeared to allow.
 
 ## `max_workers` is not the knob you might think
 

@@ -5,10 +5,11 @@
 //! can make a billed call: the provider registry is always injected, and the
 //! isolation clears every provider key from the environment anyway.
 
+use super::signin::signin_check;
 use super::*;
 
 use leviath_providers::{
-    FinishReason, InferenceResponse, ModelCapabilities, ProviderError, TokenUsage,
+    FinishReason, InferenceResponse, ModelCapabilities, ModelInfo, ProviderError, TokenUsage,
 };
 use leviath_runtime::components::AgentStatus;
 use leviath_runtime::control_socket::{ControlId, bind_control_listener, control_id};
@@ -39,22 +40,66 @@ where
     temp_env::async_with_vars(vars, f(root)).await
 }
 
-/// A provider whose single inference is decided up front.
+/// A provider whose single inference is decided up front, and whose catalogue
+/// is whatever the test says it is: nothing, by default, which is what the
+/// base `Provider` answers too.
 struct StubProvider {
     reply: Result<String, ProviderError>,
+    /// What `served_catalog` answers.
+    catalog: Option<Vec<String>>,
+    /// What `list_models` answers, unless `listing_fails`.
+    listed: Vec<String>,
+    listing_fails: bool,
+    /// The ids `serves_model` claims.
+    serves: Vec<String>,
 }
 
 impl StubProvider {
+    fn new(reply: Result<String, ProviderError>) -> Self {
+        Self {
+            reply,
+            catalog: None,
+            listed: Vec::new(),
+            listing_fails: false,
+            serves: Vec::new(),
+        }
+    }
+
     fn replying(content: &str) -> Arc<dyn Provider> {
-        Arc::new(Self {
-            reply: Ok(content.to_string()),
-        })
+        Self::new(Ok(content.to_string())).arc()
     }
 
     fn failing(message: &str) -> Arc<dyn Provider> {
-        Arc::new(Self {
-            reply: Err(ProviderError::ApiError(message.to_string())),
-        })
+        Self::new(Err(ProviderError::ApiError(message.to_string()))).arc()
+    }
+
+    /// A stub that replies, before its catalogue is shaped.
+    fn answering(content: &str) -> Self {
+        Self::new(Ok(content.to_string()))
+    }
+
+    fn with_catalog(mut self, ids: &[&str]) -> Self {
+        self.catalog = Some(ids.iter().map(ToString::to_string).collect());
+        self
+    }
+
+    fn listing(mut self, ids: &[&str]) -> Self {
+        self.listed = ids.iter().map(ToString::to_string).collect();
+        self
+    }
+
+    fn listing_fails(mut self) -> Self {
+        self.listing_fails = true;
+        self
+    }
+
+    fn serving(mut self, ids: &[&str]) -> Self {
+        self.serves = ids.iter().map(ToString::to_string).collect();
+        self
+    }
+
+    fn arc(self) -> Arc<dyn Provider> {
+        Arc::new(self)
     }
 }
 
@@ -66,6 +111,7 @@ impl Provider for StubProvider {
     ) -> leviath_providers::Result<InferenceResponse> {
         match &self.reply {
             Ok(content) => Ok(InferenceResponse {
+                parts: Vec::new(),
                 content: content.clone(),
                 tool_calls: Vec::new(),
                 tokens_used: TokenUsage {
@@ -97,6 +143,28 @@ impl Provider for StubProvider {
 
     fn capabilities(&self, _model: &str) -> ModelCapabilities {
         ModelCapabilities::default()
+    }
+
+    fn served_catalog(&self) -> Option<Vec<String>> {
+        self.catalog.clone()
+    }
+
+    async fn list_models(&self) -> leviath_providers::Result<Vec<ModelInfo>> {
+        if self.listing_fails {
+            return Err(ProviderError::ApiError("listing refused".to_string()));
+        }
+        Ok(self
+            .listed
+            .iter()
+            .map(|id| ModelInfo::new(id.clone(), "stub", ModelCapabilities::default()))
+            .collect())
+    }
+
+    fn serves_model(&self, model_key: &str) -> Option<String> {
+        self.serves
+            .iter()
+            .any(|id| id == model_key)
+            .then(|| model_key.to_string())
     }
 }
 
@@ -515,6 +583,45 @@ fn config_check_names_a_script_provider_whose_file_is_missing() {
     );
 }
 
+/// A `[mime_types]` row the registry refuses is skipped by the daemon, which
+/// then types that file by the built-in table. The config still loads, so
+/// this is a note on an OK line, naming the row.
+#[test]
+fn config_check_notes_a_mime_types_row_that_will_not_load() {
+    let config: Config = toml::from_str(
+        "default_provider = \"anthropic\"\n[mime_types.\"model/obj\"]\nfamilies = \"model\"\n",
+    )
+    .expect("the table takes arbitrary rows, so the typo deserializes");
+    let check = checked(
+        "doctor-config_check_notes_a_mime_types_row_that_will_not_load",
+        &config,
+        &ProviderRegistry::new(),
+    );
+    assert_eq!(check.status, CheckStatus::Ok);
+    assert!(
+        check
+            .detail
+            .contains("mime rows are ignored until fixed: [mime_types] in config.toml")
+            && check.detail.contains("model/obj"),
+        "got: {}",
+        check.detail
+    );
+    let clean: Config = toml::from_str(
+        "default_provider = \"anthropic\"\n[mime_types.\"model/obj\"]\ntext = true\n",
+    )
+    .unwrap();
+    let check = checked(
+        "doctor-config_check_accepts_a_good_mime_types_row",
+        &clean,
+        &ProviderRegistry::new(),
+    );
+    assert!(
+        !check.detail.contains("mime_types"),
+        "got: {}",
+        check.detail
+    );
+}
+
 /// A `[rate_limits]` entry naming no provider throttles nothing, and the
 /// unknown-key check cannot see it: the table takes arbitrary keys, so the
 /// typo deserializes perfectly.
@@ -574,6 +681,39 @@ fn config_check_counts_more_than_one_unread_key() {
             .detail
             .contains("2 keys in config.toml are read by nothing"),
         "got: {}",
+        check.detail
+    );
+}
+
+/// A config file still carrying a key that changed name gets a warning, not a
+/// note: the value's meaning changed with the name, and the line says what it
+/// was read as and that `lev update` rewrites it. It is not counted among the
+/// keys nothing reads, because something did.
+#[test]
+fn config_check_warns_about_a_renamed_key_still_in_the_file() {
+    let check = crate::config::with_isolated_config_path(
+        "doctor-config_check_warns_about_a_renamed_key_still_in_the_file",
+        |dir| {
+            std::fs::write(
+                dir.join("config.toml"),
+                "default_provider = \"ollama\"\ndefault_model = \"qwen3.8:latest\"\n",
+            )
+            .expect("write the config");
+            config_check(&Config::default(), &ProviderRegistry::new())
+        },
+    );
+    assert_eq!(check.status, CheckStatus::Warn, "{}", check.detail);
+    assert!(
+        check.detail.contains(
+            "`default_model = \"qwen3.8:latest\"` was read as `fallback_model = \"qwen3.8:latest\"`"
+        ),
+        "got: {}",
+        check.detail
+    );
+    assert!(check.detail.contains("lev update"), "got: {}", check.detail);
+    assert!(
+        !check.detail.contains("read by nothing"),
+        "a renamed key is read, not unread: {}",
         check.detail
     );
 }
@@ -721,7 +861,7 @@ fn config_check_is_quiet_when_every_rate_limit_names_a_real_provider() {
 fn resolve_check_uses_the_configured_default() {
     let config = Config {
         default_provider: "stub".to_string(),
-        default_model: Some("m-1".to_string()),
+        override_model: Some("m-1".to_string()),
         ..Config::default()
     };
     let registry = registry_with("stub", StubProvider::replying("hi"));
@@ -730,8 +870,8 @@ fn resolve_check_uses_the_configured_default() {
     assert_eq!(check.detail, "stub / m-1");
     let resolved = resolved.expect("a registered provider resolves");
     assert_eq!(
-        (resolved.provider_name.as_str(), resolved.model.as_str()),
-        ("stub", "m-1")
+        (resolved.provider_name.as_str(), resolved.model.as_deref()),
+        ("stub", Some("m-1"))
     );
 }
 
@@ -757,9 +897,237 @@ fn resolve_check_reports_an_unconfigured_provider_and_what_was_tried() {
     };
     let (check, resolved) = resolve_check(&config, None, &ProviderRegistry::new());
     assert_eq!(check.status, CheckStatus::Fail);
-    assert!(check.detail.contains("not configured"), "{}", check.detail);
-    assert!(check.detail.contains("openrouter"), "{}", check.detail);
+    assert!(
+        check.detail.contains("no configured provider"),
+        "{}",
+        check.detail
+    );
+    assert!(
+        check
+            .detail
+            .contains("default_provider = 'openrouter' is not configured"),
+        "{}",
+        check.detail
+    );
+    assert!(
+        check.detail.contains("registered: none"),
+        "{}",
+        check.detail
+    );
+    // The placeholder the chain fell back to is not the user's problem and
+    // must not be named as one: "resolved to 'anthropic'" on a machine that
+    // never mentioned anthropic is the confusion this exists to remove.
+    assert!(!check.detail.contains("anthropic"), "{}", check.detail);
+    assert!(check.detail.contains("lev setup"), "{}", check.detail);
     assert!(resolved.is_none());
+}
+
+#[test]
+fn resolve_check_names_the_provider_order_when_none_of_it_is_configured() {
+    let config = Config {
+        default_provider: "anthropic".to_string(),
+        providers: crate::config::ProviderConfig {
+            provider_order: vec!["codex".to_string(), "openrouter".to_string()],
+            ..Default::default()
+        },
+        ..Config::default()
+    };
+    let registry = registry_with("stub", StubProvider::replying("hi"));
+    let (check, resolved) = resolve_check(&config, None, &registry);
+    assert_eq!(check.status, CheckStatus::Fail);
+    assert!(
+        check
+            .detail
+            .contains("nothing in provider_order = [codex, openrouter] is configured"),
+        "{}",
+        check.detail
+    );
+    assert!(
+        check.detail.contains("registered: stub"),
+        "{}",
+        check.detail
+    );
+    assert!(resolved.is_none());
+}
+
+#[test]
+fn resolve_check_passes_a_configured_provider_that_names_no_model() {
+    // The fresh single-provider install: `default_provider = "stub"`, no
+    // `override_model`, no `fallback_model`. The chain has nothing of the
+    // user's to send and falls to its placeholder, which used to be reported
+    // as "resolved to 'anthropic', which is not configured" and stopped the
+    // doctor before the checks that bill and spawn. Now it passes on the
+    // preference, and the model is left for the inference check to pick.
+    let config = Config {
+        default_provider: "stub".to_string(),
+        ..Config::default()
+    };
+    let registry = registry_with("stub", StubProvider::replying("hi"));
+    let (check, resolved) = resolve_check(&config, None, &registry);
+    assert_eq!(check.status, CheckStatus::Ok);
+    assert!(check.detail.starts_with("stub  (note:"), "{}", check.detail);
+    assert!(
+        check.detail.contains("picks one from 'stub'"),
+        "{}",
+        check.detail
+    );
+    assert!(
+        check.detail.contains("A real run is different"),
+        "{}",
+        check.detail
+    );
+    assert!(!check.detail.contains("anthropic"), "{}", check.detail);
+    let resolved = resolved.expect("the preferred provider resolves");
+    assert_eq!(resolved.provider_name, "stub");
+    assert!(
+        resolved.model.is_none(),
+        "no model of the user's own to name"
+    );
+}
+
+#[test]
+fn resolve_check_takes_the_first_configured_provider_in_the_order() {
+    let config = Config {
+        default_provider: "anthropic".to_string(),
+        providers: crate::config::ProviderConfig {
+            provider_order: vec!["codex".to_string(), "stub".to_string()],
+            ..Default::default()
+        },
+        ..Config::default()
+    };
+    let registry = registry_with("stub", StubProvider::replying("hi"));
+    let (check, resolved) = resolve_check(&config, None, &registry);
+    assert_eq!(check.status, CheckStatus::Ok);
+    assert!(check.detail.starts_with("stub  (note:"), "{}", check.detail);
+    assert!(
+        check.detail.contains("[codex, stub]"),
+        "the note shows the preference as configured: {}",
+        check.detail
+    );
+    assert_eq!(resolved.expect("stub resolves").provider_name, "stub");
+}
+
+#[test]
+fn resolve_check_blames_the_default_provider_when_a_model_setting_pairs_with_an_absent_one() {
+    // `override_model` pairs with `default_provider`, so with the latter not
+    // configured the setting goes nowhere even though another preferred
+    // provider is here. Passing on 'stub' would hide a config that does not
+    // do what it says.
+    let config = Config {
+        default_provider: "openrouter".to_string(),
+        override_model: Some("m-1".to_string()),
+        providers: crate::config::ProviderConfig {
+            provider_order: vec!["openrouter".to_string(), "stub".to_string()],
+            ..Default::default()
+        },
+        ..Config::default()
+    };
+    let registry = registry_with("stub", StubProvider::replying("hi"));
+    let (check, resolved) = resolve_check(&config, None, &registry);
+    assert_eq!(check.status, CheckStatus::Fail);
+    assert!(
+        check
+            .detail
+            .contains("pair with default_provider = 'openrouter', which is not configured"),
+        "{}",
+        check.detail
+    );
+    assert!(check.detail.contains("such as 'stub'"), "{}", check.detail);
+    assert!(resolved.is_none());
+}
+
+#[test]
+fn resolve_check_reports_the_provider_a_model_override_named() {
+    // A bare `--model` pairs with `default_provider`; when that is not
+    // configured the chain names it, and the answer is about it rather than
+    // about the preference.
+    let config = Config {
+        default_provider: "openrouter".to_string(),
+        ..Config::default()
+    };
+    let (check, resolved) = resolve_check(&config, Some("m-1"), &ProviderRegistry::new());
+    assert_eq!(check.status, CheckStatus::Fail);
+    assert!(
+        check.detail.contains("resolved to 'openrouter'"),
+        "{}",
+        check.detail
+    );
+    assert!(
+        check.detail.contains("tried: openrouter"),
+        "{}",
+        check.detail
+    );
+    assert!(resolved.is_none());
+}
+
+// ─── probe_model ──────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn probe_model_takes_the_catalogue_first() {
+    let provider = StubProvider::answering("hi")
+        .with_catalog(&["c-1", "c-2"])
+        .listing(&["l-1"]);
+    assert_eq!(
+        probe_model(&provider).await.unwrap().as_deref(),
+        Some("c-1")
+    );
+}
+
+#[tokio::test]
+async fn probe_model_prefers_a_listed_model_the_provider_also_serves() {
+    // An empty catalogue is "cannot say" here, not "nothing": the listing
+    // decides, and the first entry the provider's own table knows wins over
+    // an embedding model that happens to be listed first.
+    let provider = StubProvider::answering("hi")
+        .with_catalog(&[])
+        .listing(&["text-embedding-3", "chat-1"])
+        .serving(&["chat-1"]);
+    assert_eq!(
+        probe_model(&provider).await.unwrap().as_deref(),
+        Some("chat-1")
+    );
+}
+
+#[tokio::test]
+async fn probe_model_falls_back_to_the_first_listed_model() {
+    let provider = StubProvider::answering("hi").listing(&["l-1", "l-2"]);
+    assert_eq!(
+        probe_model(&provider).await.unwrap().as_deref(),
+        Some("l-1")
+    );
+}
+
+#[tokio::test]
+async fn probe_model_is_none_with_nothing_to_go_on_and_the_error_when_listing_fails() {
+    assert_eq!(
+        probe_model(&StubProvider::answering("hi")).await.unwrap(),
+        None
+    );
+    let refusing = StubProvider::answering("hi").listing_fails();
+    assert!(probe_model(&refusing).await.is_err());
+}
+
+/// A provider whose listing fails is not "a provider with nothing to probe":
+/// the inference line fails with the listing's own error.
+#[tokio::test]
+async fn run_checks_reports_a_failed_listing_instead_of_skipping() {
+    let checks = with_env(|root| async move {
+        write_config(&root, "stub", None, "");
+        let build = always(registry_with(
+            "stub",
+            StubProvider::answering("PONG").listing_fails().arc(),
+        ));
+        run_checks(&DoctorArgs::default(), &build, DaemonTarget::Skip).await
+    })
+    .await;
+    let inference = checks.last().expect("checks ran");
+    assert_eq!(inference.name, "inference");
+    assert_eq!(inference.status, CheckStatus::Fail);
+    assert!(
+        inference.detail.contains("could not list its models"),
+        "{}",
+        inference.detail
+    );
 }
 
 #[test]
@@ -773,7 +1141,7 @@ fn resolve_check_says_so_when_the_configured_default_never_wins() {
     // sent an investigation of a downgraded run in the wrong direction.
     let config = Config {
         default_provider: "openrouter".to_string(),
-        default_model: None,
+        override_model: None,
         ..Config::default()
     };
     let mut registry = registry_with("openrouter", StubProvider::replying("hi"));
@@ -802,7 +1170,7 @@ fn resolve_check_says_so_when_the_configured_default_never_wins() {
 fn resolve_check_is_quiet_when_the_configured_default_does_win() {
     let config = Config {
         default_provider: "openrouter".to_string(),
-        default_model: Some("openai/gpt-4o-mini".to_string()),
+        override_model: Some("openai/gpt-4o-mini".to_string()),
         ..Config::default()
     };
     let registry = registry_with("openrouter", StubProvider::replying("hi"));
@@ -817,7 +1185,7 @@ fn resolve_check_reads_a_qualified_default_model_bare_and_says_so() {
     // setting was read so the config can be tidied.
     let config = Config {
         default_provider: "stub".to_string(),
-        default_model: Some("stub/m-1".to_string()),
+        override_model: Some("stub/m-1".to_string()),
         ..Config::default()
     };
     let registry = registry_with("stub", StubProvider::replying("hi"));
@@ -834,7 +1202,7 @@ fn resolve_check_reads_a_qualified_default_model_bare_and_says_so() {
         "{}",
         check.detail
     );
-    assert_eq!(resolved.expect("resolves").model, "m-1");
+    assert_eq!(resolved.expect("resolves").model.as_deref(), Some("m-1"));
 
     // `--model` sidelines the default entirely, note included.
     let (check, _) = resolve_check(&config, Some("stub/m-2"), &registry);
@@ -848,10 +1216,10 @@ fn resolve_check_does_not_second_guess_an_unregistered_default_provider() {
     // check's fail arm covers the case where nothing usable is left. Saying it
     // again here would put a note on every install with a stale provider name
     // in its config.
-    for default_model in [None, Some("m-1".to_string())] {
+    for override_model in [None, Some("m-1".to_string())] {
         let config = Config {
             default_provider: "ghost".to_string(),
-            default_model,
+            override_model,
             ..Config::default()
         };
         let registry = registry_with("anthropic", StubProvider::replying("hi"));
@@ -867,7 +1235,7 @@ fn resolve_check_stays_quiet_under_an_explicit_model_override() {
     // default was passed over is noise.
     let config = Config {
         default_provider: "openrouter".to_string(),
-        default_model: None,
+        override_model: None,
         ..Config::default()
     };
     let registry = registry_with("stub", StubProvider::replying("hi"));
@@ -880,7 +1248,7 @@ fn resolve_check_stays_quiet_under_an_explicit_model_override() {
 #[tokio::test]
 async fn inference_check_reports_usage_and_the_echo() {
     let provider = StubProvider::replying("PONG");
-    let check = inference_check(provider.as_ref(), "m").await;
+    let check = inference_check(provider.as_ref(), "m", serde_json::Value::Null).await;
     assert_eq!(check.status, CheckStatus::Ok);
     assert!(
         check
@@ -897,7 +1265,7 @@ async fn inference_check_passes_even_without_the_expected_word() {
     // The call is what is being checked. What the model chose to say is a note,
     // not a verdict - otherwise this command would be flaky across providers.
     let provider = StubProvider::replying("Sure! Hello there.");
-    let check = inference_check(provider.as_ref(), "m").await;
+    let check = inference_check(provider.as_ref(), "m", serde_json::Value::Null).await;
     assert_eq!(check.status, CheckStatus::Ok);
     assert!(
         check.detail.contains("no PONG in the reply"),
@@ -910,7 +1278,7 @@ async fn inference_check_passes_even_without_the_expected_word() {
 async fn inference_check_reports_the_provider_error_verbatim() {
     let raw = r#"HTTP 402 Payment Required: {"error":{"message":"credit balance too low"}}"#;
     let provider = StubProvider::failing(raw);
-    let check = inference_check(provider.as_ref(), "m").await;
+    let check = inference_check(provider.as_ref(), "m", serde_json::Value::Null).await;
     assert_eq!(check.status, CheckStatus::Fail);
     assert!(
         check.detail.contains("credit balance too low") && check.detail.contains("402"),
@@ -1408,6 +1776,75 @@ async fn run_checks_stops_at_an_unconfigured_provider() {
 }
 
 #[tokio::test]
+async fn run_checks_probes_a_catalogue_model_when_the_config_names_none() {
+    let checks = with_env(|root| async move {
+        write_config(&root, "stub", None, "");
+        let stub = StubProvider::answering("PONG").with_catalog(&["c-1"]).arc();
+        let build = always(registry_with("stub", stub));
+        run_checks(&DoctorArgs::default(), &build, DaemonTarget::Skip).await
+    })
+    .await;
+    assert_eq!(checks.len(), 4, "{checks:?}");
+    assert_eq!(checks[2].name, "resolve");
+    assert_eq!(checks[2].status, CheckStatus::Ok);
+    assert_eq!(checks[3].name, "inference");
+    assert_eq!(checks[3].status, CheckStatus::Ok);
+    // The resolve line named no model, so this one says which was probed.
+    assert!(
+        checks[3].detail.starts_with("c-1: "),
+        "{}",
+        checks[3].detail
+    );
+}
+
+/// Zero retention holds for the probe the way it holds for a run: a model the
+/// provider's retention does not clear is never sent, and the line says why.
+#[tokio::test]
+async fn run_checks_refuses_to_probe_a_model_zero_retention_refuses() {
+    let checks = with_env(|root| async move {
+        write_config(&root, "stub", None, "");
+        let stub = StubProvider::answering("PONG").with_catalog(&["c-1"]).arc();
+        let build = always(registry_with("stub", stub).with_retention(
+            leviath_providers::retention::RetentionSettings {
+                zero_requested: true,
+                ..Default::default()
+            },
+        ));
+        run_checks(&DoctorArgs::default(), &build, DaemonTarget::Skip).await
+    })
+    .await;
+    let inference = checks.last().expect("checks ran");
+    assert_eq!(inference.name, "inference");
+    assert_eq!(inference.status, CheckStatus::Fail);
+    assert!(
+        inference
+            .detail
+            .starts_with("not sent: stub/c-1, which does not run with zero data retention"),
+        "{}",
+        inference.detail
+    );
+}
+
+#[tokio::test]
+async fn run_checks_skips_inference_when_the_provider_lists_nothing_to_probe() {
+    let checks = with_env(|root| async move {
+        write_config(&root, "stub", None, "");
+        let build = always(registry_with("stub", StubProvider::replying("PONG")));
+        run_checks(&DoctorArgs::default(), &build, DaemonTarget::Skip).await
+    })
+    .await;
+    assert_eq!(checks.len(), 4, "{checks:?}");
+    assert_eq!(checks[3].name, "inference");
+    assert_eq!(checks[3].status, CheckStatus::Warn);
+    assert!(checks[3].detail.contains("skipped"), "{}", checks[3].detail);
+    assert!(
+        checks[3].detail.contains("override_model"),
+        "{}",
+        checks[3].detail
+    );
+}
+
+#[tokio::test]
 async fn run_checks_stops_at_a_failing_inference() {
     let checks = with_env(|root| async move {
         write_config(&root, "stub", Some("m"), "");
@@ -1476,11 +1913,11 @@ async fn run_checks_reports_a_scratch_dir_it_cannot_create() {
         .await
     })
     .await;
-    assert_eq!(checks.len(), 5, "{checks:?}");
-    assert_eq!(checks[4].name, "daemon");
-    assert_eq!(checks[4].status, CheckStatus::Fail);
+    assert_eq!(checks.len(), 6, "{checks:?}");
+    assert_eq!(checks[5].name, "daemon");
+    assert_eq!(checks[5].status, CheckStatus::Fail);
     assert!(
-        checks[4].detail.contains("scratch is read-only"),
+        checks[5].detail.contains("scratch is read-only"),
         "{checks:?}"
     );
 }
@@ -1503,8 +1940,11 @@ async fn run_checks_reports_a_daemon_that_would_not_start() {
     assert!(checks[4].detail.contains("did not start"), "{checks:?}");
 }
 
+/// Every check, in the order the report prints them, against a daemon that
+/// answers everything. `journal` rides with the other free checks, ahead of the
+/// two that bill, so a report cut short by a billing failure still carries it.
 #[tokio::test]
-async fn run_checks_runs_all_five_against_a_healthy_daemon() {
+async fn run_checks_runs_every_check_against_a_healthy_daemon() {
     let checks = with_env(|root| async move {
         // A key of the wrong shape, so the warning branch runs too.
         write_config(
@@ -1531,7 +1971,19 @@ async fn run_checks_runs_all_five_against_a_healthy_daemon() {
         .await
     })
     .await;
-    assert_eq!(checks.len(), 5, "{checks:?}");
+    let names: Vec<&str> = checks.iter().map(|c| c.name).collect();
+    assert_eq!(
+        names,
+        vec![
+            "config",
+            "search",
+            "journal",
+            "resolve",
+            "inference",
+            "daemon"
+        ],
+        "{checks:?}"
+    );
     assert!(
         checks.iter().all(|c| c.status != CheckStatus::Fail),
         "{checks:?}"
@@ -1626,7 +2078,7 @@ async fn a_registry_that_will_not_build_is_reported_as_a_failed_check() {
 fn the_codex_check_says_nothing_when_it_is_not_enabled() {
     // The report has no business mentioning a provider nobody asked for.
     let config = Config::default();
-    assert!(codex_check(&config).is_none());
+    assert!(signin_checks(&config).is_empty());
 }
 
 #[test]
@@ -1637,7 +2089,7 @@ fn the_codex_check_warns_when_it_is_enabled_but_not_signed_in() {
     temp_env::with_var("LEVIATH_HOME", Some(dir.path()), || {
         let mut config = Config::default();
         config.providers.codex_enabled = true;
-        let check = codex_check(&config).expect("a check");
+        let check = signin_checks(&config).pop().expect("a check");
         assert_eq!(check.status, CheckStatus::Warn);
         assert!(
             check.detail.contains("lev auth login codex"),
@@ -1652,8 +2104,8 @@ fn the_codex_check_reports_the_account_once_signed_in() {
     let dir = tempfile::tempdir().expect("tempdir");
     temp_env::with_var("LEVIATH_HOME", Some(dir.path()), || {
         let path =
-            leviath_providers::codex::ProviderAuthStore::default_path().expect("a home is set");
-        let mut store = leviath_providers::codex::ProviderAuthStore::default();
+            leviath_providers::oauth::ProviderAuthStore::default_path().expect("a home is set");
+        let mut store = leviath_providers::oauth::ProviderAuthStore::default();
         store.set(
             "codex",
             leviath_providers::ProviderGrant {
@@ -1668,14 +2120,14 @@ fn the_codex_check_reports_the_account_once_signed_in() {
 
         let mut config = Config::default();
         config.providers.codex_enabled = true;
-        let check = codex_check(&config).expect("a check");
+        let check = signin_checks(&config).pop().expect("a check");
         assert_eq!(check.status, CheckStatus::Ok);
         assert!(
             check.detail.contains("someone@example.com"),
             "{}",
             check.detail
         );
-        assert!(check.detail.contains("plus"), "{}", check.detail);
+        assert!(check.detail.contains("ChatGPT plus"), "{}", check.detail);
     });
 }
 
@@ -1686,8 +2138,8 @@ fn the_codex_check_falls_back_when_the_grant_names_no_account() {
     let dir = tempfile::tempdir().expect("tempdir");
     temp_env::with_var("LEVIATH_HOME", Some(dir.path()), || {
         let path =
-            leviath_providers::codex::ProviderAuthStore::default_path().expect("a home is set");
-        let mut store = leviath_providers::codex::ProviderAuthStore::default();
+            leviath_providers::oauth::ProviderAuthStore::default_path().expect("a home is set");
+        let mut store = leviath_providers::oauth::ProviderAuthStore::default();
         store.set(
             "codex",
             leviath_providers::ProviderGrant {
@@ -1700,8 +2152,100 @@ fn the_codex_check_falls_back_when_the_grant_names_no_account() {
 
         let mut config = Config::default();
         config.providers.codex_enabled = true;
-        let check = codex_check(&config).expect("a check");
+        let check = signin_checks(&config).pop().expect("a check");
         assert_eq!(check.status, CheckStatus::Ok);
         assert_eq!(check.detail, "signed in");
     });
+}
+
+#[test]
+fn every_enabled_sign_in_provider_gets_its_own_check() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    temp_env::with_var("LEVIATH_HOME", Some(dir.path()), || {
+        let mut config = Config::default();
+        config.providers.codex_enabled = true;
+        config.providers.grok_enabled = true;
+        let checks = signin_checks(&config);
+        let names: Vec<_> = checks.iter().map(|c| c.name).collect();
+        assert_eq!(names, ["codex", "grok"]);
+        assert!(
+            checks[1].detail.contains("lev auth login grok"),
+            "{}",
+            checks[1].detail
+        );
+    });
+    // A provider with no sign-in profile names itself as the account.
+    assert!(
+        signin_check("not-a-provider")
+            .detail
+            .contains("not-a-provider")
+    );
+}
+
+/// `yolo.toml` is checked only when it is there: no file is no finding, a
+/// file that loads names its profiles, and one that does not is a failure
+/// because every `--yolo=<name>` is refused until it does.
+#[test]
+fn the_yolo_check_follows_the_file() {
+    crate::config::with_isolated_config_path("doctor-yolo", |dir| {
+        assert!(yolo_check().is_none(), "no file, no check");
+        std::fs::write(dir.join("yolo.toml"), "").unwrap();
+        let empty = yolo_check().expect("an empty file is still a file");
+        assert!(matches!(empty.status, CheckStatus::Ok), "{empty:?}");
+        assert!(
+            empty.detail.contains("defines no profiles"),
+            "{}",
+            empty.detail
+        );
+        std::fs::write(
+            dir.join("yolo.toml"),
+            "[careful]\ndefault = \"ask\"\n\n[loose]\ndefault = \"allow\"\n",
+        )
+        .unwrap();
+        let loaded = yolo_check().expect("a check");
+        assert!(matches!(loaded.status, CheckStatus::Ok));
+        assert!(
+            loaded.detail.contains("careful, loose"),
+            "{}",
+            loaded.detail
+        );
+        std::fs::write(dir.join("yolo.toml"), "[careful]\nblock = 1\n").unwrap();
+        let broken = yolo_check().expect("a check");
+        assert!(matches!(broken.status, CheckStatus::Fail));
+        assert!(
+            broken.detail.contains("refused until it loads"),
+            "{}",
+            broken.detail
+        );
+    });
+}
+
+#[tokio::test]
+async fn a_subscription_over_its_limit_is_a_warning_and_the_rest_say_nothing() {
+    use crate::test_fixtures::{QuotaAnswer, Subscription, quota_report, subscriptions};
+    let mut config = Config::default();
+    config.providers.codex_enabled = true;
+    config.providers.grok_enabled = true;
+    let registry = subscriptions(vec![
+        Subscription {
+            name: "codex",
+            answer: QuotaAnswer::Report(quota_report(true)),
+        },
+        Subscription {
+            name: "grok",
+            answer: QuotaAnswer::Fails("HTTP 401".into()),
+        },
+    ]);
+    let checks = quota_checks(&config, &registry).await;
+    assert_eq!(checks.len(), 1);
+    assert!(
+        checks[0].detail.contains("over a usage limit"),
+        "{:?}",
+        checks[0].detail
+    );
+    let within = subscriptions(vec![Subscription {
+        name: "codex",
+        answer: QuotaAnswer::Report(quota_report(false)),
+    }]);
+    assert!(quota_checks(&config, &within).await.is_empty());
 }

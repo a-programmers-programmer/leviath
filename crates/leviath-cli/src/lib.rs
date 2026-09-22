@@ -12,16 +12,19 @@
 //! struct around it says which command it belongs to.
 
 pub(crate) mod approvals;
+pub(crate) mod blobs;
 pub(crate) mod blueprint_edit;
 pub(crate) mod bundled;
 pub mod commands;
 pub mod config;
 pub mod credentials;
 pub mod daemon;
+pub mod dependencies;
 pub mod dispatch;
 pub(crate) mod held_checkpoints;
 pub(crate) mod lint;
 pub mod logging;
+pub(crate) mod provider_checks;
 pub(crate) mod read_path_report;
 pub(crate) mod render;
 pub mod runstate;
@@ -35,3 +38,4 @@ pub(crate) mod tools;
 pub(crate) mod tui;
 pub mod ui_state;
 pub mod workdir_guard;
+pub(crate) mod yolo;

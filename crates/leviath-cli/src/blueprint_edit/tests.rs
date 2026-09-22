@@ -611,46 +611,6 @@ fn deleting_a_stage_takes_its_paths_and_repoints_the_entry() {
 }
 
 #[test]
-fn moving_a_stage_swaps_it_with_its_neighbour_in_the_file() {
-    let mut doc = coder();
-    let names = doc.stage_names();
-    doc.move_stage("plan", true).unwrap();
-    let moved = doc.stage_names();
-    assert_eq!(moved[0], "plan");
-    assert_eq!(moved[1], "discover");
-    assert_eq!(&moved[2..], &names[2..]);
-    // The file agrees, subtables and all, and still parses.
-    let text = doc.to_toml();
-    assert!(text.find("[stages.plan]").unwrap() < text.find("[stages.discover]").unwrap());
-    assert!(
-        text.find("[stages.plan.transitions.implement]").unwrap()
-            < text.find("[stages.discover]").unwrap()
-    );
-    assert!(
-        text.find("[[stages.plan.interaction_points]]").unwrap()
-            < text.find("[stages.discover]").unwrap()
-    );
-    runtime_ok(&doc);
-    doc.move_stage("plan", false).unwrap();
-    assert_eq!(doc.stage_names(), names);
-    // At the ends nothing moves; a ghost is refused.
-    doc.move_stage("discover", true).unwrap();
-    assert_eq!(doc.stage_names(), names);
-    let last = names.last().unwrap().clone();
-    doc.move_stage(&last, false).unwrap();
-    assert_eq!(doc.stage_names(), names);
-    assert_eq!(
-        doc.move_stage("ghost", true),
-        Err(EditError::NoSuchStage("ghost".into()))
-    );
-    // Re-read after renumbering: same order.
-    assert_eq!(
-        ManifestDoc::parse(&doc.to_toml()).unwrap().stage_names(),
-        names
-    );
-}
-
-#[test]
 fn stage_fields_write_and_delete_the_way_the_lair_does() {
     let mut doc = starter();
     doc.set_stage_mode("work", &StageModeView::FanOut).unwrap();
@@ -746,6 +706,12 @@ fn stage_fields_write_and_delete_the_way_the_lair_does() {
     assert_eq!(doc.stage("work").unwrap().tools, ["read_file", "bash"]);
     doc.set_tools("work", &[]).unwrap();
     assert!(!doc.to_toml().contains("available_tools"));
+    doc.set_connectors("work", &["github".into()]).unwrap();
+    assert_eq!(doc.stage("work").unwrap().connectors, ["github"]);
+    assert!(doc.to_toml().contains("available_connectors"));
+    doc.set_connectors("work", &[]).unwrap();
+    assert!(!doc.to_toml().contains("available_connectors"));
+    assert!(doc.set_connectors("ghost", &[]).is_err());
 
     // Models: a slash pins the route and writes the table form; a slashless
     // entry is a model with the route left open, and writes the bare form that
@@ -1273,6 +1239,336 @@ fn region_fields_write_the_lairs_way() {
 }
 
 #[test]
+fn mime_keys_write_the_way_the_runtime_reads_them() {
+    use ArtifactField as A;
+    let mut doc = starter();
+    let s = RegionScope::Shared;
+    doc.add_region(&s, "shots").unwrap();
+    doc.set_region_field(
+        &s,
+        "shots",
+        RegionField::Accepts,
+        RegionValue::Text("Image/*, audio/wav image/*".into()),
+    )
+    .unwrap();
+    let r = doc.region(None, "shots").unwrap();
+    assert_eq!(r.accepts, ["image/*", "audio/wav"]);
+    runtime_ok(&doc);
+    doc.set_region_field(
+        &s,
+        "shots",
+        RegionField::Accepts,
+        RegionValue::Text(" ".into()),
+    )
+    .unwrap();
+    let r = doc.region(None, "shots").unwrap();
+    assert!(r.accepts.is_empty());
+    assert!(!doc.to_toml().contains("accepts"), "{}", doc.to_toml());
+    // The stage's input lists come and go with their table.
+    assert_eq!(
+        doc.set_stage_input("ghost", InputList::Accepts, &[]),
+        Err(EditError::NoSuchStage("ghost".into()))
+    );
+    doc.set_stage_input("work", InputList::Accepts, &["video/*".to_string()])
+        .unwrap();
+    doc.set_stage_input("work", InputList::AsText, &["model/obj".to_string()])
+        .unwrap();
+    let w = doc.stage("work").unwrap();
+    assert_eq!(w.input_accepts, ["video/*"]);
+    assert_eq!(w.input_as_text, ["model/obj"]);
+    assert!(
+        doc.to_toml().contains("[stages.work.input]"),
+        "{}",
+        doc.to_toml()
+    );
+    runtime_ok(&doc);
+    doc.set_stage_input("work", InputList::Accepts, &[])
+        .unwrap();
+    assert!(
+        doc.to_toml().contains("[stages.work.input]"),
+        "as_text keeps the table: {}",
+        doc.to_toml()
+    );
+    doc.set_stage_input("work", InputList::AsText, &[]).unwrap();
+    assert!(!doc.to_toml().contains("input"), "{}", doc.to_toml());
+    // Clearing what is not there is fine.
+    doc.set_stage_input("work", InputList::AsText, &[]).unwrap();
+    // Artifacts: [[tables]] under a headed stage, edited by index, refused
+    // when wrong.
+    assert!(doc.artifacts("work").is_empty());
+    assert!(doc.artifacts("ghost").is_empty());
+    doc.add_artifact("work", "final").unwrap();
+    assert_eq!(
+        doc.add_artifact("work", "final"),
+        Err(EditError::Taken("final".into()))
+    );
+    assert_eq!(
+        doc.add_artifact("work", "no way"),
+        Err(EditError::BadName("no way".into()))
+    );
+    assert_eq!(
+        doc.add_artifact("ghost", "x"),
+        Err(EditError::NoSuchStage("ghost".into()))
+    );
+    doc.add_artifact("work", "track").unwrap();
+    assert!(
+        doc.to_toml().contains("[[stages.work.output.artifacts]]"),
+        "{}",
+        doc.to_toml()
+    );
+    doc.set_artifact("work", 0, A::Type("video/mp4".into()))
+        .unwrap();
+    doc.set_artifact("work", 0, A::Required(true)).unwrap();
+    doc.set_artifact("work", 0, A::Description("the cut".into()))
+        .unwrap();
+    doc.set_artifact("work", 1, A::Name("audio".into()))
+        .unwrap();
+    assert_eq!(
+        doc.artifacts("work"),
+        vec![
+            ArtifactView {
+                name: "final".into(),
+                mime_type: "video/mp4".into(),
+                required: true,
+                description: "the cut".into(),
+            },
+            ArtifactView {
+                name: "audio".into(),
+                mime_type: "*/*".into(),
+                required: false,
+                description: String::new(),
+            },
+        ]
+    );
+    assert_eq!(doc.stage("work").unwrap().artifacts.len(), 2);
+    assert_eq!(
+        doc.set_artifact("work", 1, A::Name("final".into())),
+        Err(EditError::Taken("final".into()))
+    );
+    assert_eq!(
+        doc.set_artifact("work", 1, A::Name("a b".into())),
+        Err(EditError::BadName("a b".into()))
+    );
+    assert!(matches!(
+        doc.set_artifact("work", 0, A::Type(String::new())),
+        Err(EditError::OutOfRange(_))
+    ));
+    assert!(matches!(
+        doc.set_artifact("work", 5, A::Required(true)),
+        Err(EditError::OutOfRange(_))
+    ));
+    assert_eq!(
+        doc.set_artifact("ghost", 0, A::Required(true)),
+        Err(EditError::NoSuchStage("ghost".into()))
+    );
+    let bp = runtime_ok(&doc);
+    let work = bp.stages.iter().find(|s| s.name == "work").unwrap();
+    let declared = &work.output.as_ref().unwrap().artifacts;
+    assert_eq!(declared.len(), 2);
+    assert!(declared[0].required && declared[0].mime_type == "video/mp4");
+    doc.set_artifact("work", 0, A::Required(false)).unwrap();
+    doc.set_artifact("work", 0, A::Description(String::new()))
+        .unwrap();
+    assert!(!doc.to_toml().contains("required"), "{}", doc.to_toml());
+    // Deleting: out of range refused; the last one takes the table with it.
+    assert!(matches!(
+        doc.delete_artifact("work", 2),
+        Err(EditError::OutOfRange(_))
+    ));
+    doc.delete_artifact("work", 0).unwrap();
+    assert_eq!(doc.artifacts("work")[0].name, "audio");
+    doc.delete_artifact("work", 0).unwrap();
+    assert!(!doc.to_toml().contains("output"), "{}", doc.to_toml());
+    assert!(matches!(
+        doc.delete_artifact("work", 0),
+        Err(EditError::OutOfRange(_))
+    ));
+    assert_eq!(
+        doc.delete_artifact("ghost", 0),
+        Err(EditError::NoSuchStage("ghost".into()))
+    );
+    // An output table with other keys keeps them when its list empties.
+    let mut shaped = ManifestDoc::parse(
+        "[agent]\nname = \"s\"\n[stages.a]\n[stages.a.output]\nformat = \"json\"\n",
+    )
+    .unwrap();
+    assert!(matches!(
+        shaped.delete_artifact("a", 0),
+        Err(EditError::OutOfRange(_))
+    ));
+    shaped.add_artifact("a", "x").unwrap();
+    shaped.delete_artifact("a", 0).unwrap();
+    let text = shaped.to_toml();
+    assert!(
+        text.contains("format = \"json\"") && !text.contains("artifacts"),
+        "{text}"
+    );
+    // An inline stage gets an inline list, edited and emptied the same way.
+    let mut inline =
+        ManifestDoc::parse("stages = { a = { mode = \"autonomous\" } }\n[agent]\nname = \"i\"\n")
+            .unwrap();
+    inline.add_artifact("a", "out").unwrap();
+    inline.add_artifact("a", "log").unwrap();
+    let text = inline.to_toml();
+    assert!(
+        text.contains(
+            "artifacts = [{ name = \"out\", type = \"*/*\" }, { name = \"log\", type = \"*/*\" }]"
+        ),
+        "{text}"
+    );
+    inline
+        .set_artifact("a", 1, A::Type("text/plain".into()))
+        .unwrap();
+    assert_eq!(inline.artifacts("a")[1].mime_type, "text/plain");
+    runtime_ok(&inline);
+    assert!(matches!(
+        inline.delete_artifact("a", 5),
+        Err(EditError::OutOfRange(_))
+    ));
+    inline.delete_artifact("a", 1).unwrap();
+    inline.delete_artifact("a", 0).unwrap();
+    assert!(!inline.to_toml().contains("output"), "{}", inline.to_toml());
+    assert!(matches!(
+        inline.delete_artifact("a", 0),
+        Err(EditError::OutOfRange(_))
+    ));
+    // A list that is not a list is refused rather than clobbered, and an
+    // entry that is not a table is skipped.
+    let mut odd = ManifestDoc::parse(
+        "[agent]\nname = \"odd\"\n[stages.a]\noutput = { artifacts = 3 }\n\
+         [stages.b]\noutput = { artifacts = [1, { name = \"x\", type = \"y\" }] }\n\
+         [stages.c]\noutput = \"nope\"\ninput = \"nope\"\n",
+    )
+    .unwrap();
+    assert_eq!(
+        odd.set_stage_input("c", InputList::Accepts, &["x/y".to_string()]),
+        Err(EditError::NotATable("input".into()))
+    );
+    odd.set_stage_input("c", InputList::Accepts, &[]).unwrap();
+    assert_eq!(
+        odd.add_artifact("a", "x"),
+        Err(EditError::NotATable("artifacts".into()))
+    );
+    assert!(matches!(
+        odd.set_artifact("a", 0, A::Required(true)),
+        Err(EditError::OutOfRange(_))
+    ));
+    assert!(matches!(
+        odd.delete_artifact("a", 0),
+        Err(EditError::OutOfRange(_))
+    ));
+    assert_eq!(odd.artifacts("b").len(), 1);
+    odd.set_artifact("b", 0, A::Type("z".into())).unwrap();
+    assert_eq!(odd.artifacts("b")[0].mime_type, "z");
+    odd.delete_artifact("b", 0).unwrap();
+    assert!(odd.artifacts("b").is_empty());
+    assert_eq!(
+        odd.add_artifact("c", "x"),
+        Err(EditError::NotATable("output".into()))
+    );
+    assert!(matches!(
+        odd.delete_artifact("c", 0),
+        Err(EditError::OutOfRange(_))
+    ));
+    // The typed-list splitter.
+    assert_eq!(split_list(" a/b,, c/D\tc/d "), ["a/b", "c/d"]);
+    assert!(split_list(", ").is_empty());
+    // The answer format comes and goes with its table.
+    let mut doc = starter();
+    doc.set_output_format("work", "markdown").unwrap();
+    assert_eq!(doc.stage("work").unwrap().output_format, "markdown");
+    assert!(
+        doc.to_toml().contains("[stages.work.output]"),
+        "{}",
+        doc.to_toml()
+    );
+    // Cleared with nothing else in the table, the table goes too.
+    doc.set_output_format("work", "").unwrap();
+    assert!(!doc.to_toml().contains("output"), "{}", doc.to_toml());
+    doc.set_output_format("work", "markdown").unwrap();
+    doc.add_artifact("work", "final").unwrap();
+    doc.set_output_format("work", "").unwrap();
+    let text = doc.to_toml();
+    assert!(
+        !text.contains("format") && text.contains("artifacts"),
+        "{text}"
+    );
+    doc.delete_artifact("work", 0).unwrap();
+    assert!(!doc.to_toml().contains("output"), "{}", doc.to_toml());
+    doc.set_output_format("work", "").unwrap();
+    assert_eq!(
+        doc.set_output_format("ghost", "x"),
+        Err(EditError::NoSuchStage("ghost".into()))
+    );
+    // What a tool may be handed: written per tool, read in order, lifted by
+    // an empty list, the table going with the last one.
+    doc.set_tool_accepts(
+        "work",
+        "spawn_agent",
+        &["image/*".to_string(), "audio/wav".to_string()],
+    )
+    .unwrap();
+    doc.set_tool_accepts("work", "context_export", &["text/*".to_string()])
+        .unwrap();
+    assert_eq!(
+        doc.stage("work").unwrap().tool_accepts,
+        vec![
+            (
+                "spawn_agent".to_string(),
+                vec!["image/*".to_string(), "audio/wav".to_string()]
+            ),
+            ("context_export".to_string(), vec!["text/*".to_string()]),
+        ]
+    );
+    assert!(
+        doc.to_toml().contains("[stages.work.tool_accepts]"),
+        "{}",
+        doc.to_toml()
+    );
+    let bp = runtime_ok(&doc);
+    assert_eq!(
+        bp.stages[0].tool_limit("context_export"),
+        Some(["text/*".to_string()].as_slice())
+    );
+    doc.set_tool_accepts("work", "spawn_agent", &[]).unwrap();
+    assert_eq!(doc.stage("work").unwrap().tool_accepts.len(), 1);
+    doc.set_tool_accepts("work", "context_export", &[]).unwrap();
+    assert!(!doc.to_toml().contains("tool_accepts"), "{}", doc.to_toml());
+    doc.set_tool_accepts("work", "context_export", &[]).unwrap();
+    assert_eq!(
+        doc.set_tool_accepts("work", "no way", &["x/y".to_string()]),
+        Err(EditError::BadName("no way".into()))
+    );
+    assert_eq!(
+        doc.set_tool_accepts("ghost", "t", &["x/y".to_string()]),
+        Err(EditError::NoSuchStage("ghost".into()))
+    );
+    // A limit that is not a list is skipped by the view and refused by the
+    // writer; a format table that is not a table is refused too.
+    let mut odd = ManifestDoc::parse(
+        "[agent]\nname = \"odd\"\n[stages.a]\ntool_accepts = { t = 3, u = [\"x/y\"] }\noutput = \"nope\"\n[stages.b]\ntool_accepts = 3\n",
+    )
+    .unwrap();
+    assert_eq!(
+        odd.stage("a").unwrap().tool_accepts,
+        vec![("u".to_string(), vec!["x/y".to_string()])]
+    );
+    assert_eq!(odd.stage("a").unwrap().output_format, "");
+    assert_eq!(
+        odd.set_output_format("a", "json"),
+        Err(EditError::NotATable("output".into()))
+    );
+    odd.set_tool_accepts("a", "t", &["a/b".to_string()])
+        .unwrap();
+    assert_eq!(odd.stage("a").unwrap().tool_accepts.len(), 2);
+    assert!(odd.stage("b").unwrap().tool_accepts.is_empty());
+    assert_eq!(
+        odd.set_tool_accepts("b", "t", &["a/b".to_string()]),
+        Err(EditError::NotATable("tool_accepts".into()))
+    );
+}
+
+#[test]
 fn tool_routing_is_created_and_tidied() {
     let mut doc = starter();
     doc.set_tool_routing_default("work", "").unwrap();
@@ -1361,12 +1657,6 @@ fn odd_content_is_refused_rather_than_clobbered() {
     runtime_ok(&inline);
     inline.rename_stage("a", "start").unwrap();
     assert!(inline.edge("start", "b").is_some());
-    inline.move_stage("b", true).unwrap();
-    assert_eq!(
-        inline.stage_names(),
-        ["start", "b"],
-        "inline stages have no position to move"
-    );
     // An inline `context = {}` gets an inline copy of the shared regions.
     let mut ctx = ManifestDoc::parse(
         "[agent]\nname = \"c\"\n[context.regions]\nnotes = { kind = \"pinned\" }\n[stages.a]\ncontext = { }\n",
@@ -1791,4 +2081,124 @@ fn renaming_an_agent_moves_its_directory_and_the_name_in_its_manifest() {
     assert!(moved.starts_with("# kept\n"), "{moved}");
     assert!(moved.contains("name = \"mine\""), "{moved}");
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn output_routing_and_context_reset_round_trip_through_the_manifest() {
+    let toml = r#"
+[agent]
+name = "draw"
+
+[context.regions]
+artwork = { kind = "pinned" }
+conversation = { kind = "sliding_window" }
+
+[stages.draw]
+mode = "autonomous"
+
+[stages.describe]
+mode = "autonomous"
+"#;
+    let mut doc = ManifestDoc::parse(toml).unwrap();
+
+    // A ghost stage is refused for both setters.
+    assert_eq!(
+        doc.set_output_routing("ghost", &[("image/*".into(), "artwork".into())]),
+        Err(EditError::NoSuchStage("ghost".into()))
+    );
+    assert_eq!(
+        doc.set_context_reset("ghost", &["conversation".into()]),
+        Err(EditError::NoSuchStage("ghost".into()))
+    );
+
+    // output_routing: written in the given order, read back, then rewritten.
+    doc.set_output_routing(
+        "draw",
+        &[
+            ("image/*".into(), "artwork".into()),
+            ("application/pdf".into(), "artwork".into()),
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        doc.stage("draw").unwrap().output_routing,
+        [
+            ("image/*".to_string(), "artwork".to_string()),
+            ("application/pdf".to_string(), "artwork".to_string()),
+        ]
+    );
+    assert!(
+        doc.to_toml().contains("[stages.draw.output_routing]"),
+        "{}",
+        doc.to_toml()
+    );
+    runtime_ok(&doc);
+    // Rewriting replaces the whole table.
+    doc.set_output_routing("draw", &[("image/*".into(), "artwork".into())])
+        .unwrap();
+    assert_eq!(
+        doc.stage("draw").unwrap().output_routing,
+        [("image/*".to_string(), "artwork".to_string())]
+    );
+    // Empty clears the table entirely.
+    doc.set_output_routing("draw", &[]).unwrap();
+    assert!(doc.stage("draw").unwrap().output_routing.is_empty());
+    assert!(
+        !doc.to_toml().contains("output_routing"),
+        "{}",
+        doc.to_toml()
+    );
+
+    // context.reset: set, read back, then cleared.
+    doc.set_context_reset("describe", &["conversation".into()])
+        .unwrap();
+    assert_eq!(
+        doc.stage("describe").unwrap().context_reset,
+        ["conversation"]
+    );
+    assert!(doc.to_toml().contains("reset"), "{}", doc.to_toml());
+    runtime_ok(&doc);
+    doc.set_context_reset("describe", &[]).unwrap();
+    assert!(doc.stage("describe").unwrap().context_reset.is_empty());
+    // With nothing else in the context table, clearing reset takes the table
+    // with it.
+    assert!(
+        !doc.to_toml().contains("[stages.describe.context]"),
+        "{}",
+        doc.to_toml()
+    );
+}
+
+#[test]
+fn output_routing_and_context_reset_refuse_odd_content_and_keep_a_shared_table() {
+    // A non-table `output_routing` or `context` is refused, not clobbered.
+    let mut odd = ManifestDoc::parse(
+        "[agent]\nname = \"o\"\n[stages.a]\noutput_routing = 3\ncontext = \"nope\"\n",
+    )
+    .unwrap();
+    assert_eq!(
+        odd.set_output_routing("a", &[("image/*".into(), "art".into())]),
+        Err(EditError::NotATable("output_routing".into()))
+    );
+    assert_eq!(
+        odd.set_context_reset("a", &["conversation".into()]),
+        Err(EditError::NotATable("context".into()))
+    );
+
+    // Clearing reset leaves a context table that still holds a layout: the
+    // table stays, only `reset` goes.
+    let mut doc = ManifestDoc::parse(
+        "[agent]\nname = \"k\"\n\n[stages.work]\nmode = \"autonomous\"\n\n\
+         [stages.work.context]\nreset = [\"conversation\"]\n\n\
+         [stages.work.context.regions]\nnotes = { kind = \"pinned\" }\n",
+    )
+    .unwrap();
+    assert_eq!(doc.stage("work").unwrap().context_reset, ["conversation"]);
+    doc.set_context_reset("work", &[]).unwrap();
+    assert!(doc.stage("work").unwrap().context_reset.is_empty());
+    assert!(
+        doc.to_toml().contains("[stages.work.context.regions]"),
+        "the layout keeps the context table: {}",
+        doc.to_toml()
+    );
 }

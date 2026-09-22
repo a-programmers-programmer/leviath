@@ -21,19 +21,13 @@ Per-agent tools live in that agent's own `tools/` directory instead, and are che
 > [!WARNING]
 > The directory is `~/.leviath/tools/`, inside Leviath's data root next to `providers/` and
 > `agents/`. It is not `$HOME/tools/`. Every `.rhai` file here becomes a tool for every agent, and
-> not every file in it was written by you: once a run uses the `install_tool` built-in, the
-> directory holds model-authored code as well. `install_tool` is the audited way in: it compiles
-> the script, refuses a colliding name, and starts each file with a
+> not every file in it was written by you: once a run uses `install_global_tool`, the
+> directory holds model-authored code as well. Each installed file starts with a
 > `// installed by leviath: agent run in <workdir> at <unix seconds>` line naming where it came
-> from. It is not the only way in. A shell redirect outside the workdir is
-> [refused](/docs/tools#where-a-redirect-may-write), but a program the shell runs (`cp`, `tee`) is
-> confined only by a [`[sandbox]`](/docs/security#sandboxes), so an unattended run with `shell` and
-> no sandbox can still put a `.rhai` file here; a file without a provenance line was not installed
-> through `install_tool`. Every call to any tool here is still gated by the tool policy (`ask` by default,
-> waived only by `--yolo`). Audit the directory with `lev tools`, which lists each tool with its
-> description and parameters and prints its provenance line under it (or says the file has none),
-> and remove a tool by deleting its `.rhai` file (and any sibling `.toml`): the next spawn no
-> longer sees it.
+> from, and every call to any tool here is still gated by the tool policy (`ask` by default, waived
+> only by `--yolo`). Audit the directory with `lev tools`, which lists each tool with its
+> description and parameters, and remove a tool by deleting its `.rhai` file (and any sibling
+> `.toml`): the next spawn no longer sees it.
 
 ## Declaring a tool
 
@@ -41,8 +35,8 @@ A tool declares itself with leading `// @` directives and reads its arguments fr
 object. The recognized directives:
 
 - `// @tool <name>` is required and names the tool. A stage sees it when its `available_tools`
-  lists that name, or when the stage sets `available_global_tools = true` and the script lives in
-  `~/.leviath/tools/`.
+  lists that name or includes `@scripts`, the [tool group](/docs/tools#tool-groups) that grants
+  every Rhai tool the install has.
 - `// @description <text>` is an optional one-liner shown to the model.
 - `// @param <name> <type> <required|optional> "<description>"` is repeatable. `<type>` is a JSON
   schema type: `string`, `integer`, `number`, `boolean`, `array`, `object`. A typo here produces a
@@ -52,9 +46,16 @@ object. The recognized directives:
 - `// @requires <cap> [<cap>...]` lists platform capabilities the tool needs (`network`, `shell`,
   `filesystem`), comma or space separated and repeatable. Leviath drops the tool where the platform
   cannot provide one.
+- `// @accepts <type> [...]` and `// @produces <type> [...]` name the mime types the tool reads as
+  [parts](/docs/mime) and hands back as parts (`image/*`, `audio/wav`), comma or space separated
+  and repeatable. Advisory: `lev tools` shows them, and a stage that needs a `video/mp4` can be
+  checked against the tools it holds.
 
 The script's return value becomes the tool result: a string is returned verbatim, anything else is
-JSON-encoded, and a bare `()` is an empty string. A missing optional param reads as `()`.
+JSON-encoded, and a bare `()` is an empty string. A missing optional param reads as `()`. One shape
+is special: a map with a `parts` list, `#{ content: "...", parts: [ ... ] }`, is a result that
+carries typed parts beside its text. Each entry is a part map as `write_part` or `find_part` handed
+it back; the text is the `content`, or nothing when it is left off.
 
 ## Host functions inside a tool
 
@@ -67,12 +68,38 @@ tool's `@requires` line is not a gate: it only filters which platforms discover 
 
 | Function | Does |
 |---|---|
-| `http_get(url [, headers])` | An HTTP GET |
+| `http_get(url [, headers])` | An HTTP GET, as text. A body that is not text is refused, not decoded. See below |
+| `http_get_bytes(url [, headers])` | The same GET, as bytes: a map with `mime_type` and `bytes`, ready for `write_part`. See below |
 | `http_post(url, body [, headers])` | An HTTP POST |
 | `shell(cmd)` | Runs a shell command |
 | `read_file(path)` | Reads a file, always confined to the workdir |
+| `read_file_bytes(path)` | The same file, as bytes: an exact Rhai blob, ready for `write_part`. See below |
 | `write_file(path, content)` | Writes a file |
 | `env_var(name)` | Reads an environment variable. Credential-shaped names need [`allow_env_vars`](/docs/configuration#security) |
+| `read_part(name)` | The bytes of a stored [part](/docs/mime) the run holds, as a Rhai blob. See below |
+| `write_part(bytes [, type [, name]])` | Stores bytes as a part of the run and returns its map. See below |
+| `list_parts()` | Every stored part the run holds, as maps |
+| `find_part(name)` | One part's map by name or hash prefix, or `()` |
+
+`http_get` refuses a body that is not text, such as an image, a sound or a PDF, and the message
+names its type. It does not decode those bytes into noise. `http_get_bytes` is how you fetch them.
+Its `mime_type` is the one the server declared, its `bytes` are a Rhai blob, and bodies over 32 MiB
+are refused before they are read. It is gated like `http_get`.
+
+`read_file_bytes` is for a file that is not text, like an image your shell command rendered or a
+design someone handed you. The blob is exact. Files up to `[mime] max_part_bytes` are read, and
+larger ones are refused before they are read. It is gated and confined like `read_file`.
+
+`read_part` takes a file name, or the first six or more characters of a part's sha256. Reading
+needs no permission, because the part is already the run's. `write_part` sniffs the type when you
+leave it off and makes up a name, such as `part-3.png`. It is gated like `write_file`, and charged
+to the run's write budget.
+
+A part map carries `mime_type`, `name`, `sha256`, `size`, `width`, `height`, `duration_ms`,
+`tokens` and `stand_in`. The parts a tool can name are the ones in the agent's context window when
+the batch was dispatched, plus whatever the tools in that batch wrote. A tool that takes an image by
+name reads `params.image` and calls `read_part` on it; the model names parts the way the stand-in
+in its context does, by file name.
 
 **These are pure** and need no permission, because they only transform values you already have:
 
@@ -84,8 +111,8 @@ tool's `@requires` line is not a gate: it only filters which platforms discover 
 
 `decode_base64` fails rather than returning something wrong, in two ways worth telling apart. Input
 that is not valid base64 says so. Input that is valid base64 but decodes to bytes that are not UTF-8
-says *that* - base64 carries any bytes, a Rhai string holds text, so a script decoding an image has
-asked for something the function cannot return. Both reach the model as an `[error]` line naming
+says *that*. Base64 carries any bytes and a Rhai string holds text, so a script decoding an image
+has asked for something the function cannot return. Both reach the model as an `[error]` line naming
 your tool, so a script that hits one stops rather than carrying on with an empty string.
 
 ## A complete tool
@@ -111,6 +138,25 @@ let body = http_get(params.url);
 html_to_text(body)
 ```
 
+A tool that makes a part. It renders a diagram with a command-line tool, then reads the picture the
+command wrote as bytes and hands it back typed. A model that sees images sees the diagram. One that
+does not sees a line naming it:
+
+```rhai
+// @tool render_diagram
+// @description Render a Mermaid diagram to a PNG
+// @param source string required "the Mermaid source"
+// @produces image/png
+// @requires shell
+write_file("work/diagram.mmd", params.source);
+shell("mmdc -i work/diagram.mmd -o work/diagram.png");
+let png = read_file_bytes("work/diagram.png");
+#{ content: "rendered the diagram", parts: [write_part(png, "image/png", "diagram.png")] }
+```
+
+The source goes through a file rather than into the command line, so nothing the model writes is
+ever run by the shell.
+
 For parameter shapes that directives cannot express (enums, array `items`, numeric bounds), drop a
 sibling `.toml` named after the script (`export.toml` beside `export.rhai`). When present it
 overrides the annotations entirely:
@@ -130,16 +176,37 @@ schema   = { type = "string", enum = ["json", "yaml"], description = "output for
 
 ## Installing a tool from a run
 
-A running agent can add to the global inventory itself with the `install_tool` built-in. It takes
-the tool's `name`, the complete `.rhai` `source`, and an optional `overwrite` flag, compiles the
-script, and writes it to `~/.leviath/tools/<name>.rhai`. This is the persist path for mechanical
-learnings: a step an agent worked out by hand once (a parsing routine, a repeated lookup, a fixed
-transformation) becomes a tool every later run can call instead of rediscovering it.
+A running agent can add a tool itself. Both built-ins take the tool's `name`, the complete `.rhai`
+`source`, and an optional `overwrite` flag, compile the script, and write it out. This is the
+persist path for mechanical learnings. A step an agent worked out by hand once, such as a parsing
+routine, a repeated lookup or a fixed transformation, becomes a tool that later runs call instead of
+rediscovering it.
 
-The install is refused, and nothing is written, when the script does not compile, has no
-`// @tool` or `// @description`, declares a `// @tool` name that differs from `name`, takes the
-name of a built-in, sub-agent or MCP tool (a script under one of those is dropped at discovery, so
-it would never run), exceeds 256 KiB, or would replace an existing script without `overwrite`.
+What differs is who ends up with the tool:
+
+| Built-in | Writes to | Who sees it |
+|---|---|---|
+| `install_self_tool` | the agent's own `tools/` | that agent's runs, and nothing else |
+| `install_global_tool` | `~/.leviath/tools/` | every agent on the machine that asks for script tools |
+
+Reach for `install_self_tool`. What an agent learns is usually about its own job, and the wide one
+arms every agent that names `@scripts` or `@all` with code one agent wrote. `install_tool` is the
+name they were split out of, and it still works: it means `install_global_tool`, which is what it
+always did.
+
+Neither one falls back to the other. An agent with no blueprint directory to write to is told so,
+rather than quietly installing machine-wide.
+
+The install is refused, and nothing is written, when the script:
+
+- Does not compile.
+- Has no `// @tool` or `// @description`.
+- Declares a `// @tool` name that differs from `name`.
+- Takes the name of a built-in, sub-agent or MCP tool.
+- Exceeds 256 KiB.
+- Would replace an existing script without `overwrite`.
+
+A script that takes one of those reserved names is dropped at discovery, so it would never run.
 A sibling `<name>.toml` that declares a different `[tool] name` is refused too, since the TOML
 would win and the tool would appear under the other name. The result the model reads back names
 the file, the description, the parameters and the required capabilities.
@@ -148,11 +215,9 @@ Three things keep the directory yours:
 
 - Every installed file starts with a `// installed by leviath: agent run in <workdir> at <unix
   seconds>` comment, so `cat` and `lev tools` show which run wrote it. The comment carries no `@`
-  directive and compiles as an ordinary comment. Only `install_tool` writes it: a file in the
-  directory without one was hand-written, or put there by something that bypassed the install
-  (a `cp` from a `shell` call in a run with no `[sandbox]`, for instance).
-- `install_tool` is `ask` by default, like `write_file` and `shell`. A blueprint or `config.toml`
-  can set `install_tool = "allow"` under `[tool_permissions]`, and `--yolo` waives the prompt for
+  directive and compiles as an ordinary comment.
+- Both are `ask` by default, like `write_file` and `shell`. A blueprint or `config.toml` can set
+  `install_self_tool = "allow"` under `[tool_permissions]`, and `--yolo` waives the prompt for
   an unattended run. See [Security](/docs/security) for what an unattended run can persist.
 - The script's own calls are still gated when it runs: an installed tool reads the same
   [`[tool_script_permissions]`](/docs/configuration#tool_script_permissions) as a hand-written one.
@@ -160,19 +225,17 @@ Three things keep the directory yours:
 A tool is meant for repeatable mechanical steps, never for judgement. A script that encodes a
 decision the model should be making each time ages badly and is hard to notice from the outside.
 
-To use an installed tool in the same run, the agent must be a `dynamic_tools` agent, which picks
-the new tool up on its next turn. Any later run sees it at spawn, and a stage advertises it when its
-`available_tools` names it or it sets `available_global_tools = true`. See [Tools](/docs/tools) for
-how a stage's tool set is put together.
+To use an installed tool in the same run, the agent needs
+[`tool_rescan`](/docs/agents#discovering-tools-mid-run): `after_writes` picks the new tool up on its
+next turn, and `before_dispatch` also picks it up in the turn that wrote it. Any later run sees it at spawn, and a stage advertises it when its
+`available_tools` names it or includes `@scripts`. See [Tools](/docs/tools) for how a stage's tool
+set is put together.
 
 ## Inspecting the inventory
 
-`lev tools` lists the global inventory without starting the daemon. Compiled tools are marked,
-files that failed to compile are shown with their reason (they are not advertised at all), and a tool
-whose `@requires` capability the platform cannot satisfy is flagged unavailable. Under each tool it
-prints the file's `// installed by leviath: ...` line, or
-`no provenance line (hand-written, or written outside install_tool)` when the file has none; the
-JSON output carries the same line as `provenance`, `null` when absent:
+`lev tools` lists the global inventory without starting the daemon. Compiled tools are marked. A
+file that failed to compile is shown with its reason, and is not advertised at all. A tool whose
+`@requires` capability the platform cannot satisfy is flagged unavailable:
 
 ```bash
 lev tools           # human-readable inventory, params, requires, and skipped files

@@ -357,7 +357,12 @@ fn a_missing_published_artifact_is_reported_on_its_own() {
     let problems = check_schemas(dir.path());
     assert_eq!(
         problems,
-        vec!["docs/schema/config.example.toml: missing".to_string()]
+        vec![
+            "docs/schema/config.example.toml: missing".to_string(),
+            "docs/schema/yolo.example.toml: missing".to_string(),
+            "docs/schema/mime_types.example.toml: missing".to_string(),
+            "docs/schema/leviath.graphql: missing".to_string(),
+        ]
     );
 }
 

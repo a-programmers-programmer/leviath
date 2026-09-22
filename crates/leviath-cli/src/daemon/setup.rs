@@ -166,7 +166,7 @@ pub(crate) async fn setup_daemon_host_with(
     // name silently gets a 128 000-token window, with every percentage region
     // budget sized against it. Awaited rather than spawned so the first run has
     // the answer instead of racing it; failures are warnings.
-    providers
+    let prime_failures = providers
         .prime_capabilities(
             std::time::Duration::from_secs(PROVIDER_PRIME_TIMEOUT_SECS),
             // The machine's default, so a script provider named there can
@@ -175,6 +175,19 @@ pub(crate) async fn setup_daemon_host_with(
             &[config.default_provider.as_str()],
         )
         .await;
+    // Write what the prime learned to the shared capability cache, so a
+    // short-lived `lev models`, `lev validate` or serve handler answers a
+    // model's real limits from the same numbers instead of re-priming to its own
+    // conservative default. Best-effort: a home that does not resolve (path is
+    // `None`), or a file that cannot be written, just leaves the pre-cache
+    // behaviour in place.
+    let cache_path = leviath_core::paths::capability_cache_path();
+    providers.save_capability_cache(
+        cache_path.as_deref(),
+        chrono::Utc::now().timestamp(),
+        &crate::provider_checks::fingerprints(cache_path.as_deref(), &config),
+        &prime_failures,
+    );
     // Keeps that registry in step with `config.toml` from here on: a run
     // started after a `lev setup`, a `PUT /api/config` or a hand edit resolves
     // against the providers the file names now, without a daemon restart.
@@ -237,6 +250,8 @@ fn make_reaper(
             let run_id = md.run_id.clone();
             mcp_pool.release_run(&run_id);
         }
+        // A finished run deletes what it put in providers' file storage.
+        leviath_runtime::provider_files::forget_finished(world.world(), entity);
         tool_service.reap(entity)
     })
 }
@@ -267,6 +282,19 @@ fn make_resumer(
             return;
         };
         state.reread_config(&reloader.current());
+    })
+}
+
+/// The hook the host runs on every safety re-drive: the config as it stands
+/// on disk now, applied to the world where it differs from what is in it.
+/// One stat of `config.toml` and one read of `mime_types.toml` when nothing
+/// changed. Factored out so the closure body is unit-testable.
+fn make_housekeeper(
+    reloader: Arc<crate::daemon::config_reload::ConfigReloader>,
+    live_limits: Arc<crate::daemon::live_limits::LiveLimits>,
+) -> leviath_runtime::host::Housekeeper {
+    Box::new(move |world| {
+        live_limits.apply(&reloader.current(), world);
     })
 }
 
@@ -528,6 +556,13 @@ pub fn build_host(parts: HostParts) -> WorldHost {
     // an unanswered prompt waits for ever by default.
     host.set_resumer(make_resumer(tool_service.clone(), reloader.clone()));
 
+    // Housekeeping: on the host's own timer, whether or not a spawn comes
+    // along, re-read the config layers that reach runs already under way.
+    // This is what makes an edit to `mime_types.toml` (or a `[limits]` key)
+    // land in a live run within one re-drive interval rather than waiting
+    // for the next `lev run` to walk the spawn path.
+    host.set_housekeeper(make_housekeeper(reloader.clone(), live_limits.clone()));
+
     // Preprocessor: before the sync spawner runs, connect the blueprint's declared
     // MCP servers into the shared pool (lazy, deduped) so they're warm to advertise -
     // and pre-warm the servers declared by any `worker_agent`/`worker_query`
@@ -562,6 +597,11 @@ pub fn build_host(parts: HostParts) -> WorldHost {
             // asks it what its models are. The sync spawner installs whatever
             // this built.
             reload.refresh_and_prime(&config).await;
+            // Under zero retention, what the providers read their answer
+            // from (Bedrock's account mode) is read again here, on the one
+            // hook that can await, so the gate a moment later judges this
+            // spawn by the mode as it is now.
+            reload.refresh_retention(&config).await;
             warm_blueprint_models(
                 &reload.registry(),
                 &blueprint_path,
@@ -679,7 +719,7 @@ fn write_placeholder_meta(runs_dir: &std::path::Path, args: &leviath_runtime::ho
         .nth(2)
         .unwrap_or(&args.run_id)
         .to_string();
-    let meta = leviath_core::run_meta::RunMeta::new(
+    let mut meta = leviath_core::run_meta::RunMeta::new(
         args.run_id.clone(),
         agent_name,
         args.blueprint_path.clone(),
@@ -688,8 +728,47 @@ fn write_placeholder_meta(runs_dir: &std::path::Path, args: &leviath_runtime::ho
         args.workdir.clone(),
         0,
     );
-    if let Err(e) = crate::runstate::create_run_in(&runs_dir.join(&args.run_id), &meta) {
+    let dir = runs_dir.join(&args.run_id);
+    // The manifest text, read before it is parsed: a blueprint that will not
+    // load still leaves behind the bytes that would not load, which is what
+    // somebody reading the failure wants to see.
+    let snapshot = std::fs::read_to_string(&args.blueprint_path).ok();
+    meta.blueprint_digest = snapshot
+        .as_deref()
+        .map(|text| leviath_core::mime::store::sha256_hex(text.as_bytes()));
+    if let Err(e) = crate::runstate::create_run_in(&dir, &meta) {
         tracing::warn!(run_id = %args.run_id, error = %e, "could not pre-create run directory");
+    }
+    if let Some(text) = snapshot {
+        write_blueprint_snapshot(&dir, &text, &args.run_id);
+    }
+}
+
+/// Copy the manifest a run is about to execute into the run directory.
+///
+/// Best-effort, like the placeholder metadata beside it: a run that executes
+/// is better than a run refused because its own archive copy could not be
+/// written. A reader that finds no snapshot falls back to the installed file,
+/// which is what every run before this behaved like.
+fn write_blueprint_snapshot(dir: &std::path::Path, manifest: &str, run_id: &str) {
+    let path = dir.join(leviath_core::files::BLUEPRINT_SNAPSHOT_FILE);
+    if let Err(e) = crate::runstate::write_private_atomic(&path, manifest) {
+        tracing::warn!(run_id = %run_id, error = %e, "could not snapshot the run's blueprint");
+    }
+}
+
+/// The blueprint a run should execute: its own snapshot when it has one, and
+/// the installed file otherwise.
+///
+/// Recovery pages a run back in by spawning it afresh from a manifest path, so
+/// this is what decides whether a restart resumes the run on what it started
+/// with or on whatever the installed file says now. Runs written before
+/// snapshots existed have only the latter, and keep the old behaviour.
+pub(crate) fn blueprint_source(dir: &std::path::Path, installed: &str) -> String {
+    let snapshot = dir.join(leviath_core::files::BLUEPRINT_SNAPSHOT_FILE);
+    match snapshot.is_file() {
+        true => snapshot.to_string_lossy().into_owned(),
+        false => installed.to_string(),
     }
 }
 
@@ -865,6 +944,60 @@ mod tests {
     /// it. Both arms in one test: an entity with no tool state (a fan-out
     /// parent paged back in before its workers register) is a no-op, and one
     /// with state has its config layers re-read.
+    /// The housekeeper applies the config as it stands on disk, so an edit
+    /// to `mime_types.toml` reaches the world on the next pass with no
+    /// spawn to carry it.
+    #[tokio::test]
+    async fn make_housekeeper_applies_the_files_on_disk() {
+        crate::config::with_isolated_config_path_async("housekeeper", |dir| async move {
+            let world_config = Config::default();
+            let mut world = PipelineWorld::new(
+                ProviderRegistry::new(),
+                Arc::new(CliToolService::new()),
+                leviath_runtime::inference_pool::InferencePoolConfig::new(),
+                1,
+                None,
+                Handle::current(),
+            );
+            let config_path = dir.join("config.toml");
+            std::fs::write(&config_path, toml::to_string(&world_config).unwrap()).unwrap();
+            let reloader = Arc::new(crate::daemon::config_reload::ConfigReloader::new(
+                config_path,
+                world_config,
+            ));
+            let live = crate::daemon::live_limits::for_daemon(
+                InteractionHub::new(),
+                leviath_runtime::host::HostSettings::default(),
+            );
+            let mut housekeeper = make_housekeeper(reloader, live);
+            let obj: leviath_core::mime::MimeType = "model/obj".parse().unwrap();
+            let family = |world: &PipelineWorld| {
+                world
+                    .world()
+                    .get_resource::<leviath_runtime::blob_store::MimeRegistryHandle>()
+                    .expect("the first pass installs the registry")
+                    .0
+                    .info(&obj)
+                    .family
+                    .clone()
+            };
+            housekeeper(&mut world);
+            assert_eq!(family(&world), "model");
+            std::fs::write(
+                dir.join("mime_types.toml"),
+                "[\"model/obj\"]\nfamily = \"scene\"\n",
+            )
+            .unwrap();
+            housekeeper(&mut world);
+            assert_eq!(
+                family(&world),
+                "scene",
+                "the file edit landed with no spawn"
+            );
+        })
+        .await;
+    }
+
     #[tokio::test]
     async fn make_resumer_rereads_the_config_of_a_registered_agent() {
         let tool_service = Arc::new(CliToolService::new());
@@ -958,7 +1091,9 @@ mod tests {
             callback_secret: None,
             title: None,
             title_error: None,
+            blueprint_digest: None,
             unattended: false,
+            yolo_profile: None,
             read_paths: None,
             output_request: None,
             model_override: None,
@@ -989,52 +1124,66 @@ mod tests {
 
     #[tokio::test]
     async fn setup_daemon_host_builds_a_working_host() {
-        // `setup_daemon_host_with` mirrors `[security] allow_local_network`
-        // into a process-wide atomic, which makes this test a writer of the
-        // switch the script-host redirect tests read. Without the lock, standing
-        // up a host here flipped that switch mid-request over there and the
-        // refusal it saw was this test's config, not its own.
+        // The host's reloader watches `Config::config_path()`, which the
+        // isolated tests point at their own scratch files; read in one of their
+        // windows, this host would adopt a neighbour's config on its next
+        // spawn. So this test holds a path of its own for its whole run.
         let _redirect = crate::daemon::script_host::REDIRECT_MIRROR.lock().await;
-        // Config::default has no MCP servers → the shared MCP connect is a no-op.
-        // An empty runs dir → restart recovery finds nothing to reload.
-        // A key for the manifest's provider, because a spawn whose stages have
-        // no usable provider is refused outright.
-        let runs = tempfile::tempdir().unwrap();
-        let mut host = setup_daemon_host(
-            config_with_anthropic_key(),
-            runs.path().to_path_buf(),
-            Handle::current(),
-        )
-        .await
-        .expect("the daemon host builds in tests");
+        crate::config::with_isolated_config_path_async(
+            "setup_daemon_host_builds_a_working_host",
+            |_| async move {
+                // `setup_daemon_host_with` mirrors `[security] allow_local_network`
+                // into a process-wide atomic, which makes this test a writer of the
+                // switch the script-host redirect tests read. Without the lock, standing
+                // up a host here flipped that switch mid-request over there and the
+                // refusal it saw was this test's config, not its own.
+                // Config::default has no MCP servers → the shared MCP connect is a no-op.
+                // An empty runs dir → restart recovery finds nothing to reload.
+                // A key for the manifest's provider, because a spawn whose stages have
+                // no usable provider is refused outright.
+                let runs = tempfile::tempdir().unwrap();
+                let mut host = setup_daemon_host(
+                    config_with_anthropic_key(),
+                    runs.path().to_path_buf(),
+                    Handle::current(),
+                )
+                .await
+                .expect("the daemon host builds in tests");
 
-        // Spawning through the wired host exercises the real setup end to end
-        // (including the now_secs timestamp closure).
-        let dir = tempfile::tempdir().unwrap();
-        let manifest = dir.path().join("agent.leviath");
-        std::fs::write(&manifest, crate::test_support::inline_coder_manifest()).unwrap();
-        let (reply, rx) = oneshot::channel();
-        host.handle(ControlOp::Spawn {
-            args: Box::new(SpawnArgs {
-                run_id: "run-s".to_string(),
-                blueprint_path: manifest.to_string_lossy().to_string(),
-                task: "t".to_string(),
-                regions: Default::default(),
-                model: None,
-                workdir: std::env::temp_dir().to_string_lossy().to_string(),
-                metadata: Default::default(),
-                callback_url: None,
-                callback_secret: None,
-                yolo: false,
-                no_seed_commands: false,
-                allow: Vec::new(),
-                max_depth: None,
-                parent_run_id: None,
-                output: None,
-            }),
-            reply,
-        });
-        assert_eq!(rx.await.unwrap(), Ok("run-s".to_string()));
+                // Spawning through the wired host exercises the real setup end to end
+                // (including the now_secs timestamp closure).
+                let dir = tempfile::tempdir().unwrap();
+                let manifest = dir.path().join("agent.leviath");
+                std::fs::write(&manifest, crate::test_support::inline_coder_manifest()).unwrap();
+                let (reply, rx) = oneshot::channel();
+                host.handle(ControlOp::Spawn {
+                    args: Box::new(SpawnArgs {
+                        run_id: "run-s".to_string(),
+                        blueprint_path: manifest.to_string_lossy().to_string(),
+                        task: "t".to_string(),
+                        regions: Default::default(),
+                        model: None,
+                        workdir: std::env::temp_dir().to_string_lossy().to_string(),
+                        metadata: Default::default(),
+                        callback_url: None,
+                        callback_secret: None,
+                        yolo: false,
+                        yolo_profile: None,
+                        no_seed_commands: false,
+                        allow: Vec::new(),
+                        max_depth: None,
+                        parent_run_id: None,
+                        worker_stage: None,
+                        output: None,
+                        parts: Vec::new(),
+                        capture_model_input: false,
+                    }),
+                    reply,
+                });
+                assert_eq!(rx.await.unwrap(), Ok("run-s".to_string()));
+            },
+        )
+        .await;
     }
 
     /// A spawn can die before any state exists (3 of 13 empty runs in one live
@@ -1044,47 +1193,163 @@ mod tests {
     /// otherwise claim the run was alive for ever, records the failure in it.
     #[tokio::test]
     async fn spawner_records_the_failure_in_the_run_dir_it_staked_out() {
-        // `setup_daemon_host_with` mirrors `[security] allow_local_network`
-        // into a process-wide atomic, which makes this test a writer of the
-        // switch the script-host redirect tests read. Without the lock, standing
-        // up a host here flipped that switch mid-request over there and the
-        // refusal it saw was this test's config, not its own.
         let _redirect = crate::daemon::script_host::REDIRECT_MIRROR.lock().await;
-        let runs = tempfile::tempdir().unwrap();
-        let mut host = setup_daemon_host(
-            Config::default(),
-            runs.path().to_path_buf(),
-            Handle::current(),
-        )
-        .await
-        .expect("the daemon host builds in tests");
-        let (reply, rx) = oneshot::channel();
-        host.handle(ControlOp::Spawn {
-            args: Box::new(SpawnArgs {
-                // A blueprint path that doesn't exist: the spawn fails at the
-                // very first step inside build_agent.
-                run_id: "my-agent-1234-ab12".to_string(),
-                blueprint_path: "/no/such/agent.leviath".to_string(),
-                task: "t".to_string(),
-                workdir: std::env::temp_dir().to_string_lossy().to_string(),
-                ..Default::default()
-            }),
-            reply,
-        });
-        assert!(rx.await.unwrap().is_err());
+        crate::config::with_isolated_config_path_async(
+            "spawner_records_the_failure_in_the_run_dir_it_staked_out",
+            |_| async move {
+                // `setup_daemon_host_with` mirrors `[security] allow_local_network`
+                // into a process-wide atomic, which makes this test a writer of the
+                // switch the script-host redirect tests read. Without the lock, standing
+                // up a host here flipped that switch mid-request over there and the
+                // refusal it saw was this test's config, not its own.
+                let runs = tempfile::tempdir().unwrap();
+                let mut host = setup_daemon_host(
+                    Config::default(),
+                    runs.path().to_path_buf(),
+                    Handle::current(),
+                )
+                .await
+                .expect("the daemon host builds in tests");
+                let (reply, rx) = oneshot::channel();
+                host.handle(ControlOp::Spawn {
+                    args: Box::new(SpawnArgs {
+                        // A blueprint path that doesn't exist: the spawn fails at the
+                        // very first step inside build_agent.
+                        run_id: "my-agent-1234-ab12".to_string(),
+                        blueprint_path: "/no/such/agent.leviath".to_string(),
+                        task: "t".to_string(),
+                        workdir: std::env::temp_dir().to_string_lossy().to_string(),
+                        ..Default::default()
+                    }),
+                    reply,
+                });
+                assert!(rx.await.unwrap().is_err());
 
-        let meta = crate::runstate::read_meta_from(&runs.path().join("my-agent-1234-ab12"))
-            .expect("a failed spawn still leaves meta.json behind");
-        // Terminal, not `Starting`: nothing is going to advance this run.
-        assert_eq!(meta.status, leviath_core::run_meta::RunStatus::Error);
-        assert!(
-            meta.error
-                .is_some_and(|e| e.contains("/no/such/agent.leviath")),
-            "and it says what went wrong"
+                let meta = crate::runstate::read_meta_from(&runs.path().join("my-agent-1234-ab12"))
+                    .expect("a failed spawn still leaves meta.json behind");
+                // Terminal, not `Starting`: nothing is going to advance this run.
+                assert_eq!(meta.status, leviath_core::run_meta::RunStatus::Error);
+                assert!(
+                    meta.error
+                        .is_some_and(|e| e.contains("/no/such/agent.leviath")),
+                    "and it says what went wrong"
+                );
+                assert_eq!(meta.task, "t");
+                // The agent name is recovered from the run id's prefix, dashes and all.
+                assert_eq!(meta.agent_name, "my-agent");
+            },
+        )
+        .await;
+    }
+
+    /// The run keeps its own copy of the manifest it is about to execute, and
+    /// records that copy's digest.
+    ///
+    /// This is what makes "what did this run execute" answerable later. Without
+    /// it, the answer was whatever the installed file said by the time somebody
+    /// asked, which is a different file after any edit.
+    #[test]
+    fn a_spawn_snapshots_the_manifest_it_is_about_to_run() {
+        let runs = tempfile::tempdir().unwrap();
+        let installed = tempfile::tempdir().unwrap();
+        let manifest = installed.path().join("agent.leviath");
+        let text = "[agent]\nname = \"my-agent\"\n";
+        std::fs::write(&manifest, text).unwrap();
+        let args = SpawnArgs {
+            run_id: "my-agent-1788924523-abc123".to_string(),
+            blueprint_path: manifest.to_string_lossy().into_owned(),
+            task: "t".to_string(),
+            ..Default::default()
+        };
+
+        write_placeholder_meta(runs.path(), &args);
+
+        let dir = runs.path().join(&args.run_id);
+        let snapshot =
+            std::fs::read_to_string(dir.join(leviath_core::files::BLUEPRINT_SNAPSHOT_FILE))
+                .unwrap();
+        assert_eq!(snapshot, text, "the bytes the run will execute");
+        let meta = crate::runstate::read_meta_from(&dir).unwrap();
+        assert_eq!(
+            meta.blueprint_digest.as_deref(),
+            Some(leviath_core::mime::store::sha256_hex(text.as_bytes()).as_str()),
+            "the digest identifies the snapshot"
         );
-        assert_eq!(meta.task, "t");
-        // The agent name is recovered from the run id's prefix, dashes and all.
-        assert_eq!(meta.agent_name, "my-agent");
+    }
+
+    /// A manifest that cannot be read leaves no snapshot and no digest, and the
+    /// spawn carries on to fail on its own terms.
+    ///
+    /// `None` here reads as "unknown", which is the truth. A digest over
+    /// nothing would have claimed the run executed something.
+    #[test]
+    fn a_manifest_that_cannot_be_read_leaves_no_snapshot() {
+        let runs = tempfile::tempdir().unwrap();
+        let args = SpawnArgs {
+            run_id: "ghost-1788924523-abc123".to_string(),
+            blueprint_path: "/nowhere/agent.leviath".to_string(),
+            ..Default::default()
+        };
+
+        write_placeholder_meta(runs.path(), &args);
+
+        let dir = runs.path().join(&args.run_id);
+        assert!(
+            !dir.join(leviath_core::files::BLUEPRINT_SNAPSHOT_FILE)
+                .exists(),
+            "nothing to copy"
+        );
+        assert!(
+            crate::runstate::read_meta_from(&dir)
+                .unwrap()
+                .blueprint_digest
+                .is_none()
+        );
+    }
+
+    /// A snapshot that cannot be written is logged, not fatal.
+    ///
+    /// The copy is an archive, not a prerequisite: a run that executes is
+    /// better than a run refused because its own record could not be filed.
+    #[test]
+    fn a_snapshot_that_cannot_be_written_is_logged_not_fatal() {
+        crate::test_support::with_tracing(|| {
+            let dir = tempfile::tempdir().unwrap();
+            // A regular file where the snapshot's directory should be, so the
+            // write cannot land.
+            let blocker = dir.path().join("run-a");
+            std::fs::write(&blocker, "x").unwrap();
+            write_blueprint_snapshot(&blocker, "[agent]\nname = \"a\"\n", "run-a");
+            assert!(
+                !blocker
+                    .join(leviath_core::files::BLUEPRINT_SNAPSHOT_FILE)
+                    .exists()
+            );
+        });
+    }
+
+    /// A run with a snapshot resumes on its own copy; one without falls back to
+    /// the installed file, exactly as every run did before snapshots existed.
+    #[test]
+    fn a_reload_prefers_the_runs_own_blueprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let run_dir = dir.path().join("run-a");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let installed = "/agents/coder/agent.leviath";
+
+        assert_eq!(
+            blueprint_source(&run_dir, installed),
+            installed,
+            "no snapshot, so the installed file"
+        );
+
+        let snapshot = run_dir.join(leviath_core::files::BLUEPRINT_SNAPSHOT_FILE);
+        std::fs::write(&snapshot, "[agent]\nname = \"coder\"\n").unwrap();
+        assert_eq!(
+            blueprint_source(&run_dir, installed),
+            snapshot.to_string_lossy(),
+            "the run's own copy wins"
+        );
     }
 
     #[test]
@@ -1192,59 +1457,65 @@ mod tests {
     /// must be terminated on disk instead.
     #[tokio::test]
     async fn cancelling_an_unreloadable_run_terminates_it_on_disk() {
-        // A writer of the redirect mirror, like every test that stands up a
-        // host: see `setup_daemon_host_builds_a_working_host`.
         let _redirect = crate::daemon::script_host::REDIRECT_MIRROR.lock().await;
-        let runs = tempfile::tempdir().unwrap();
-        let mut host = setup_daemon_host(
-            Config::default(),
-            runs.path().to_path_buf(),
-            Handle::current(),
+        crate::config::with_isolated_config_path_async(
+            "cancelling_an_unreloadable_run_terminates_it_on_disk",
+            |_| async move {
+                // A writer of the redirect mirror, like every test that stands up a
+                // host: see `setup_daemon_host_builds_a_working_host`.
+                let runs = tempfile::tempdir().unwrap();
+                let mut host = setup_daemon_host(
+                    Config::default(),
+                    runs.path().to_path_buf(),
+                    Handle::current(),
+                )
+                .await
+                .expect("the daemon host builds in tests");
+
+                // Staked out *after* startup, so the recovery sweep (which marks
+                // un-reloadable runs as crashed) hasn't already dealt with it - this is
+                // the live case: the daemon is up and the run cannot be paged in.
+                let run_dir = runs.path().join("gone-1234-ab12");
+                let meta = leviath_core::run_meta::RunMeta::new(
+                    "gone-1234-ab12".to_string(),
+                    "gone".to_string(),
+                    // A blueprint path that does not exist - the deleted-manifest case.
+                    "/no/such/dir/agent.leviath".to_string(),
+                    "t".to_string(),
+                    None,
+                    std::env::temp_dir().to_string_lossy().to_string(),
+                    1,
+                );
+                crate::runstate::create_run_in(&run_dir, &meta).unwrap();
+                assert!(
+                    !crate::runstate::is_terminal_status(
+                        &crate::runstate::read_meta_from(&run_dir).unwrap().status
+                    ),
+                    "the run starts out looking live"
+                );
+
+                let (reply, rx) = oneshot::channel();
+                host.handle(ControlOp::Cancel {
+                    run_id: "gone-1234-ab12".to_string(),
+                    reply,
+                });
+                assert!(rx.await.unwrap(), "the cancel reports that it applied");
+                assert_eq!(
+                    crate::runstate::read_meta_from(&run_dir).unwrap().status,
+                    leviath_core::run_meta::RunStatus::Cancelled,
+                    "and it reached disk, so nothing shows the run as live any more"
+                );
+
+                // A run id that names nothing at all is still an honest miss.
+                let (reply, rx) = oneshot::channel();
+                host.handle(ControlOp::Cancel {
+                    run_id: "no-such-run".to_string(),
+                    reply,
+                });
+                assert!(!rx.await.unwrap());
+            },
         )
-        .await
-        .expect("the daemon host builds in tests");
-
-        // Staked out *after* startup, so the recovery sweep (which marks
-        // un-reloadable runs as crashed) hasn't already dealt with it - this is
-        // the live case: the daemon is up and the run cannot be paged in.
-        let run_dir = runs.path().join("gone-1234-ab12");
-        let meta = leviath_core::run_meta::RunMeta::new(
-            "gone-1234-ab12".to_string(),
-            "gone".to_string(),
-            // A blueprint path that does not exist - the deleted-manifest case.
-            "/no/such/dir/agent.leviath".to_string(),
-            "t".to_string(),
-            None,
-            std::env::temp_dir().to_string_lossy().to_string(),
-            1,
-        );
-        crate::runstate::create_run_in(&run_dir, &meta).unwrap();
-        assert!(
-            !crate::runstate::is_terminal_status(
-                &crate::runstate::read_meta_from(&run_dir).unwrap().status
-            ),
-            "the run starts out looking live"
-        );
-
-        let (reply, rx) = oneshot::channel();
-        host.handle(ControlOp::Cancel {
-            run_id: "gone-1234-ab12".to_string(),
-            reply,
-        });
-        assert!(rx.await.unwrap(), "the cancel reports that it applied");
-        assert_eq!(
-            crate::runstate::read_meta_from(&run_dir).unwrap().status,
-            leviath_core::run_meta::RunStatus::Cancelled,
-            "and it reached disk, so nothing shows the run as live any more"
-        );
-
-        // A run id that names nothing at all is still an honest miss.
-        let (reply, rx) = oneshot::channel();
-        host.handle(ControlOp::Cancel {
-            run_id: "no-such-run".to_string(),
-            reply,
-        });
-        assert!(!rx.await.unwrap());
+        .await;
     }
 
     /// The run ids present in `dir`. An unreadable or absent directory is an
@@ -1632,6 +1903,8 @@ system_prompt = "x"
                 exporter: leviath_core::config::TelemetryExporterKind::Stdout,
                 endpoint: None,
                 service_name: None,
+                log_file_max_bytes: leviath_core::config::DEFAULT_LOG_FILE_MAX_BYTES,
+                capture_model_input: false,
             },
             ..Config::default()
         };
@@ -1673,6 +1946,8 @@ system_prompt = "x"
                 exporter: leviath_core::config::TelemetryExporterKind::Otlp,
                 endpoint: Some("http://127.0.0.1:9".to_string()),
                 service_name: Some("leviath-test".to_string()),
+                log_file_max_bytes: leviath_core::config::DEFAULT_LOG_FILE_MAX_BYTES,
+                capture_model_input: false,
             },
             ..Config::default()
         };
@@ -1703,67 +1978,77 @@ system_prompt = "x"
 
     #[tokio::test]
     async fn serve_runs_spawn_preprocessor_for_per_agent_mcp() {
-        // Drive a real spawn through `serve()` so the spawn preprocessor fires
-        // (the only path that invokes it): the agent declares an MCP server, which
-        // gets connected + advertised, and the spawn replies Ok.
-        let (_stub_dir, stub) = stub_server_py();
-        let agent_dir = tempfile::tempdir().unwrap();
-        let manifest = blueprint_with_mcp(agent_dir.path(), &stub);
-        // A `fake` provider so stage resolution succeeds.
-        let mut providers = ProviderRegistry::new();
-        providers.register("fake".to_string(), Arc::new(fake_provider()));
-        let runs = tempfile::tempdir().unwrap();
-        let mut host = build_host(HostParts {
-            config: Config::default(),
-            providers,
-            runs_dir: runs.path().to_path_buf(),
-            shared_mcp: Arc::new(Mutex::new(leviath_mcp::ToolExecutor::new())),
-            mcp_tool_defs: Vec::new(),
-            mcp_tool_owners: Default::default(),
-            mcp_pool: crate::daemon::mcp_pool::McpPool::for_daemon(
-                Arc::new(Mutex::new(leviath_mcp::ToolExecutor::new())),
-                &[],
-            ),
-            runtime: Handle::current(),
-            now_secs: || 0,
-            reloader: None,
-            provider_reload: None,
-        });
-        let (ctl_tx, ctl_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (reply, reply_rx) = oneshot::channel();
-        ctl_tx
-            .send(ControlOp::Spawn {
-                args: Box::new(SpawnArgs {
-                    run_id: "run-mcp".to_string(),
-                    blueprint_path: manifest.to_string_lossy().to_string(),
-                    task: "t".to_string(),
-                    regions: Default::default(),
-                    model: None,
-                    workdir: std::env::temp_dir().to_string_lossy().to_string(),
-                    metadata: Default::default(),
-                    callback_url: None,
-                    callback_secret: None,
-                    yolo: false,
-                    no_seed_commands: false,
-                    allow: Vec::new(),
-                    max_depth: None,
-                    parent_run_id: None,
-                    output: None,
-                }),
-                reply,
-            })
-            .unwrap();
-        // Close the control channel so serve() returns after handling the op.
-        drop(ctl_tx);
-        host.serve(ctl_rx).await;
-        assert_eq!(reply_rx.await.unwrap(), Ok("run-mcp".to_string()));
+        crate::config::with_isolated_config_path_async(
+            "serve_runs_spawn_preprocessor_for_per_agent_mcp",
+            |_| async move {
+                // Drive a real spawn through `serve()` so the spawn preprocessor fires
+                // (the only path that invokes it): the agent declares an MCP server, which
+                // gets connected + advertised, and the spawn replies Ok.
+                let (_stub_dir, stub) = stub_server_py();
+                let agent_dir = tempfile::tempdir().unwrap();
+                let manifest = blueprint_with_mcp(agent_dir.path(), &stub);
+                // A `fake` provider so stage resolution succeeds.
+                let mut providers = ProviderRegistry::new();
+                providers.register("fake".to_string(), Arc::new(fake_provider()));
+                let runs = tempfile::tempdir().unwrap();
+                let mut host = build_host(HostParts {
+                    config: Config::default(),
+                    providers,
+                    runs_dir: runs.path().to_path_buf(),
+                    shared_mcp: Arc::new(Mutex::new(leviath_mcp::ToolExecutor::new())),
+                    mcp_tool_defs: Vec::new(),
+                    mcp_tool_owners: Default::default(),
+                    mcp_pool: crate::daemon::mcp_pool::McpPool::for_daemon(
+                        Arc::new(Mutex::new(leviath_mcp::ToolExecutor::new())),
+                        &[],
+                    ),
+                    runtime: Handle::current(),
+                    now_secs: || 0,
+                    reloader: None,
+                    provider_reload: None,
+                });
+                let (ctl_tx, ctl_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (reply, reply_rx) = oneshot::channel();
+                ctl_tx
+                    .send(ControlOp::Spawn {
+                        args: Box::new(SpawnArgs {
+                            run_id: "run-mcp".to_string(),
+                            blueprint_path: manifest.to_string_lossy().to_string(),
+                            task: "t".to_string(),
+                            regions: Default::default(),
+                            model: None,
+                            workdir: std::env::temp_dir().to_string_lossy().to_string(),
+                            metadata: Default::default(),
+                            callback_url: None,
+                            callback_secret: None,
+                            yolo: false,
+                            yolo_profile: None,
+                            no_seed_commands: false,
+                            allow: Vec::new(),
+                            max_depth: None,
+                            parent_run_id: None,
+                            worker_stage: None,
+                            output: None,
+                            parts: Vec::new(),
+                            capture_model_input: false,
+                        }),
+                        reply,
+                    })
+                    .unwrap();
+                // Close the control channel so serve() returns after handling the op.
+                drop(ctl_tx);
+                host.serve(ctl_rx).await;
+                assert_eq!(reply_rx.await.unwrap(), Ok("run-mcp".to_string()));
+            },
+        )
+        .await;
     }
 
     /// A config that names one endpoint provider, written to `path`.
     fn config_naming(path: &std::path::Path, providers: &[(&str, &str)], default: &str) -> Config {
         let mut config = Config {
             default_provider: default.to_string(),
-            default_model: Some("m".to_string()),
+            override_model: Some("m".to_string()),
             ..Config::default()
         };
         for (name, url) in providers {
@@ -1830,11 +2115,15 @@ task = {{ kind = "pinned", max_tokens = 200, seed = {{ caller = "task" }} }}
                 callback_url: None,
                 callback_secret: None,
                 yolo: false,
+                yolo_profile: None,
                 no_seed_commands: false,
                 allow: Vec::new(),
                 max_depth: None,
                 parent_run_id: None,
+                worker_stage: None,
                 output: None,
+                parts: Vec::new(),
+                capture_model_input: false,
             }),
             reply,
         };
@@ -1932,153 +2221,172 @@ task = {{ kind = "pinned", max_tokens = 200, seed = {{ caller = "task" }} }}
 
     #[tokio::test]
     async fn build_host_spawns_agents_through_the_installed_spawner() {
-        let dir = tempfile::tempdir().unwrap();
-        let manifest = dir.path().join("agent.leviath");
-        std::fs::write(&manifest, crate::test_support::inline_coder_manifest()).unwrap();
+        crate::config::with_isolated_config_path_async(
+            "build_host_spawns_agents_through_the_installed_spawner",
+            |_| async move {
+                let dir = tempfile::tempdir().unwrap();
+                let manifest = dir.path().join("agent.leviath");
+                std::fs::write(&manifest, crate::test_support::inline_coder_manifest()).unwrap();
 
-        let mut registry = ProviderRegistry::new();
-        registry.register("anthropic".to_string(), Arc::new(fake_provider()));
-        let mcp = Arc::new(Mutex::new(leviath_mcp::ToolExecutor::new()));
+                let mut registry = ProviderRegistry::new();
+                registry.register("anthropic".to_string(), Arc::new(fake_provider()));
+                let mcp = Arc::new(Mutex::new(leviath_mcp::ToolExecutor::new()));
 
-        let runs = tempfile::tempdir().unwrap();
-        let mut host = build_host(HostParts {
-            config: Config::default(),
-            providers: registry,
-            runs_dir: runs.path().to_path_buf(),
-            shared_mcp: mcp,
-            mcp_tool_defs: vec![],
-            mcp_tool_owners: Default::default(),
-            mcp_pool: crate::daemon::mcp_pool::McpPool::for_daemon(
-                Arc::new(Mutex::new(leviath_mcp::ToolExecutor::new())),
-                &[],
-            ),
-            runtime: Handle::current(),
-            now_secs: || 100,
-            reloader: None,
-            provider_reload: None,
-        });
+                let runs = tempfile::tempdir().unwrap();
+                let mut host = build_host(HostParts {
+                    config: Config::default(),
+                    providers: registry,
+                    runs_dir: runs.path().to_path_buf(),
+                    shared_mcp: mcp,
+                    mcp_tool_defs: vec![],
+                    mcp_tool_owners: Default::default(),
+                    mcp_pool: crate::daemon::mcp_pool::McpPool::for_daemon(
+                        Arc::new(Mutex::new(leviath_mcp::ToolExecutor::new())),
+                        &[],
+                    ),
+                    runtime: Handle::current(),
+                    now_secs: || 100,
+                    reloader: None,
+                    provider_reload: None,
+                });
 
-        // Drive a Spawn control op through the host.
-        let (reply, rx) = oneshot::channel();
-        host.handle(ControlOp::Spawn {
-            args: Box::new(SpawnArgs {
-                run_id: "run-1".to_string(),
-                blueprint_path: manifest.to_string_lossy().to_string(),
-                task: "do it".to_string(),
-                regions: Default::default(),
-                model: None,
-                workdir: std::env::temp_dir().to_string_lossy().to_string(),
-                metadata: Default::default(),
-                callback_url: None,
-                callback_secret: None,
-                yolo: false,
-                no_seed_commands: false,
-                allow: Vec::new(),
-                max_depth: None,
-                parent_run_id: None,
-                output: None,
-            }),
-            reply,
-        });
-        assert_eq!(rx.await.unwrap(), Ok("run-1".to_string()));
+                // Drive a Spawn control op through the host.
+                let (reply, rx) = oneshot::channel();
+                host.handle(ControlOp::Spawn {
+                    args: Box::new(SpawnArgs {
+                        run_id: "run-1".to_string(),
+                        blueprint_path: manifest.to_string_lossy().to_string(),
+                        task: "do it".to_string(),
+                        regions: Default::default(),
+                        model: None,
+                        workdir: std::env::temp_dir().to_string_lossy().to_string(),
+                        metadata: Default::default(),
+                        callback_url: None,
+                        callback_secret: None,
+                        yolo: false,
+                        yolo_profile: None,
+                        no_seed_commands: false,
+                        allow: Vec::new(),
+                        max_depth: None,
+                        parent_run_id: None,
+                        worker_stage: None,
+                        output: None,
+                        parts: Vec::new(),
+                        capture_model_input: false,
+                    }),
+                    reply,
+                });
+                assert_eq!(rx.await.unwrap(), Ok("run-1".to_string()));
 
-        // The run is registered and Active.
-        let (reply, rx) = oneshot::channel();
-        host.handle(ControlOp::Status {
-            run_id: "run-1".to_string(),
-            reply,
-        });
-        assert_eq!(rx.await.unwrap(), Some(AgentStatus::Active));
+                // The run is registered and Active.
+                let (reply, rx) = oneshot::channel();
+                host.handle(ControlOp::Status {
+                    run_id: "run-1".to_string(),
+                    reply,
+                });
+                assert_eq!(rx.await.unwrap(), Some(AgentStatus::Active));
+            },
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn build_host_reloads_and_registers_persisted_runs() {
-        // A running run persisted under the runs dir must be reloaded + registered
-        // by `build_host` (exercising the recovery register loop).
-        let agent = tempfile::tempdir().unwrap();
-        let manifest = agent.path().join("agent.leviath");
-        std::fs::write(&manifest, crate::test_support::inline_coder_manifest()).unwrap();
+        crate::config::with_isolated_config_path_async(
+            "build_host_reloads_and_registers_persisted_runs",
+            |_| async move {
+                // A running run persisted under the runs dir must be reloaded + registered
+                // by `build_host` (exercising the recovery register loop).
+                let agent = tempfile::tempdir().unwrap();
+                let manifest = agent.path().join("agent.leviath");
+                std::fs::write(&manifest, crate::test_support::inline_coder_manifest()).unwrap();
 
-        let runs = tempfile::tempdir().unwrap();
-        let run_dir = runs.path().join("resumed");
-        std::fs::create_dir_all(&run_dir).unwrap();
-        let meta = leviath_core::run_meta::RunMeta {
-            active: Default::default(),
-            run_id: "resumed".to_string(),
-            agent_name: "coder".to_string(),
-            agent_path: manifest.to_string_lossy().to_string(),
-            task: "resume".to_string(),
-            model: None,
-            pid: 0,
-            status: leviath_core::run_meta::RunStatus::Running,
-            current_stage: "implement".to_string(),
-            stage_index: 0,
-            num_stages: 1,
-            iteration: 2,
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            cached_tokens: 0,
-            cache_write_tokens: 0,
-            tool_calls: 0,
-            cost_usd: Some(0.0),
-            unpriced_calls: 0,
-            cost_is_exact: true,
-            cost_priced_usd: 0.0,
-            workdir: std::env::temp_dir().to_string_lossy().to_string(),
-            started_at: 1,
-            updated_at: 1,
-            last_progress_at: None,
-            error: None,
-            title: None,
-            title_error: None,
-            metadata: Default::default(),
-            callback_url: None,
-            callback_secret: None,
-            parent_run_id: None,
-            children: Vec::new(),
-            depth: 0,
-            max_child_depth: 0,
-            flags: Default::default(),
-            yolo: false,
-            read_paths: None,
-            final_output: None,
-            waiting_on: None,
-            output_request: None,
-            model_override: None,
-        };
-        std::fs::write(
-            run_dir.join("meta.json"),
-            serde_json::to_string(&meta).unwrap(),
+                let runs = tempfile::tempdir().unwrap();
+                let run_dir = runs.path().join("resumed");
+                std::fs::create_dir_all(&run_dir).unwrap();
+                let meta = leviath_core::run_meta::RunMeta {
+                    stage_models: Vec::new(),
+                    active: Default::default(),
+                    run_id: "resumed".to_string(),
+                    agent_name: "coder".to_string(),
+                    agent_path: manifest.to_string_lossy().to_string(),
+                    task: "resume".to_string(),
+                    model: None,
+                    pid: 0,
+                    status: leviath_core::run_meta::RunStatus::Running,
+                    current_stage: "implement".to_string(),
+                    stage_index: 0,
+                    num_stages: 1,
+                    iteration: 2,
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    cached_tokens: 0,
+                    cache_write_tokens: 0,
+                    tool_calls: 0,
+                    cost_usd: Some(0.0),
+                    unpriced_calls: 0,
+                    cost_is_exact: true,
+                    cost_priced_usd: 0.0,
+                    workdir: std::env::temp_dir().to_string_lossy().to_string(),
+                    started_at: 1,
+                    updated_at: 1,
+                    last_progress_at: None,
+                    error: None,
+                    title: None,
+                    title_error: None,
+                    blueprint_digest: None,
+                    metadata: Default::default(),
+                    callback_url: None,
+                    callback_secret: None,
+                    parent_run_id: None,
+                    children: Vec::new(),
+                    depth: 0,
+                    max_child_depth: 0,
+                    flags: Default::default(),
+                    yolo: false,
+                    yolo_profile: None,
+                    read_paths: None,
+                    final_output: None,
+                    waiting_on: None,
+                    output_request: None,
+                    model_override: None,
+                };
+                std::fs::write(
+                    run_dir.join("meta.json"),
+                    serde_json::to_string(&meta).unwrap(),
+                )
+                .unwrap();
+
+                let mut registry = ProviderRegistry::new();
+                registry.register("anthropic".to_string(), Arc::new(fake_provider()));
+                let mcp = Arc::new(Mutex::new(leviath_mcp::ToolExecutor::new()));
+                let mut host = build_host(HostParts {
+                    config: Config::default(),
+                    providers: registry,
+                    runs_dir: runs.path().to_path_buf(),
+                    shared_mcp: mcp,
+                    mcp_tool_defs: vec![],
+                    mcp_tool_owners: Default::default(),
+                    mcp_pool: crate::daemon::mcp_pool::McpPool::for_daemon(
+                        Arc::new(Mutex::new(leviath_mcp::ToolExecutor::new())),
+                        &[],
+                    ),
+                    runtime: Handle::current(),
+                    now_secs: || 100,
+                    reloader: None,
+                    provider_reload: None,
+                });
+
+                // The reloaded run is registered → Status resolves it.
+                let (reply, rx) = oneshot::channel();
+                host.handle(ControlOp::Status {
+                    run_id: "resumed".to_string(),
+                    reply,
+                });
+                assert_eq!(rx.await.unwrap(), Some(AgentStatus::Active));
+            },
         )
-        .unwrap();
-
-        let mut registry = ProviderRegistry::new();
-        registry.register("anthropic".to_string(), Arc::new(fake_provider()));
-        let mcp = Arc::new(Mutex::new(leviath_mcp::ToolExecutor::new()));
-        let mut host = build_host(HostParts {
-            config: Config::default(),
-            providers: registry,
-            runs_dir: runs.path().to_path_buf(),
-            shared_mcp: mcp,
-            mcp_tool_defs: vec![],
-            mcp_tool_owners: Default::default(),
-            mcp_pool: crate::daemon::mcp_pool::McpPool::for_daemon(
-                Arc::new(Mutex::new(leviath_mcp::ToolExecutor::new())),
-                &[],
-            ),
-            runtime: Handle::current(),
-            now_secs: || 100,
-            reloader: None,
-            provider_reload: None,
-        });
-
-        // The reloaded run is registered → Status resolves it.
-        let (reply, rx) = oneshot::channel();
-        host.handle(ControlOp::Status {
-            run_id: "resumed".to_string(),
-            reply,
-        });
-        assert_eq!(rx.await.unwrap(), Some(AgentStatus::Active));
+        .await;
     }
 
     #[tokio::test]
@@ -2116,6 +2424,7 @@ task = {{ kind = "pinned", max_tokens = 200, seed = {{ caller = "task" }} }}
         let run_dir = runs.path().join("late");
         std::fs::create_dir_all(&run_dir).unwrap();
         let meta = leviath_core::run_meta::RunMeta {
+            stage_models: Vec::new(),
             active: Default::default(),
             run_id: "late".to_string(),
             agent_name: "coder".to_string(),
@@ -2144,6 +2453,7 @@ task = {{ kind = "pinned", max_tokens = 200, seed = {{ caller = "task" }} }}
             error: None,
             title: None,
             title_error: None,
+            blueprint_digest: None,
             metadata: Default::default(),
             callback_url: None,
             callback_secret: None,
@@ -2153,6 +2463,7 @@ task = {{ kind = "pinned", max_tokens = 200, seed = {{ caller = "task" }} }}
             max_child_depth: 0,
             flags: Default::default(),
             yolo: false,
+            yolo_profile: None,
             read_paths: None,
             final_output: None,
             waiting_on: None,

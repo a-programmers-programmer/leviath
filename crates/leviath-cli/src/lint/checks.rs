@@ -67,9 +67,22 @@ pub(super) fn lint_declarations(stage: &leviath_core::Stage, keys: StageKeys) ->
 /// never granted.
 pub(super) fn lint_tools(stage: &leviath_core::Stage, env: &LintEnv) -> Vec<LintFinding> {
     let mut findings = Vec::new();
+    let groups = stage.tool_groups();
+
+    // Which group a name written elsewhere in the stage would fall under, or
+    // `None` when the install was never asked (or the name matches nothing),
+    // in which case a group-aware check says nothing rather than guessing.
+    let source_of = |name: &str| -> Option<ToolGroup> {
+        if name.contains("__") {
+            return Some(ToolGroup::Mcp);
+        }
+        leviath_tools::tool_name_spellings(name).find_map(|n| env.tool_sources.get(n).copied())
+    };
+    let group_grants =
+        |name: &str| source_of(name).is_some_and(|source| groups.iter().any(|g| g.covers(source)));
 
     if !env.known_tools.is_empty() {
-        for tool in &stage.available_tools {
+        for tool in stage.named_tools() {
             // `server__tool` is an MCP name, and every MCP name has that shape:
             // advertised names are always server-qualified, so the test is
             // exact rather than a heuristic. Such a name resolves only once
@@ -93,6 +106,42 @@ pub(super) fn lint_tools(stage: &leviath_core::Stage, env: &LintEnv) -> Vec<Lint
         }
     }
 
+    // `Stage::validate` insists every required tool is also granted, except
+    // when a group is in play: whether `@scripts` reaches `summarize` depends
+    // on where `summarize` lives, which only an install can say. Say it here,
+    // because a required tool the stage never grants is a tool the model
+    // never sees, whatever the name promised.
+    if !groups.is_empty() && !env.tool_sources.is_empty() {
+        let named: Vec<&str> = stage.named_tools().map(String::as_str).collect();
+        for tool in &stage.required_tools {
+            let by_name = named
+                .iter()
+                .any(|n| canonical_tool_name(n) == canonical_tool_name(tool));
+            if by_name || group_grants(tool) {
+                continue;
+            }
+            let granted = groups
+                .iter()
+                .map(|g| g.token())
+                .collect::<Vec<_>>()
+                .join(", ");
+            findings.push(
+                LintFinding::new(
+                    LintSeverity::Error,
+                    "required-tool-not-granted",
+                    format!(
+                        "requires '{tool}' but grants it neither by name nor through \
+                         {granted}, so the model never sees it"
+                    ),
+                )
+                .in_stage(&stage.name)
+                .with_fix(format!(
+                    "add '{tool}' to available_tools, or grant the group it belongs to"
+                )),
+            );
+        }
+    }
+
     // A stage granting a whole connector has a tool set nobody can enumerate
     // here: it is whatever that server advertises at spawn, which is the point
     // of naming the server. So a permission that looks orphaned might name a
@@ -106,6 +155,13 @@ pub(super) fn lint_tools(stage: &leviath_core::Stage, env: &LintEnv) -> Vec<Lint
     let granted: HashSet<&str> = stage.available_tools.iter().map(String::as_str).collect();
     for tool in stage.tool_permissions.keys() {
         if granted.contains(tool.as_str()) {
+            continue;
+        }
+        // A group is a grant too, of a set only the install can spell out.
+        // Where it can, a permission the group reaches is not orphaned; where
+        // it cannot (no inventory), the check stays quiet for the same reason
+        // it does under a connector.
+        if !groups.is_empty() && (env.tool_sources.is_empty() || group_grants(tool)) {
             continue;
         }
         findings.push(
@@ -138,8 +194,11 @@ pub(super) fn lint_tools(stage: &leviath_core::Stage, env: &LintEnv) -> Vec<Lint
     let routes_to_region = stage.tool_result_routing.as_ref().is_some_and(|r| {
         r.default_region != "conversation" || r.tool_overrides.values().any(|v| v != "conversation")
     });
-    let reads_files = granted.contains("read_file") || granted.contains("read_files");
-    if routes_to_region && reads_files && !granted.contains("context_read") {
+    let all_builtins = stage.grants_all_builtins();
+    let reads_files =
+        all_builtins || granted.contains("read_file") || granted.contains("read_files");
+    let reads_context = all_builtins || granted.contains("context_read");
+    if routes_to_region && reads_files && !reads_context {
         findings.push(
             LintFinding::new(
                 LintSeverity::Warning,
@@ -165,22 +224,23 @@ pub(super) fn lint_blocking_tools(stage: &leviath_core::Stage) -> Vec<LintFindin
     if !matches!(stage.mode, StageMode::Autonomous) || stage.allow_blocking_tools {
         return Vec::new();
     }
-    stage
+    // A tool kept in `required_tools` is the same statement of intent
+    // `allow_blocking_tools` makes, made one tool at a time - and it is the
+    // one that also survives an unattended run, so it is worth more.
+    //
+    // Canonicalised on both sides, as the runtime does: a stage granting
+    // `bash` and keeping `shell` is one decision, not two.
+    let required = |tool: &str| {
+        stage
+            .required_tools
+            .iter()
+            .any(|r| canonical_tool_name(r) == canonical_tool_name(tool))
+    };
+    let mut findings: Vec<LintFinding> = stage
         .available_tools
         .iter()
         .filter(|t| BLOCKING_INTERACTION_TOOLS.contains(&canonical_tool_name(t)))
-        // A tool kept in `required_tools` is the same statement of intent
-        // `allow_blocking_tools` makes, made one tool at a time - and it is the
-        // one that also survives an unattended run, so it is worth more.
-        //
-        // Canonicalised on both sides, as the runtime does: a stage granting
-        // `bash` and keeping `shell` is one decision, not two.
-        .filter(|t| {
-            !stage
-                .required_tools
-                .iter()
-                .any(|r| canonical_tool_name(r) == canonical_tool_name(t))
-        })
+        .filter(|t| !required(t))
         .map(|tool| {
             LintFinding::new(
                 LintSeverity::Warning,
@@ -197,58 +257,43 @@ pub(super) fn lint_blocking_tools(stage: &leviath_core::Stage) -> Vec<LintFindin
                  allow_blocking_tools = true to say you meant it",
             )
         })
-        .collect()
-}
+        .collect();
 
-/// A `fail_all` fan-out stage with nowhere to go when a worker fails.
-///
-/// `on_worker_failure = "fail_all"` means one failed worker ends the stage. That
-/// is a deliberate choice - a merge that cannot be trusted with a partial set
-/// should not run on one - but it only reads as that choice when the blueprint
-/// says where to go instead. Without an edge the run simply stops, and a single
-/// flaky worker takes the whole thing down.
-///
-/// The default, `continue`, needs none of this: it merges what succeeded and
-/// reports the rest, so there is nothing to escape from.
-///
-/// A warning rather than an error, because a run that ends loudly on a failed
-/// worker is a defensible design, just rarely the intended one.
-pub(super) fn lint_fanout_escape(stage: &leviath_core::Stage) -> Vec<LintFinding> {
-    let StageMode::FanOut { config } = &stage.mode else {
-        return Vec::new();
-    };
-    if config.on_worker_failure != leviath_core::blueprint::WorkerFailurePolicy::FailAll {
-        return Vec::new();
+    // A group that reaches the built-ins reaches every blocking tool at once.
+    // One finding for the group rather than five for its members: the fix is
+    // the same whichever member is named, and a list that long is skimmed.
+    let group = stage
+        .tool_groups()
+        .into_iter()
+        .find(|g| g.covers(ToolGroup::Builtin));
+    if let Some(group) = group {
+        let members: Vec<&str> = BLOCKING_INTERACTION_TOOLS
+            .iter()
+            .copied()
+            .filter(|t| !required(t))
+            .collect();
+        if !members.is_empty() {
+            findings.push(
+                LintFinding::new(
+                    LintSeverity::Warning,
+                    "blocking-tool-in-autonomous-stage",
+                    format!(
+                        "is autonomous but grants '{group}', which includes {}; each \
+                         suspends the run until a person answers",
+                        members.join(", ")
+                    ),
+                )
+                .in_stage(&stage.name)
+                .with_fix(
+                    "name the tools you want instead of the group, switch the stage to an \
+                     interactive mode, list the blocking tools you need in required_tools \
+                     so they survive an unattended run too, or set allow_blocking_tools = \
+                     true to say you meant it",
+                ),
+            );
+        }
     }
-    let escapes = stage
-        .transitions
-        .iter()
-        .flat_map(|t| t.values())
-        .any(|edge| {
-            matches!(
-                edge.condition,
-                leviath_core::blueprint::TransitionCondition::Error
-                    | leviath_core::blueprint::TransitionCondition::DeadEnd
-            )
-        });
-    if escapes {
-        return Vec::new();
-    }
-    vec![
-        LintFinding::new(
-            LintSeverity::Warning,
-            "fanout-no-escape",
-            "sets on_worker_failure = \"fail_all\" but declares no 'error' or 'dead_end' \
-             transition, so one failed worker ends the run with nowhere to go"
-                .to_string(),
-        )
-        .in_stage(&stage.name)
-        .with_fix(
-            "add a transition with condition = \"error\" to a recovery stage, or use the \
-             default on_worker_failure = \"continue\""
-                .to_string(),
-        ),
-    ]
+    findings
 }
 
 /// A stage's own output declarations: a demand it cannot meet, a shape nothing
@@ -302,17 +347,23 @@ pub(super) fn lint_output_stage(stage: &leviath_core::Stage) -> Vec<LintFinding>
     // An output stage summarizes work; one that can also change files invites
     // the model to keep working where it was meant to report.
     if stage.mode == StageMode::Output {
-        let modifying: Vec<&String> = stage
-            .available_tools
-            .iter()
+        let modifying = stage
+            .named_tools()
             .filter(|t| leviath_core::blueprint::MODIFYING_TOOLS.contains(&canonical_tool_name(t)))
-            .collect();
-        for tool in modifying {
+            .map(|tool| format!("'{tool}', which changes the workspace"));
+        // A group reaching the built-ins carries every modifying tool with it,
+        // so it is named once, as the group, rather than once per member.
+        let grouped = stage
+            .tool_groups()
+            .into_iter()
+            .find(|g| g.covers(ToolGroup::Builtin))
+            .map(|g| format!("'{g}', which includes every tool that changes the workspace"));
+        for what in modifying.chain(grouped) {
             findings.push(
                 LintFinding::new(
                     LintSeverity::Warning,
                     "output-stage-can-modify",
-                    format!("is an output stage but grants '{tool}', which changes the workspace"),
+                    format!("is an output stage but grants {what}"),
                 )
                 .in_stage(&stage.name)
                 .with_fix(
@@ -323,6 +374,76 @@ pub(super) fn lint_output_stage(stage: &leviath_core::Stage) -> Vec<LintFinding>
         }
     }
     findings
+}
+
+/// An output stage whose models cannot call tools and which declares no
+/// file for them to hand back.
+///
+/// `submit_output` is a tool, so a stage on an image model or a 3D generator
+/// (every compiled row for those says `supports_tools = false`) can never
+/// call it. Such a stage answers only one way: the model's produced part,
+/// routed into a region with `output_routing` and declared under
+/// `[[stages.<name>.output.artifacts]]`, is emitted as the run's answer.
+/// Without both, the runtime re-enters the stage and nudges it for text it
+/// cannot write - up to six re-submitted jobs on a paid API - and the run
+/// ends with nothing. Only providers with compiled tables are judged; an open
+/// route is taken on trust.
+pub(super) fn lint_output_stage_can_answer(stage: &leviath_core::Stage) -> Vec<LintFinding> {
+    if !(stage.require_output || stage.mode == StageMode::Output) {
+        return Vec::new();
+    }
+    let catalog = leviath_providers::capabilities::builtin_catalog();
+    let judged: Vec<&leviath_core::blueprint::ModelEntry> = stage
+        .model
+        .models
+        .iter()
+        .filter(|e| !e.provider.is_empty())
+        .collect();
+    if judged.is_empty() || judged.len() != stage.model.models.len() {
+        return Vec::new();
+    }
+    let tool_less: Vec<String> = judged
+        .iter()
+        .filter(|e| {
+            catalog.iter().any(|row| {
+                row.provider == e.provider && row.id == e.model && !row.capabilities.supports_tools
+            })
+        })
+        .map(|e| format!("{}/{}", e.provider, e.model))
+        .collect();
+    if tool_less.len() != judged.len() {
+        return Vec::new();
+    }
+    let declares_file = stage
+        .output
+        .as_ref()
+        .is_some_and(|o| !o.artifacts.is_empty());
+    let routes_part = !stage.output_routing.is_empty();
+    if declares_file && routes_part {
+        return Vec::new();
+    }
+    let missing = match (declares_file, routes_part) {
+        (false, false) => "declares no artifact and routes no produced part",
+        (false, true) => "routes its produced part but declares no artifact for it",
+        _ => "declares an artifact but routes no produced part into a region",
+    };
+    vec![
+        LintFinding::new(
+            LintSeverity::Error,
+            "output-stage-cannot-answer",
+            format!(
+                "must produce a final output, but its models ({}) cannot call tools, so \
+                 submit_output is out of reach, and it {missing}",
+                tool_less.join(", ")
+            ),
+        )
+        .in_stage(&stage.name)
+        .with_fix(
+            "declare the file under [[stages.<name>.output.artifacts]] and route the model's \
+             part into a region with [stages.<name>.output_routing], so the runtime emits it \
+             as the answer; or list a model that calls tools",
+        ),
+    ]
 }
 
 /// Output stages nothing can reach, and the upstream `allow_complete` that is
@@ -569,6 +690,46 @@ fn sample_catalog(ids: &[String]) -> String {
     }
 }
 
+/// Under `[providers] zero_retention`, the models this stage names that keep
+/// something: an error for the one the stage would start on, since the spawn
+/// gate refuses it, and a warning for a fallback, since failover drops it.
+pub(super) fn lint_retention(stage: &leviath_core::Stage, env: &LintEnv) -> Vec<LintFinding> {
+    let Some(refusals) = env.retention_refusals.get(&stage.name) else {
+        return Vec::new();
+    };
+    refusals
+        .iter()
+        .map(|r| match r.head {
+            true => LintFinding::new(
+                LintSeverity::Error,
+                "retention-not-zero",
+                format!(
+                    "would run on {}, which does not run with zero data retention ({}); \
+                     `[providers] zero_retention` is on, so the spawn is refused",
+                    r.route, r.reason
+                ),
+            )
+            .in_stage(&stage.name)
+            .with_fix(
+                "name a model that keeps nothing (`lev providers retention` says which), \
+                 declare the agreement in `[providers] zero_retention_agreements` if you \
+                 hold one, or `lev providers retention set off`",
+            ),
+            false => LintFinding::new(
+                LintSeverity::Warning,
+                "retention-fallback-dropped",
+                format!(
+                    "lists {} as a fallback, which does not run with zero data retention \
+                     ({}); `[providers] zero_retention` is on, so failover skips it",
+                    r.route, r.reason
+                ),
+            )
+            .in_stage(&stage.name)
+            .with_fix("list a fallback that keeps nothing, or drop this one"),
+        })
+        .collect()
+}
+
 /// Models and providers the install cannot resolve.
 pub(super) fn lint_models(stage: &leviath_core::Stage, env: &LintEnv) -> Vec<LintFinding> {
     let mut findings = Vec::new();
@@ -719,7 +880,7 @@ pub(super) fn lint_models(stage: &leviath_core::Stage, env: &LintEnv) -> Vec<Lin
                 "no-reachable-provider",
                 format!(
                     "names nothing this install can run (tried {}), so it \
-                     falls back to your default model",
+                     falls back to your fallback_model, if one is set",
                     tried.join(", ")
                 ),
             )
@@ -816,10 +977,11 @@ pub(super) fn lint_compacted_deliverables(blueprint: &Blueprint) -> Vec<LintFind
 /// them: the caller owns those, and they are validated at spawn.
 pub(super) fn lint_required_regions_enforceable(blueprint: &Blueprint) -> Vec<LintFinding> {
     let writes_context = |stage: &leviath_core::Stage| {
-        stage
-            .available_tools
-            .iter()
-            .any(|t| t == "context_write" || t == "context_append")
+        stage.grants_all_builtins()
+            || stage
+                .available_tools
+                .iter()
+                .any(|t| t == "context_write" || t == "context_append")
     };
 
     let mut findings = Vec::new();
@@ -961,6 +1123,14 @@ fn widest_declared_window<'a>(blueprint: &Blueprint, env: &'a LintEnv) -> Option
         .stages
         .iter()
         .flat_map(|stage| stage.model.models.iter())
+        // A model that does not write text has no context window in the
+        // sense this check means: a 3D generator's "window" is the ceiling
+        // its REST call takes a mesh under, and one Meshy stage made every
+        // percentage region in the blueprint resolve against it.
+        .filter(|m| {
+            leviath_providers::mime_tables::builtin_mime(&m.provider, &m.model)
+                .produces(&leviath_core::mime::text_plain())
+        })
         .filter_map(|m| {
             env.model_windows
                 .get_key_value(&(m.provider.clone(), m.model.clone()))

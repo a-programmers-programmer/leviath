@@ -71,7 +71,7 @@ example = """
 """
 ```
 
-`format` is a label. Markdown, XML, CSV, [a2ui](https://a2ui.org/), a media type, or a format you
+`format` is a label. Markdown, XML, CSV, [a2ui](https://a2ui.org/), a mime type, or a format you
 invent this afternoon all work the same way. The label, your instructions, and your example go
 into the `submit_output` tool description, and into the stage's system prompt too when
 `require_output` is set.
@@ -102,7 +102,7 @@ format's parser.
 
 For JSON, use a JSON Schema. For anything else, ship a [Rhai validator](/docs/rhai-validators) with
 your agent. A validator that cannot run rejects the submission by default, sending the script's
-error back to the model as feedback; set `on_validator_error = "accept"` on the output block if you
+error back to the model as feedback. Set `on_validator_error = "accept"` on the output block if you
 would rather record the answer unchecked.
 
 ## Asking for a shape at launch
@@ -252,7 +252,7 @@ precedence over the nudge, and the run records both flags, `max_iterations_hit` 
 
 | Surface | Where the answer appears |
 |---|---|
-| `lev result <run-id>` | The whole answer, and the files it named. `--raw` for pipelines |
+| `lev result <run-id>` | The whole answer, and the files it named, each with its type, size and hash. `--raw` for pipelines |
 | `lev ps --json` | `has_final_output` only. Fetch the answer itself with `lev result` |
 | `GET /api/agents/{id}/result` | `final_output`, beside the existing `output` log tail |
 | Completion webhook | `final_output`. The `result` field is the run's error, as it always was |
@@ -347,18 +347,131 @@ A file larger than one response is read a window at a time. Pass `offset`, then 
 `next_offset` each response carries until it comes back null. Concatenating the windows gives you the
 file back exactly, including through multi-byte characters.
 
-Name your files in `artifacts` when you submit:
+Name your files in `artifacts` when you submit, as a path or as `{ name, path, type }`:
 
 ```
 submit_output(
   content: "2.1M registrations across 14 countries. Norway leads per-capita ...",
-  artifacts: ["data/registrations.csv"]
+  artifacts: ["data/registrations.csv", { name: "chart", path: "out/trend.png" }]
 )
 ```
 
-Paths must land inside the working directory, the same rule that governs serving one. A path that
-escapes refuses the whole submission rather than being quietly dropped, so a named file is always a
-file you can fetch.
+Every path must land inside the working directory, the same rule that governs serving one, and
+name a file that exists when you submit. A path that escapes, or a file that is not there, refuses
+the whole submission rather than being quietly dropped, so a named file is always a file you can
+fetch. Each accepted file is typed by the [mime registry](/docs/mime), hashed, and stored as a part
+of the run when it fits `[mime] max_part_bytes`. A `type` you give wins over the registry's reading.
+A later stage sees the file in the `final_output` region the way it sees any other part. The answer
+records `name`, `path`, `mime_type`, `size` and `sha256` per file.
+
+A file the run **produced** but never wrote to disk can be named the same way, such as a picture
+from an image model that lives in the run's store. The name (then a sha256 prefix) is checked
+against the parts the run has produced first, and a match is written to that path before it is
+recorded. So a describe-the-image stage can attach the picture it was handed with
+`artifacts: [{ name: "image", path: "image-1.png" }]`, and the user gets a real file. The file name
+is shown beside the part in its region. Only a name no part answers to is read from the working
+directory. A name that is neither a produced part nor a file is refused, saying both places were
+checked.
+
+The part comes first because a file with the same name may already be sitting in the working
+directory, left by an earlier run of the same agent or put there by you. If it holds the same bytes,
+nothing is written. If it holds something else, it is left alone, the part is written beside it as
+`<stem>-<sha8>.<ext>` (`image-1-5ea93f29.png`), and that is the path the answer records and the
+model is told about. To replace the file instead, set `overwrite_artifacts`:
+
+```toml
+[agent.output]
+overwrite_artifacts = true
+```
+
+It can go on a stage's output table too, and a caller's requested shape can set it. When no level
+says, `[mime] overwrite_artifacts` in [your config](/docs/configuration#mime) decides, and it is off
+unless you turn it on.
+
+A stage can say up front which files it hands back:
+
+```toml
+[[stages.assemble.output.artifacts]]
+name = "final"
+type = "video/mp4"
+required = true
+description = "the finished cut"
+
+[[stages.assemble.output.artifacts]]
+name = "shots"
+type = "text/*"
+```
+
+The model is told to submit each by name. A `required` one that is missing is refused back to the
+model like a schema failure. So is a submitted file whose type does not match its declaration, such
+as a `video/*` that turns out to be a PNG. That refusal names both types. Declared artifacts cascade
+like the rest of the shape: the nearest non-empty list wins whole, and a caller who reshapes the
+output with `--output-format` retires them with the schema and validator.
+
+Files are what a stage hands back; what it takes is its regions' `accepts`, and
+`[stages.<name>.input]` can narrow or widen that. See [Mime](/docs/mime).
+
+### A model that makes files answers on its own
+
+Some models produce a file rather than prose: a 3D generator returns a mesh, an image model returns
+a picture. When an output stage's model is one of those, there is nothing for a `submit_output` call
+to add, because the produced part *is* the answer. So an output stage records it directly: route
+the produced part into a region with `output_routing`, declare it as an artifact, and the run hands
+it back with no tool call and no text turn.
+
+```toml
+[stages.build]
+mode = "output"
+
+[stages.build.model]
+allow_user_default = false
+
+[[stages.build.model.models]]
+provider = "meshy"
+model = "image-to-3d"
+
+[stages.build.output_routing]
+"model/*" = "model"
+
+[[stages.build.output.artifacts]]
+name = "model"
+type = "model/gltf-binary"
+required = true
+```
+
+When the stage finishes, the parts it routed are matched against the artifacts it declared, by type
+and in order; if every `required` artifact is matched, they become the run's final output. Only the
+regions this stage's `output_routing` names are searched, so an input mesh sat in another region is
+never mistaken for the one this stage made. If a required artifact has no matching produced part,
+because the model returned only text, the stage falls back to the ordinary `submit_output` nudge.
+
+This is what lets a pure "bytes in, bytes out" pipeline run with no text provider at all: the
+bundled `image-to-model` and `model-to-animated-model` need only Meshy configured.
+
+Image, video and speech models work the same way. A stage on xAI's video model hands back an
+MP4, one on `grok-tts` an audio file, and one on Meta's image model a picture:
+
+```toml
+[stages.clip]
+mode = "output"
+
+[stages.clip.model]
+models = ["xai/grok-imagine-video"]
+parameters = { duration = 6, resolution = "720p" }
+request_timeout_secs = 900
+
+[stages.clip.output_routing]
+"video/*" = "clip"
+
+[[stages.clip.output.artifacts]]
+name = "clip"
+type = "video/mp4"
+required = true
+```
+
+A stage whose routing or format names an image, video or audio type, and whose model answers with
+words only, is told it produced nothing and asked again, up to three times. The model's own words
+are quoted back to it, since a refused generation usually says why.
 
 This is why there is no pagination. What a caller reads is bounded by what a model can say. What
 gets big is a file, and files are fetched by path.
@@ -388,8 +501,20 @@ unreachable.
 | `allow-complete-skips-output` | An earlier stage may end the run instead of routing onward |
 | `output-shape-not-required` | A shape is declared but nothing must produce it |
 | `output-stage-can-modify` | An output stage can also write files |
+| `output-stage-cannot-answer` | An output stage can neither call `submit_output` nor hand a file back. See below |
+| `mime-unseen` | A stage's regions take a mime type its listed models cannot see. See below |
 
-The second one is worth knowing about. `allow_complete` offers the model a "DONE" it can choose
+`output-stage-cannot-answer` fires when the stage's models cannot call tools at all, such as an
+image model or a 3D generator, so `submit_output` is out of their reach. The stage then has to hand
+its file back the other way, and it stays silent only if it both declares an artifact and routes a
+produced part into a region. Missing either one fires the finding, and the message names which.
+Such a run would end with nothing.
+
+`mime-unseen` means those parts reach the model as stand-ins. It is a warning when the models see
+none of what the stage takes. It is information when they see some of it, which is a media pipeline
+working as designed.
+
+The `allow-complete-skips-output` finding is worth knowing about. `allow_complete` offers the model a "DONE" it can choose
 instead of a transition. Leviath appends that option even to a stage's own `transition_prompt`, so a
 stage can offer an exit its prompt never mentions. A run that takes it ends with no answer and looks
 like a success.

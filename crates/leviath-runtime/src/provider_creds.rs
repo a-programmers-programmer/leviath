@@ -19,7 +19,8 @@ use std::sync::Arc;
 #[derive(Clone, PartialEq)]
 pub struct ProviderCreds {
     /// Provider identifier: `anthropic` | `openai` | `google` | `openrouter` |
-    /// `ollama` | `claude-code`. Selects which provider is instantiated.
+    /// `ollama` | `claude-code` | `meshy` | `bedrock`. Selects which provider
+    /// is instantiated.
     pub name: String,
     /// API key, when the provider needs one (`None` for `ollama`/`claude-code`).
     pub api_key: Option<String>,
@@ -37,7 +38,8 @@ pub struct ProviderCreds {
     /// Provider-specific settings that don't fit the api-key / base-URL shape.
     ///
     /// `claude-code` reads `binary` (path to the `claude` executable) and
-    /// `effort` (reasoning level). An OpenAI-compatible endpoint is marked by
+    /// `effort` (reasoning level); `bedrock` reads `region`, the AWS region
+    /// its hosts are derived from. An OpenAI-compatible endpoint is marked by
     /// `kind` and carries its headers and model list here too; see
     /// [`Self::openai_compatible`] and [`EndpointSpec`], which are the only
     /// two places that spell those keys. Kept as a map rather than named
@@ -50,6 +52,10 @@ pub struct ProviderCreds {
 const KIND_OPTION: &str = "kind";
 /// The `kind` value for one.
 const OPENAI_COMPATIBLE: &str = "openai-compatible";
+/// The `kind` value for OpenAI's own API at a host of its own.
+const OPENAI_HOST: &str = "openai";
+/// The `options` key naming the header a key goes in instead of a bearer.
+const AUTH_HEADER_OPTION: &str = "auth_header";
 /// The `options` key prefix a request header travels under: `header:0:X-Org`.
 const HEADER_PREFIX: &str = "header:";
 /// The `options` key holding the configured model ids, as a JSON array.
@@ -75,6 +81,8 @@ pub struct EndpointSpec {
     pub models: Option<Vec<String>>,
     /// Ids a bare model name may route here on.
     pub serves: Vec<String>,
+    /// The header the key goes in instead of `Authorization: Bearer`.
+    pub auth_header: Option<String>,
 }
 
 impl EndpointSpec {
@@ -106,22 +114,7 @@ impl EndpointSpec {
                 creds.name
             ))
         };
-        // Sorted by the position the encoder stamped, so the config's own
-        // order is what the wire sees whatever order the map iterates in.
-        let mut headers: Vec<(usize, String, String)> = Vec::new();
-        for (key, value) in &creds.options {
-            let Some(rest) = key.strip_prefix(HEADER_PREFIX) else {
-                continue;
-            };
-            let position = rest
-                .split_once(':')
-                .and_then(|(position, name)| Some((position.parse().ok()?, name)));
-            let Some((position, name)) = position else {
-                return Err(malformed(key, "a numbered header (header:<n>:<name>)"));
-            };
-            headers.push((position, name.to_string(), value.clone()));
-        }
-        headers.sort();
+        let headers = creds.headers()?;
         let list = |option: &str| -> Result<Option<Vec<String>>, _> {
             creds
                 .options
@@ -132,12 +125,65 @@ impl EndpointSpec {
         };
         Ok(Some(Self {
             base_url,
-            headers: headers
-                .into_iter()
-                .map(|(_, name, value)| (name, value))
-                .collect(),
+            headers,
             models: list(MODELS_OPTION)?,
             serves: list(SERVES_OPTION)?.unwrap_or_default(),
+            auth_header: creds.options.get(AUTH_HEADER_OPTION).cloned(),
+        }))
+    }
+}
+
+/// What [`build_provider_registry`] needs to register OpenAI's own provider
+/// under another name, read back out of a [`ProviderCreds`] made by
+/// [`ProviderCreds::openai_host`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenaiHostSpec {
+    /// The host's API root.
+    pub base_url: String,
+    /// Extra headers on every request, in the order the config listed them.
+    pub headers: Vec<(String, String)>,
+    /// Ids a bare model name may route here on: deployment names.
+    pub serves: Vec<String>,
+    /// The header the key goes in instead of `Authorization: Bearer`.
+    pub auth_header: Option<String>,
+    /// The key the host issued.
+    pub api_key: String,
+}
+
+impl OpenaiHostSpec {
+    /// The host `creds` describes, or `Ok(None)` when it is not one, or is
+    /// one with no address or no key to reach it with (the config layer
+    /// refuses both at load, so this is a second guard).
+    pub fn from_creds(
+        creds: &ProviderCreds,
+    ) -> Result<Option<Self>, leviath_providers::ProviderError> {
+        let (Some(OPENAI_HOST), Some(base_url), Some(api_key)) = (
+            creds.options.get(KIND_OPTION).map(String::as_str),
+            creds.base_url.clone(),
+            creds.api_key.clone(),
+        ) else {
+            return Ok(None);
+        };
+        let serves = creds
+            .options
+            .get(SERVES_OPTION)
+            .map(|json| serde_json::from_str::<Vec<String>>(json))
+            .transpose()
+            .map_err(|_| {
+                leviath_providers::ProviderError::Other(format!(
+                    "provider '{}': the '{SERVES_OPTION}' option is not a JSON list of \
+                     strings; the runtime wrote it from the config, so this is a bug in \
+                     leviath rather than in the config",
+                    creds.name
+                ))
+            })?
+            .unwrap_or_default();
+        Ok(Some(Self {
+            base_url,
+            headers: creds.headers()?,
+            serves,
+            auth_header: creds.options.get(AUTH_HEADER_OPTION).cloned(),
+            api_key,
         }))
     }
 }
@@ -193,6 +239,51 @@ impl ProviderCreds {
         }
     }
 
+    /// Carry extra request headers, one `header:<n>:<name>` option per
+    /// header, numbered so the config's order survives a `HashMap`. What a
+    /// built-in provider behind a gateway sends alongside its own headers;
+    /// [`Self::headers`] reads them back.
+    pub fn with_headers(mut self, headers: Vec<(String, String)>) -> Self {
+        for (position, (header, value)) in headers.into_iter().enumerate() {
+            self.options
+                .insert(format!("{HEADER_PREFIX}{position}:{header}"), value);
+        }
+        self
+    }
+
+    /// The extra headers [`Self::with_headers`] or
+    /// [`Self::openai_compatible`] wrote, in the order the config listed
+    /// them. An option that is there but does not read back is an error, not
+    /// an absence: the runtime wrote it, so a failure is a bug, and a header
+    /// with a bad position is a header the server never sees.
+    pub fn headers(&self) -> Result<Vec<(String, String)>, leviath_providers::ProviderError> {
+        // Sorted by the position the encoder stamped, so the config's own
+        // order is what the wire sees whatever order the map iterates in.
+        let mut headers: Vec<(usize, String, String)> = Vec::new();
+        for (key, value) in &self.options {
+            let Some(rest) = key.strip_prefix(HEADER_PREFIX) else {
+                continue;
+            };
+            let position = rest
+                .split_once(':')
+                .and_then(|(position, name)| Some((position.parse().ok()?, name)));
+            let Some((position, name)) = position else {
+                return Err(leviath_providers::ProviderError::Other(format!(
+                    "provider '{}': the '{key}' option is not a numbered header \
+                     (header:<n>:<name>); the runtime wrote it from the config, so this \
+                     is a bug in leviath rather than in the config",
+                    self.name
+                )));
+            };
+            headers.push((position, name.to_string(), value.clone()));
+        }
+        headers.sort();
+        Ok(headers
+            .into_iter()
+            .map(|(_, name, value)| (name, value))
+            .collect())
+    }
+
     /// A cred entry for an OpenAI-compatible endpoint registered as `name`.
     ///
     /// Everything an [`leviath_providers::EndpointProvider`] needs travels in
@@ -234,6 +325,40 @@ impl ProviderCreds {
             rate_limit: None,
             options,
         }
+    }
+
+    /// A cred entry for OpenAI's own API at another host, registered as
+    /// `name`: an Azure resource, or a gateway in front of OpenAI.
+    /// [`OpenaiHostSpec::from_creds`] reads it back.
+    pub fn openai_host(
+        name: impl Into<String>,
+        base_url: impl Into<String>,
+        api_key: String,
+        headers: Vec<(String, String)>,
+        serves: Vec<String>,
+    ) -> Self {
+        let mut creds = Self::simple(name).with_headers(headers);
+        creds.api_key = Some(api_key);
+        creds.base_url = Some(base_url.into());
+        creds
+            .options
+            .insert(KIND_OPTION.to_string(), OPENAI_HOST.to_string());
+        if !serves.is_empty() {
+            creds.options.insert(
+                SERVES_OPTION.to_string(),
+                serde_json::to_string(&serves).expect("a list of strings is JSON"),
+            );
+        }
+        creds
+    }
+
+    /// Send the key in `header` instead of as a bearer token. `None` leaves
+    /// the entry as it was.
+    pub fn with_auth_header(mut self, header: Option<String>) -> Self {
+        if let Some(header) = header {
+            self.options.insert(AUTH_HEADER_OPTION.to_string(), header);
+        }
+        self
     }
 }
 
@@ -374,6 +499,25 @@ pub fn build_provider_registry_probing(
         // Decided by kind before the name is looked at: an endpoint is
         // registered under whatever name the config gave it, and that name is
         // the user's to choose.
+        if let Some(host) = OpenaiHostSpec::from_creds(c)? {
+            registry.register(
+                c.name.clone(),
+                Arc::new(
+                    leviath_providers::OpenAIProvider::with_overrides(
+                        clients.get_or_build(timeout, build_client)?,
+                        host.api_key,
+                        caps,
+                        c.rate_limit.as_ref(),
+                    )
+                    .named(c.name.clone())
+                    .with_base_url(Some(host.base_url))
+                    .with_headers(host.headers)
+                    .with_auth_header(host.auth_header)
+                    .with_serves(host.serves),
+                ),
+            );
+            continue;
+        }
         if let Some(endpoint) = EndpointSpec::from_creds(c)? {
             registry.register(
                 c.name.clone(),
@@ -385,6 +529,7 @@ pub fn build_provider_registry_probing(
                         c.api_key.clone(),
                         endpoint.headers,
                     )
+                    .with_auth_header(endpoint.auth_header)
                     .with_overrides(caps)
                     .with_rate_limit(c.rate_limit.as_ref())
                     .with_request_timeout(timeout)
@@ -407,6 +552,7 @@ pub fn build_provider_registry_probing(
                                 c.rate_limit.as_ref(),
                             )
                             .with_base_url(c.base_url.clone())
+                            .with_headers(c.headers()?)
                             // An unrecognised value keeps the default rather
                             // than failing the daemon's boot over a cache
                             // setting; the config layer is what validates it.
@@ -433,7 +579,8 @@ pub fn build_provider_registry_probing(
                                 caps,
                                 c.rate_limit.as_ref(),
                             )
-                            .with_base_url(c.base_url.clone()),
+                            .with_base_url(c.base_url.clone())
+                            .with_headers(c.headers()?),
                         ),
                     );
                 }
@@ -449,7 +596,8 @@ pub fn build_provider_registry_probing(
                                 caps,
                                 c.rate_limit.as_ref(),
                             )
-                            .with_base_url(c.base_url.clone()),
+                            .with_base_url(c.base_url.clone())
+                            .with_headers(c.headers()?),
                         ),
                     );
                 }
@@ -465,10 +613,117 @@ pub fn build_provider_registry_probing(
                                 caps,
                                 c.rate_limit.as_ref(),
                             )
-                            .with_base_url(c.base_url.clone()),
+                            .with_base_url(c.base_url.clone())
+                            .with_headers(c.headers()?),
                         ),
                     );
                 }
+            }
+            "meshy" => {
+                if let Some(ref key) = c.api_key {
+                    registry.register(
+                        "meshy".to_string(),
+                        Arc::new(
+                            leviath_providers::MeshyProvider::with_overrides(
+                                clients.get_or_build(timeout, build_client)?,
+                                key.clone(),
+                                caps,
+                                c.rate_limit.as_ref(),
+                            )
+                            .with_base_url(c.base_url.clone())
+                            .with_headers(c.headers()?),
+                        ),
+                    );
+                }
+            }
+            "bedrock" => {
+                if let Some(ref key) = c.api_key {
+                    registry.register(
+                        "bedrock".to_string(),
+                        Arc::new(
+                            leviath_providers::BedrockProvider::with_overrides(
+                                clients.get_or_build(timeout, build_client)?,
+                                key.clone(),
+                                caps,
+                                c.rate_limit.as_ref(),
+                            )
+                            .with_base_url(c.base_url.clone())
+                            .with_headers(c.headers()?)
+                            // Absent means the provider's default region; the
+                            // config layer writes it only when one was set.
+                            .with_region(c.options.get("region").cloned()),
+                        ),
+                    );
+                }
+            }
+            "xai" | "meta" => {
+                if let Some(ref key) = c.api_key {
+                    let client = clients.get_or_build(timeout, build_client)?;
+                    let effort = c.options.get("effort").cloned();
+                    let provider: Arc<dyn leviath_providers::Provider> = match c.name.as_str() {
+                        "xai" => Arc::new(
+                            leviath_providers::xai::XaiProvider::new(
+                                client,
+                                leviath_providers::xai::Auth::Key(key.clone()),
+                            )
+                            .with_overrides(caps)
+                            .with_rate_limit(c.rate_limit.as_ref())
+                            .with_request_timeout(timeout)
+                            .with_base_url(c.base_url.clone())
+                            .with_headers(c.headers()?)
+                            .with_reasoning_effort(effort),
+                        ),
+                        _ => Arc::new(
+                            leviath_providers::meta::MetaProvider::new(client, key.clone())
+                                .with_overrides(caps)
+                                .with_rate_limit(c.rate_limit.as_ref())
+                                .with_request_timeout(timeout)
+                                .with_base_url(c.base_url.clone())
+                                .with_headers(c.headers()?)
+                                .with_reasoning_effort(effort),
+                        ),
+                    };
+                    registry.register(c.name.clone(), provider);
+                }
+            }
+            "grok" => {
+                // Registered without reading the grant, for the reason the
+                // Codex arm below gives: a keychain read at daemon start can
+                // raise a GUI prompt, and a `grok/...` model failing at its
+                // first inference with "run `lev auth login grok`" is the
+                // better failure.
+                let Some(store_path) = c.options.get("auth_store_path") else {
+                    tracing::warn!(
+                        "the grok provider was configured without a grant location, \
+                         so it is skipped; this is a bug in leviath rather than in the config"
+                    );
+                    continue;
+                };
+                let client = clients.get_or_build(timeout, build_client)?;
+                let tokens = leviath_providers::oauth::OAuthTokenSource::new(
+                    leviath_providers::grok::PROVIDER_NAME,
+                    std::path::PathBuf::from(store_path),
+                    Arc::new(leviath_providers::oauth::HttpRefresh::new(
+                        client.clone(),
+                        &leviath_providers::grok::PROFILE,
+                    )),
+                )
+                .with_credential_store(credential_store(c));
+                registry.register(
+                    leviath_providers::grok::PROVIDER_NAME.to_string(),
+                    Arc::new(
+                        leviath_providers::xai::XaiProvider::new(
+                            client,
+                            leviath_providers::xai::Auth::Signin(Arc::new(tokens)),
+                        )
+                        .with_overrides(caps)
+                        .with_rate_limit(c.rate_limit.as_ref())
+                        .with_request_timeout(timeout)
+                        .with_base_url(c.base_url.clone())
+                        .with_headers(c.headers()?)
+                        .with_reasoning_effort(c.options.get("effort").cloned()),
+                    ),
+                );
             }
             "ollama" => {
                 let url = c
@@ -534,21 +789,14 @@ pub fn build_provider_registry_probing(
                     continue;
                 };
                 let store_path = std::path::PathBuf::from(store_path);
-                let credential_store = c
-                    .options
-                    .get("credential_store")
-                    .map(String::as_str)
-                    .and_then(|kind| match kind {
-                        "keychain" => leviath_providers::codex::store::store_for(
-                            leviath_core::CredentialStoreKind::Keychain,
-                        ),
-                        _ => None,
-                    });
+                let credential_store = credential_store(c);
                 let client = clients.get_or_build(timeout, build_client)?;
-                let tokens = leviath_providers::codex::CodexTokenSource::new(
+                let tokens = leviath_providers::oauth::OAuthTokenSource::new(
+                    leviath_providers::codex::PROVIDER_NAME,
                     store_path,
-                    Arc::new(leviath_providers::codex::refresh::HttpRefresh::new(
+                    Arc::new(leviath_providers::oauth::HttpRefresh::new(
                         client.clone(),
+                        &leviath_providers::codex::PROFILE,
                     )),
                 )
                 .with_credential_store(credential_store);
@@ -583,6 +831,17 @@ pub fn build_provider_registry_probing(
     Ok(registry)
 }
 
+/// The OS credential store a sign-in provider's grant lives in, when its
+/// options name the keychain; `None` is the grant file.
+fn credential_store(c: &ProviderCreds) -> Option<Arc<dyn leviath_core::CredentialStore>> {
+    match c.options.get("credential_store").map(String::as_str) {
+        Some("keychain") => {
+            leviath_providers::oauth::store::store_for(leviath_core::CredentialStoreKind::Keychain)
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -605,6 +864,56 @@ mod tests {
                 "configured {configured:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_meshy_key_registers_the_provider_and_a_missing_one_does_not() {
+        let mut cred = ProviderCreds::simple("meshy");
+        cred.api_key = Some("msy-test".to_string());
+        cred.base_url = Some("https://gateway.example/v1".to_string());
+        let registry = build_provider_registry(&[cred]).expect("an HTTPS client builds in tests");
+        assert!(
+            registry.get("meshy").is_some(),
+            "a keyed meshy is registered"
+        );
+
+        // A meshy cred with no key registers nothing, like every other keyed
+        // provider: an empty account authenticates as nobody.
+        let keyless = ProviderCreds::simple("meshy");
+        let registry = build_provider_registry(&[keyless]).expect("builds");
+        assert!(
+            registry.get("meshy").is_none(),
+            "a keyless meshy is skipped"
+        );
+    }
+
+    #[test]
+    fn a_bedrock_key_registers_the_provider_with_or_without_a_region() {
+        let mut cred = ProviderCreds::simple("bedrock");
+        cred.api_key = Some("ABSK-test".to_string());
+        cred.options
+            .insert("region".to_string(), "eu-west-1".to_string());
+        let registry = build_provider_registry(&[cred]).expect("an HTTPS client builds in tests");
+        assert!(
+            registry.get("bedrock").is_some(),
+            "a keyed bedrock is registered"
+        );
+
+        // No region carried: the provider's own default applies.
+        let mut cred = ProviderCreds::simple("bedrock");
+        cred.api_key = Some("ABSK-test".to_string());
+        cred.base_url = Some("https://gateway.example/bedrock".to_string());
+        let registry = build_provider_registry(&[cred]).expect("builds");
+        assert!(registry.get("bedrock").is_some());
+
+        // A bedrock cred with no key registers nothing, like every keyed
+        // provider: an empty account authenticates as nobody.
+        let registry =
+            build_provider_registry(&[ProviderCreds::simple("bedrock")]).expect("builds");
+        assert!(
+            registry.get("bedrock").is_none(),
+            "a keyless bedrock is skipped"
+        );
     }
 
     /// One `tracing::debug!(?creds)` - or an error context that formats a struct
@@ -656,6 +965,7 @@ mod tests {
                 ],
                 models: Some(vec!["llama-3".to_string()]),
                 serves: vec!["llama".to_string()],
+                auth_header: None,
             }
         );
 
@@ -667,6 +977,134 @@ mod tests {
         assert_eq!(spec.models, None);
         assert!(spec.serves.is_empty());
         assert!(spec.headers.is_empty());
+    }
+
+    /// Two hosts of OpenAI's API, each with its own key, sit side by side in
+    /// one registry: each is registered under its own name, reaches its own
+    /// address, and sends its own credential the way it was told to.
+    #[tokio::test]
+    async fn two_openai_hosts_register_side_by_side_with_their_own_keys() {
+        let listing = br#"{"data":[{"id":"gpt-5.5","created":1}]}"#;
+        let (east_url, east) =
+            leviath_testkit::spawn_mock_recorder(200, "OK", listing.to_vec()).await;
+        let (west_url, west) =
+            leviath_testkit::spawn_mock_recorder(200, "OK", listing.to_vec()).await;
+        let creds = [
+            ProviderCreds::openai_host("azure-east", &east_url, "east-key".into(), vec![], vec![])
+                .with_auth_header(Some("api-key".to_string())),
+            ProviderCreds::openai_host(
+                "azure-west",
+                &west_url,
+                "west-key".into(),
+                vec![("X-Team".to_string(), "search".to_string())],
+                vec!["prod-gpt55".to_string()],
+            ),
+        ];
+        let spec = OpenaiHostSpec::from_creds(&creds[1])
+            .expect("decodes")
+            .expect("a host");
+        assert_eq!(spec.serves, vec!["prod-gpt55".to_string()]);
+        assert_eq!(spec.auth_header, None);
+        // No header named leaves the entry as it was.
+        assert_eq!(creds[1].clone().with_auth_header(None), creds[1]);
+        // A host with no key is not one this can register.
+        let mut keyless = creds[1].clone();
+        keyless.api_key = None;
+        assert_eq!(OpenaiHostSpec::from_creds(&keyless).expect("decodes"), None);
+        // A serves list the runtime could not have written is a named bug,
+        // and fails the registry rather than routing nothing.
+        let mut garbled = creds[0].clone();
+        garbled
+            .options
+            .insert(SERVES_OPTION.to_string(), "not json".to_string());
+        let err = build_provider_registry(&[garbled]).err().expect("refused");
+        assert!(err.to_string().contains("azure-east"));
+        let mut misnumbered = creds[0].clone();
+        misnumbered
+            .options
+            .insert(format!("{HEADER_PREFIX}first:X-Team"), "search".to_string());
+        assert!(OpenaiHostSpec::from_creds(&misnumbered).is_err());
+        // And a client that will not build fails the registry too.
+        assert!(build_provider_registry_with(&creds[..1], &failing_client).is_err());
+
+        let registry = build_provider_registry(&creds).expect("builds");
+        let east_provider = registry.get("azure-east").expect("east registered");
+        let west_provider = registry.get("azure-west").expect("west registered");
+        assert!(registry.get("openai").is_none());
+        assert_eq!(east_provider.name(), "azure-east");
+        assert_eq!(
+            west_provider.serves_model("prod-gpt55").as_deref(),
+            Some("prod-gpt55")
+        );
+        assert_eq!(east_provider.serves_model("prod-gpt55"), None);
+
+        let listed = east_provider.list_models().await.expect("east lists");
+        assert_eq!(listed[0].provider, "azure-east");
+        west_provider.list_models().await.expect("west lists");
+
+        let east = east.lock().unwrap()[0].to_ascii_lowercase();
+        assert!(east.contains("api-key: east-key"), "{east}");
+        assert!(!east.contains("authorization"), "{east}");
+        let west = west.lock().unwrap()[0].to_ascii_lowercase();
+        assert!(west.contains("authorization: bearer west-key"), "{west}");
+        assert!(west.contains("x-team: search"), "{west}");
+    }
+
+    /// A built-in provider's extra headers ride the same numbered options an
+    /// endpoint's do, read back in the config's order, and reach the
+    /// registry's constructor; a header that lost its position fails the
+    /// registry naming the provider, the way an endpoint's does.
+    #[test]
+    fn a_builtin_providers_headers_travel_in_the_options_and_reach_the_registry() {
+        let creds = ProviderCreds {
+            api_key: Some("sk-test".to_string()),
+            ..ProviderCreds::simple("openai")
+        }
+        .with_headers(vec![
+            ("X-Gateway-Token".to_string(), "t-1".to_string()),
+            ("X-Org".to_string(), "research".to_string()),
+        ]);
+        assert_eq!(
+            creds.headers().expect("decodes"),
+            vec![
+                ("X-Gateway-Token".to_string(), "t-1".to_string()),
+                ("X-Org".to_string(), "research".to_string()),
+            ]
+        );
+        assert!(
+            ProviderCreds::simple("openai")
+                .headers()
+                .expect("decodes")
+                .is_empty()
+        );
+        let registry = build_provider_registry(&[creds]).expect("builds");
+        assert!(registry.has("openai"));
+
+        // Every built-in that takes headers refuses a header without a
+        // position the same way, naming itself.
+        for name in [
+            "anthropic",
+            "openai",
+            "google",
+            "openrouter",
+            "meshy",
+            "bedrock",
+            "xai",
+            "meta",
+        ] {
+            let mut bad = ProviderCreds {
+                api_key: Some("sk-test".to_string()),
+                ..ProviderCreds::simple(name)
+            };
+            bad.options
+                .insert("header:X-No-Position".to_string(), "v".to_string());
+            let err = build_provider_registry(&[bad])
+                .map(drop)
+                .expect_err("a header without a position is a bug, not an absence")
+                .to_string();
+            assert!(err.contains(&format!("'{name}'")), "{err}");
+            assert!(err.contains("header:X-No-Position"), "{err}");
+        }
     }
 
     /// Not an endpoint: a native provider, and an endpoint that lost its
@@ -924,7 +1362,7 @@ mod tests {
         // api_key is present; a `None` key exercises the skip (else) path of
         // each `if let Some(ref key)` and leaves the provider unregistered.
         let caps = std::collections::HashMap::new();
-        let creds: Vec<ProviderCreds> = ["anthropic", "openai", "google", "openrouter"]
+        let creds: Vec<ProviderCreds> = ["anthropic", "openai", "google", "openrouter", "bedrock"]
             .into_iter()
             .map(|name| ProviderCreds {
                 name: name.to_string(),
@@ -941,6 +1379,7 @@ mod tests {
         assert!(!registry.has("openai"));
         assert!(!registry.has("google"));
         assert!(!registry.has("openrouter"));
+        assert!(!registry.has("bedrock"));
     }
 
     #[test]
@@ -1004,7 +1443,18 @@ mod tests {
         // seam exists to close.
         let endpoint =
             ProviderCreds::openai_compatible("mock", "http://h/v1", None, vec![], None, vec![]);
-        let keyed = ["anthropic", "openai", "google", "openrouter", "ollama"].map(|name| {
+        let keyed = [
+            "anthropic",
+            "openai",
+            "google",
+            "openrouter",
+            "meshy",
+            "bedrock",
+            "ollama",
+            "xai",
+            "meta",
+        ]
+        .map(|name| {
             let mut cred = ProviderCreds::simple(name);
             cred.api_key = Some("k".to_string());
             cred
@@ -1135,7 +1585,6 @@ mod tests {
         // observable consequence of the provider having been built at all.
         let provider = registry.get("codex").expect("registered");
         assert!(provider.served_catalog().is_none());
-        assert!(provider.explicit_route_only());
     }
 
     /// The file backend reaches no OS store at all, which is the default and
@@ -1188,5 +1637,55 @@ mod tests {
             options: Default::default(),
         }];
         assert!(!build(&creds).has("codex"));
+    }
+
+    // ─── xai, meta and grok ────────────────────────────────────────────────
+
+    fn keyed(name: &str, key: Option<&str>) -> ProviderCreds {
+        ProviderCreds {
+            name: name.to_string(),
+            api_key: key.map(str::to_string),
+            base_url: Some("https://gw.example/v1".to_string()),
+            model_capabilities: Default::default(),
+            request_timeout_secs: Some(30),
+            rate_limit: None,
+            options: [("effort".to_string(), "high".to_string())].into(),
+        }
+    }
+
+    #[test]
+    fn xai_and_meta_register_with_a_key_and_not_without_one() {
+        let registry = build(&[keyed("xai", Some("xai-k")), keyed("meta", Some("m-k"))]);
+        assert!(registry.has("xai"));
+        assert!(registry.has("meta"));
+        let registry = build(&[keyed("xai", None), keyed("meta", None)]);
+        assert!(!registry.has("xai"));
+        assert!(!registry.has("meta"));
+    }
+
+    #[test]
+    fn grok_registers_with_a_grant_location_and_is_skipped_without_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut creds = codex_creds(dir.path(), &[("effort", "low")]);
+        creds[0].name = "grok".to_string();
+        assert!(build(&creds).has("grok"));
+        creds[0].options.remove("auth_store_path");
+        assert!(!build(&creds).has("grok"));
+    }
+
+    #[test]
+    fn grok_needs_a_client_and_refuses_a_header_without_a_position() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut creds = codex_creds(dir.path(), &[]);
+        creds[0].name = "grok".to_string();
+        assert!(build_provider_registry_probing(&creds, &failing_client, &|_| true).is_err());
+        creds[0]
+            .options
+            .insert("header:X-No-Position".to_string(), "v".to_string());
+        let err = build_provider_registry(&creds)
+            .map(drop)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("header:X-No-Position"), "{err}");
     }
 }

@@ -83,9 +83,11 @@ on_validator_error = "accept"
 ```
 
 With `accept`, a validator that cannot run records the submission as if no validator were declared.
-Choose it when any answer beats no answer, and be aware of what you are trading: a genuine script
-bug under the default reads as "this answer is wrong" on every retry, so the agent can burn its
-whole budget against a check that can never pass. The setting works at both levels, `[agent.output]`
+Choose it when any answer beats no answer, and be aware of what you are trading. Under the default,
+a genuine script bug reads as "this answer is wrong" on every retry. The agent can burn its whole
+budget against a check that can never pass.
+
+The setting works at both levels, `[agent.output]`
 and `[stages.<name>.output]`, and the stage's value wins. Anything other than `reject` or `accept`
 refuses to load.
 
@@ -101,8 +103,8 @@ In both modes the run flags the script:
 | `lev dash` | `⚠ 1 broken script` in the run's detail header |
 | `meta.json`, the API | `flags.broken_scripts`, naming each script |
 
-Named rather than counted, because the useful question is which one. Recorded once per script
-however many times the stage submits - a validator that throws throws every time.
+Named rather than counted, because the useful question is which one. It is recorded once per
+script however many times the stage submits, since a validator that throws throws every time.
 
 Under `accept` the flag is the only trace: the run completes, reports success, and an answer nobody
 checked looks exactly like an answer that passed. Check it before trusting those runs.
@@ -116,7 +118,7 @@ Only when the format it was written for is the one in effect.
 
 A validator describes one format. If a caller overrides the format at launch, your validator is
 retired along with any JSON Schema, because neither describes what is now being produced. The
-caller can bring a JSON Schema of their own (`--output-schema`, or `output_schema` on the API); a
+caller can bring a JSON Schema of their own (`--output-schema`, or `output_schema` on the API). A
 replacement validator is the one check no request can supply, so a reshaped run keeps only whatever
 schema came with it.
 

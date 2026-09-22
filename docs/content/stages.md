@@ -73,6 +73,11 @@ hint = "Implementation complete, ready for review"
 condition = "stuck"          # a runtime signal, not the agent's choice
 ```
 
+`error` fires when a stage cannot go on. A provider refused the request, or the model's replies were
+cut off in the middle of a tool call four times in a row (see
+[stages and models](/docs/agents#stages-and-models)). The recovery stage finds the
+reason in the context. With no `error` edge the run fails.
+
 An edge with a `hint` and no `condition` is routed by the model, exactly as though you had written
 `condition = "llm_choice"`. The full set of values is `always`, `llm_choice`, `error`,
 `max_iterations`, `stuck`, and `dead_end`. Anything else is a parse error rather than an edge that
@@ -114,17 +119,26 @@ somewhere else.
 |---|---|---|
 | `max_revisits` | unlimited | How many times this stage may be re-entered, not counting the first visit. See below |
 | `transition_prompt` | built-in | Replaces the prompt used to ask the model which edge to take |
-| `allow_complete` | `false` | Offers the model an explicit `DONE` answer that ends the run, rather than forcing it down the one available edge |
+| `allow_complete` | `false` | Offers the model an explicit `DONE` answer that ends the run. See below |
 | `requires_children` | `false` | Holds the stage until every sub-agent it spawned has finished |
 | `allow_as_worker` | `false` | Lets this stage be the target of a [fan-out](/docs/sub-agents) |
 | `accepts_messages` | `true` | Whether `lev msg` reaches this stage. See [Human-in-the-loop](/docs/interaction) |
 | `allow_blocking_tools` | `false` | Marks an autonomous stage as deliberately offering the tools that wait on a person |
-| `available_global_tools` | `false` | Also advertises every Rhai tool installed in `~/.leviath/tools/` at spawn. See [which tools a stage gets](/docs/agents#which-tools-a-stage-gets) |
+| `input.accepts` | the visible regions' `accepts` | The mime types the stage takes as [parts](/docs/mime). See below |
+| `input.as_text` | `[]` | Mime types whose parts reach this stage's model as text whatever the model takes |
+| `output.artifacts` | `[]` | The files the stage hands back beside its answer, by name and type. See [Final outputs](/docs/outputs#large-results) |
+| `output.overwrite_artifacts` | `[mime]` setting, off | Whether an artifact may replace a different file already at its path. See [Final outputs](/docs/outputs#large-results) |
+| `output_routing` | `{}` | Where the model's produced parts go, by mime type: `"image/*" = "artwork"`. See [Routing produced parts](/docs/context#routing-produced-parts) |
+| `context.reset` | `[]` | Regions emptied when the stage is entered, for a clean slate. See [A clean slate for the next stage](/docs/context#a-clean-slate-for-the-next-stage) |
+| `tool_accepts` | `{}` | What each tool may be handed at this stage, as `tool = ["image/*"]`. See [Mime](/docs/mime#what-a-tool-may-be-handed) |
 
-Three of those need a sentence more.
+Some of those need a sentence more.
 
 `max_revisits` is also read when the runtime builds the list of edges to offer. An edge pointing at
 a stage that is out of budget is dropped from the choices.
+
+`allow_complete` adds `DONE` to the answers the model may give, and that answer ends the run.
+Without it the model has to take one of the stage's outgoing edges, even when only one is on offer.
 
 `allow_as_worker` is off by default so that you can only fan out into a stage that was designed for
 it, rather than into any stage that happens to look suitable.
@@ -134,6 +148,16 @@ human-in-the-loop tool waits until somebody answers, and on an unattended run th
 is why `lev validate` warns about it. Setting this key tells the linter you meant it, so it stops
 reporting a deliberate choice as an oversight. Use it when the stage is driven from the dashboard,
 or by somebody watching.
+
+`input.accepts` is read in two places. It prefers a model that can see those types, and
+`lev validate` reads it as well.
+
+`output.overwrite_artifacts` decides what happens when a produced part handed back as an artifact
+lands on a path some other file already holds. Off, the part is written beside that file, under a
+name carrying its hash.
+
+`tool_accepts` fences each tool separately. A stored part outside a tool's list is out of that
+tool's reach at this stage.
 
 ### Every stage should name its own model
 
@@ -167,10 +191,10 @@ transform = "compact"        # direct | clear | compact | summarize | custom
   results = { kind = "sliding_window", budget = "20%", summarizable = false }
   ```
 
-  That protects it wherever it is used, rather than at each of the edges that might touch it, and it
-  wins over an explicit `compact` list. `lev validate` warns when a bare `compact` edge would
-  summarize a region declared `required`, which is the closest thing a blueprint has to "this is a
-  deliverable".
+  That protects it wherever it is used, rather than at each edge that might touch it.
+  `summarizable = false` also wins over an explicit `compact` list. `lev validate` warns when a bare
+  `compact` edge would summarize a region declared `required`, which is the closest thing a
+  blueprint has to "this is a deliverable".
 - `custom` takes a `transform_config` that names regions one at a time:
 
 ```toml
@@ -204,9 +228,14 @@ gate = { require_modifications = true, max_attempts = 3 }
 | `require_regions` | `[]` | Regions that must **all** hold content. ANDed with every other condition here |
 | `require_region_updated` | unset | Require that a named region **changed** during this stage, rather than only holding content. See below |
 | `require_no_open_items` | unset | Name a [checklist region](/docs/context) that must have no open items before this edge is taken |
+| `require_region_entries` | unset | `{ region = "views", at_least = 4 }`: the region must hold that many entries or more. See below |
 | `message` | generated | The nudge shown when the gate blocks |
 | `region` | unset | An **alternative** way to satisfy `require_modifications`: the gate also passes if this region is non-empty. See below |
 | `tools` | `[]` | Extra tool names to count as modifying, beyond `write_file` and `edit_file` |
+
+`require_region_entries` re-runs the stage with the gate's message until the count is met. That is
+how a stage whose model cannot call tools keeps going until its set is complete. An image model
+returns however many pictures it likes per reply, and the gate asks again until there are enough.
 
 ### `region` is an alternative, `require_regions` is a requirement
 

@@ -1,19 +1,13 @@
 //! The core of `install_tool`: compile a Rhai tool script and place it in the
 //! global tools directory, where every future agent run discovers it.
 //!
-//! This is the audited persist path for mechanical learnings. A stage hook
-//! cannot touch the filesystem by design, a script tool's `write_file` is
-//! confined to the run's workdir, and this is the one built-in that writes to
-//! `~/.leviath/tools/` on purpose, checking the script and recording who put
-//! it there. It is not the only way bytes can land in that directory: a shell
-//! redirect outside the workdir is refused, but the programs a shell line runs
-//! (`cp`, `tee`) are confined only by a `[sandbox]`, so an unattended run with
-//! `shell` and no sandbox can put a `.rhai` file there with none of the checks
-//! below. A file without a provenance line did not come through here. The
-//! function is deliberately pure over its inputs: the destination directory,
-//! the reserved-name set, the provenance and the filesystem predicates are all
-//! parameters, so the built-in tool, the MCP server and the tests call the same
-//! code with nothing ambient.
+//! This is the persist path for mechanical learnings. A stage hook cannot touch
+//! the filesystem by design, and a script tool's `write_file` is confined to the
+//! run's workdir, so before this nothing an agent could do reached
+//! `~/.leviath/tools/`. The function is deliberately pure over its inputs: the
+//! destination directory, the reserved-name set, the provenance and the
+//! filesystem predicates are all parameters, so the built-in tool and the
+//! tests call the same code with nothing ambient.
 //!
 //! Every refusal happens before anything is written. A script that does not
 //! compile, a name that collides with a built-in, a name that is not a plain
@@ -64,10 +58,37 @@ pub struct InstalledTool {
     pub toml_sibling: bool,
 }
 
+/// Who will be able to call an installed tool, which is the whole difference
+/// between the two installers and so the thing its result has to say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstalledFor {
+    /// The blueprint that installed it, and nothing else on the machine.
+    ThisAgent,
+    /// Every agent on this machine that asks for script tools.
+    EveryAgent,
+}
+
+impl InstalledFor {
+    /// The sentence that says who gets it.
+    fn audience(self) -> &'static str {
+        match self {
+            Self::ThisAgent => {
+                "\nOnly this agent's runs can call it - it is in this agent's own directory, not \
+                 the machine-wide one."
+            }
+            Self::EveryAgent => "\nEvery agent on this machine can call it from its next spawn.",
+        }
+    }
+}
+
 impl InstalledTool {
     /// The tool result a model reads back: what was installed, its interface,
-    /// and when it becomes callable.
-    pub fn summary(&self) -> String {
+    /// who can call it, and when.
+    ///
+    /// Takes the audience rather than assuming one. A default here would be
+    /// wrong for one of the two installers, and wrong in the direction that
+    /// tells a model its private tool is now everybody's.
+    pub fn summary_for(&self, who: InstalledFor) -> String {
         let mut out = format!("Installed tool '{}' at {}.", self.name, self.path.display());
         if self.replaced {
             out.push_str(" It replaced the previous script of that name.");
@@ -85,10 +106,10 @@ impl InstalledTool {
                 self.name
             ));
         }
+        out.push_str(who.audience());
         out.push_str(
-            "\nEvery agent on this machine can call it from its next spawn. A stage that sets \
-             `available_global_tools = true` advertises it; a `dynamic_tools` agent already running \
-             sees it on its next turn.",
+            " A stage whose `available_tools` names it or includes `@scripts` advertises it; a \
+             run whose `tool_rescan` is not `at_spawn` sees it without being restarted.",
         );
         out
     }
@@ -321,25 +342,67 @@ pub fn install_script_tool_with(
 }
 
 impl BuiltinTools {
-    /// The `install_tool` built-in: compile the `source` argument as a Rhai
-    /// tool named `name` and install it into the global tools directory.
+    /// Install a Rhai tool into the machine-wide tools directory, where every
+    /// agent on this machine that names `@scripts` or `@all` will be offered it.
     ///
     /// Synchronous, like the environment tools, so a seed or a host with no
     /// runtime can call it. It takes no per-path lock: fan-out workers that
     /// install the same name concurrently are last-writer-wins through an
     /// atomic rename, which is acceptable for what should be identical
     /// learnings and never leaves a half-written script.
+    pub(crate) fn install_global_tool(&self, args: &Value) -> String {
+        self.install_into(
+            "install_global_tool",
+            self.ctx.tools_dir.as_deref(),
+            InstalledFor::EveryAgent,
+            "no home directory resolves, so there is no machine-wide tools \
+             directory to install into",
+            args,
+        )
+    }
+
+    /// Install a Rhai tool into this blueprint's own `tools/` directory, where
+    /// only this blueprint's runs will see it.
+    ///
+    /// The narrow half of the pair, and the one to reach for: an agent that
+    /// learns something usually learns it about its own job. It refuses rather
+    /// than falling back to the machine-wide directory, because falling back
+    /// would make "arm me" mean "arm everyone" exactly when the author was
+    /// trying to say the opposite.
+    pub(crate) fn install_self_tool(&self, args: &Value) -> String {
+        self.install_into(
+            "install_self_tool",
+            self.ctx.agent_tools_dir.as_deref(),
+            InstalledFor::ThisAgent,
+            "this run has no blueprint directory to install into, so there is \
+             nothing this tool could be private to",
+            args,
+        )
+    }
+
+    /// The half the two share: read the arguments, refuse the names discovery
+    /// would drop, and write.
     ///
     /// Reserved names are everything discovery would drop a script for: this
     /// platform's built-ins, the sub-agent tools, and whatever the spawn put on
     /// the context (the MCP tools this run offers).
-    pub(crate) fn install_tool(&self, args: &Value) -> String {
+    fn install_into(
+        &self,
+        tool: &str,
+        dir: Option<&Path>,
+        who: InstalledFor,
+        no_dir: &str,
+        args: &Value,
+    ) -> String {
         let Some(name) = args.get("name").and_then(Value::as_str) else {
-            return "[error] install_tool: missing 'name' argument".to_string();
+            return format!("[error] {tool}: missing 'name' argument");
         };
         let Some(source) = args.get("source").and_then(Value::as_str) else {
-            return "[error] install_tool: missing 'source' argument".to_string();
+            return format!("[error] {tool}: missing 'source' argument");
         };
+        if dir.is_none() {
+            return format!("[error] {tool}: {no_dir}");
+        }
         let overwrite = args
             .get("overwrite")
             .and_then(Value::as_bool)
@@ -348,16 +411,9 @@ impl BuiltinTools {
         reserved.extend(SUBAGENT_TOOLS.iter().map(|s| s.to_string()));
         reserved.extend(self.ctx.reserved_names.iter().cloned());
         let provenance = format!("agent run in {}", self.ctx.workdir.display());
-        match install_script_tool(
-            self.ctx.tools_dir.as_deref(),
-            name,
-            source,
-            overwrite,
-            &reserved,
-            Some(&provenance),
-        ) {
-            Ok(installed) => installed.summary(),
-            Err(e) => format!("[error] install_tool: {e}"),
+        match install_script_tool(dir, name, source, overwrite, &reserved, Some(&provenance)) {
+            Ok(installed) => installed.summary_for(who),
+            Err(e) => format!("[error] {tool}: {e}"),
         }
     }
 }
@@ -403,11 +459,11 @@ mod tests {
         let (set, skipped) = leviath_scripting::ScriptToolSet::discover(&[tools]);
         assert!(skipped.is_empty());
         assert!(set.contains("upper"));
-        let text = installed.summary();
+        let text = installed.summary_for(InstalledFor::EveryAgent);
         assert!(text.contains("Installed tool 'upper'"), "{text}");
         assert!(text.contains("text:string! (input to transform)"), "{text}");
         assert!(!text.contains("replaced"), "{text}");
-        assert!(text.contains("available_global_tools"), "{text}");
+        assert!(text.contains("@scripts"), "{text}");
     }
 
     /// The provenance line is the first line of the file, the annotation
@@ -537,7 +593,7 @@ mod tests {
         let installed = install(Some(&tools), "upper", &newer, true, &[]).unwrap();
         assert!(installed.replaced);
         assert_eq!(std::fs::read_to_string(&installed.path).unwrap(), newer);
-        let text = installed.summary();
+        let text = installed.summary_for(InstalledFor::EveryAgent);
         assert!(text.contains("replaced the previous script"), "{text}");
         assert!(text.contains("Description: Shout"), "{text}");
     }
@@ -548,7 +604,11 @@ mod tests {
         std::fs::write(home.path().join("upper.toml"), "[tool]\nname = \"upper\"\n").unwrap();
         let installed = install(Some(home.path()), "upper", UPPER, false, &[]).unwrap();
         assert!(installed.toml_sibling);
-        assert!(installed.summary().contains("upper.toml sits beside"));
+        assert!(
+            installed
+                .summary_for(InstalledFor::EveryAgent)
+                .contains("upper.toml sits beside")
+        );
     }
 
     /// A sibling that would install the script under another name is refused:
@@ -703,7 +763,7 @@ mod tests {
             replaced: false,
             toml_sibling: false,
         };
-        let text = installed.summary();
+        let text = installed.summary_for(InstalledFor::EveryAgent);
         assert!(text.contains("Params: flags:string\n"), "{text}");
         assert!(text.contains("Requires: shell"), "{text}");
         assert!(!text.contains("Description:"), "{text}");
@@ -744,11 +804,13 @@ mod tests {
         assert!(text.ends_with(UPPER), "{text}");
 
         // Without overwrite the second install is refused; with it, replaced.
+        // Called by the old name throughout, which is how this also holds the
+        // alias: it has to reach the machine-wide half, which is what it meant.
         let out = builtins
             .execute("install_tool", json!({"name": "upper", "source": UPPER}))
             .await;
         assert!(
-            out.starts_with("[error] install_tool: tool 'upper' already exists"),
+            out.starts_with("[error] install_global_tool: tool 'upper' already exists"),
             "{out}"
         );
         let out = builtins
@@ -766,16 +828,16 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let builtins = tools_installing_into(workdir.path(), home.path());
         assert_eq!(
-            builtins.install_tool(&json!({"source": UPPER})),
-            "[error] install_tool: missing 'name' argument"
+            builtins.install_global_tool(&json!({"source": UPPER})),
+            "[error] install_global_tool: missing 'name' argument"
         );
         assert_eq!(
-            builtins.install_tool(&json!({"name": "upper"})),
-            "[error] install_tool: missing 'source' argument"
+            builtins.install_global_tool(&json!({"name": "upper"})),
+            "[error] install_global_tool: missing 'source' argument"
         );
         assert_eq!(
-            builtins.install_tool(&json!({"name": 3, "source": UPPER})),
-            "[error] install_tool: missing 'name' argument"
+            builtins.install_global_tool(&json!({"name": 3, "source": UPPER})),
+            "[error] install_global_tool: missing 'name' argument"
         );
         assert!(std::fs::read_dir(home.path()).unwrap().next().is_none());
     }
@@ -790,7 +852,7 @@ mod tests {
         let builtins = tools_installing_into(workdir.path(), home.path());
         for taken in ["read_file", "bash", "spawn_agent", "acme_search"] {
             let src = UPPER.replace("@tool upper", &format!("@tool {taken}"));
-            let out = builtins.install_tool(&json!({"name": taken, "source": src}));
+            let out = builtins.install_global_tool(&json!({"name": taken, "source": src}));
             assert!(out.contains("built-in tool"), "{taken}: {out}");
         }
         assert!(std::fs::read_dir(home.path()).unwrap().next().is_none());
@@ -806,26 +868,106 @@ mod tests {
         let builtins = tools_installing_into(workdir.path(), home.path())
             .with_reserved_names(vec!["late_mcp".to_string()]);
         let src = UPPER.replace("@tool upper", "@tool late_mcp");
-        let out = builtins.install_tool(&json!({"name": "late_mcp", "source": src}));
+        let out = builtins.install_global_tool(&json!({"name": "late_mcp", "source": src}));
         assert!(
             out.contains("'late_mcp' is the name of a built-in tool"),
             "{out}"
         );
         // The context's own list was replaced, so `acme_search` is free again.
         let src = UPPER.replace("@tool upper", "@tool acme_search");
-        let out = builtins.install_tool(&json!({"name": "acme_search", "source": src}));
+        let out = builtins.install_global_tool(&json!({"name": "acme_search", "source": src}));
         assert!(out.starts_with("Installed tool 'acme_search'"), "{out}");
     }
 
+    /// Each half refuses when its own directory is missing, and says which one
+    /// is missing rather than falling back to the other.
+    ///
+    /// The fallback is the whole thing the pair exists to prevent: an agent
+    /// asking to arm itself must never end up arming every agent on the
+    /// machine because its own directory could not be resolved.
     #[test]
-    fn the_builtin_reports_a_missing_tools_dir() {
+    fn each_half_refuses_without_its_own_directory() {
         let workdir = tempfile::tempdir().unwrap();
-        let builtins =
-            BuiltinTools::new(ToolContext::new(workdir.path().to_path_buf()).with_tools_dir(None));
-        let out = builtins.install_tool(&json!({"name": "upper", "source": UPPER}));
-        assert!(
-            out.starts_with("[error] install_tool: no home directory"),
-            "{out}"
+        let builtins = BuiltinTools::new(
+            ToolContext::new(workdir.path().to_path_buf())
+                .with_tools_dir(None)
+                .with_agent_tools_dir(None),
         );
+        let global = builtins.install_global_tool(&json!({"name": "upper", "source": UPPER}));
+        assert!(
+            global.starts_with("[error] install_global_tool: no home directory"),
+            "{global}"
+        );
+        let own = builtins.install_self_tool(&json!({"name": "upper", "source": UPPER}));
+        assert!(
+            own.starts_with("[error] install_self_tool: this run has no blueprint directory"),
+            "{own}"
+        );
+    }
+
+    /// Both halves dispatch by name through `execute`, which is how a model
+    /// reaches them.
+    #[tokio::test]
+    async fn both_halves_dispatch_by_name() {
+        let workdir = tempfile::tempdir().unwrap();
+        let global_dir = tempfile::tempdir().unwrap();
+        let own_dir = tempfile::tempdir().unwrap();
+        let builtins = BuiltinTools::new(
+            ToolContext::new(workdir.path().to_path_buf())
+                .with_tools_dir(Some(global_dir.path().to_path_buf()))
+                .with_agent_tools_dir(Some(own_dir.path().to_path_buf())),
+        );
+
+        let out = builtins
+            .execute(
+                "install_self_tool",
+                json!({"name": "upper", "source": UPPER}),
+            )
+            .await;
+        assert!(out.starts_with("Installed tool 'upper'"), "{out}");
+        assert!(own_dir.path().join("upper.rhai").is_file());
+
+        let lower = UPPER.replace("upper", "lower").replace("Upper", "Lower");
+        let out = builtins
+            .execute(
+                "install_global_tool",
+                json!({"name": "lower", "source": lower}),
+            )
+            .await;
+        assert!(out.starts_with("Installed tool 'lower'"), "{out}");
+        assert!(global_dir.path().join("lower.rhai").is_file());
+    }
+
+    /// The two write to two directories, and neither reaches the other's.
+    #[test]
+    fn the_two_halves_write_where_they_say_they_do() {
+        let workdir = tempfile::tempdir().unwrap();
+        let global_dir = tempfile::tempdir().unwrap();
+        let own_dir = tempfile::tempdir().unwrap();
+        let builtins = BuiltinTools::new(
+            ToolContext::new(workdir.path().to_path_buf())
+                .with_tools_dir(Some(global_dir.path().to_path_buf()))
+                .with_agent_tools_dir(Some(own_dir.path().to_path_buf())),
+        );
+
+        let out = builtins.install_self_tool(&json!({"name": "upper", "source": UPPER}));
+        assert!(out.starts_with("Installed tool 'upper'"), "{out}");
+        assert!(
+            out.contains("Only this agent's runs can call it"),
+            "the result has to say who gets it, or the model reads the wide \
+             sentence and believes it: {out}"
+        );
+        assert!(own_dir.path().join("upper.rhai").is_file());
+        assert!(
+            !global_dir.path().join("upper.rhai").exists(),
+            "an agent arming itself must not arm every agent"
+        );
+
+        let lower = UPPER.replace("upper", "lower").replace("Upper", "Lower");
+        let out = builtins.install_global_tool(&json!({"name": "lower", "source": lower}));
+        assert!(out.starts_with("Installed tool 'lower'"), "{out}");
+        assert!(out.contains("Every agent on this machine"), "{out}");
+        assert!(global_dir.path().join("lower.rhai").is_file());
+        assert!(!own_dir.path().join("lower.rhai").exists());
     }
 }

@@ -48,10 +48,13 @@ pub enum Commands {
     /// List and inspect available models
     Models(commands::models::ModelsArgs),
 
+    /// Show the mime registry, and what a file resolves to under it
+    Mime(commands::mime::MimeArgs),
+
     /// Inspect and move the secrets Leviath holds
     Auth(commands::auth::AuthArgs),
 
-    /// Manage MCP tool servers, or serve Leviath itself as one
+    /// Manage MCP tool servers and their authentication
     Mcp(commands::mcp::McpArgs),
 
     /// Show what runs without an approval prompt, and why
@@ -60,12 +63,12 @@ pub enum Commands {
     /// Manage taint tracking policy rules
     Policy(commands::policy::PolicyArgs),
 
+    /// List, inspect and try the profiles behind `--yolo=<name>`
+    Yolo(commands::yolo::YoloArgs),
+
     /// Update Leviath, then everything that shipped with it
     #[command(long_about = commands::update::UPDATE_LONG_ABOUT)]
     Update(commands::update::UpdateArgs),
-
-    /// Register Leviath as an MCP server in Claude Code, Grok, Codex, Gemini or Hermes
-    Integrate(commands::integrate::IntegrateArgs),
 
     // ─── Blueprints ───────────────────────────────────────────────────────────
     /// Create a new agent blueprint
@@ -82,6 +85,9 @@ pub enum Commands {
 
     /// Validate an agent blueprint
     Validate(commands::validate::ValidateArgs),
+
+    /// Inspect and install an agent's declared dependencies
+    Deps(commands::deps::DepsArgs),
 
     /// Run blueprint tests
     Test(commands::test::TestArgs),
@@ -127,6 +133,9 @@ pub enum Commands {
     /// Show a run's context-window history (from its run.lvr archive)
     Context(commands::context::ContextArgs),
 
+    /// List the files a run holds as stored parts, and fetch one
+    Blobs(commands::blobs::BlobsArgs),
+
     /// Show a run's per-stage token ledger, where a staged agent's cost lives
     Stages(commands::stages::StagesArgs),
 
@@ -143,6 +152,9 @@ pub enum Commands {
 
     /// Run the shared-world daemon in the foreground
     Daemon(commands::daemon::DaemonArgs),
+
+    /// Pack the logs and settings a bug report needs, with every key removed
+    Rage(commands::rage::RageArgs),
 }
 
 /// The top-level `lev --help` layout. Renders the categorized [`COMMANDS_HELP`]
@@ -169,13 +181,15 @@ Setup and configuration:
   setup         Configure API keys and defaults
   providers     Show configured providers and set their priority order
   doctor        Check that provider wiring works, end to end
+  rage          Pack the logs and settings a bug report needs, with every key removed
   models        List and inspect available models
+  mime         Show the mime registry, and what a file resolves to under it
   auth          Inspect and move the secrets Leviath holds
-  mcp           Manage MCP tool servers, or serve Leviath itself as one
+  mcp           Manage MCP tool servers and their authentication
   approvals     Show what runs without an approval prompt, and why
   policy        Manage taint tracking policy rules
+  yolo          List, inspect and try the profiles behind `--yolo=<name>`
   update        Update Leviath, then everything that shipped with it
-  integrate     Register Leviath as an MCP server in Claude Code, Grok, Codex, Gemini or Hermes
 
 Blueprints:
   create        Create a new agent blueprint
@@ -183,6 +197,7 @@ Blueprints:
   add           Install a blueprint
   remove        Remove an installed blueprint
   validate      Validate an agent blueprint
+  deps          Inspect and install an agent's dependencies
   test          Run blueprint tests
   pack          Bundle a blueprint for distribution
   tools         List and validate the global Rhai script tools
@@ -200,6 +215,7 @@ Running agents:
 Inspecting runs:
   result        Print what an agent handed back when a run finished
   context       Show a run's context-window history (from its run.lvr archive)
+  blobs         List the files a run holds as stored parts, and fetch one
   stages        Show a run's per-stage token ledger, where a staged agent's cost lives
   timeline      Show where a run's wall-clock time went: model calls, tools, waiting on children
 
@@ -299,6 +315,12 @@ pub trait RiskyExecutors {
         &self,
         args: commands::mcp::McpArgs,
     ) -> impl std::future::Future<Output = anyhow::Result<()>>;
+    /// `lev deps` - reads env and PATH, and (on install) runs commands and
+    /// rewrites config.
+    fn deps(
+        &self,
+        args: commands::deps::DepsArgs,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>>;
     /// `lev providers` - reads the config file and may rewrite `provider_order`.
     fn providers(
         &self,
@@ -318,11 +340,11 @@ pub trait RiskyExecutors {
         args: commands::update::UpdateArgs,
     ) -> impl std::future::Future<Output = anyhow::Result<()>>;
 
-    /// `lev integrate` - writes a host agent's config under the real home
-    /// directory and may run the host's own CLI.
-    fn integrate(
+    /// `lev rage` - takes over the real terminal, reads the real data root
+    /// and asks the daemon (never starting one) over the control socket.
+    fn rage(
         &self,
-        args: commands::integrate::IntegrateArgs,
+        args: commands::rage::RageArgs,
     ) -> impl std::future::Future<Output = anyhow::Result<()>>;
 }
 
@@ -360,22 +382,34 @@ pub async fn dispatch(command: Commands, ex: &impl RiskyExecutors) -> anyhow::Re
         Commands::Pack(args) => commands::pack::execute(args).await,
         Commands::Dashboard(args) => ex.dashboard(args).await,
         Commands::Models(args) => commands::models::execute(args).await,
+        Commands::Mime(args) => commands::mime::execute(args).await,
         Commands::Validate(args) => commands::validate::execute(args).await,
         Commands::Tools(args) => commands::tools::execute(args).await,
         Commands::Approvals(args) => commands::approvals::execute(args).await,
         Commands::Policy(args) => commands::policy::execute(args).await,
+        Commands::Yolo(args) => commands::yolo::execute(args).await,
+        // Printing the schema serves nothing, so it answers here rather than in
+        // the executor: regenerating the checked-in copy has to work on a
+        // machine with no daemon, no token and no config, and everything the
+        // executor does first needs all three.
+        Commands::Serve(args) if args.print_graphql_schema => {
+            println!("{}", commands::serve::graphql_schema());
+            Ok(())
+        }
         Commands::Serve(args) => ex.serve(args).await,
         Commands::AgentClient(args) => ex.agent_client(args).await,
         Commands::Daemon(args) => ex.daemon(args).await,
         Commands::Context(args) => commands::context::execute(args).await,
+        Commands::Blobs(args) => commands::blobs::execute(args).await,
         Commands::Stages(args) => commands::stages::execute(args).await,
         Commands::Timeline(args) => commands::timeline::execute(args).await,
         Commands::Result(args) => commands::result::execute(args).await,
         Commands::Mcp(args) => ex.mcp(args).await,
+        Commands::Deps(args) => ex.deps(args).await,
         Commands::Providers(args) => ex.providers(args).await,
         Commands::Auth(args) => ex.auth(args).await,
         Commands::Update(args) => ex.update(args).await,
-        Commands::Integrate(args) => ex.integrate(args).await,
+        Commands::Rage(args) => ex.rage(args).await,
     }
 }
 
@@ -417,7 +451,11 @@ mod tests {
     /// Test double for [`RiskyExecutors`]: every method is a no-op returning
     /// `Ok(())`, so `dispatch()`'s risky routing arms are exercised without
     /// touching a real terminal / stdin / port / subprocess.
-    struct MockRisky;
+    #[derive(Default)]
+    struct MockRisky {
+        /// Whether `serve` was reached, for the one route that must not reach it.
+        served: std::sync::atomic::AtomicBool,
+    }
 
     impl RiskyExecutors for MockRisky {
         async fn run(&self, _args: commands::run::RunArgs) -> anyhow::Result<()> {
@@ -451,12 +489,17 @@ mod tests {
             Ok(())
         }
         async fn serve(&self, _args: commands::serve::ServeArgs) -> anyhow::Result<()> {
+            self.served
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             Ok(())
         }
         async fn agent_client(
             &self,
             _args: commands::agent_client::AgentClientArgs,
         ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn rage(&self, _args: commands::rage::RageArgs) -> anyhow::Result<()> {
             Ok(())
         }
         async fn daemon(&self, _args: commands::daemon::DaemonArgs) -> anyhow::Result<()> {
@@ -470,15 +513,15 @@ mod tests {
             Ok(())
         }
 
+        async fn deps(&self, _args: commands::deps::DepsArgs) -> anyhow::Result<()> {
+            Ok(())
+        }
+
         async fn providers(&self, _args: commands::providers::ProvidersArgs) -> anyhow::Result<()> {
             Ok(())
         }
 
         async fn update(&self, _args: commands::update::UpdateArgs) -> anyhow::Result<()> {
-            Ok(())
-        }
-
-        async fn integrate(&self, _args: commands::integrate::IntegrateArgs) -> anyhow::Result<()> {
             Ok(())
         }
     }
@@ -512,7 +555,11 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_run_variant_is_routed_through_the_executor() {
-        let result = dispatch(Commands::Run(commands::run::RunArgs::default()), &MockRisky).await;
+        let result = dispatch(
+            Commands::Run(commands::run::RunArgs::default()),
+            &MockRisky::default(),
+        )
+        .await;
         assert!(result.is_ok());
     }
 
@@ -526,20 +573,29 @@ mod tests {
             openai_key: None,
             google_key: None,
             openrouter_key: None,
+            bedrock_key: None,
+            bedrock_region: None,
+            zero_retention: None,
+            zero_retention_agreements: None,
             ollama_url: None,
-            default_model: None,
+            override_model: None,
+            fallback_model: None,
             claude_code: None,
             claude_code_effort: None,
             codex: None,
+            grok: None,
+            xai_key: None,
+            meta_key: None,
+            file_uploads: None,
         };
-        let result = dispatch(Commands::Setup(args), &MockRisky).await;
+        let result = dispatch(Commands::Setup(args), &MockRisky::default()).await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn dispatch_dashboard_variant_is_routed_through_the_executor() {
         let args = commands::dashboard::DashboardArgs {};
-        let result = dispatch(Commands::Dashboard(args), &MockRisky).await;
+        let result = dispatch(Commands::Dashboard(args), &MockRisky::default()).await;
         assert!(result.is_ok());
     }
 
@@ -548,8 +604,13 @@ mod tests {
         let args = commands::ctl::MsgArgs {
             agent_id: "a".to_string(),
             content: "c".to_string(),
+            attach: Vec::new(),
         };
-        assert!(dispatch(Commands::Msg(args), &MockRisky).await.is_ok());
+        assert!(
+            dispatch(Commands::Msg(args), &MockRisky::default())
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -564,8 +625,13 @@ mod tests {
             session: false,
             stage: false,
             json: false,
+            attach: Vec::new(),
         };
-        assert!(dispatch(Commands::Respond(args), &MockRisky).await.is_ok());
+        assert!(
+            dispatch(Commands::Respond(args), &MockRisky::default())
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -573,7 +639,23 @@ mod tests {
         // Routed, not called directly: `lev doctor` bills two inferences and
         // auto-starts a daemon, so a unit test must never reach the real one.
         let args = commands::doctor::DoctorArgs::default();
-        assert!(dispatch(Commands::Doctor(args), &MockRisky).await.is_ok());
+        assert!(
+            dispatch(Commands::Doctor(args), &MockRisky::default())
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_rage_variant_is_routed_through_the_executor() {
+        // Routed, not called directly: `lev rage` takes over the terminal and
+        // reads the real data root.
+        let args = commands::rage::RageArgs::default();
+        assert!(
+            dispatch(Commands::Rage(args), &MockRisky::default())
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -582,7 +664,11 @@ mod tests {
             run_id: "r".to_string(),
             force: false,
         };
-        assert!(dispatch(Commands::Cancel(args), &MockRisky).await.is_ok());
+        assert!(
+            dispatch(Commands::Cancel(args), &MockRisky::default())
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -590,7 +676,11 @@ mod tests {
         let args = commands::ctl::PauseArgs {
             run_id: "r".to_string(),
         };
-        assert!(dispatch(Commands::Pause(args), &MockRisky).await.is_ok());
+        assert!(
+            dispatch(Commands::Pause(args), &MockRisky::default())
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -598,12 +688,20 @@ mod tests {
         let args = commands::ctl::ResumeArgs {
             run_id: "r".to_string(),
         };
-        assert!(dispatch(Commands::Resume(args), &MockRisky).await.is_ok());
+        assert!(
+            dispatch(Commands::Resume(args), &MockRisky::default())
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
     async fn dispatch_ps_variant_is_routed_through_the_executor() {
-        let result = dispatch(Commands::Ps(commands::ps::PsArgs::default()), &MockRisky).await;
+        let result = dispatch(
+            Commands::Ps(commands::ps::PsArgs::default()),
+            &MockRisky::default(),
+        )
+        .await;
         assert!(result.is_ok());
     }
 
@@ -613,14 +711,14 @@ mod tests {
             action: None,
             socket: None,
         };
-        let result = dispatch(Commands::Daemon(args), &MockRisky).await;
+        let result = dispatch(Commands::Daemon(args), &MockRisky::default()).await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn dispatch_auth_variant_is_routed_through_the_executor() {
         let args = commands::auth::AuthArgs::status_for_test();
-        let result = dispatch(Commands::Auth(args), &MockRisky).await;
+        let result = dispatch(Commands::Auth(args), &MockRisky::default()).await;
         assert!(result.is_ok());
     }
 
@@ -630,34 +728,14 @@ mod tests {
         // package manager and blocks on stdin, so a unit test must never reach
         // it. Its own tests drive the command core against injected seams.
         let args = commands::update::UpdateArgs::default();
-        let result = dispatch(Commands::Update(args), &MockRisky).await;
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn dispatch_integrate_variant_is_routed_through_the_executor() {
-        // Routed, not called directly: the real command writes under the real
-        // home directory and may run the host's CLI, neither of which a unit
-        // test may touch. Its own tests drive the core against a tempdir.
-        let args = commands::integrate::IntegrateArgs::claude_code_for_test();
-        let result = dispatch(Commands::Integrate(args), &MockRisky).await;
+        let result = dispatch(Commands::Update(args), &MockRisky::default()).await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn dispatch_mcp_variant_is_routed_through_the_executor() {
         let args = commands::mcp::McpArgs::list_for_test();
-        let result = dispatch(Commands::Mcp(args), &MockRisky).await;
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn dispatch_mcp_serve_variant_is_routed_through_the_executor() {
-        // `lev mcp serve` takes over real stdio and talks to the daemon, so it
-        // rides the same risky arm as the rest of `lev mcp`; the binary tells
-        // the two apart with `McpArgs::route`.
-        let args = commands::mcp::McpArgs::serve_for_test();
-        let result = dispatch(Commands::Mcp(args), &MockRisky).await;
+        let result = dispatch(Commands::Mcp(args), &MockRisky::default()).await;
         assert!(result.is_ok());
     }
 
@@ -666,18 +744,20 @@ mod tests {
         // Routed, not called directly: the real command reads and rewrites the
         // config file, so a unit test must never reach it against the real one.
         let args = commands::providers::ProvidersArgs::list_for_test();
-        let result = dispatch(Commands::Providers(args), &MockRisky).await;
+        let result = dispatch(Commands::Providers(args), &MockRisky::default()).await;
         assert!(result.is_ok());
     }
 
-    #[tokio::test]
-    async fn dispatch_serve_variant_is_routed_through_the_executor() {
-        let args = commands::serve::ServeArgs {
+    /// Arguments for `lev serve`, printing the schema or not.
+    fn serve_args(print_graphql_schema: bool) -> commands::serve::ServeArgs {
+        commands::serve::ServeArgs {
             port: 0,
+            name: None,
             host: "127.0.0.1".to_string(),
             cors: None,
             token: Some("test-token".to_string()),
             allow_admin: false,
+            print_graphql_schema,
             workdir_root: None,
             no_remote_yolo: false,
             tls_cert: None,
@@ -685,15 +765,36 @@ mod tests {
             no_remote_seed_commands: false,
             max_concurrent_requests: None,
             request_timeout_secs: None,
-        };
-        let result = dispatch(Commands::Serve(args), &MockRisky).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_serve_variant_is_routed_through_the_executor() {
+        let result = dispatch(Commands::Serve(serve_args(false)), &MockRisky::default()).await;
         assert!(result.is_ok());
+    }
+
+    /// Printing the schema answers here rather than reaching the executor.
+    ///
+    /// It has to work on a machine with no daemon, no token and no config,
+    /// which is exactly what regenerating the checked-in copy runs on. The
+    /// executor sets up a log file and starts a daemon before it serves
+    /// anything, so reaching it at all would be the bug.
+    #[tokio::test]
+    async fn dispatch_prints_the_schema_without_starting_a_server() {
+        let mock = MockRisky::default();
+        let result = dispatch(Commands::Serve(serve_args(true)), &mock).await;
+        assert!(result.is_ok());
+        assert!(
+            !mock.served.load(std::sync::atomic::Ordering::Relaxed),
+            "printing the schema must not start a server"
+        );
     }
 
     #[tokio::test]
     async fn dispatch_agent_client_variant_is_routed_through_the_executor() {
         let args = commands::agent_client::AgentClientArgs::default();
-        let result = dispatch(Commands::AgentClient(args), &MockRisky).await;
+        let result = dispatch(Commands::AgentClient(args), &MockRisky::default()).await;
         assert!(result.is_ok());
     }
 
@@ -708,7 +809,7 @@ mod tests {
             name: dir.path().to_str().unwrap().to_string(),
             ..create_args()
         };
-        let result = dispatch(Commands::Create(args), &MockRisky).await;
+        let result = dispatch(Commands::Create(args), &MockRisky::default()).await;
         assert!(result.is_err());
     }
 
@@ -721,7 +822,7 @@ mod tests {
                 filter: commands::list::ListFilter::All,
                 json: false,
             };
-            let result = dispatch(Commands::List(args), &MockRisky).await;
+            let result = dispatch(Commands::List(args), &MockRisky::default()).await;
             assert!(result.is_ok());
         })
         .await;
@@ -735,8 +836,9 @@ mod tests {
         // `add` loads the real config to report the `[read_paths]` grant status
         // of what it installs, so it needs the same isolation every other
         // config-touching test takes.
+        let mock = MockRisky::default();
         let result = crate::config::with_isolated_config_path_async("dispatch-add", |_| {
-            dispatch(Commands::Add(args), &MockRisky)
+            dispatch(Commands::Add(args), &mock)
         })
         .await;
         assert!(result.is_err());
@@ -747,7 +849,7 @@ mod tests {
         let args = commands::remove::RemoveArgs {
             name: "definitely-not-an-installed-agent-xyz".to_string(),
         };
-        let result = dispatch(Commands::Remove(args), &MockRisky).await;
+        let result = dispatch(Commands::Remove(args), &MockRisky::default()).await;
         assert!(result.is_err());
     }
 
@@ -759,7 +861,7 @@ mod tests {
             filter: None,
             dry_run: true,
         };
-        let result = dispatch(Commands::Test(args), &MockRisky).await;
+        let result = dispatch(Commands::Test(args), &MockRisky::default()).await;
         assert!(result.is_err());
     }
 
@@ -770,7 +872,7 @@ mod tests {
             path: Some(dir.path().to_str().unwrap().to_string()),
             output: None,
         };
-        let result = dispatch(Commands::Pack(args), &MockRisky).await;
+        let result = dispatch(Commands::Pack(args), &MockRisky::default()).await;
         assert!(result.is_err());
     }
 
@@ -784,9 +886,11 @@ mod tests {
                     offline: false,
                     all: false,
                     json: false,
+                    accepts: None,
+                    produces: None,
                 }),
             };
-            let result = dispatch(Commands::Models(args), &MockRisky).await;
+            let result = dispatch(Commands::Models(args), &MockRisky::default()).await;
             assert!(result.is_ok());
         })
         .await;
@@ -811,10 +915,23 @@ mod tests {
                 graph: false,
                 width: 120,
             };
-            let result = dispatch(Commands::Validate(args), &MockRisky).await;
+            let result = dispatch(Commands::Validate(args), &MockRisky::default()).await;
             assert!(result.is_err());
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn dispatch_deps_variant_is_routed() {
+        // `deps` is a risky executor (install writes config / runs commands);
+        // MockRisky answers Ok, so this exercises only the routing.
+        let args = commands::deps::DepsArgs {
+            command: commands::deps::DepsCommand::List(commands::deps::AgentRef {
+                agent: "x".to_string(),
+            }),
+        };
+        let result = dispatch(Commands::Deps(args), &MockRisky::default()).await;
+        assert!(result.is_ok());
     }
 
     #[tokio::test]
@@ -826,7 +943,7 @@ mod tests {
             [("LEVIATH_HOME", Some(home.path().to_str().unwrap()))],
             async {
                 let args = commands::tools::ToolsArgs { json: false };
-                dispatch(Commands::Tools(args), &MockRisky).await
+                dispatch(Commands::Tools(args), &MockRisky::default()).await
             },
         )
         .await;
@@ -842,7 +959,7 @@ mod tests {
                 calls: false,
                 tree: false,
             }),
-            &MockRisky,
+            &MockRisky::default(),
         )
         .await;
         assert!(result.is_err(), "no journal for a run that never ran");
@@ -859,7 +976,7 @@ mod tests {
                 regions: false,
                 visits: false,
             }),
-            &MockRisky,
+            &MockRisky::default(),
         )
         .await;
         assert!(result.is_err(), "no ledger for a run that never ran");
@@ -873,7 +990,7 @@ mod tests {
             json: false,
             full: false,
         };
-        let result = dispatch(Commands::Context(args), &MockRisky).await;
+        let result = dispatch(Commands::Context(args), &MockRisky::default()).await;
         assert!(result.is_err());
     }
 
@@ -885,9 +1002,46 @@ mod tests {
             run_id: "no-such-run-xyzzy".to_string(),
             json: false,
             raw: false,
+            artifact: None,
+            out: None,
+            open: None,
         };
-        let result = dispatch(Commands::Result(args), &MockRisky).await;
+        let result = dispatch(Commands::Result(args), &MockRisky::default()).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn dispatch_blobs_and_mime_variants_are_routed() {
+        // A run that is not there errors, which shows the routing reached it.
+        let blobs = commands::blobs::BlobsArgs {
+            run_id: "no-such-run-xyzzy".to_string(),
+            part: None,
+            out: None,
+            open: false,
+            json: false,
+        };
+        assert!(
+            dispatch(Commands::Blobs(blobs), &MockRisky::default())
+                .await
+                .is_err()
+        );
+        // A file that is not there errors the same way, before any config is
+        // consulted for anything the test would have to isolate.
+        crate::config::with_isolated_config_path_async("dispatch-mime", |_dir| async move {
+            let mime = commands::mime::MimeArgs {
+                command: commands::mime::MimeCommand::Check(commands::mime::CheckArgs {
+                    file: std::path::PathBuf::from("/no/such/file.png"),
+                    mime_type: None,
+                    json: false,
+                }),
+            };
+            assert!(
+                dispatch(Commands::Mime(mime), &MockRisky::default())
+                    .await
+                    .is_err()
+            );
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -912,7 +1066,7 @@ mod tests {
                         },
                     ),
                 };
-                dispatch(Commands::Approvals(args), &MockRisky).await
+                dispatch(Commands::Approvals(args), &MockRisky::default()).await
             },
         )
         .await;
@@ -941,7 +1095,7 @@ mod tests {
                         },
                     ),
                 };
-                dispatch(Commands::Approvals(args), &MockRisky).await
+                dispatch(Commands::Approvals(args), &MockRisky::default()).await
             },
         )
         .await;
@@ -953,7 +1107,22 @@ mod tests {
         let args = commands::policy::PolicyArgs {
             command: commands::policy::PolicyCommand::List(commands::policy::PolicyListArgs {}),
         };
-        let result = dispatch(Commands::Policy(args), &MockRisky).await;
+        let result = dispatch(Commands::Policy(args), &MockRisky::default()).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dispatch_yolo_variant_is_routed() {
+        let result = crate::config::with_isolated_config_path_async("dispatch-yolo", |_| async {
+            dispatch(
+                Commands::Yolo(commands::yolo::YoloArgs {
+                    command: commands::yolo::YoloCommand::List(commands::yolo::ListArgs::default()),
+                }),
+                &MockRisky::default(),
+            )
+            .await
+        })
+        .await;
         assert!(result.is_ok());
     }
 
@@ -966,7 +1135,7 @@ mod tests {
                 taint: "public".to_string(),
             }),
         };
-        let result = dispatch(Commands::Policy(args), &MockRisky).await;
+        let result = dispatch(Commands::Policy(args), &MockRisky::default()).await;
         assert!(result.is_ok());
     }
 }

@@ -42,6 +42,28 @@ impl ToolSource {
             Self::Global => "global",
         }
     }
+
+    /// What to call this source in a chooser, in a few words.
+    pub(crate) fn describe(self) -> &'static str {
+        match self {
+            Self::Builtin => "built in",
+            Self::Subagent => "sub-agent tool",
+            Self::Agent => "this agent's script",
+            Self::Global => "global script",
+        }
+    }
+
+    /// The `available_tools` group a tool from this source answers to. Both
+    /// script directories are one group: `@scripts` grants a script wherever
+    /// it lives, exactly as naming it would.
+    pub(crate) fn group(self) -> leviath_core::blueprint::ToolGroup {
+        use leviath_core::blueprint::ToolGroup;
+        match self {
+            Self::Builtin => ToolGroup::Builtin,
+            Self::Subagent => ToolGroup::Subagent,
+            Self::Agent | Self::Global => ToolGroup::Scripts,
+        }
+    }
 }
 
 /// One tool an agent may name in `available_tools`.
@@ -51,10 +73,21 @@ pub(crate) struct ToolEntry {
     pub name: String,
     /// Where the tool comes from.
     pub source: ToolSource,
+    /// What the tool does, in the words the model is given. Empty only for a
+    /// script whose `@description` is empty, which discovery already refuses.
+    pub description: String,
+    /// The JSON Schema of the tool's arguments, as advertised to the model.
+    ///
+    /// The same object the provider is sent, so a picker showing what a tool
+    /// takes and a model deciding how to call it are reading one thing.
+    pub arguments: serde_json::Value,
     /// The `.rhai` file behind it, for the script-backed sources only.
     pub path: Option<PathBuf>,
     /// Which agent owns it, for [`ToolSource::Agent`] only.
     pub agent: Option<String>,
+    /// Platform capabilities a script declares with `@requires`. Empty for a
+    /// built-in, whose requirements are compiled in rather than declared.
+    pub requires: Vec<String>,
 }
 
 /// A `.rhai` file that was found but did not become a usable tool.
@@ -97,21 +130,40 @@ impl ToolInventory {
         let builtins = leviath_tools::BuiltinTools::new(leviath_tools::ToolContext::new(ctx_dir));
 
         let mut tools: Vec<ToolEntry> = Vec::new();
-        for name in builtins.names() {
-            tools.push(ToolEntry {
-                name,
-                source: ToolSource::Builtin,
+        // The defs carry the description and the argument schema; `names()`
+        // carries the aliases too. Both, so an alias is still listed and every
+        // tool that has a def says what it takes.
+        let defs: std::collections::HashMap<String, leviath_providers::Tool> = builtins
+            .tool_defs()
+            .into_iter()
+            .chain(leviath_tools::BuiltinTools::subagent_tool_defs())
+            .map(|def| (def.name.clone(), def))
+            .collect();
+        let described = |name: &str, source| {
+            // Looked up under the canonical name, so an alias is listed under
+            // its own name carrying the description of the tool it names. Both
+            // halves default together: a name with no def behind it cannot come
+            // out of the registry, and one that somehow did would be listed as
+            // callable, which it is, rather than dropped.
+            let (description, arguments) = defs
+                .get(leviath_tools::canonical_tool_name(name))
+                .map(|def| (def.description.clone(), def.parameters.clone()))
+                .unwrap_or_default();
+            ToolEntry {
+                name: name.to_string(),
+                source,
+                description,
+                arguments,
                 path: None,
                 agent: None,
-            });
+                requires: Vec::new(),
+            }
+        };
+        for name in builtins.names() {
+            tools.push(described(&name, ToolSource::Builtin));
         }
         for name in leviath_tools::BuiltinTools::subagent_tool_names() {
-            tools.push(ToolEntry {
-                name,
-                source: ToolSource::Subagent,
-                path: None,
-                agent: None,
-            });
+            tools.push(described(&name, ToolSource::Subagent));
         }
 
         let mut taken: HashSet<String> = tools.iter().map(|t| t.name.clone()).collect();
@@ -153,6 +205,9 @@ impl ToolInventory {
                     _ => None,
                 };
                 tools.push(ToolEntry {
+                    arguments: meta.parameters_schema(),
+                    description: meta.description,
+                    requires: meta.required_caps,
                     name: meta.name,
                     source,
                     path: Some(path),
@@ -199,6 +254,15 @@ mod tests {
         assert_eq!(ToolSource::Subagent.as_str(), "subagent");
         assert_eq!(ToolSource::Agent.as_str(), "agent");
         assert_eq!(ToolSource::Global.as_str(), "global");
+        assert_eq!(ToolSource::Builtin.describe(), "built in");
+        assert_eq!(ToolSource::Subagent.describe(), "sub-agent tool");
+        assert_eq!(ToolSource::Agent.describe(), "this agent's script");
+        assert_eq!(ToolSource::Global.describe(), "global script");
+        use leviath_core::blueprint::ToolGroup;
+        assert_eq!(ToolSource::Builtin.group(), ToolGroup::Builtin);
+        assert_eq!(ToolSource::Subagent.group(), ToolGroup::Subagent);
+        assert_eq!(ToolSource::Agent.group(), ToolGroup::Scripts);
+        assert_eq!(ToolSource::Global.group(), ToolGroup::Scripts);
     }
 
     /// All four sources in one inventory, which is the whole point of the

@@ -5,7 +5,14 @@
 //! ordering rule is a plain unit test with no HTTP and no temp directory. Only
 //! the tests that genuinely need files on disk take the isolated-runs-dir path.
 
+use std::sync::Arc;
+
 use super::*;
+use crate::commands::serve::core::runs::matching::{apply_search, highlights_for, matches_query};
+use crate::commands::serve::core::runs::{
+    MAX_HIGHLIGHTS, MAX_SEARCH_SCAN, RunSpec, paginate, sort_runs,
+};
+use crate::commands::serve::cursor::{self, CursorKey};
 use crate::runstate::{RunStatus, create_run};
 
 // ─── fixtures ───────────────────────────────────────────────────────────────
@@ -63,25 +70,40 @@ fn urlencode(raw: &str) -> String {
         .collect()
 }
 
-fn resolve_ok(pairs: &[(&str, &str)]) -> Resolved {
+fn resolve_ok(pairs: &[(&str, &str)]) -> RunSpec {
     match resolve(&query(pairs)) {
-        Ok(resolved) => resolved,
-        Err((_, body)) => panic!("expected resolve to succeed: {}", body.0.error),
+        Ok(spec) => spec,
+        Err(e) => panic!("expected resolve to succeed: {e}"),
     }
 }
 
+/// The message of a refusal, having checked it is the refusal a client caused.
+///
+/// Both surfaces render this one failure: REST as a 400, GraphQL as
+/// `BAD_USER_INPUT`, so the status assertion lives where the mapping does and
+/// this one checks the variant.
 fn resolve_err(pairs: &[(&str, &str)]) -> String {
     match resolve(&query(pairs)) {
         Ok(_) => String::new(),
-        Err((status, body)) => {
-            assert_eq!(status, StatusCode::BAD_REQUEST);
-            body.0.error.clone()
+        Err(e) => {
+            assert_eq!(e.status(), StatusCode::BAD_REQUEST, "{e}");
+            e.to_string()
         }
     }
 }
 
-fn ids(runs: &[RunMeta]) -> Vec<&str> {
+fn ids(runs: &[Arc<RunMeta>]) -> Vec<&str> {
     runs.iter().map(|m| m.run_id.as_str()).collect()
+}
+
+fn arcs(runs: Vec<RunMeta>) -> Vec<Arc<RunMeta>> {
+    runs.into_iter().map(Arc::new).collect()
+}
+
+/// A state that talks to no daemon and starts with nothing remembered, so every
+/// handler call here reads the isolated runs directory afresh.
+fn test_state() -> AppState {
+    crate::commands::serve::testutil::state_with_agent_paths(Vec::new())
 }
 
 // ─── query resolution ───────────────────────────────────────────────────────
@@ -154,7 +176,7 @@ fn fields_always_keeps_run_id_and_rejects_what_it_cannot_serve() {
 
 /// A field that only appears on runs that have it is still a field.
 ///
-/// `known_meta_fields` builds its allowlist by serializing a probe `RunMeta`,
+/// `known_fields` builds its allowlist by serializing a probe `RunMeta`,
 /// and several fields carry `skip_serializing_if = "Option::is_none"`. A probe
 /// left at its defaults omits those, so asking for one was refused as unknown
 /// even on a run that carried it. The probe fills every option to keep the
@@ -167,6 +189,7 @@ fn fields_accepts_the_optional_ones_that_only_some_runs_carry() {
         "waiting_on",
         "output_request",
         "model_override",
+        "yolo_profile",
     ] {
         let r = resolve_ok(&[("fields", optional)]);
         let fields = r.fields.expect("fields set");
@@ -198,7 +221,7 @@ fn every_skip_if_none_option_on_run_meta_is_filled_by_the_probe() {
         .collect();
     assert!(declared.len() > 30, "found only {declared:?}");
 
-    let known = known_meta_fields();
+    let known = known_fields();
     let missing: Vec<&str> = declared
         .iter()
         .copied()
@@ -241,7 +264,7 @@ fn an_empty_query_string_is_treated_as_no_search() {
     assert!(resolve_ok(&[("q", "")]).q.is_none());
 }
 
-/// The three things `parent` can mean, and the one spelling that is a keyword.
+/// Every shape `parent` has, and the two spellings that are keywords.
 #[test]
 fn parent_resolves_to_the_three_shapes_it_has() {
     assert_eq!(resolve_ok(&[]).parent, ParentFilter::Any);
@@ -252,8 +275,16 @@ fn parent_resolves_to_the_three_shapes_it_has() {
         ParentFilter::Roots
     );
     assert_eq!(
+        resolve_ok(&[("parent", "sub")]).parent,
+        ParentFilter::SubAgents
+    );
+    assert_eq!(
         resolve_ok(&[("parent", "run-7")]).parent,
         ParentFilter::Of("run-7".to_string())
+    );
+    assert_eq!(
+        resolve_ok(&[("descendant_of", "run-7")]).parent,
+        ParentFilter::Under("run-7".to_string())
     );
 
     // And what each keeps, which is the half the handler leans on.
@@ -263,6 +294,44 @@ fn parent_resolves_to_the_three_shapes_it_has() {
     assert!(ParentFilter::Roots.keeps(&root) && !ParentFilter::Roots.keeps(&child));
     let of_root = ParentFilter::Of("root".to_string());
     assert!(of_root.keeps(&child) && !of_root.keeps(&root));
+    // The mirror of `Roots`, and the one filter a single record cannot answer:
+    // a subtree needs the tree, so per-record it keeps everything and the
+    // listing narrows it with `keeps_in`.
+    assert!(ParentFilter::SubAgents.keeps(&child) && !ParentFilter::SubAgents.keeps(&root));
+    let under = ParentFilter::Under("root".to_string());
+    assert!(under.keeps(&root) && under.keeps(&child));
+    let descendants = std::collections::HashSet::from(["child".to_string()]);
+    assert!(under.keeps_in(&child, &descendants));
+    assert!(!under.keeps_in(&root, &descendants), "not the root itself");
+    // Every other filter answers the same either way, so the listing can call
+    // the tree-aware form for all of them.
+    assert!(ParentFilter::Roots.keeps_in(&root, &descendants));
+}
+
+/// `parent` and `descendant_of` name two different sets, so one request cannot
+/// ask for both.
+#[test]
+fn the_two_tree_filters_cannot_be_combined() {
+    let refused = resolve_err(&[("parent", "root"), ("descendant_of", "root")]);
+    assert!(
+        refused.contains("descendant_of") && refused.contains("parent"),
+        "it names both: {refused}"
+    );
+}
+
+/// A blueprint filter is part of the filter set, so a cursor cannot cross it.
+#[test]
+fn a_cursor_is_bound_to_the_blueprint_filter() {
+    let all = resolve_ok(&[]);
+    let narrowed = resolve_ok(&[("blueprint", "coder")]);
+    assert_eq!(narrowed.blueprint.as_deref(), Some("coder"));
+    assert_ne!(
+        all.digest, narrowed.digest,
+        "a cursor from one listing cannot resume in the other"
+    );
+    // And a listing that does not use it digests exactly as it did before the
+    // parameter existed, so a cursor a client is holding still resumes.
+    assert!(all.blueprint.is_none());
 }
 
 /// A cursor carries the filters it was minted under, so a walk cannot change
@@ -332,7 +401,11 @@ fn a_malformed_cursor_is_refused() {
 
 #[test]
 fn runs_sort_by_the_chosen_key_in_the_chosen_direction() {
-    let mut runs = vec![meta_at("b", 200), meta_at("a", 100), meta_at("c", 300)];
+    let mut runs = arcs(vec![
+        meta_at("b", 200),
+        meta_at("a", 100),
+        meta_at("c", 300),
+    ]);
     sort_runs(&mut runs, &resolve_ok(&[]));
     assert_eq!(ids(&runs), vec!["c", "b", "a"]);
 
@@ -345,7 +418,11 @@ fn runs_sort_by_the_chosen_key_in_the_chosen_direction() {
 /// colliding run it happened to resume past.
 #[test]
 fn runs_sharing_a_sort_value_are_broken_apart_by_id() {
-    let mut runs = vec![meta_at("b", 100), meta_at("c", 100), meta_at("a", 100)];
+    let mut runs = arcs(vec![
+        meta_at("b", 100),
+        meta_at("c", 100),
+        meta_at("a", 100),
+    ]);
     sort_runs(&mut runs, &resolve_ok(&[]));
     assert_eq!(ids(&runs), vec!["c", "b", "a"], "descending id tie-break");
 
@@ -371,8 +448,8 @@ fn a_missing_last_progress_at_falls_back_to_started_at() {
 /// property rather than on one hand-picked page.
 #[test]
 fn paging_all_the_way_through_visits_every_run_exactly_once() {
-    let all: Vec<RunMeta> = (0..25)
-        .map(|i| meta_at(&format!("run-{i:02}"), i))
+    let all: Vec<Arc<RunMeta>> = (0..25)
+        .map(|i| Arc::new(meta_at(&format!("run-{i:02}"), i)))
         .collect();
 
     let mut seen: Vec<String> = Vec::new();
@@ -406,7 +483,7 @@ fn paging_all_the_way_through_visits_every_run_exactly_once() {
 /// run one extra empty request, every single time.
 #[test]
 fn no_cursor_is_emitted_on_the_last_page() {
-    let all: Vec<RunMeta> = (0..3).map(|i| meta_at(&format!("r{i}"), i)).collect();
+    let all = arcs((0..3).map(|i| meta_at(&format!("r{i}"), i)).collect());
     let (page, next) = paginate(all, &resolve_ok(&[("limit", "3")]));
     assert_eq!(page.len(), 3);
     assert!(next.is_none(), "exactly-full page must not promise more");
@@ -423,8 +500,8 @@ fn an_empty_list_pages_to_nothing() {
 /// the window, the way an offset would.
 #[test]
 fn a_run_arriving_at_the_head_does_not_shift_the_next_page() {
-    let all: Vec<RunMeta> = (0..6)
-        .map(|i| meta_at(&format!("run-{i}"), i * 10))
+    let all: Vec<Arc<RunMeta>> = (0..6)
+        .map(|i| Arc::new(meta_at(&format!("run-{i}"), i * 10)))
         .collect();
     let resolved = resolve_ok(&[("limit", "2")]);
     let mut sorted = all.clone();
@@ -434,7 +511,7 @@ fn a_run_arriving_at_the_head_does_not_shift_the_next_page() {
 
     // A brand new run arrives at the head between the two requests.
     let mut with_new = all.clone();
-    with_new.push(meta_at("run-9", 999));
+    with_new.push(Arc::new(meta_at("run-9", 999)));
     let raw = next.expect("more pages");
     let resolved2 = resolve_ok(&[("limit", "2"), ("cursor", &raw)]);
     let mut sorted2 = with_new;
@@ -584,8 +661,8 @@ fn a_files_highlight_reports_the_matching_path() {
 /// service against a run set nothing prunes.
 #[test]
 fn a_filesystem_search_stops_after_the_scan_budget_and_says_so() {
-    let runs: Vec<RunMeta> = (0..MAX_SEARCH_SCAN + 10)
-        .map(|i| meta_at(&format!("run-{i:05}"), i as i64))
+    let runs: Vec<Arc<RunMeta>> = (0..MAX_SEARCH_SCAN + 10)
+        .map(|i| Arc::new(meta_at(&format!("run-{i:05}"), i as i64)))
         .collect();
     let (kept, truncated) = apply_search(runs, &resolve_ok(&[("q", "x"), ("q_in", "logs")]));
     assert!(
@@ -599,8 +676,8 @@ fn a_filesystem_search_stops_after_the_scan_budget_and_says_so() {
 /// otherwise a plain title search would stop working past 500 runs.
 #[test]
 fn an_in_memory_search_is_not_budgeted_however_many_runs_there_are() {
-    let runs: Vec<RunMeta> = (0..MAX_SEARCH_SCAN + 10)
-        .map(|i| meta_at(&format!("run-{i:05}"), i as i64))
+    let runs: Vec<Arc<RunMeta>> = (0..MAX_SEARCH_SCAN + 10)
+        .map(|i| Arc::new(meta_at(&format!("run-{i:05}"), i as i64)))
         .collect();
     let (kept, truncated) = apply_search(
         runs,
@@ -612,7 +689,7 @@ fn an_in_memory_search_is_not_budgeted_however_many_runs_there_are() {
 
 #[test]
 fn without_a_query_search_keeps_everything_untouched() {
-    let runs: Vec<RunMeta> = (0..3).map(|i| meta_at(&format!("r{i}"), i)).collect();
+    let runs = arcs((0..3).map(|i| meta_at(&format!("r{i}"), i)).collect());
     let (kept, truncated) = apply_search(runs, &resolve_ok(&[]));
     assert_eq!(kept.len(), 3);
     assert!(!truncated);
@@ -621,7 +698,10 @@ fn without_a_query_search_keeps_everything_untouched() {
 // ─── the handler, over real files ───────────────────────────────────────────
 
 async fn page_of(pairs: &[(&str, &str)]) -> Page<RunItem> {
-    list_runs(Query(query(pairs))).await.expect("page").0
+    list_runs(State(test_state()), Query(query(pairs)))
+        .await
+        .expect("page")
+        .0
 }
 
 fn item_ids(page: &Page<RunItem>) -> Vec<String> {
@@ -644,6 +724,59 @@ async fn the_handler_pages_and_reports_a_total_and_a_server_time() {
         assert!(page.server_time > 0);
         assert!(page.next_cursor.is_some());
         assert!(!page.scan_truncated);
+    })
+    .await;
+}
+
+/// `descendant_of=` reads a whole subtree, at any depth, and not the run
+/// itself.
+///
+/// The one filter that cannot be decided from a single record: a grandchild
+/// names its parent and not its ancestor, so the handler walks the index's own
+/// parent map once before it filters.
+#[tokio::test]
+async fn the_handler_reads_a_whole_subtree() {
+    crate::runstate::with_isolated_runs_dir_async("runs-handler-subtree", |_d| async move {
+        create_run(&meta_at("root", 100)).unwrap();
+        let mut worker = meta_at("worker", 200);
+        worker.parent_run_id = Some("root".to_string());
+        create_run(&worker).unwrap();
+        let mut grandchild = meta_at("grandchild", 300);
+        grandchild.parent_run_id = Some("worker".to_string());
+        create_run(&grandchild).unwrap();
+        create_run(&meta_at("stranger", 400)).unwrap();
+
+        let page = page_of(&[("descendant_of", "root")]).await;
+        let mut ids = item_ids(&page);
+        ids.sort();
+        assert_eq!(ids, vec!["grandchild".to_string(), "worker".to_string()]);
+        assert_eq!(page.total, Some(2), "the count describes the subtree");
+    })
+    .await;
+}
+
+/// `blueprint=` keeps only the runs of that blueprint, by the name each run
+/// recorded.
+///
+/// A name nothing matches is an empty page rather than an error: a blueprint
+/// with no runs yet is an ordinary answer.
+#[tokio::test]
+async fn the_handler_keeps_one_blueprints_runs() {
+    crate::runstate::with_isolated_runs_dir_async("runs-handler-blueprint", |_d| async move {
+        let mut coded = meta_at("run-coder", 100);
+        coded.agent_name = "coder".to_string();
+        create_run(&coded).unwrap();
+        let mut wrote = meta_at("run-writer", 200);
+        wrote.agent_name = "writer".to_string();
+        create_run(&wrote).unwrap();
+
+        let page = page_of(&[("blueprint", "coder")]).await;
+        assert_eq!(item_ids(&page), vec!["run-coder".to_string()]);
+        assert_eq!(page.total, Some(1));
+
+        let none = page_of(&[("blueprint", "nobody")]).await;
+        assert!(none.items.is_empty());
+        assert_eq!(none.total, Some(0));
     })
     .await;
 }
@@ -989,7 +1122,7 @@ fn plant_journal(run_id: &str, content: &str, secret: Option<&str>) {
                     current_tokens: 1,
                     max_tokens: 100,
                     entries: vec![RegionEntrySnapshot {
-                        content: content.to_string(),
+                        content: content.to_string().into(),
                         tokens: 1,
                         kind: leviath_core::region::EntryKind::Text,
                         metadata: None,
@@ -1067,7 +1200,7 @@ fn plant_rich_journal(run_id: &str) {
 
     fn entry(content: &str) -> RegionEntrySnapshot {
         RegionEntrySnapshot {
-            content: content.to_string(),
+            content: content.to_string().into(),
             tokens: 1,
             kind: leviath_core::region::EntryKind::Text,
             metadata: None,
@@ -1124,15 +1257,18 @@ fn plant_rich_journal(run_id: &str) {
         &mut buf,
         &RunRecord::ToolBatch {
             calls: vec![ToolCallRecord {
+                execution_id: String::new(),
                 id: "c1".to_string(),
                 name: "write_file".to_string(),
                 arguments: r#"{"path":"toolneedle.rs"}"#.to_string(),
-                result: Some("wrote resultneedle".to_string()),
+                result: Some("wrote resultneedle".to_string().into()),
                 thought_signature: None,
             }],
             at: 2,
             stage_index: 3,
             iteration: 0,
+            visit_id: String::new(),
+            requested_by: String::new(),
             response: String::new(),
         },
     );
@@ -1186,6 +1322,43 @@ fn plant_rich_journal(run_id: &str) {
             at: 7,
         },
     );
+    // A question a person was asked, and the words they answered it with. The
+    // prompt is where the tool's own arguments were shown to them, so it is
+    // where "which run asked me about that" is answered.
+    write(
+        &mut buf,
+        &RunRecord::Interaction {
+            request_id: "approve-1".to_string(),
+            kind: leviath_core::interaction::InteractionKind::ToolApproval,
+            tool: Some("shell".to_string()),
+            prompt: "Run `rm -rf promptneedle`?".to_string(),
+            stage: "implement".to_string(),
+            settlement: leviath_core::interaction::Settlement::Answered {
+                approved: Some(false),
+                scope: None,
+                choice: None,
+                text: None,
+                feedback: Some("answerneedle instead".to_string()),
+            },
+            asked_at: 8,
+            at: 9,
+        },
+    );
+    // One nobody answered, which carries a prompt and no answer: the arm that
+    // reads a settlement with nothing in it has to be reachable too.
+    write(
+        &mut buf,
+        &RunRecord::Interaction {
+            request_id: "ask-2".to_string(),
+            kind: leviath_core::interaction::InteractionKind::FreeText,
+            tool: None,
+            prompt: "Which of these, unanswerneedle?".to_string(),
+            stage: "plan".to_string(),
+            settlement: leviath_core::interaction::Settlement::TimedOut,
+            asked_at: 10,
+            at: 11,
+        },
+    );
     std::fs::write(crate::runstate::run_dir(run_id).join("run.lvr"), &buf).unwrap();
 }
 
@@ -1207,6 +1380,22 @@ async fn journal_highlights_name_the_record_the_match_came_from() {
             assert_eq!(page.items.len(), 1, "{needle} should match");
             assert_eq!(page.items[0].highlights[0].field, field);
             assert_eq!(page.items[0].highlights[0].stage, stage);
+        }
+
+        // A question names the tool it was about, so a client can jump to the
+        // call somebody stopped. One with no tool is named for the asking.
+        for (needle, field) in [
+            ("promptneedle", "journal.asked.shell"),
+            ("answerneedle", "journal.asked.shell"),
+            ("unanswerneedle", "journal.asked"),
+        ] {
+            let page = page_of(&[("q", needle), ("q_in", "journal")]).await;
+            assert_eq!(page.items.len(), 1, "{needle} should match");
+            assert_eq!(page.items[0].highlights[0].field, field);
+            assert_eq!(
+                page.items[0].highlights[0].stage, None,
+                "a question is not a stage's own text"
+            );
         }
 
         // Context text is named by the region it lived in, whether it arrived
@@ -1287,7 +1476,7 @@ async fn a_context_search_names_the_region_that_matched() {
                     current_tokens: 1,
                     max_tokens: 100,
                     entries: vec![leviath_core::run_meta::RegionEntrySnapshot {
-                        content: "the plan mentions ctxneedle somewhere".to_string(),
+                        content: "the plan mentions ctxneedle somewhere".to_string().into(),
                         tokens: 1,
                         kind: leviath_core::region::EntryKind::Text,
                         metadata: None,
@@ -1448,7 +1637,7 @@ async fn deep_sources_that_read_files_and_find_nothing_are_quiet() {
                     current_tokens: 1,
                     max_tokens: 100,
                     entries: vec![leviath_core::run_meta::RegionEntrySnapshot {
-                        content: "nothing of interest".to_string(),
+                        content: "nothing of interest".to_string().into(),
                         tokens: 1,
                         kind: leviath_core::region::EntryKind::Text,
                         metadata: None,
@@ -1489,7 +1678,7 @@ async fn deep_sources_that_read_files_and_find_nothing_are_quiet() {
 #[tokio::test]
 async fn a_bad_request_is_reported_rather_than_served() {
     crate::runstate::with_isolated_runs_dir_async("runs-handler-bad", |_d| async move {
-        let (status, _) = list_runs(Query(query(&[("sort", "nonsense")])))
+        let (status, _) = list_runs(State(test_state()), Query(query(&[("sort", "nonsense")])))
             .await
             .expect_err("should be rejected");
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -1644,9 +1833,12 @@ async fn a_bulk_sweep_never_forces_an_unreadable_run() {
         )
         .unwrap();
 
-        let resp = delete_runs(Query(delete_query(&[("ids", "run-corrupt")])))
-            .await
-            .expect("the sweep runs");
+        let resp = delete_runs(
+            State(test_state()),
+            Query(delete_query(&[("ids", "run-corrupt")])),
+        )
+        .await
+        .expect("the sweep runs");
 
         assert!(resp.deleted.is_empty());
         assert!(resp.skipped[0].reason.contains("force=true"));
@@ -1664,9 +1856,12 @@ async fn a_bulk_delete_by_age_takes_the_old_finished_runs_and_leaves_the_rest() 
         live.status = RunStatus::Running;
         create_run(&live).unwrap();
 
-        let resp = delete_runs(Query(delete_query(&[("before", "200")])))
-            .await
-            .expect("the sweep runs");
+        let resp = delete_runs(
+            State(test_state()),
+            Query(delete_query(&[("before", "200")])),
+        )
+        .await
+        .expect("the sweep runs");
 
         assert_eq!(resp.deleted, vec!["run-ancient".to_string()]);
         // The live run is old enough by the clock and is still not swept: it is
@@ -1686,10 +1881,10 @@ async fn a_bulk_delete_by_id_reports_a_verdict_for_every_run_it_was_given() {
         create_run(&finished("run-done", 1)).unwrap();
         create_run(&meta_at("run-live", 2)).unwrap();
 
-        let resp = delete_runs(Query(delete_query(&[(
-            "ids",
-            "run-done,run-live,run-gone",
-        )])))
+        let resp = delete_runs(
+            State(test_state()),
+            Query(delete_query(&[("ids", "run-done,run-live,run-gone")])),
+        )
         .await
         .expect("the sweep runs");
 
@@ -1800,9 +1995,12 @@ async fn a_bulk_delete_reports_the_sub_agent_runs_it_removed() {
         create_run(&finished("run-parent", 1)).unwrap();
         create_run(&finished_child("run-kid", "run-parent", 2)).unwrap();
 
-        let resp = delete_runs(Query(delete_query(&[("ids", "run-parent")])))
-            .await
-            .expect("the sweep runs");
+        let resp = delete_runs(
+            State(test_state()),
+            Query(delete_query(&[("ids", "run-parent")])),
+        )
+        .await
+        .expect("the sweep runs");
 
         // Deepest first, which is the order they were removed in.
         assert_eq!(
@@ -1825,9 +2023,12 @@ async fn a_bulk_delete_naming_a_parent_and_its_child_counts_each_once() {
         create_run(&finished("run-parent", 1)).unwrap();
         create_run(&finished_child("run-kid", "run-parent", 2)).unwrap();
 
-        let resp = delete_runs(Query(delete_query(&[("ids", "run-parent,run-kid")])))
-            .await
-            .expect("the sweep runs");
+        let resp = delete_runs(
+            State(test_state()),
+            Query(delete_query(&[("ids", "run-parent,run-kid")])),
+        )
+        .await
+        .expect("the sweep runs");
 
         assert_eq!(
             resp.deleted,
@@ -1849,7 +2050,7 @@ async fn a_bulk_delete_with_no_predicate_is_refused() {
     crate::runstate::with_isolated_runs_dir_async("runs-delete-nothing", |_d| async move {
         create_run(&finished("run-done", 1)).unwrap();
 
-        let (code, body) = delete_runs(Query(delete_query(&[])))
+        let (code, body) = delete_runs(State(test_state()), Query(delete_query(&[])))
             .await
             .expect_err("a predicate is required");
 
@@ -1867,7 +2068,7 @@ async fn a_bulk_delete_naming_more_runs_than_the_cap_is_refused() {
         .collect::<Vec<_>>()
         .join(",");
 
-    let (code, body) = delete_runs(Query(delete_query(&[("ids", &many)])))
+    let (code, body) = delete_runs(State(test_state()), Query(delete_query(&[("ids", &many)])))
         .await
         .expect_err("over the cap");
 

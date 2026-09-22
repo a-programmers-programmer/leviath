@@ -8,6 +8,16 @@ use std::path::Path;
 
 use super::{UpdateArgs, UpdateEnv, UpdatePlan, agreed};
 use crate::config::Config;
+use crate::config::DEFAULT_MAX_MEDIA_BYTES_PER_REQUEST;
+use crate::config::renamed::legacy_keys_present;
+
+/// The `max_media_bytes_per_request` value shipped as the default before it was
+/// lowered. `lev setup` wrote the default into `config.toml` explicitly, so an
+/// install that ran setup before the change carries this number verbatim and
+/// never picks up the new default on its own; the migration below spots exactly
+/// this value and lowers it, while leaving a number the user chose themselves
+/// alone.
+const OLD_MAX_MEDIA_BYTES_PER_REQUEST: u64 = 64 * 1024 * 1024;
 
 // ─── Config migrations ────────────────────────────────────────────────────────
 
@@ -16,8 +26,9 @@ use crate::config::Config;
 /// The mechanism exists so that a future incompatibility - a key that moved, a
 /// value whose meaning changed - is either fixed automatically or at least
 /// explained at the moment the user updates into it, rather than surfacing as a
-/// broken run days later. [`MIGRATIONS`] is empty today because no shipped
-/// version has changed a key's name or meaning; the tests drive the machinery
+/// broken run days later. A key that only changed name is one entry in
+/// [`crate::config::renamed::RENAMED_KEYS`], and the `renamed-keys` migration
+/// here turns that table into the rewrite; the tests also drive the machinery
 /// with a sample so the wiring is proven rather than assumed.
 pub struct Migration {
     /// A short stable name, shown in the report and in `--json`.
@@ -31,8 +42,10 @@ pub struct Migration {
     /// value entirely, and a key that is still read but now means something
     /// else is only visible there.
     pub applies: fn(&Config, &toml::Table) -> bool,
-    /// Make the change, returning one line per thing it did.
-    pub apply: fn(&mut Config) -> Vec<String>,
+    /// Make the change, returning one line per thing it did. Gets the raw
+    /// document for the same reason `applies` does: a key that vanished from
+    /// the parsed value is still there to be named and quoted.
+    pub apply: fn(&mut Config, &toml::Table) -> Vec<String>,
 }
 
 /// Why `serves = []` is worth a migration at all.
@@ -51,29 +64,75 @@ pub struct Migration {
 ///
 /// The migrations this build knows about, oldest first.
 ///
-/// Adding one is adding an entry here.
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    name: "stale-empty-serves",
-    description: "remove `serves = []` from [model_providers.*] - it never meant anything",
-    applies: |config, _raw| {
-        config
-            .model_providers
-            .values()
-            .any(|p| p.serves.as_ref().is_some_and(Vec::is_empty))
-    },
-    apply: |config| {
-        let mut done = Vec::new();
-        for (name, provider) in &mut config.model_providers {
-            if provider.serves.as_ref().is_some_and(Vec::is_empty) {
-                provider.serves = None;
-                done.push(format!(
-                    "removed empty `serves` from [model_providers.{name}]"
-                ));
+/// Adding one is adding an entry here. A key that only changed name goes in
+/// [`RENAMED_KEYS`] instead, which the `renamed-keys` entry below reads.
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        name: "stale-empty-serves",
+        description: "remove `serves = []` from [model_providers.*] - it never meant anything",
+        applies: |config, _raw| {
+            config
+                .model_providers
+                .values()
+                .any(|p| p.serves.as_ref().is_some_and(Vec::is_empty))
+        },
+        apply: |config, _raw| {
+            let mut done = Vec::new();
+            for (name, provider) in &mut config.model_providers {
+                if provider.serves.as_ref().is_some_and(Vec::is_empty) {
+                    provider.serves = None;
+                    done.push(format!(
+                        "removed empty `serves` from [model_providers.{name}]"
+                    ));
+                }
             }
-        }
-        done
+            done
+        },
     },
-}];
+    // A value whose default changed. The loader cannot tell "the user wrote the
+    // old default" from "the user wants exactly this number", so it leaves the
+    // written value alone; this migration lowers it, but only when it is the old
+    // default to the letter, so a deliberate choice survives.
+    Migration {
+        name: "media-request-cap",
+        description: "lower `max_media_bytes_per_request` from the old 64 MiB default to 20 MiB, \
+                      so an image-heavy request stays under the ~30 MB limit several vendors enforce",
+        applies: |config, _raw| {
+            config.mime.max_media_bytes_per_request == OLD_MAX_MEDIA_BYTES_PER_REQUEST
+        },
+        apply: |config, _raw| {
+            config.mime.max_media_bytes_per_request = DEFAULT_MAX_MEDIA_BYTES_PER_REQUEST;
+            vec![format!(
+                "`max_media_bytes_per_request = {OLD_MAX_MEDIA_BYTES_PER_REQUEST}` becomes \
+                 `{DEFAULT_MAX_MEDIA_BYTES_PER_REQUEST}`: the old 64 MiB default sat above the \
+                 ~30 MB image-content limit several vendors enforce, so a request heavy with \
+                 images hit the vendor's error instead of the runtime's own backstop"
+            )]
+        },
+    },
+    // The loader already read each old key under its new name, so the parsed
+    // config is right and the save writes it right; what this adds is the
+    // moment where the user sees it happen, key by key, with what it means.
+    Migration {
+        name: "renamed-keys",
+        description: "rewrite config keys that changed name (`default_model` is now `fallback_model`)",
+        applies: |_config, raw| !legacy_keys_present(raw).is_empty(),
+        apply: |_config, raw| {
+            legacy_keys_present(raw)
+                .iter()
+                .map(|r| {
+                    format!(
+                        "`{old} = {value}` becomes `{new} = {value}`. {note}",
+                        old = r.key.old_path(),
+                        new = r.key.new_path(),
+                        value = r.value,
+                        note = r.key.note,
+                    )
+                })
+                .collect()
+        },
+    },
+];
 
 /// What the plan found when it read the config file.
 ///
@@ -86,18 +145,20 @@ pub const MIGRATIONS: &[Migration] = &[Migration {
 /// and applying a migration to a document nobody has looked at since the report
 /// was printed is exactly the surprise this command exists to avoid.
 pub(crate) enum ConfigState {
-    /// The config as it stands, for the migrations to be applied to. Boxed
-    /// because a `Config` is far larger than the message beside it.
-    Loaded(Box<Config>),
+    /// The config as it stands and the document behind it, for the migrations
+    /// to be applied to. Boxed because a `Config` is far larger than the
+    /// message beside it.
+    Loaded(Box<LoadedConfig>),
     /// It could not be read, and this is why.
     Unreadable(String),
 }
 
 /// The config as `lev update` needs to see it: parsed, and the document behind
 /// it.
-pub(super) struct LoadedConfig {
-    pub(super) config: Config,
-    pub(super) raw: toml::Table,
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LoadedConfig {
+    pub(crate) config: Config,
+    pub(crate) raw: toml::Table,
 }
 
 /// Read the config file both ways.
@@ -121,22 +182,22 @@ pub(super) fn migrate_config(
     env: &UpdateEnv,
     plan: &UpdatePlan,
 ) -> anyhow::Result<()> {
-    let config = match &plan.config {
+    let loaded = match &plan.config {
         ConfigState::Unreadable(e) => {
             println!("  the config could not be read, so it was left alone: {e}");
             return Ok(());
         }
-        ConfigState::Loaded(config) => config,
+        ConfigState::Loaded(loaded) => loaded,
     };
     if plan.migrations.is_empty() {
         println!("  the config needs no changes");
         return Ok(());
     }
 
-    let mut config = config.as_ref().clone();
+    let mut config = loaded.config.clone();
     let mut changed = Vec::new();
     for migration in &plan.migrations {
-        for line in (migration.apply)(&mut config) {
+        for line in (migration.apply)(&mut config, &loaded.raw) {
             changed.push(format!("{}: {line}", migration.name));
         }
     }

@@ -4,118 +4,33 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use clap::Args;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
+use super::artifact_types::ArtifactResp;
 use super::events::ServerEvent;
 use crate::config::Config;
 use crate::daemon::config_reload::ConfigReloader;
 
-// ─── CLI ─────────────────────────────────────────────────────────────────────
-
-/// Arguments for `lev serve`.
-#[derive(Args, Clone)]
-pub struct ServeArgs {
-    /// Port to listen on
-    #[arg(short, long, default_value = "3000")]
-    pub port: u16,
-
-    /// Host to bind to
-    #[arg(short = 'H', long, default_value = "127.0.0.1")]
-    pub host: String,
-
-    /// Allow browser requests from this origin (e.g. `http://localhost:5173`).
-    ///
-    /// Defaults to **none**: the API is for programmatic clients, which are not
-    /// subject to CORS at all, so a browser-facing default of `*` gave nothing
-    /// to the normal case and widened the surface for the unusual one. A
-    /// dashboard served from another origin sets this explicitly.
-    ///
-    /// `*` is still accepted and still means "any origin". It is now a decision
-    /// someone typed rather than what you get by not thinking about it.
-    #[arg(long)]
-    pub cors: Option<String>,
-
-    /// API token clients must present (`Authorization: Bearer <token>`, or
-    /// `?token=` for WebSockets). Overrides the LEVIATH_API_TOKEN env var; the
-    /// server refuses to start if neither is set.
-    ///
-    /// Prefer the environment variable: an argument is visible in `ps` to every
-    /// local user for the lifetime of the process.
-    #[arg(long)]
-    pub token: Option<String>,
-
-    /// Enable the MCP administration endpoints (`POST`/`DELETE
-    /// /api/mcp/servers`).
-    ///
-    /// **Off by default, because they are remote code execution by
-    /// construction.** Adding an MCP server writes a `command` and `args` into
-    /// `~/.leviath/config.toml`, and Leviath then spawns exactly that - so any
-    /// token holder could run an arbitrary process, persistently, for every
-    /// future run. The rest of the API can only run agents the user already
-    /// installed; this one adds new executables to the machine.
-    #[arg(long)]
-    pub allow_admin: bool,
-
-    /// Restrict agent working directories to this root.
-    ///
-    /// Without it, `POST /api/agents` accepts any `workdir` - including `/` -
-    /// so a token holder can point a tool-executing agent at the whole
-    /// filesystem. Set this to the directory the API is meant to work in.
-    #[arg(long)]
-    pub workdir_root: Option<PathBuf>,
-
-    /// PEM certificate chain to serve HTTPS with. Needs `--tls-key` too.
-    ///
-    /// Bring your own; Leviath never generates one. Without HTTPS the browser
-    /// console cannot reach a `lev serve` that is not on loopback - the browser
-    /// blocks the request before sending it, so no server-side header and no
-    /// `--cors` value can help. A LAN address is blocked exactly like a public
-    /// one.
-    ///
-    /// `mkcert` and `tailscale cert` both produce certificates that work here.
-    /// See the "reaching a Leviath on another machine" section of the docs.
-    #[arg(long, value_name = "PATH")]
-    pub tls_cert: Option<PathBuf>,
-
-    /// PEM private key for `--tls-cert`. Needs `--tls-cert` too.
-    #[arg(long, value_name = "PATH")]
-    pub tls_key: Option<PathBuf>,
-
-    /// Refuse `"yolo": true` and `"allow": [...]` on spawn requests, so an API
-    /// caller cannot waive approval prompts for an agent running on the host.
-    ///
-    /// Both fields, because they are one lever: `"allow": ["*"]` reaches the
-    /// same wildcard override `"yolo": true` writes.
-    #[arg(long)]
-    pub no_remote_yolo: bool,
-
-    /// Run every spawn as if it carried `"no_seed_commands": true`, so a
-    /// blueprint's `seed = { command = ... }` regions never execute for a
-    /// remotely started run.
-    ///
-    /// A command seed runs at spawn, before the first inference and so before
-    /// any approval prompt. `[security] allow_seed_commands = false` refuses
-    /// them machine-wide; this refuses them only for runs that arrive over
-    /// the API, leaving `lev run` on the host as it was.
-    #[arg(long)]
-    pub no_remote_seed_commands: bool,
-
-    /// Requests in flight at once before the next one is answered 503.
-    ///
-    /// Overrides `[serve] max_concurrent_requests` (default 64). `0` disables
-    /// the cap. The websocket routes are never counted.
-    #[arg(long, value_name = "N")]
-    pub max_concurrent_requests: Option<u64>,
-
-    /// Seconds one request may take before it is answered 408.
-    ///
-    /// Overrides `[serve] request_timeout_secs` (default 30). `0` disables the
-    /// timeout. The websocket routes are never timed.
-    #[arg(long, value_name = "SECS")]
-    pub request_timeout_secs: Option<u64>,
+/// A query parameter that is on when it is there and says so: `?flag=1`,
+/// `?flag=true`, `?flag=yes` or `?flag=on`, and off otherwise.
+///
+/// `axum`'s `Query` parses a `bool` through `str::parse`, which accepts
+/// `true` and `false` and refuses everything else with a 400. That made
+/// `?refresh=1` - which is what the API guide documents, what the OpenAPI
+/// spec describes as a boolean, and what a console writes without thinking -
+/// a rejected request rather than a refresh. Anything unrecognised reads as
+/// off, because a mistyped flag should leave the cheap default in place
+/// rather than fail the whole request.
+pub(super) fn flag<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    Ok(matches!(raw.as_str(), "1" | "true" | "yes" | "on"))
 }
+
+// ─── CLI ─────────────────────────────────────────────────────────────────────
 
 // ─── Shared state ────────────────────────────────────────────────────────────
 
@@ -157,6 +72,11 @@ pub(crate) struct AppState {
     /// The update runs `POST /api/update` has started, and the machine to start
     /// another on. On the state for the same reason the cache above is.
     pub(super) update_jobs: super::update_job::UpdateJobs,
+    /// What the read routes remember between requests; see `caches`.
+    pub(super) caches: super::caches::ServeCaches,
+    /// The key this process signs byte URLs with. Random per process, so a
+    /// restart invalidates every URL it handed out.
+    pub(super) signer: Arc<super::signed_url::UrlSigner>,
 }
 
 impl AppState {
@@ -282,64 +202,6 @@ pub(super) fn err(code: axum::http::StatusCode, message: String) -> ApiError {
     (code, axum::response::Json(ErrorResponse { error: message }))
 }
 
-/// A daemon reply this handler has no arm for.
-///
-/// 500 rather than 502: the reply decoded, so the two still speak the same
-/// protocol; the handler simply did not expect this answer to this request.
-pub(super) fn unexpected_response(
-    other: leviath_runtime::control_socket::ControlResponse,
-) -> ApiError {
-    err(
-        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-        format!("Unexpected daemon response: {other:?}"),
-    )
-}
-
-/// The status for a control request the daemon answers with `Ok { ok }`.
-///
-/// `success` when it did the thing; 404 carrying `not_found` when it could
-/// not, since every such request names a run or an interaction and "could
-/// not" means the daemon had nothing by that name in the right state.
-pub(super) fn daemon_ok(
-    reply: std::io::Result<leviath_runtime::control_socket::ControlResponse>,
-    success: axum::http::StatusCode,
-    not_found: String,
-) -> Result<axum::http::StatusCode, ApiError> {
-    match reply {
-        Ok(leviath_runtime::control_socket::ControlResponse::Ok { ok: true }) => Ok(success),
-        Ok(leviath_runtime::control_socket::ControlResponse::Ok { ok: false }) => {
-            Err(err(axum::http::StatusCode::NOT_FOUND, not_found))
-        }
-        Ok(other) => Err(unexpected_response(other)),
-        Err(e) => Err(daemon_error(e)),
-    }
-}
-
-/// The response for a control request the daemon did not answer.
-///
-/// Two different failures, told apart by the error's kind, because they have
-/// different remedies:
-///
-/// - **503 Service Unavailable**: the daemon is not reachable right now. It
-///   may be restarting (the client already waited a grace period for that),
-///   stopped, or wedged. Retrying later, or `lev daemon restart`, is the fix.
-/// - **502 Bad Gateway**: the daemon answered, but this server could not
-///   understand it - the daemon was updated under a running `lev serve`, and
-///   the two no longer speak the same protocol. Retrying cannot help; the
-///   message says what does, which is restarting `lev serve`.
-pub(super) fn daemon_error(e: std::io::Error) -> ApiError {
-    match e.kind() {
-        std::io::ErrorKind::Unsupported => err(
-            axum::http::StatusCode::BAD_GATEWAY,
-            format!("This server needs a restart: {e}"),
-        ),
-        _ => err(
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            format!("Daemon not reachable: {e}"),
-        ),
-    }
-}
-
 // ─── Pagination ─────────────────────────────────────────────────────────────
 
 /// One page of a collection: the shape every paginated route returns.
@@ -422,7 +284,7 @@ pub(super) struct RunItem {
 ///
 /// The part of search that cannot be done in the browser: the console never has
 /// a run's transcript, so without this a deep match is an unexplained result.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub(super) struct Highlight {
     /// What matched: a `RunMeta` field name, `metadata.<key>`,
     /// `modified_files`, `context.<region>`, `logs.output`, `logs.operational`,
@@ -438,8 +300,17 @@ pub(super) struct Highlight {
 
 // ─── Blueprint types ────────────────────────────────────────────────────────
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub(super) struct BlueprintInfo {
+    /// The parsed manifest, kept from the parse the discovery already did.
+    ///
+    /// Not serialized: the REST body is unchanged by this field's presence.
+    /// It exists because GraphQL resolves a whole blueprint object from a
+    /// listing row, and parsing the same text a second time would be both
+    /// slower and a failure path that cannot happen, since a row only exists
+    /// when its manifest parsed.
+    #[serde(skip)]
+    pub(super) parsed: Arc<leviath_core::Blueprint>,
     pub(super) name: String,
     pub(super) version: String,
     pub(super) description: String,
@@ -454,7 +325,8 @@ pub(super) struct BlueprintInfo {
     /// answer to that would be an error arm no test can reach.
     ///
     /// Skipped when serializing, so `GET /api/blueprints` stays a catalog.
-    /// [`BlueprintDetail`] is what puts it on the wire.
+    /// [`BlueprintDetail`](super::blueprint_types::BlueprintDetail) is what puts
+    /// it on the wire.
     #[serde(skip)]
     pub(super) manifest: String,
 }
@@ -521,38 +393,6 @@ pub(super) struct FanOutInfo {
     pub(super) results_region: Option<String>,
 }
 
-/// One blueprint, with the manifest text behind it.
-///
-/// The detail route only. A listing that carried one of these per blueprint
-/// would send every manifest on the machine to answer "what agents are there",
-/// which is why this is a separate shape rather than an extra field on
-/// [`BlueprintInfo`].
-///
-/// Flattened, so the detail route's JSON is [`BlueprintInfo`]'s own fields
-/// plus `manifest`, and a client that reads only those is unaffected.
-#[derive(Debug, Serialize)]
-pub(super) struct BlueprintDetail {
-    #[serde(flatten)]
-    pub(super) info: BlueprintInfo,
-    /// The blueprint's context regions.
-    ///
-    /// On the detail route rather than the listing, for the same reason the
-    /// manifest is: answering "what agents are there" should not cost every
-    /// region of every agent on the machine.
-    pub(super) regions: Vec<RegionInfo>,
-    /// The blueprint's fan-out stages, with their limits as the daemon will
-    /// apply them. Empty for a blueprint that never fans out.
-    pub(super) fan_outs: Vec<FanOutInfo>,
-    /// The manifest exactly as it is on disk.
-    ///
-    /// Without this a console has no way to read what it is editing: naming
-    /// the file in `path` is not the same as being able to open it, since the
-    /// browser cannot, and the fallbacks it is left with (a draft in local
-    /// storage, or a copy bundled at build time) are both disconnected from
-    /// the file the daemon actually runs.
-    pub(super) manifest: String,
-}
-
 /// Query for `GET /api/blueprints`.
 #[derive(Deserialize, Default)]
 pub(super) struct BlueprintsQuery {
@@ -617,7 +457,7 @@ impl ValidateResponse {
 
 // ─── Agent types ────────────────────────────────────────────────────────────
 
-#[derive(Default, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 pub(super) struct SpawnAgentReq {
     pub(super) blueprint: String,
     pub(super) task: String,
@@ -627,6 +467,10 @@ pub(super) struct SpawnAgentReq {
     /// Approve every tool call for this run.
     #[serde(default)]
     pub(super) yolo: bool,
+    /// Run under a named profile from `yolo.toml` (the `--yolo=<name>` of
+    /// the CLI). Implies `yolo`.
+    #[serde(default)]
+    pub(super) yolo_profile: Option<String>,
     /// Tools to allow outright for this run.
     #[serde(default)]
     pub(super) allow: Vec<String>,
@@ -634,6 +478,11 @@ pub(super) struct SpawnAgentReq {
     /// otherwise execute at spawn before any approval prompt.
     #[serde(default)]
     pub(super) no_seed_commands: bool,
+    /// Write this run's exact requests into its journal, once per provider
+    /// attempt, whatever the machine's `[observability] capture_model_input`
+    /// says. A captured request is the whole prompt, and there is no size cap.
+    #[serde(default)]
+    pub(super) capture_model_input: bool,
     pub(super) workdir: Option<String>,
     /// Literal seed content for named caller-input regions, keyed by region name.
     #[serde(default)]
@@ -645,7 +494,7 @@ pub(super) struct SpawnAgentReq {
     /// `X-Leviath-Signature: sha256=<hex>` HMAC of the body keyed on this secret.
     pub(super) callback_secret: Option<String>,
     /// Ask for the run's final output in a particular shape, overriding what the
-    /// blueprint declares. Any label works - `markdown`, `xml`, `a2ui`, a media
+    /// blueprint declares. Any label works - `markdown`, `xml`, `a2ui`, a mime
     /// type, your own - because nothing converts between shapes: the label and
     /// instructions are handed to the model, which produces the bytes.
     pub(super) output_format: Option<String>,
@@ -662,6 +511,11 @@ pub(super) struct SpawnAgentReq {
     /// names what was retired. Supply this field when the new shape should
     /// still be checked.
     pub(super) output_schema: Option<serde_json::Value>,
+    /// Files already inside the working directory to attach as typed parts.
+    /// A `multipart/form-data` body carries files instead; a `@path` token
+    /// inside `task` or a region's text attaches that file too.
+    #[serde(default)]
+    pub(super) parts: Vec<super::upload::PartRef>,
 }
 
 /// A run's final output as the API serves it.
@@ -679,10 +533,11 @@ pub(crate) struct FinalOutputResp {
     pub submitted_at: i64,
     /// Whether the answer hit the size cap and was cut short.
     pub truncated: bool,
-    /// Files the run produced, as workdir-relative paths. Fetch one with
-    /// `GET /api/agents/{id}/files?path=`.
+    /// Files the run produced, typed and hashed. Fetch one with
+    /// `GET /api/agents/{id}/artifacts/{name}`, which reads the store by
+    /// hash and then the workdir, the way the runtime does.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub artifacts: Vec<String>,
+    pub artifacts: Vec<ArtifactResp>,
 }
 
 impl From<leviath_core::output::FinalOutput> for FinalOutputResp {
@@ -693,7 +548,7 @@ impl From<leviath_core::output::FinalOutput> for FinalOutputResp {
             stage: o.stage,
             submitted_at: o.submitted_at,
             truncated: o.truncated,
-            artifacts: o.artifacts,
+            artifacts: o.artifacts.into_iter().map(ArtifactResp::from).collect(),
         }
     }
 }
@@ -820,7 +675,8 @@ pub(super) struct FileQuery {
     /// absolute paths are accepted but must still land inside it. Absent means
     /// "list", and a directory lists rather than erroring.
     pub(super) path: Option<String>,
-    /// `modified` (default) or `workdir`. See [`FileSource`].
+    /// `modified` (default) or `workdir`. See
+    /// [`FileSource`](super::core::files::FileSource).
     pub(super) source: Option<String>,
     /// Include dot-prefixed entries when listing a directory. Off by default,
     /// mirroring `DirsQuery`.
@@ -837,29 +693,6 @@ pub(super) struct FileQuery {
 /// Whether a count is zero, for `skip_serializing_if`.
 fn is_zero(n: &u64) -> bool {
     *n == 0
-}
-
-/// Which question a listing answers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum FileSource {
-    /// What the run recorded modifying. Free, but a claim about the run rather
-    /// than about the disk, and capped at record time.
-    Modified,
-    /// What is in the run's working directory now, one level at a time.
-    Workdir,
-}
-
-impl FileQuery {
-    /// Resolve `source`, or report the bad value.
-    pub(super) fn file_source(&self) -> Result<FileSource, String> {
-        match self.source.as_deref() {
-            None | Some("modified") => Ok(FileSource::Modified),
-            Some("workdir") => Ok(FileSource::Workdir),
-            Some(other) => Err(format!(
-                "Invalid source '{other}': expected 'modified' or 'workdir'"
-            )),
-        }
-    }
 }
 
 /// Response of `GET /api/agents/{id}/files`: either one file's contents, or a
@@ -950,6 +783,11 @@ pub(super) struct RunFileEntry {
     /// True for a recorded path that resolves outside the workdir - possible
     /// when a tool was handed an absolute path. Reported rather than hidden.
     pub(super) outside_workdir: bool,
+    /// What the run's mime registry makes of the file from its name, so a
+    /// console can decide whether to render it without a request per row or a
+    /// guess of its own. Typed by extension only (not sniffed), and empty for
+    /// a directory. `GET .../files/raw` types the same bytes, sniffing them.
+    pub(super) mime_type: String,
 }
 
 /// Response of `GET /api/agents/{id}/files`: one file the run wrote, as text.
@@ -974,7 +812,7 @@ pub(super) struct FileContentResp {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) next_offset: Option<u64>,
     /// This window's bytes as UTF-8, capped at
-    /// [`MAX_FILE_READ_BYTES`](super::agents::MAX_FILE_READ_BYTES).
+    /// [`MAX_FILE_READ_BYTES`](super::core::files::MAX_FILE_READ_BYTES).
     pub(super) content: String,
     /// Whether the file continues past this window. Read on from `next_offset`.
     pub(super) truncated: bool,
@@ -1125,6 +963,10 @@ pub(super) struct SubmitInteractionReq {
     /// the plain deny every existing caller sends.
     #[serde(default)]
     pub(super) feedback: Option<String>,
+    /// Files already inside the working directory to send with a text
+    /// answer.
+    #[serde(default)]
+    pub(super) parts: Vec<super::upload::PartRef>,
 }
 
 #[derive(Deserialize)]
@@ -1132,6 +974,9 @@ pub(super) struct SendMessageReq {
     pub(super) message: String,
     #[serde(default)]
     pub(super) target_region: Option<String>,
+    /// Files already inside the working directory to send with the message.
+    #[serde(default)]
+    pub(super) parts: Vec<super::upload::PartRef>,
 }
 
 // ─── Config types ───────────────────────────────────────────────────────────
@@ -1140,7 +985,7 @@ pub(super) struct SendMessageReq {
 // re-exported here, so every `use super::types::*` still reaches them.
 pub(super) use super::config_types::*;
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub(super) struct ModelEntry {
     pub(super) id: String,
     pub(super) provider: String,
@@ -1166,6 +1011,10 @@ pub(super) struct ModelEntry {
     pub(super) retires: Option<String>,
     /// USD per million tokens, when the provider's listing quotes a rate.
     pub(super) pricing: Option<leviath_providers::ModelPricing>,
+    /// Mime type patterns the model accepts in a request, `text/*` included.
+    pub(super) input_types: Vec<String>,
+    /// Mime type patterns the model can hand back.
+    pub(super) output_types: Vec<String>,
 }
 
 #[cfg(test)]
@@ -1219,30 +1068,33 @@ mod status_matches_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    /// A daemon that is not there is a 503 (try later, or restart it); a
-    /// daemon that answered in a way this server cannot read is a 502 with the
-    /// remedy in the message, because no daemon restart fixes that.
+    /// A flag is on when it says so, off when it says anything else, and an
+    /// error only when the value is not text at all.
     #[test]
-    fn daemon_errors_are_503_unless_the_two_ends_no_longer_understand_each_other() {
-        let (code, body) = daemon_error(std::io::Error::new(
-            std::io::ErrorKind::ConnectionRefused,
-            "no socket",
-        ));
-        assert_eq!(code, axum::http::StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(body.error, "Daemon not reachable: no socket");
-
-        let (code, body) = daemon_error(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "the daemon is now version 9; restart this process",
-        ));
-        assert_eq!(code, axum::http::StatusCode::BAD_GATEWAY);
-        assert_eq!(
-            body.error,
-            "This server needs a restart: the daemon is now version 9; restart this process"
-        );
+    fn a_query_flag_is_on_when_it_says_so_and_off_otherwise() {
+        #[derive(Deserialize)]
+        struct Q {
+            #[serde(default, deserialize_with = "super::flag")]
+            on: bool,
+        }
+        for (value, expected) in [
+            ("1", true),
+            ("true", true),
+            ("yes", true),
+            ("on", true),
+            ("0", false),
+            ("false", false),
+            ("maybe", false),
+        ] {
+            let parsed: Q =
+                serde_json::from_str(&format!(r#"{{"on": "{value}"}}"#)).expect("a string");
+            assert_eq!(parsed.on, expected, "{value}");
+        }
+        assert!(!serde_json::from_str::<Q>("{}").expect("absent is off").on);
+        assert!(serde_json::from_str::<Q>(r#"{"on": 1}"#).is_err());
     }
+
+    use super::*;
 
     #[test]
     fn validate_response_serde_roundtrip() {
@@ -1288,15 +1140,22 @@ mod tests {
     fn redacted_config_serde_roundtrip() {
         let config = RedactedConfig {
             default_provider: "anthropic".to_string(),
-            default_model: Some("claude-sonnet-5".to_string()),
+            override_model: Some("claude-sonnet-5".to_string()),
+            fallback_model: None,
             provider_order: Vec::new(),
             has_anthropic_key: true,
             has_openai_key: false,
             has_google_key: false,
             has_openrouter_key: false,
+            has_bedrock_key: false,
+            has_xai_key: false,
+            has_meta_key: false,
+            bedrock_region: None,
             ollama_base_url: None,
             ollama_enabled: false,
             codex_enabled: false,
+            grok_enabled: false,
+            file_uploads: true,
             codex_reasoning_effort: None,
             codex_verbosity: None,
             codex_replay_reasoning: true,
@@ -1312,7 +1171,7 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let parsed: RedactedConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.default_provider, "anthropic");
-        assert_eq!(parsed.default_model.as_deref(), Some("claude-sonnet-5"));
+        assert_eq!(parsed.override_model.as_deref(), Some("claude-sonnet-5"));
         assert!(parsed.has_anthropic_key);
         assert!(!parsed.has_openai_key);
     }

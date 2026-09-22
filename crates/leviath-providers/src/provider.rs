@@ -191,6 +191,11 @@ pub enum ProviderError {
     #[error("Invalid response: {0}")]
     InvalidResponse(String),
 
+    /// Zero data retention is on and the model keeps something: refused
+    /// before sending, never retried, failed over or held against the provider.
+    #[error("{0}")]
+    RetentionRefused(String),
+
     /// The prompt plus the reply budget cannot fit the model's context window.
     ///
     /// `used` is the prompt alone: the pre-flight guard refuses when
@@ -321,6 +326,7 @@ impl ProviderError {
             // same work and reads the same certificate store, so it fails the
             // same way - and so would every other provider.
             | ProviderError::ClientBuild(_)
+            | ProviderError::RetentionRefused(_)
             | ProviderError::Other(_) => false,
         }
     }
@@ -379,10 +385,14 @@ pub struct ModelInfo {
     /// Whether this entry came from the provider's own listing rather than a
     /// table compiled into this build.
     pub learned: bool,
+
+    /// What mime the model takes and can hand back. See [`Provider::mime`].
+    pub mime: crate::capabilities::ModelMime,
 }
 
 impl ModelInfo {
-    /// An entry from a compiled table: nothing learned, nothing dated.
+    /// An entry from a compiled table: nothing learned, nothing dated, text
+    /// in and text out until [`Self::with_mime`] says otherwise.
     pub fn new(
         id: impl Into<String>,
         provider: impl Into<String>,
@@ -397,7 +407,14 @@ impl ModelInfo {
             retires: None,
             pricing: None,
             learned: false,
+            mime: crate::capabilities::ModelMime::text_only(),
         }
+    }
+
+    /// The same entry, with what the model takes and produces filled in.
+    pub fn with_mime(mut self, mime: crate::capabilities::ModelMime) -> Self {
+        self.mime = mime;
+        self
     }
 
     /// This entry with a display name.
@@ -429,146 +446,9 @@ impl ModelInfo {
     }
 }
 
-/// Rich message content: either a plain text string or structured content blocks.
-///
-/// Provider serialization converts this to the appropriate API format
-/// (e.g., Anthropic content blocks, OpenAI message + tool_calls).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum MessageContent {
-    /// Plain text content (backward compatible).
-    Text(String),
-    /// Structured content blocks (tool_use, tool_result, text).
-    Blocks(Vec<ContentBlock>),
-}
-
-impl From<String> for MessageContent {
-    fn from(s: String) -> Self {
-        MessageContent::Text(s)
-    }
-}
-
-impl From<&str> for MessageContent {
-    fn from(s: &str) -> Self {
-        MessageContent::Text(s.to_string())
-    }
-}
-
-impl MessageContent {
-    /// Get the plain text content, concatenating text blocks if needed.
-    pub fn as_text(&self) -> String {
-        match self {
-            MessageContent::Text(s) => s.clone(),
-            MessageContent::Blocks(blocks) => blocks
-                .iter()
-                .filter_map(|b| match b {
-                    ContentBlock::Text { text } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join(""),
-        }
-    }
-}
-
-/// A content block within a rich message.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum ContentBlock {
-    /// A text content block.
-    #[serde(rename = "text")]
-    Text {
-        /// The text itself.
-        text: String,
-    },
-    /// A tool use request from the assistant.
-    #[serde(rename = "tool_use")]
-    ToolUse {
-        /// Provider-assigned call id, which the matching result must quote back.
-        id: String,
-        /// The tool the model asked for.
-        name: String,
-        /// Arguments as the model supplied them, before any validation.
-        input: serde_json::Value,
-        /// See [`ToolCall::thought_signature`]: replayed verbatim so a
-        /// provider that requires it accepts the follow-up request.
-        ///
-        /// **Never serialized.** This is one provider's field riding in shared
-        /// history, and history is replayed to whichever provider runs next -
-        /// which, with per-stage models, is routinely a different one. Anthropic
-        /// rejects the unknown key outright (`tool_use.thought_signature: Extra
-        /// inputs are not permitted`), so a Gemini stage followed by an
-        /// Anthropic stage dies on its first request.
-        ///
-        /// A provider that wants it emits it deliberately rather than getting
-        /// it by default: `openai_compat` already does exactly that when
-        /// building its tool calls, which is why the OpenAI-shaped path
-        /// (Gemini included) keeps working. The field stays on the struct - it
-        /// is still needed in memory and still persisted through
-        /// `SerializedToolCall` - it just never reaches a body nobody asked to
-        /// put it in.
-        #[serde(default, skip_serializing)]
-        thought_signature: Option<String>,
-    },
-    /// A tool result from executing a tool.
-    #[serde(rename = "tool_result")]
-    ToolResult {
-        /// The [`ContentBlock::ToolUse`] id this answers.
-        tool_use_id: String,
-        /// The tool's output as text. Every provider takes a string here, so a
-        /// structured result is already rendered by this point.
-        content: String,
-        /// Whether the tool refused or failed.
-        is_error: bool,
-    },
-}
-
-/// A system prompt block, separated from conversation messages.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SystemBlock {
-    /// The text content of this system block.
-    pub text: String,
-    /// Cache hint for this system block.
-    pub cache_hint: leviath_core::CacheHint,
-    /// The region this block was rendered from, for diagnostics.
-    ///
-    /// Empty for a block that is not a region - a hint, a tool preamble - which
-    /// is exactly the set of blocks no volatility warning could be about.
-    ///
-    /// Defaulted on the wire so a request serialized before these fields
-    /// existed still deserializes - a script provider that round-trips one, or
-    /// a dumped body replayed later, must not fail on a field it predates.
-    #[serde(default)]
-    pub region: String,
-    /// How much the region this block came from moves between requests.
-    ///
-    /// Carried so assembly can order blocks by it: a provider caches by prefix,
-    /// so a block that moves invalidates everything behind it, and the
-    /// arrangement that pays is stable content first and churn last. The
-    /// region's *kind* cannot answer this - a pinned region is written
-    /// constantly - so the blueprint says and this carries the answer.
-    #[serde(default)]
-    pub volatility: leviath_core::Volatility,
-}
-
-/// An `f32` as JSON, at the precision it was written with.
-///
-/// `serde_json` widens an `f32` to `f64` to store it, and `0.7f32` widened is
-/// `0.699999988079071`. That is what every request carried: it read as a
-/// Leviath bug in provider error messages, and Z.AI rejects it outright with
-/// `The temperature parameter is illegal: 限制小数点[2]位` - at most two decimal
-/// places - which made an entire vendor family unusable.
-///
-/// `f32`'s own `Display` gives the shortest decimal that round-trips back to
-/// the same `f32`, so `0.7f32` prints "0.7". Parsing that as `f64` gets the
-/// number the blueprint author actually wrote, without imposing a fixed
-/// precision on someone who wanted `0.125`.
-pub(crate) fn json_number(value: f32) -> serde_json::Value {
-    // `f32::Display` always produces a decimal that parses back, including for
-    // the non-finite values, so the fallback is the same number rather than a
-    // branch nothing reaches.
-    serde_json::json!(value.to_string().parse::<f64>().unwrap_or(f64::from(value)))
-}
+mod content;
+pub(crate) use content::json_number;
+pub use content::{ContentBlock, MessageContent, SystemBlock};
 
 /// Request for LLM inference.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -605,6 +485,12 @@ pub struct InferenceRequest {
     #[serde(default)]
     pub request_timeout_secs: Option<u64>,
 }
+
+/// The user turn a request carries when its context holds none: every
+/// provider refuses a request without one. It is a placeholder, not something
+/// anyone asked, so a model that takes its prompt from the request's text (an
+/// image, video or speech model) reads past it.
+pub const OPENING_TURN: &str = "Begin.";
 
 /// A message in a conversation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -670,6 +556,13 @@ pub struct InferenceResponse {
     /// that produced it, never by another.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
+
+    /// Mime the model produced beside its text: an image from a model that
+    /// draws, audio from one that speaks. Bytes, not references, because the
+    /// provider has no store; the runtime stores them on the assistant turn.
+    /// Never serialised: a journal carries the stored reference instead.
+    #[serde(skip)]
+    pub parts: Vec<leviath_core::mime::Blob>,
 }
 
 // `TokenUsage` lives in `crate::pricing` alongside the rates it is priced
@@ -745,6 +638,9 @@ pub struct StreamChunk {
     /// See [`InferenceResponse::reasoning`]. Arrives on whichever chunk
     /// carries the provider's reasoning item, not necessarily the last.
     pub reasoning: Option<String>,
+
+    /// See [`InferenceResponse::parts`]: mime this chunk carried whole.
+    pub parts: Vec<leviath_core::mime::Blob>,
 }
 
 /// A partial tool call update from streaming.
@@ -790,7 +686,7 @@ mod http;
 pub use http::{
     DEFAULT_INFERENCE_TIMEOUT_SECS, HttpClient, HttpClientFactory, HttpError,
     SIDE_CALL_TIMEOUT_SECS, apply_request_timeout, build_http_client, build_http1_client,
-    malformed_url_error, side_call_client,
+    malformed_url_error, side_call_client, with_extra_header_pairs, with_extra_headers,
 };
 
 // Folding a streamed answer back into one response.
@@ -829,6 +725,7 @@ pub trait Provider: Send + Sync {
             tokens: Some(response.tokens_used),
             finish_reason: Some(response.finish_reason),
             reasoning: None,
+            parts: Vec::new(),
         };
         Ok(Box::pin(stream_once::once(Ok(chunk))))
     }
@@ -852,6 +749,18 @@ pub trait Provider: Send + Sync {
 
     /// Get the capabilities of the given model.
     fn capabilities(&self, model: &str) -> ModelCapabilities;
+
+    /// What mime `model` takes and can hand back, as mime type patterns.
+    ///
+    /// Answered the way [`Self::capabilities`] is: the compiled table, then
+    /// the provider's own listing, then the operator's `[model_capabilities]`
+    /// row. A provider that knows nothing about mime answers text only,
+    /// which is the default here, so a stored part sent its way arrives as
+    /// text or as its stand-in rather than as bytes it would reject.
+    fn mime(&self, model: &str) -> crate::capabilities::ModelMime {
+        let _ = model;
+        crate::capabilities::ModelMime::text_only()
+    }
 
     /// Learn what this provider's own API says about its models, before any
     /// inference asks.
@@ -918,6 +827,25 @@ pub trait Provider: Send + Sync {
         self.serves_model_from_table(model_key)
     }
 
+    /// What this provider has *read* about its retention of `model`'s
+    /// requests, when it can read anything: Bedrock keeps a data retention
+    /// mode on the account and answers from it once primed. `None`, the
+    /// default, means the compiled-in table ([`crate::retention::builtin`])
+    /// stands, which is the honest answer for a provider whose retention is
+    /// a matter of documentation and contract rather than an API.
+    fn live_retention(&self, model: &str) -> Option<crate::retention::RetentionPolicy> {
+        let _ = model;
+        None
+    }
+
+    /// Read again whatever [`Self::live_retention`] answers from: the
+    /// account's mode, the per-model listing. Called when zero retention is
+    /// switched on under a running daemon, so a mode set by
+    /// `lev providers retention` reaches the daemon's copy of the provider
+    /// rather than waiting for a restart. Best effort; a provider that reads
+    /// nothing does nothing.
+    async fn refresh_retention(&self) {}
+
     /// Every model id this provider will accept, when it is in a position to
     /// say so.
     ///
@@ -939,6 +867,17 @@ pub trait Provider: Send + Sync {
         None
     }
 
+    /// This provider's primed catalogue, so a registry can read it into the
+    /// shared on-disk cache after priming and fill it from that cache on a
+    /// build that has not primed.
+    ///
+    /// `None` for a provider that keeps no learned store: a script provider,
+    /// and any whose listing this build never reads. Such a provider answers
+    /// from its compiled table either way, so there is nothing to cache.
+    fn learned_models(&self) -> Option<&crate::learned::LearnedModels> {
+        None
+    }
+
     /// Why this provider will not serve `model_key`, when it has something
     /// more useful to say than "it is not in my catalogue".
     ///
@@ -955,24 +894,42 @@ pub trait Provider: Send + Sync {
         None
     }
 
-    /// Whether this provider may only be reached by name.
+    /// What a subscription has left, for a provider billed to one.
     ///
-    /// A blueprint entry that names a model without a provider asks every
-    /// registered provider whether it serves that name, and the first one that
-    /// says yes wins. That is right for providers a user configured to be
-    /// interchangeable, and wrong for one whose selection changes what gets
-    /// billed: enabling a subscription transport must not silently re-route
-    /// existing bare-named stages onto the subscription.
-    ///
-    /// A provider answering `true` is still reachable by an explicit
-    /// `provider/model` reference, an explicit `fallback_order` entry, or by
-    /// being the configured `default_provider`. It is only excluded from
-    /// winning a route nobody asked it to serve.
-    ///
-    /// `false` by default, which is the behaviour every provider had before
-    /// this existed.
-    fn explicit_route_only(&self) -> bool {
-        false
+    /// `None` for every provider that is not (the default): a key-billed
+    /// provider has a balance on a vendor's console, not a usage window to
+    /// show. A subscription provider reads its account and answers `Some`,
+    /// with an error when that read failed.
+    async fn quota(&self) -> Option<Result<crate::quota::QuotaReport>> {
+        None
+    }
+
+    /// What this provider documents about the media a request to `model` may
+    /// carry, and whether a part can go by file id. The default documents
+    /// nothing: the Leviath settings bound the request and nothing uploads.
+    fn media_limits(&self, model: &str) -> crate::files::MediaLimits {
+        let _ = model;
+        crate::files::MediaLimits::NONE
+    }
+
+    /// Put `upload` in the vendor's file storage. Called only for a model
+    /// whose [`Self::media_limits`] names a file size, which the default does
+    /// not.
+    async fn upload_file(
+        &self,
+        upload: &crate::files::FileUpload,
+    ) -> Result<crate::files::RemoteFile> {
+        let _ = upload;
+        Err(ProviderError::Other(format!(
+            "{} has no file storage",
+            self.name()
+        )))
+    }
+
+    /// Delete a file this provider uploaded. One already gone is deleted.
+    async fn delete_file(&self, file: &crate::files::RemoteFile) -> Result<()> {
+        let _ = file;
+        Ok(())
     }
 
     /// Prove the stored credential works *right now*, and report the models it
@@ -1039,12 +996,42 @@ pub trait Provider: Send + Sync {
 mod helpers;
 
 use helpers::stream_once;
+pub use helpers::tool_input_object;
 pub(crate) use helpers::*;
 
 #[cfg(test)]
 mod tests {
 
     use super::*;
+
+    /// A provider with no file storage and no subscription says so: nothing
+    /// uploads, a delete is nothing to do, and there is no quota to show.
+    #[tokio::test]
+    async fn the_file_and_quota_defaults_do_nothing_and_refuse_an_upload() {
+        let openrouter = crate::OpenRouterProvider::new(
+            build_http_client(None).expect("a test client builds"),
+            "k".to_string(),
+        );
+        assert_eq!(
+            openrouter.media_limits("any/model"),
+            crate::files::MediaLimits::NONE
+        );
+        let upload = crate::files::FileUpload {
+            bytes: std::sync::Arc::from(&b"x"[..]),
+            mime_type: "text/plain".into(),
+            name: "a.txt".into(),
+            ttl_secs: 3_600,
+        };
+        let err = openrouter.upload_file(&upload).await.unwrap_err();
+        assert!(err.to_string().contains("no file storage"), "{err}");
+        let file = crate::files::RemoteFile {
+            id: "f".into(),
+            uri: None,
+            expires_at: None,
+        };
+        openrouter.delete_file(&file).await.unwrap();
+        assert!(openrouter.quota().await.is_none());
+    }
 
     /// Most providers have nothing to get ready, which is what the default is
     /// for. Exercised through a real one rather than a stub: a stub written for
@@ -1843,6 +1830,22 @@ mod tests {
         );
     }
 
+    /// An object is sent as it is; the text of a cut-off call, or any other
+    /// shape, is wrapped so the request carries an object.
+    #[test]
+    fn tool_input_is_always_an_object_on_the_wire() {
+        let whole = serde_json::json!({ "path": "a.md" });
+        assert_eq!(tool_input_object(&whole), whole);
+        assert_eq!(
+            tool_input_object(&serde_json::json!("{\"path\": \"re")),
+            serde_json::json!({ "_raw": "{\"path\": \"re" })
+        );
+        assert_eq!(
+            tool_input_object(&serde_json::Value::Null),
+            serde_json::json!({ "_raw": null })
+        );
+    }
+
     #[test]
     fn parse_finish_reason_unknown_is_kept_apart_from_complete() {
         assert_eq!(parse_openai_finish_reason("unknown"), FinishReason::Unknown);
@@ -2015,6 +2018,7 @@ mod tests {
                 },
                 finish_reason: FinishReason::Complete,
                 reasoning: None,
+                parts: Vec::new(),
             })
         }
 
@@ -2068,6 +2072,9 @@ mod tests {
             .prime_capabilities()
             .await
             .expect("a provider that needs no priming reports success");
+        // A provider whose limits come from its compiled table keeps no learned
+        // store, so it neither writes to nor is filled from the shared cache.
+        assert!(MinimalProvider.learned_models().is_none());
     }
 
     #[tokio::test]
@@ -2249,7 +2256,6 @@ mod tests {
                 ModelCapabilities::default()
             }
         }
-        assert!(!Ordinary.explicit_route_only());
         assert!(Ordinary.served_catalog().is_none());
         // The rest of the stub is part of the same contract; answering it here
         // keeps the impl honest rather than leaving unreachable bodies.

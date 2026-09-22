@@ -91,7 +91,50 @@ pub fn parse_inference_dynamic(value: Dynamic) -> Result<InferenceResponse> {
         tokens_used: parse_usage(json.get("tokens_used")),
         finish_reason: finish_reason_from_str(json.get("finish_reason").and_then(|v| v.as_str())),
         reasoning: None,
+        parts: parse_parts(&json),
     })
+}
+
+/// The `parts` array of an `inference` result or a stream chunk: each a
+/// map with `bytes` (a Rhai blob) or `data` (base64), a `mime_type`, and
+/// an optional `name`. An entry with no bytes, or bytes that do not decode,
+/// is skipped; a missing or unparsable type is `application/octet-stream`,
+/// which the runtime's registry sniffs past.
+fn parse_parts(json: &Value) -> Vec<leviath_core::mime::Blob> {
+    use base64::Engine;
+    json.get("parts")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let bytes: Vec<u8> = match (item.get("bytes"), item.get("data")) {
+                        (Some(Value::Array(raw)), _) => raw
+                            .iter()
+                            .filter_map(|b| b.as_u64().and_then(|b| u8::try_from(b).ok()))
+                            .collect(),
+                        (_, Some(Value::String(text))) => base64::engine::general_purpose::STANDARD
+                            .decode(text.trim())
+                            .ok()?,
+                        _ => return None,
+                    };
+                    if bytes.is_empty() {
+                        return None;
+                    }
+                    let mime_type = item
+                        .get("mime_type")
+                        .and_then(|v| v.as_str())
+                        .and_then(|t| leviath_core::mime::MimeType::parse(t).ok())
+                        .unwrap_or_else(leviath_core::mime::octet_stream);
+                    let mut blob = leviath_core::mime::Blob::new(mime_type, bytes);
+                    if let Some(name) = item.get("name").and_then(|v| v.as_str()) {
+                        blob = blob.named(name);
+                    }
+                    Some(blob)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Parse the `tool_calls` array of an `inference` result.
@@ -101,11 +144,14 @@ fn parse_tool_calls(json: &Value) -> Vec<ToolCall> {
         .map(|arr| {
             arr.iter()
                 .map(|tc| ToolCall {
-                    id: tc
-                        .get("id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string(),
+                    // A script that names its calls keeps its own ids. One that
+                    // does not gets minted ones rather than empty strings: an
+                    // empty id pairs with every result and answers every
+                    // prompt.
+                    id: match tc.get("id").and_then(|v| v.as_str()) {
+                        Some(id) if !id.is_empty() => id.to_string(),
+                        _ => crate::call_ids::mint("rhai_call"),
+                    },
                     name: tc
                         .get("name")
                         .and_then(|v| v.as_str())
@@ -147,6 +193,7 @@ pub fn chunk_from_dynamic(value: Dynamic) -> Result<StreamChunk> {
         // opaque reasoning item to carry, and inventing one from a script's
         // JSON would let a script forge another provider's token.
         reasoning: None,
+        parts: parse_parts(&json),
     })
 }
 
@@ -283,7 +330,15 @@ pub fn map_rhai_err(err: Box<EvalAltResult>) -> ProviderError {
                 Some("rate_limited") => ProviderError::RateLimitExceeded {
                     retry_after_secs: None,
                 },
-                Some("transport") | Some("server") => ProviderError::RequestFailed(message),
+                Some("transport") => ProviderError::RequestFailed(message),
+                // The script reached its server and the server failed: said
+                // so, so a run parked over it does not read as a network
+                // problem.
+                Some("server") => ProviderError::labelled(
+                    crate::FailureKind::ServerError,
+                    "the provider script's server",
+                    &message,
+                ),
                 // A script's `api` error is the same shape a built-in provider
                 // gets back from an HTTP call, so it classifies the same way:
                 // an OpenAI-compatible endpoint answering 402 through a Rhai
@@ -318,6 +373,54 @@ mod cost_tests {
     /// A script provider knows what its own endpoint charged; nothing else
     /// does, since a custom model has no rate card here. Both spellings are
     /// accepted because a script author will reach for either.
+    /// A script's `parts` come through as blobs, as bytes or as base64, typed
+    /// by what it said or as octet-stream, and named when it named them.
+    #[test]
+    fn a_script_provider_can_hand_back_mime() {
+        let value = rhai::serde::to_dynamic(serde_json::json!({
+            "content": "drawn",
+            "finish_reason": "stop",
+            "parts": [
+                {"bytes": [137, 80, 78, 71], "mime_type": "image/png", "name": "hero.png"},
+                {"data": "AQID"},
+                {"data": "!!", "mime_type": "image/png"},
+                {"bytes": [], "mime_type": "image/png"},
+                {"mime_type": "image/png"},
+                {"data": "AQID", "mime_type": "not a type"}
+            ]
+        }))
+        .unwrap();
+        let response = parse_inference_dynamic(value).unwrap();
+        assert_eq!(response.parts.len(), 3);
+        assert_eq!(response.parts[0].name.as_deref(), Some("hero.png"));
+        assert_eq!(response.parts[0].mime_type.as_str(), "image/png");
+        assert_eq!(response.parts[0].bytes, vec![137, 80, 78, 71]);
+        assert_eq!(
+            response.parts[1].mime_type.as_str(),
+            "application/octet-stream"
+        );
+        assert!(response.parts[1].name.is_none());
+        assert_eq!(
+            response.parts[2].mime_type.as_str(),
+            "application/octet-stream"
+        );
+        let chunk = chunk_from_dynamic(
+            rhai::serde::to_dynamic(serde_json::json!({
+                "delta": "x",
+                "parts": [{"data": "AQID", "mime_type": "audio/wav"}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(chunk.parts.len(), 1);
+        assert_eq!(chunk.parts[0].mime_type.as_str(), "audio/wav");
+        let none = parse_inference_dynamic(
+            rhai::serde::to_dynamic(serde_json::json!({"content": "plain"})).unwrap(),
+        )
+        .unwrap();
+        assert!(none.parts.is_empty());
+    }
+
     #[test]
     fn a_script_provider_can_report_its_own_cost() {
         for key in ["cost_usd", "cost"] {

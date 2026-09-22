@@ -80,6 +80,14 @@ fn entry_to_json(entry: &RegionEntry) -> serde_json::Value {
         "tokens": entry.tokens,
         "timestamp": entry.timestamp,
         "key": entry.key,
+        // Every part, text included, in order: what a render that wants to
+        // place an image itself reads. `content` stays the rendering.
+        "parts": entry
+            .content
+            .parts()
+            .iter()
+            .map(leviath_scripting::parts::part_summary)
+            .collect::<Vec<_>>(),
     });
     let (kind, extra) = match &entry.kind {
         EntryKind::Text => ("text", None),
@@ -179,7 +187,7 @@ pub(crate) struct RegionRender<'a> {
     /// Its render hook, when it declares one.
     pub script: Option<&'a Arc<RegionScript>>,
     /// Whether the region persists across stage transitions.
-    pub persistent: bool,
+    pub pinned: bool,
     /// Stage metadata the hook sees.
     pub meta: &'a AssembleMeta,
     /// How full the window is right now.
@@ -203,7 +211,7 @@ pub(crate) fn render_custom_region(render: RegionRender<'_>, out: RenderSink<'_>
     let RegionRender {
         region,
         script,
-        persistent,
+        pinned,
         meta,
         window_current,
         window_max,
@@ -253,30 +261,15 @@ pub(crate) fn render_custom_region(render: RegionRender<'_>, out: RenderSink<'_>
         }
     };
 
-    match parse_render_output(&rendered, persistent) {
+    match parse_render_output(&rendered, pinned) {
         Ok((blocks, msgs)) => {
             let emitted_tokens: usize = blocks
                 .iter()
                 .map(|b| leviath_core::estimate_tokens(&b.text))
-                .chain(msgs.iter().map(|m| {
-                    match &m.content {
-                        leviath_providers::MessageContent::Text(t) => {
-                            leviath_core::estimate_tokens(t)
-                        }
-                        leviath_providers::MessageContent::Blocks(bs) => bs
-                            .iter()
-                            .map(|b| match b {
-                                leviath_providers::ContentBlock::Text { text } => {
-                                    leviath_core::estimate_tokens(text)
-                                }
-                                leviath_providers::ContentBlock::ToolUse { input, .. } => {
-                                    leviath_core::estimate_tokens(&input.to_string())
-                                }
-                                leviath_providers::ContentBlock::ToolResult { content, .. } => {
-                                    leviath_core::estimate_tokens(content)
-                                }
-                            })
-                            .sum(),
+                .chain(msgs.iter().map(|m| match &m.content {
+                    leviath_providers::MessageContent::Text(t) => leviath_core::estimate_tokens(t),
+                    leviath_providers::MessageContent::Blocks(bs) => {
+                        bs.iter().map(leviath_providers::mime::block_tokens).sum()
                     }
                 }))
                 .sum();
@@ -314,7 +307,7 @@ pub(crate) fn render_custom_region(render: RegionRender<'_>, out: RenderSink<'_>
 /// which the caller turns into the fallback block.
 fn parse_render_output(
     value: &serde_json::Value,
-    persistent: bool,
+    pinned: bool,
 ) -> Result<
     (
         Vec<leviath_providers::SystemBlock>,
@@ -323,7 +316,7 @@ fn parse_render_output(
     String,
 > {
     // A persistent region's rendered output is expected stable → cacheable.
-    let hint = if persistent {
+    let hint = if pinned {
         leviath_core::CacheHint::Always
     } else {
         leviath_core::CacheHint::UntilChanged
@@ -439,9 +432,11 @@ fn message_from_json(value: &serde_json::Value) -> Result<leviath_providers::Mes
             blocks.push(leviath_providers::ContentBlock::ToolUse {
                 id: id.to_string(),
                 name: name.to_string(),
+                // A script copies a stored call's arguments, and a call the
+                // output cap cut off is stored as its partial text.
                 input: call
                     .get("arguments")
-                    .cloned()
+                    .map(leviath_providers::tool_input_object)
                     .unwrap_or(serde_json::Value::Object(Default::default())),
                 thought_signature: call
                     .get("thought_signature")
@@ -716,7 +711,7 @@ mod tests {
             "brain".to_string(),
             RegionKind::Custom {
                 script: "test.rhai".to_string(),
-                persistent: false,
+                pinned: false,
             },
             1000,
         );
@@ -731,7 +726,7 @@ mod tests {
     fn render(
         region: &Region,
         script: Option<&Arc<RegionScript>>,
-        persistent: bool,
+        pinned: bool,
     ) -> (
         Vec<leviath_providers::SystemBlock>,
         Vec<leviath_providers::Message>,
@@ -743,7 +738,7 @@ mod tests {
                 RegionRender {
                     region,
                     script,
-                    persistent,
+                    pinned,
                     meta: &AssembleMeta {
                         stage_name: "plan".to_string(),
                         stage_iterations: 2,
@@ -802,6 +797,8 @@ mod tests {
         assert_eq!(entries[3]["kind"], json!("tool_result"));
         assert_eq!(entries[3]["tool_call_id"], json!("c1"));
         assert_eq!(entries[3]["is_error"], json!(true));
+        assert_eq!(entries[0]["parts"][0]["text"], json!("plain"));
+        assert_eq!(entries[0]["parts"][0]["mime_type"], json!("text/plain"));
     }
 
     // ─── render: happy paths ─────────────────────────────────────────────
@@ -1151,6 +1148,22 @@ mod tests {
         // Indexing a missing key yields Null, so this covers absent-or-null
         // without a short-circuit branch the coverage gate can't see taken.
         assert_eq!(blocks[0]["thought_signature"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn render_assistant_tool_call_wraps_arguments_that_are_not_an_object() {
+        // A script copies a stored call's arguments from `ctx.entries`, and a
+        // call the output cap cut off is stored as its partial text. Providers
+        // want an object, so the text goes out wrapped.
+        let src = r#"
+            fn render(ctx) {
+                #{ messages: [#{ role: "assistant", tool_calls: [#{ id: "c", name: "n", arguments: "{\"a\":" }] }] }
+            }
+        "#;
+        let region = region_with(&[("x", EntryKind::Text)]);
+        let (_, messages) = render(&region, Some(&script(src)), false);
+        let blocks = serde_json::to_value(&messages[0].content).unwrap();
+        assert_eq!(blocks[0]["input"], json!({ "_raw": "{\"a\":" }));
     }
 
     // ─── on_write ────────────────────────────────────────────────────────

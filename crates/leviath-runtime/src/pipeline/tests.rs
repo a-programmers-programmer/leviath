@@ -13,6 +13,7 @@ use tokio::sync::mpsc;
 struct Cfg {
     supports_temperature: bool,
     max_output: usize,
+    supports_tools: bool,
 }
 #[async_trait::async_trait]
 impl Provider for Cfg {
@@ -33,6 +34,7 @@ impl Provider for Cfg {
             },
             finish_reason: leviath_providers::FinishReason::Complete,
             reasoning: None,
+            parts: Vec::new(),
         })
     }
     async fn count_tokens(&self, _t: &str, _m: &str) -> usize {
@@ -48,6 +50,7 @@ impl Provider for Cfg {
         leviath_providers::ModelCapabilities {
             supports_temperature: self.supports_temperature,
             max_output_tokens: self.max_output,
+            supports_tools: self.supports_tools,
             limits_source: LimitsSource::Builtin,
             ..Default::default()
         }
@@ -83,7 +86,268 @@ fn provider(supports_temperature: bool, max_output: usize) -> Arc<dyn Provider> 
     Arc::new(Cfg {
         supports_temperature,
         max_output,
+        supports_tools: true,
     })
+}
+
+/// A window whose conversation already holds a tool call and its result, the
+/// shape a stage inherits after an earlier stage used tools.
+fn window_with_tool_turns() -> ContextWindow {
+    let mut w = ContextWindow::new(10_000);
+    w.add_region(Region::new(
+        "conversation".to_string(),
+        RegionKind::SlidingWindow {
+            max_items: 20,
+            eviction_strategy: leviath_core::EvictionStrategy::PerItem,
+        },
+        5000,
+    ));
+    w.add_typed_entry(
+        "conversation",
+        leviath_core::EntryKind::AssistantTurn {
+            tool_calls: vec![leviath_core::SerializedToolCall {
+                id: "c1".into(),
+                name: "context_append".into(),
+                arguments: serde_json::json!({"region": "feedback", "content": "bigger bars"}),
+                thought_signature: None,
+            }],
+        },
+        String::new(),
+        1,
+    )
+    .unwrap();
+    w.add_typed_entry(
+        "conversation",
+        leviath_core::EntryKind::ToolResult {
+            tool_call_id: "c1".into(),
+            tool_name: "context_append".into(),
+            is_error: false,
+        },
+        "appended".to_string(),
+        1,
+    )
+    .unwrap();
+    w
+}
+
+/// Regression: an image model (`supports_tools = false`) re-entered after a
+/// stage that called `context_append` was sent that call in its history and
+/// Google refused the request with "Function calling is not enabled for
+/// this model". The request such a model gets carries the history as prose
+/// and advertises no tool, whatever the stage granted.
+#[test]
+fn a_model_without_tools_gets_its_history_as_prose_and_no_tools() {
+    let w = window_with_tool_turns();
+    let si = stage("nano-banana", vec![tool("context_append")], None);
+    let no_tools = Arc::new(Cfg {
+        supports_temperature: true,
+        max_output: 1000,
+        supports_tools: false,
+    }) as Arc<dyn Provider>;
+    let req = build_request(
+        &w,
+        None,
+        &si,
+        &no_tools,
+        "generate",
+        0,
+        crate::pipeline::inference::PriorCalls::default(),
+    )
+    .0;
+    assert!(req.tools.is_empty(), "nothing advertised: {:?}", req.tools);
+    let blocks: Vec<&leviath_providers::ContentBlock> = req
+        .messages
+        .iter()
+        .filter_map(|m| match &m.content {
+            leviath_providers::MessageContent::Blocks(b) => Some(b.iter()),
+            leviath_providers::MessageContent::Text(_) => None,
+        })
+        .flatten()
+        .collect();
+    assert!(
+        blocks
+            .iter()
+            .all(|b| matches!(b, leviath_providers::ContentBlock::Text { .. })),
+        "a tool block reached the request: {blocks:?}"
+    );
+    let text = format!("{:?}", req.messages);
+    assert!(text.contains("called context_append"), "{text}");
+    assert!(text.contains("appended"), "{text}");
+    // The same window to a model that calls tools keeps its structure.
+    let req = build_request(
+        &w,
+        None,
+        &si,
+        &provider(true, 1000),
+        "generate",
+        0,
+        crate::pipeline::inference::PriorCalls::default(),
+    )
+    .0;
+    assert_eq!(req.tools.len(), 1);
+    assert!(format!("{:?}", req.messages).contains("ToolUse"));
+    // A tool-less model on a stage that grants nothing: the usual image
+    // stage. Nothing to leave out, nothing to say about it.
+    let quiet = stage("nano-banana", vec![], None);
+    let req = build_request(
+        &w,
+        None,
+        &quiet,
+        &no_tools,
+        "generate",
+        0,
+        crate::pipeline::inference::PriorCalls::default(),
+    )
+    .0;
+    assert!(req.tools.is_empty());
+    assert!(!format!("{:?}", req.messages).contains("ToolUse"));
+}
+
+/// A model that does not read a system prompt has the stage's instruction
+/// folded into the user turn. A stage leaves it in the system blocks with a
+/// bare "Begin." nudge - the convention that makes a text model act - and a
+/// model that ignores the system prompt (an image generator) would generate
+/// from the nudge, never the subject, so the fold rescues it.
+#[test]
+fn a_model_that_ignores_the_system_prompt_gets_it_folded_into_the_user_turn() {
+    let mut w = ContextWindow::new(10_000);
+    w.add_region(Region::new("task".to_string(), RegionKind::Pinned, 1000));
+    w.add_typed_entry(
+        "task",
+        leviath_core::EntryKind::Text,
+        "draw a picture of a rabbit".to_string(),
+        5,
+    )
+    .unwrap();
+    let prov = Arc::new(Cfg {
+        supports_temperature: true,
+        max_output: 1000,
+        supports_tools: false,
+    }) as Arc<dyn Provider>;
+
+    // gemini-2.5-flash-image ignores the system prompt (the one-off): the whole
+    // system, the task included, folds into the user turn, the nudge replaced,
+    // and the system is left empty.
+    let req = build_request(
+        &w,
+        None,
+        &stage("google/gemini-2.5-flash-image", vec![], None),
+        &prov,
+        "draw",
+        0,
+        crate::pipeline::inference::PriorCalls::default(),
+    )
+    .0;
+    assert!(
+        req.system.is_empty(),
+        "system folded away: {:?}",
+        req.system
+    );
+    let user_text = req
+        .messages
+        .iter()
+        .filter(|m| m.role == "user")
+        .map(|m| m.content.as_text())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        user_text.contains("draw a picture of a rabbit"),
+        "prompt in the user turn: {user_text}"
+    );
+    assert!(!user_text.contains("Begin."), "nudge replaced: {user_text}");
+
+    // A model that reads the system prompt keeps it there, with the nudge.
+    let text = build_request(
+        &w,
+        None,
+        &stage("some-text-model", vec![], None),
+        &prov,
+        "draw",
+        0,
+        crate::pipeline::inference::PriorCalls::default(),
+    )
+    .0;
+    assert!(
+        text.messages
+            .iter()
+            .any(|m| m.content.as_text().contains("Begin.")),
+        "text model nudged"
+    );
+    assert!(
+        format!("{:?}", text.system).contains("draw a picture of a rabbit"),
+        "text model keeps the prompt in system"
+    );
+
+    // An empty window has nothing to fold; the request still builds.
+    let empty = ContextWindow::new(10_000);
+    let req = build_request(
+        &empty,
+        None,
+        &stage("google/gemini-2.5-flash-image", vec![], None),
+        &prov,
+        "draw",
+        0,
+        crate::pipeline::inference::PriorCalls::default(),
+    )
+    .0;
+    assert!(req.system.is_empty());
+    assert_eq!(req.messages.last().unwrap().content.as_text(), "Begin.");
+}
+
+/// The fold, on the turn shapes `build_request` cannot produce on its own: a
+/// first user turn carrying blocks (an input image), a real text turn (prefixed
+/// not replaced), and no user turn at all (the system becomes one).
+#[test]
+fn folding_the_system_covers_blocks_a_prefix_and_no_user_turn() {
+    use crate::pipeline::inference::fold_system_into_user;
+    use leviath_providers::{ContentBlock, Message, MessageContent, SystemBlock};
+    let sys = || {
+        vec![SystemBlock {
+            text: "PROMPT".to_string(),
+            cache_hint: leviath_core::CacheHint::Always,
+            volatility: leviath_core::Volatility::Stable,
+            region: String::new(),
+        }]
+    };
+    let user = |content: MessageContent| Message {
+        role: "user".to_string(),
+        content,
+        cache_breakpoint: false,
+        reasoning: None,
+    };
+
+    // A first user turn carrying blocks: the text is inserted ahead, image kept.
+    let mut system = sys();
+    let mut messages = vec![user(MessageContent::Blocks(vec![ContentBlock::Text {
+        text: "img".to_string(),
+    }]))];
+    fold_system_into_user(&mut system, &mut messages);
+    assert!(system.is_empty());
+    assert_eq!(
+        messages[0].content,
+        MessageContent::Blocks(vec![
+            ContentBlock::Text {
+                text: "PROMPT".to_string()
+            },
+            ContentBlock::Text {
+                text: "img".to_string()
+            },
+        ])
+    );
+
+    // A real text turn is prefixed, not replaced.
+    let mut system = sys();
+    let mut messages = vec![user(MessageContent::Text("hello".to_string()))];
+    fold_system_into_user(&mut system, &mut messages);
+    assert_eq!(messages[0].content.as_text(), "PROMPT\n\nhello");
+
+    // No user turn at all: the folded system becomes one.
+    let mut system = sys();
+    let mut messages: Vec<Message> = vec![];
+    fold_system_into_user(&mut system, &mut messages);
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].role, "user");
+    assert_eq!(messages[0].content.as_text(), "PROMPT");
 }
 
 // ── build_request branch coverage ──
@@ -181,7 +445,7 @@ fn build_request_threads_stage_meta_into_custom_region_render() {
         "brain".to_string(),
         RegionKind::Custom {
             script: "meta.rhai".to_string(),
-            persistent: false,
+            pinned: false,
         },
         1_000,
     ));
@@ -222,6 +486,7 @@ fn build_request_filters_tools_and_uses_config_overrides() {
         batch_tool_hint: false,
         shell_hint: false,
         request_timeout_secs: None,
+        as_text: Vec::new(),
     };
     let si = stage(
         "m",
@@ -291,6 +556,7 @@ fn build_request_passes_through_extra_params() {
         batch_tool_hint: false,
         shell_hint: false,
         request_timeout_secs: None,
+        as_text: Vec::new(),
     };
     let si = stage("m", vec![], None);
     let req = build_request(
@@ -325,6 +591,7 @@ fn build_request_prepends_batch_hint_when_enabled() {
         batch_tool_hint: true,
         shell_hint: false,
         request_timeout_secs: None,
+        as_text: Vec::new(),
     };
     let si = stage("m", vec![], None);
     let req = build_request(
@@ -362,6 +629,7 @@ fn build_request_omits_batch_hint_when_disabled_or_absent() {
         batch_tool_hint: false,
         shell_hint: false,
         request_timeout_secs: None,
+        as_text: Vec::new(),
     };
     let req = build_request(
         &window_with_sys(),
@@ -400,6 +668,7 @@ fn hint_config(batch_tool_hint: bool, shell_hint: bool) -> InferenceConfig {
         batch_tool_hint,
         shell_hint,
         request_timeout_secs: None,
+        as_text: Vec::new(),
     }
 }
 
@@ -536,6 +805,7 @@ async fn cfg_provider_metadata_is_exercised() {
     let p = Cfg {
         supports_temperature: true,
         max_output: 1,
+        supports_tools: true,
     };
     assert_eq!(p.name(), "cfg");
     assert_eq!(p.count_tokens("t", "m").await, 1);
@@ -619,6 +889,188 @@ async fn dispatch_uses_the_configured_retry_schedule() {
     assert!(world.get::<AwaitingInference>(e).is_some());
     let outcome = rx.recv().await.expect("outcome");
     assert!(outcome.result.is_ok());
+}
+
+/// A dispatched job journals its attempt, carrying the run, the stage and the
+/// name the run calls the provider by - none of which the retry loop knows on
+/// its own, which is why the dispatch system hands them over with the request.
+///
+/// A world with no persistence lane journals nothing and dispatches exactly as
+/// it always did, which every other test in this section exercises.
+#[tokio::test]
+async fn a_dispatched_call_journals_the_attempt_it_makes() {
+    let (mut world, mut rx) = build_world(InferencePools::new(InferencePoolConfig::new()));
+    let (lane, mut journal) = mpsc::unbounded_channel();
+    world.insert_resource(crate::pipeline::PersistenceStage(lane.clone()));
+    world.spawn((
+        agent_state(),
+        window(),
+        stage("m", vec![tool("read_file")], None),
+        ReadyToInfer,
+    ));
+
+    run(&mut world);
+    assert!(rx.recv().await.expect("outcome").result.is_ok());
+
+    // One lane carries every kind of record the run makes - a usage record lands
+    // on this one from the response system, a context change from the window - so
+    // reading the attempts back has to skip the rest rather than trip over it.
+    lane.send(crate::persistence_bridge::PersistMsg::Append {
+        run_id: "r".to_string(),
+        record: Box::new(leviath_core::run_archive::RunRecord::Message {
+            message: leviath_core::run_archive::MessageRecord {
+                role: "user".to_string(),
+                content: "not an attempt".to_string(),
+            },
+            at: 0,
+        }),
+        ack: None,
+    })
+    .expect("the journal is still open");
+
+    // The attempt record is appended before the outcome is reported, so the
+    // outcome arriving means the append has already been sent.
+    let records = crate::inference_bridge::journaled_attempts(&mut journal);
+    assert_eq!(records.len(), 1, "{records:?}");
+    let record = &records[0];
+    assert_eq!(record.attempt, 1);
+    assert_eq!(record.stage, "s");
+    assert_eq!(record.provider, "cfg");
+    assert_eq!(record.model, "m");
+    assert_eq!(
+        record.outcome,
+        leviath_core::run_archive::AttemptOutcome::Succeeded
+    );
+    // The digest is what the request was, counted rather than copied: one tool
+    // was advertised and the stage's own budget was asked for.
+    assert_eq!(record.digest.tools, 1);
+    assert!(record.digest.max_tokens > 0, "{:?}", record.digest);
+
+    // Nobody asked for this run's prompts, so the body is absent - and the rest
+    // of the model input is there anyway, because the parameters, the tool set
+    // and the assembly version cost nothing to record and answer questions the
+    // digest cannot. The window fingerprint is the one field capture pays for.
+    let input = record.model_input.as_ref().expect("a model input");
+    assert_eq!(
+        input.capture_status,
+        leviath_core::run_archive::CaptureStatus::NotCaptured
+    );
+    assert!(input.request.is_none(), "{input:?}");
+    assert_eq!(input.bytes, 0);
+    assert_eq!(input.source_context_digest, "");
+    assert!(
+        input.parameters.contains_key("max_output_tokens"),
+        "{input:?}"
+    );
+    assert!(!input.tool_catalog_version.is_empty());
+    assert_eq!(
+        input.assembly_version,
+        crate::pipeline::MODEL_INPUT_ASSEMBLY_VERSION
+    );
+}
+
+/// A run the operator asked to capture writes the request itself, and says which
+/// window it came from.
+///
+/// The marker is the whole switch: the same world without it is the test above,
+/// and every difference between the two records is what turning capture on buys.
+#[tokio::test]
+async fn a_captured_run_journals_the_request_it_sent_and_the_window_it_came_from() {
+    let (mut world, mut rx) = build_world(InferencePools::new(InferencePoolConfig::new()));
+    let (lane, mut journal) = mpsc::unbounded_channel();
+    world.insert_resource(crate::pipeline::PersistenceStage(lane));
+    world.spawn((
+        agent_state(),
+        window(),
+        stage("m", vec![tool("read_file")], None),
+        ReadyToInfer,
+        crate::pipeline::CaptureModelInput,
+    ));
+
+    run(&mut world);
+    assert!(rx.recv().await.expect("outcome").result.is_ok());
+
+    let records = crate::inference_bridge::journaled_attempts(&mut journal);
+    assert_eq!(records.len(), 1, "{records:?}");
+    let input = records[0].model_input.as_ref().expect("a model input");
+    assert_eq!(
+        input.capture_status,
+        leviath_core::run_archive::CaptureStatus::Retained
+    );
+    let body = input.request.as_ref().expect("a retained body");
+    // The request Leviath assembled, field for field: the model it named and the
+    // conversation it carried are both readable, which is the point.
+    assert_eq!(body["model"], "m");
+    assert!(body["messages"].is_array(), "{body}");
+    assert_eq!(input.bytes, body.to_string().len() as u64);
+    // The window this came from, folded from the same digest the snapshot lane
+    // computes, and stable for a window that has not moved.
+    assert_eq!(
+        input.source_context_digest,
+        crate::pipeline::source_context_digest(&window(), "s")
+    );
+}
+
+/// The tool catalogue identifier answers one question: were these two attempts
+/// offered the same tools?
+#[test]
+fn a_tool_set_identifies_itself_by_what_is_in_it_and_in_what_order() {
+    let read = tool("read_file");
+    let write = tool("write_file");
+    let one = crate::pipeline::tool_catalog_version(&[read.clone(), write.clone()]);
+    assert_eq!(
+        one,
+        crate::pipeline::tool_catalog_version(&[read.clone(), write.clone()])
+    );
+    assert_ne!(
+        one,
+        crate::pipeline::tool_catalog_version(&[write, read.clone()])
+    );
+    assert_ne!(one, crate::pipeline::tool_catalog_version(&[read]));
+    // A description or a schema is part of what the model was offered, so a tool
+    // that kept its name and changed either is a different catalogue.
+    let mut described = tool("read_file");
+    described.description = "reads a file".to_string();
+    assert_ne!(
+        crate::pipeline::tool_catalog_version(&[tool("read_file")]),
+        crate::pipeline::tool_catalog_version(&[described])
+    );
+    let mut schema = tool("read_file");
+    schema.parameters = serde_json::json!({ "type": "object" });
+    assert_ne!(
+        crate::pipeline::tool_catalog_version(&[tool("read_file")]),
+        crate::pipeline::tool_catalog_version(&[schema])
+    );
+}
+
+/// The parameters recorded are the request's own, not the stage's declaration.
+#[test]
+fn the_effective_parameters_are_read_off_the_request_that_was_built() {
+    let bare = leviath_providers::InferenceRequest {
+        system: Vec::new(),
+        messages: Vec::new(),
+        model: "m".to_string(),
+        max_tokens: 512,
+        temperature: 0.0,
+        tools: Vec::new(),
+        extra: serde_json::Value::Null,
+        request_timeout_secs: None,
+    };
+    let table = crate::pipeline::effective_parameters(&bare);
+    assert_eq!(table["temperature"], serde_json::json!(0.0));
+    assert_eq!(table["max_output_tokens"], serde_json::json!(512));
+    assert_eq!(table.len(), 2, "{table:?}");
+
+    // A stage's pass-through parameters and its per-call deadline are flattened
+    // in beside them, because both went out on the request.
+    let full = leviath_providers::InferenceRequest {
+        extra: serde_json::json!({ "top_p": 0.9 }),
+        request_timeout_secs: Some(90),
+        ..bare
+    };
+    let table = crate::pipeline::effective_parameters(&full);
+    assert_eq!(table["top_p"], serde_json::json!(0.9));
+    assert_eq!(table["request_timeout_secs"], serde_json::json!(90));
 }
 
 #[tokio::test]
@@ -838,6 +1290,7 @@ async fn a_panicking_inference_job_reports_an_error_instead_of_vanishing() {
 fn agent_state() -> AgentState {
     AgentState {
         agent_id: "a".to_string(),
+        current_visit: String::new(),
         current_stage: "s".to_string(),
         iteration: 0,
         status: AgentStatus::Active,
@@ -849,6 +1302,7 @@ fn agent_state() -> AgentState {
 
 fn resp(text: &str) -> leviath_providers::InferenceResponse {
     leviath_providers::InferenceResponse {
+        parts: Vec::new(),
         content: text.to_string(),
         tool_calls: vec![],
         tokens_used: leviath_providers::TokenUsage {
@@ -891,6 +1345,7 @@ fn collect_applies_ok_and_advances_to_process_response() {
     tx.send(InferenceOutcome {
         latency: std::time::Duration::ZERO,
         entity: e,
+        attempt_id: String::new(),
         result: Ok(response),
         pricing: None,
     })
@@ -923,6 +1378,7 @@ fn collect_holds_a_success_that_lands_on_a_paused_agent() {
     tx.send(InferenceOutcome {
         latency: std::time::Duration::ZERO,
         entity: e,
+        attempt_id: String::new(),
         result: Ok(resp("hi")),
         pricing: None,
     })
@@ -970,6 +1426,7 @@ fn collect_holds_a_failure_that_lands_on_a_paused_agent() {
     tx.send(InferenceOutcome {
         latency: std::time::Duration::ZERO,
         entity: e,
+        attempt_id: String::new(),
         result: Err(leviath_providers::ProviderError::RequestFailed(
             "reading response body: error decoding response body".to_string(),
         )),
@@ -996,6 +1453,71 @@ fn collect_holds_a_failure_that_lands_on_a_paused_agent() {
 /// A provider that never answered says nothing about the run, so ending it
 /// throws away completed work for a condition that is usually over in seconds.
 #[test]
+fn collect_choice_parks_without_a_stage_log_to_write_to() {
+    let (mut world, tx) = world_with_transition_results();
+    let bp = blueprint(vec![
+        stage_named("a", None, false, None),
+        stage_named("b", None, false, None),
+    ]);
+    let e = spawn_responding_agent(
+        &mut world,
+        bp,
+        vec![si("m0"), si("m1")],
+        vec![plain_edge("b")],
+    );
+    tx.send(InferenceOutcome {
+        latency: std::time::Duration::ZERO,
+        entity: e,
+        attempt_id: String::new(),
+        result: Err(leviath_providers::ProviderError::labelled(
+            leviath_providers::FailureKind::ConnectionRefused,
+            "sending the request",
+            "refused",
+        )),
+        pricing: None,
+    })
+    .unwrap();
+    run_collect_transition(&mut world);
+    let parked = world
+        .get::<crate::pipeline::PausedForSetup>(e)
+        .expect("parked");
+    assert_eq!(
+        parked.blocker,
+        leviath_core::run_meta::SetupBlocker::ProviderUnreachable
+    );
+}
+
+#[test]
+fn setup_park_says_which_way_a_call_with_no_answer_went() {
+    use leviath_core::run_meta::SetupBlocker;
+    use leviath_providers::{FailureKind, ProviderError};
+    let park = |kind| {
+        crate::pipeline::park::setup_park(
+            &ProviderError::labelled(kind, "reading the response stream", "cut off"),
+            "p",
+        )
+        .expect("parks")
+    };
+    let (blocker, remedy) = park(FailureKind::ConnectionDropped);
+    assert_eq!(blocker, SetupBlocker::ProviderFailed);
+    assert!(remedy.starts_with("'p' failed while answering"), "{remedy}");
+    assert!(remedy.contains("cut off"), "{remedy}");
+    assert_eq!(
+        park(FailureKind::ServerError).0,
+        SetupBlocker::ProviderFailed
+    );
+    assert_eq!(park(FailureKind::Timeout).0, SetupBlocker::ProviderTimedOut);
+    let (blocker, remedy) = park(FailureKind::ConnectionRefused);
+    assert_eq!(blocker, SetupBlocker::ProviderUnreachable);
+    assert!(remedy.starts_with("could not reach 'p'"), "{remedy}");
+    // A refusal by rule is not the provider's failure and never parks.
+    assert!(
+        crate::pipeline::park::setup_park(&ProviderError::RetentionRefused("no".into()), "p")
+            .is_none()
+    );
+}
+
+#[test]
 fn collect_parks_a_run_whose_provider_is_unreachable() {
     let (mut world, tx) = world_with_results();
     let e = world
@@ -1004,6 +1526,7 @@ fn collect_parks_a_run_whose_provider_is_unreachable() {
     tx.send(InferenceOutcome {
         latency: std::time::Duration::ZERO,
         entity: e,
+        attempt_id: String::new(),
         result: Err(leviath_providers::ProviderError::RequestFailed(
             "reading response body: error decoding response body".to_string(),
         )),
@@ -1021,9 +1544,10 @@ fn collect_parks_a_run_whose_provider_is_unreachable() {
     let parked = world
         .get::<crate::pipeline::PausedForSetup>(e)
         .expect("it parks with a remedy a person can act on");
+    // An unlabelled transport failure is taken as never reaching the provider.
     assert_eq!(
         parked.blocker,
-        leviath_core::run_meta::SetupBlocker::ProvidersUnavailable
+        leviath_core::run_meta::SetupBlocker::ProviderUnreachable
     );
     assert!(
         parked.remedy.contains("lev resume"),
@@ -1063,6 +1587,7 @@ fn a_run_with_no_stage_log_still_parks_on_an_unreachable_provider() {
     tx.send(InferenceOutcome {
         latency: std::time::Duration::ZERO,
         entity: e,
+        attempt_id: String::new(),
         result: Err(leviath_providers::ProviderError::RequestFailed(
             "reading response body: error decoding response body".to_string(),
         )),
@@ -1086,6 +1611,7 @@ fn collect_marks_error_on_failure() {
     tx.send(InferenceOutcome {
         latency: std::time::Duration::ZERO,
         entity: e,
+        attempt_id: String::new(),
         result: Err(leviath_providers::ProviderError::Other("boom".to_string())),
         pricing: None,
     })
@@ -1143,6 +1669,7 @@ fn an_unusable_provider_fails_over_instead_of_killing_the_run() {
     tx.send(InferenceOutcome {
         latency: std::time::Duration::ZERO,
         entity: e,
+        attempt_id: String::new(),
         result: Err(credits_exhausted()),
         pricing: None,
     })
@@ -1183,6 +1710,7 @@ fn failover_is_recorded_in_the_stage_log() {
     tx.send(InferenceOutcome {
         latency: std::time::Duration::ZERO,
         entity: e,
+        attempt_id: String::new(),
         result: Err(credits_exhausted()),
         pricing: None,
     })
@@ -1198,6 +1726,91 @@ fn failover_is_recorded_in_the_stage_log() {
         .expect("the swap is written to the stage log");
     assert!(line.contains("dead/model-a"), "{line}");
     assert!(line.contains("alive/model-b"), "{line}");
+}
+
+/// The move to another provider is journaled, so a reader of the attempts can
+/// see who decided the run changed model. Without it the attempts simply name a
+/// different provider from one record to the next, which reads as a run that was
+/// always configured that way.
+#[test]
+fn a_failover_is_journaled_with_the_provider_it_left_and_the_one_it_took() {
+    let (mut world, tx) = world_with_results();
+    let (lane, mut journal) = mpsc::unbounded_channel();
+    world.insert_resource(crate::pipeline::PersistenceStage(lane));
+    let e = world
+        .spawn((agent_state(), AwaitingInference, stage_with_fallback()))
+        .id();
+    tx.send(InferenceOutcome {
+        latency: std::time::Duration::ZERO,
+        entity: e,
+        // Reached, and classified, so the record carries a kind as well as a
+        // reason: a run that failed over because the socket went quiet is not
+        // the same story as one whose account ran out of credits.
+        attempt_id: String::new(),
+        result: Err(leviath_providers::ProviderError::RequestFailed(
+            "[timeout] the provider went quiet".to_string(),
+        )),
+        pricing: None,
+    })
+    .unwrap();
+
+    run_collect(&mut world);
+
+    let mut records = Vec::new();
+    while let Ok(msg) = journal.try_recv() {
+        if let crate::persistence_bridge::PersistMsg::Append { record, .. } = msg
+            && let leviath_core::run_archive::RunRecord::InferenceFailover(failover) = *record
+        {
+            records.push(failover);
+        }
+    }
+    assert_eq!(records.len(), 1, "{records:?}");
+    let record = &records[0];
+    assert_eq!(record.stage, "s");
+    assert_eq!(record.from_provider, "dead");
+    assert_eq!(record.from_model, "model-a");
+    assert_eq!(record.to_provider, "alive");
+    assert_eq!(record.to_model, "model-b");
+    assert_eq!(record.reason, "unreachable");
+    assert_eq!(record.kind, "timeout");
+    // The agent never had a turn, so the iteration the record names is the one
+    // the failed call was made under.
+    assert_eq!(record.iteration, 0);
+}
+
+/// And a failure the provider classified not at all still journals the move:
+/// the reason is always there, the kind is empty, and neither absence is allowed
+/// to cost the record.
+#[test]
+fn a_failover_on_an_unclassified_failure_journals_an_empty_kind() {
+    let (mut world, tx) = world_with_results();
+    let (lane, mut journal) = mpsc::unbounded_channel();
+    world.insert_resource(crate::pipeline::PersistenceStage(lane));
+    let e = world
+        .spawn((agent_state(), AwaitingInference, stage_with_fallback()))
+        .id();
+    tx.send(InferenceOutcome {
+        latency: std::time::Duration::ZERO,
+        entity: e,
+        attempt_id: String::new(),
+        result: Err(credits_exhausted()),
+        pricing: None,
+    })
+    .unwrap();
+
+    run_collect(&mut world);
+
+    let mut records = Vec::new();
+    while let Ok(msg) = journal.try_recv() {
+        if let crate::persistence_bridge::PersistMsg::Append { record, .. } = msg
+            && let leviath_core::run_archive::RunRecord::InferenceFailover(failover) = *record
+        {
+            records.push(failover);
+        }
+    }
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].reason, "credits-exhausted");
+    assert_eq!(records[0].kind, "");
 }
 
 #[test]
@@ -1219,6 +1832,7 @@ fn an_exhausted_fallback_list_pauses_on_credits_instead_of_dying() {
     tx.send(InferenceOutcome {
         latency: std::time::Duration::ZERO,
         entity: e,
+        attempt_id: String::new(),
         result: Err(credits_exhausted()),
         pricing: None,
     })
@@ -1274,6 +1888,7 @@ fn an_unattended_run_out_of_credits_parks_instead_of_losing_its_work() {
     tx.send(InferenceOutcome {
         latency: std::time::Duration::ZERO,
         entity: e,
+        attempt_id: String::new(),
         result: Err(credits_exhausted()),
         pricing: None,
     })
@@ -1312,6 +1927,7 @@ fn a_credits_pause_records_the_remedy_on_the_run() {
     tx.send(InferenceOutcome {
         latency: std::time::Duration::ZERO,
         entity: e,
+        attempt_id: String::new(),
         result: Err(credits_exhausted()),
         pricing: None,
     })
@@ -1341,6 +1957,7 @@ fn the_credits_pause_copes_without_a_stage_log_buffer() {
     tx.send(InferenceOutcome {
         latency: std::time::Duration::ZERO,
         entity: e,
+        attempt_id: String::new(),
         result: Err(credits_exhausted()),
         pricing: None,
     })
@@ -1367,6 +1984,7 @@ fn an_exhausted_fallback_list_still_terminates_on_a_dead_key() {
     tx.send(InferenceOutcome {
         latency: std::time::Duration::ZERO,
         entity: e,
+        attempt_id: String::new(),
         result: Err(leviath_providers::ProviderError::Unavailable {
             reason: leviath_providers::UnavailableReason::AuthFailed,
             detail: "HTTP 401 Unauthorized".to_string(),
@@ -1396,6 +2014,7 @@ fn an_ordinary_error_does_not_burn_a_fallback() {
     tx.send(InferenceOutcome {
         latency: std::time::Duration::ZERO,
         entity: e,
+        attempt_id: String::new(),
         result: Err(leviath_providers::ProviderError::ApiError(
             "HTTP 400: bad request".to_string(),
         )),
@@ -1431,6 +2050,7 @@ fn provider_fatal_failures_trip_the_breaker_and_a_success_clears_it() {
         tx.send(InferenceOutcome {
             latency: std::time::Duration::ZERO,
             entity: e,
+            attempt_id: String::new(),
             result: Err(credits_exhausted()),
             pricing: None,
         })
@@ -1451,6 +2071,7 @@ fn provider_fatal_failures_trip_the_breaker_and_a_success_clears_it() {
     tx.send(InferenceOutcome {
         latency: std::time::Duration::ZERO,
         entity: e,
+        attempt_id: String::new(),
         result: Ok(resp("hi")),
         pricing: None,
     })
@@ -1497,6 +2118,7 @@ fn a_success_between_failures_clears_the_count_end_to_end() {
         tx.send(InferenceOutcome {
             latency: std::time::Duration::ZERO,
             entity: e,
+            attempt_id: String::new(),
             result,
             pricing: None,
         })
@@ -1559,6 +2181,7 @@ fn a_slow_provider_keeps_its_place_where_a_refused_one_loses_it() {
             tx.send(InferenceOutcome {
                 latency: std::time::Duration::ZERO,
                 entity: e,
+                attempt_id: String::new(),
                 result: Err(fail_with(label)),
                 pricing: None,
             })
@@ -1602,6 +2225,7 @@ fn an_ordinary_error_does_not_count_against_the_provider() {
     tx.send(InferenceOutcome {
         latency: std::time::Duration::ZERO,
         entity: e,
+        attempt_id: String::new(),
         result: Err(leviath_providers::ProviderError::ApiError(
             "HTTP 400: bad request".to_string(),
         )),
@@ -1629,6 +2253,7 @@ fn collect_works_without_the_breaker_installed() {
     tx.send(InferenceOutcome {
         latency: std::time::Duration::ZERO,
         entity: e,
+        attempt_id: String::new(),
         result: Err(credits_exhausted()),
         pricing: None,
     })
@@ -1653,6 +2278,7 @@ fn an_unusable_provider_without_a_stage_component_still_terminates() {
     tx.send(InferenceOutcome {
         latency: std::time::Duration::ZERO,
         entity: e,
+        attempt_id: String::new(),
         result: Err(leviath_providers::ProviderError::Unavailable {
             reason: leviath_providers::UnavailableReason::AuthFailed,
             detail: "HTTP 401 Unauthorized".to_string(),
@@ -1866,6 +2492,60 @@ fn reconcile_stage_ledger_completes_current_stage_on_run_complete() {
     assert_eq!(led.0[0].ended_at, Some(50));
 }
 
+/// A produced part the run cannot keep leaves its note in the stage log, after
+/// the token line, so the log says why a stage has nothing to hand back.
+#[test]
+fn collect_inference_logs_a_produced_part_the_run_dropped() {
+    let (mut world, tx) = world_with_results();
+    let mut state = agent_state();
+    state.current_stage = "impl".to_string();
+    let e = world
+        .spawn((
+            state,
+            AwaitingInference,
+            StageCursor { index: 1 },
+            ledger2(),
+            StageIoBuffer::default(),
+        ))
+        .id();
+    let mut response = resp("");
+    response.tokens_used.prompt_tokens = 5;
+    response.tokens_used.completion_tokens = 3;
+    // This world has no blob store, so the part cannot be kept.
+    response.parts = vec![leviath_core::mime::Blob {
+        mime_type: leviath_core::mime::MimeType::parse("image/png").unwrap(),
+        bytes: vec![0; 12],
+        name: Some("hero.png".to_string()),
+    }];
+    tx.send(InferenceOutcome {
+        latency: std::time::Duration::ZERO,
+        entity: e,
+        attempt_id: String::new(),
+        result: Ok(response),
+        pricing: None,
+    })
+    .unwrap();
+
+    run_collect(&mut world);
+
+    let buf = world.get::<StageIoBuffer>(e).unwrap();
+    assert!(
+        buf.output.is_empty(),
+        "an empty reply is not buffered as output"
+    );
+    assert_eq!(
+        buf.logs,
+        vec![
+            (1, "[Tokens: 5 in, 3 out]".to_string()),
+            (
+                1,
+                "[mime] model output dropped: image/png of 12 B, this run has no blob store"
+                    .to_string()
+            ),
+        ]
+    );
+}
+
 #[test]
 fn collect_inference_buffers_output_token_line_and_stage_tokens() {
     let (mut world, tx) = world_with_results();
@@ -1889,6 +2569,7 @@ fn collect_inference_buffers_output_token_line_and_stage_tokens() {
     tx.send(InferenceOutcome {
         latency: std::time::Duration::ZERO,
         entity: e,
+        attempt_id: String::new(),
         result: Ok(response),
         pricing: None,
     })
@@ -2036,17 +2717,124 @@ async fn dispatch_records_what_it_believed_the_request_would_cost() {
     );
 }
 
+/// Only the parts the model takes as bytes count, at their real cost over the
+/// stand-in the window charged. One the model does not take, one sent as
+/// text, and one the stage marks `as_text` all cost the window what it
+/// already charged, and a plain text message is not a part at all.
+#[test]
+fn native_media_tokens_counts_only_the_bytes_the_model_takes() {
+    use leviath_core::mime::{BlobRef, Delivery, MimeType};
+    use leviath_providers::{ContentBlock, InferenceRequest, Message, MessageContent};
+    let blob = |mime: &str, tokens: usize| BlobRef {
+        sha256: "a".repeat(64),
+        mime_type: MimeType::parse(mime).unwrap(),
+        size: 10,
+        width: None,
+        height: None,
+        duration_ms: None,
+        tokens,
+        stand_in: "[x] a".to_string(),
+    };
+    let mime_block = |mime: &str, tokens: usize, deliver: Option<Delivery>| ContentBlock::Mime {
+        part: blob(mime, tokens),
+        data: String::new(),
+        name: None,
+        deliver,
+        remote: None,
+    };
+    let request = InferenceRequest {
+        system: Vec::new(),
+        messages: vec![
+            Message {
+                role: "user".into(),
+                content: MessageContent::Text("hi".into()),
+                cache_breakpoint: false,
+                reasoning: None,
+            },
+            Message {
+                role: "user".into(),
+                content: MessageContent::Blocks(vec![
+                    ContentBlock::Text {
+                        text: "look".into(),
+                    },
+                    mime_block("image/png", 1_500, None),
+                    mime_block("model/gltf-binary", 9_000, None),
+                    mime_block("image/png", 1_500, Some(Delivery::Text)),
+                    mime_block("audio/wav", 800, None),
+                ]),
+                cache_breakpoint: false,
+                reasoning: None,
+            },
+        ],
+        model: "m".into(),
+        max_tokens: 0,
+        temperature: 0.0,
+        tools: Vec::new(),
+        extra: serde_json::Value::Null,
+        request_timeout_secs: None,
+    };
+    let mime = leviath_providers::capabilities::ModelMime {
+        input: vec!["text/*".into(), "image/*".into(), "audio/*".into()],
+        output: vec!["text/*".into()],
+    };
+    let stand_in = leviath_core::estimate_tokens("[x] a");
+    let counted = super::inference::native_media_tokens(&request, &mime, &["audio/*".to_string()]);
+    assert_eq!(
+        counted,
+        1_500 - stand_in,
+        "one image taken as bytes, nothing else"
+    );
+}
+
+/// The bytes a request sent are billed at their real cost and charged to the
+/// window as stand-ins. That gap belongs to the request, not the estimator:
+/// counted as drift, one stage that showed a model four renders taught the
+/// run a shortfall the size of the window, and the text-only stage after it
+/// had no room left to answer.
+#[test]
+fn collect_does_not_learn_the_cost_of_the_bytes_a_request_sent() {
+    let (mut world, tx) = world_with_results();
+    let e = world
+        .spawn((
+            agent_state(),
+            AwaitingInference,
+            PromptEstimate(1_000, 20_000),
+        ))
+        .id();
+    let mut response = resp("done");
+    response.tokens_used.prompt_tokens = 21_500;
+    tx.send(InferenceOutcome {
+        latency: std::time::Duration::ZERO,
+        entity: e,
+        attempt_id: String::new(),
+        result: Ok(response),
+        pricing: None,
+    })
+    .unwrap();
+
+    run_collect(&mut world);
+
+    let shortfall = world
+        .get::<PromptCalibration>(e)
+        .map_or(0, PromptCalibration::shortfall);
+    assert_eq!(
+        shortfall, 500,
+        "only the text drift is drift; the 20,000 tokens of pictures were known at dispatch"
+    );
+}
+
 #[test]
 fn collect_learns_the_drift_between_what_was_believed_and_what_was_charged() {
     let (mut world, tx) = world_with_results();
     let e = world
-        .spawn((agent_state(), AwaitingInference, PromptEstimate(1_000)))
+        .spawn((agent_state(), AwaitingInference, PromptEstimate(1_000, 0)))
         .id();
     let mut response = resp("done");
     response.tokens_used.prompt_tokens = 1_200;
     tx.send(InferenceOutcome {
         latency: std::time::Duration::ZERO,
         entity: e,
+        attempt_id: String::new(),
         result: Ok(response),
         pricing: None,
     })
@@ -2072,7 +2860,7 @@ fn collect_folds_a_worse_call_into_an_existing_calibration() {
         .spawn((
             agent_state(),
             AwaitingInference,
-            PromptEstimate(1_000),
+            PromptEstimate(1_000, 0),
             existing,
         ))
         .id();
@@ -2081,6 +2869,7 @@ fn collect_folds_a_worse_call_into_an_existing_calibration() {
     tx.send(InferenceOutcome {
         latency: std::time::Duration::ZERO,
         entity: e,
+        attempt_id: String::new(),
         result: Ok(response),
         pricing: None,
     })
@@ -2106,11 +2895,12 @@ fn collect_folds_a_worse_call_into_an_existing_calibration() {
 fn collect_learns_from_a_refused_request_too() {
     let (mut world, tx) = world_with_results();
     let e = world
-        .spawn((agent_state(), AwaitingInference, PromptEstimate(1_000)))
+        .spawn((agent_state(), AwaitingInference, PromptEstimate(1_000, 0)))
         .id();
     tx.send(InferenceOutcome {
         latency: std::time::Duration::ZERO,
         entity: e,
+        attempt_id: String::new(),
         result: Err(leviath_providers::ProviderError::TokenLimitExceeded {
             used: 1_300,
             reply_budget: 100,
@@ -2140,6 +2930,7 @@ fn collect_calibrates_nothing_when_there_was_no_estimate() {
     tx.send(InferenceOutcome {
         latency: std::time::Duration::ZERO,
         entity: e,
+        attempt_id: String::new(),
         result: Ok(response),
         pricing: None,
     })
@@ -2255,6 +3046,7 @@ fn collect_inference_drops_a_response_for_a_cancelled_run() {
     tx.send(InferenceOutcome {
         latency: std::time::Duration::ZERO,
         entity: e,
+        attempt_id: String::new(),
         result: Ok(resp("too late")),
         pricing: None,
     })
@@ -2289,6 +3081,7 @@ fn collect_inference_skips_empty_output_but_logs_tokens() {
     tx.send(InferenceOutcome {
         latency: std::time::Duration::ZERO,
         entity: e,
+        attempt_id: String::new(),
         result: Ok(resp("   ")), // whitespace-only ⇒ no output line
         pricing: None,
     })
@@ -2315,6 +3108,7 @@ fn collect_inference_error_buffers_error_line() {
     tx.send(InferenceOutcome {
         latency: std::time::Duration::ZERO,
         entity: e,
+        attempt_id: String::new(),
         result: Err(leviath_providers::ProviderError::Other("boom".to_string())),
         pricing: None,
     })
@@ -2341,6 +3135,7 @@ fn collect_inference_tolerates_cursor_beyond_ledger() {
     tx.send(InferenceOutcome {
         latency: std::time::Duration::ZERO,
         entity: e,
+        attempt_id: String::new(),
         result: Ok(resp("x")),
         pricing: None,
     })
@@ -2373,7 +3168,7 @@ fn collect_tools_buffers_one_tool_log_line_per_call() {
     tx.send(ToolOutcome {
         elapsed: std::time::Duration::ZERO,
         entity: e,
-        results: vec![("c1".to_string(), "file\nbody".to_string())],
+        results: vec![("c1".to_string(), "file\nbody".into())],
     })
     .unwrap();
 
@@ -2818,6 +3613,7 @@ fn dispatch_persistence_serializes_fan_out_waiting() {
         e,
         crate::fanout::FanOutState {
             origin: crate::fanout::FanOutOrigin::Stage,
+            parts: Vec::new(),
             config: FanOutConfig {
                 worker_agent: None,
                 worker_stage: Some("w".to_string()),
@@ -3169,7 +3965,7 @@ fn dispatch_persistence_persists_taint_audit_when_the_gate_has_events() {
     s.run(&mut world);
     run_dispatch_persistence(&mut world);
 
-    let job = snapshot_job(prx.try_recv().expect("persist job"));
+    let job = next_snapshot(&mut prx);
     let (idx, json) = job.taint_audit.expect("taint audit persisted");
     assert_eq!(idx, 1);
     assert!(json.contains("shell"));
@@ -3201,7 +3997,7 @@ fn dispatch_persistence_taint_audit_is_not_rewritten_when_unchanged() {
     s.add_systems(dispatch_tools);
     s.run(&mut world);
     run_dispatch_persistence(&mut world);
-    let first = snapshot_job(prx.try_recv().expect("first job"));
+    let first = next_snapshot(&mut prx);
     assert!(first.taint_audit.is_some(), "first write carries the audit");
 
     // Force a heartbeat snapshot with no new gate events: the audit rides
@@ -3254,7 +4050,7 @@ fn dispatch_persistence_resends_the_taint_audit_on_the_terminal_snapshot() {
     run_dispatch_persistence(&mut world);
     // This is the snapshot the lane would coalesce away: it carried the audit,
     // and it advanced the watermark past it.
-    let coalesced = snapshot_job(prx.try_recv().expect("first job"));
+    let coalesced = next_snapshot(&mut prx);
     assert!(coalesced.taint_audit.is_some());
 
     // The run finishes with no further gate events.
@@ -3518,6 +4314,171 @@ fn spawn_agent_seeded_errors_when_resolved_per_stage_layout_is_invalid() {
     assert!(err.contains("working tokens"), "{err}");
 }
 
+/// A provider that reports a fixed context window, so a test can register two
+/// stages with different windows and exercise the per-region sizing.
+struct FixedWindow(usize);
+#[async_trait::async_trait]
+impl Provider for FixedWindow {
+    async fn infer(
+        &self,
+        _r: &InferenceRequest,
+    ) -> leviath_providers::Result<leviath_providers::InferenceResponse> {
+        Ok(leviath_providers::InferenceResponse {
+            content: "ok".to_string(),
+            tool_calls: vec![],
+            tokens_used: leviath_providers::TokenUsage {
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                total_tokens: 2,
+                cached_tokens: 0,
+                cache_write_tokens: 0,
+                reported_cost_usd: None,
+            },
+            finish_reason: leviath_providers::FinishReason::Complete,
+            reasoning: None,
+            parts: Vec::new(),
+        })
+    }
+    async fn count_tokens(&self, _t: &str, _m: &str) -> usize {
+        1
+    }
+    fn max_context_tokens(&self, _m: &str) -> usize {
+        self.0
+    }
+    fn name(&self) -> &str {
+        "fixed"
+    }
+    fn capabilities(&self, _m: &str) -> leviath_providers::ModelCapabilities {
+        leviath_providers::ModelCapabilities::default()
+    }
+}
+
+/// Two stages, a wide entry model and a narrow later one, sharing the global
+/// layout. This is the world the two footgun tests below spawn into.
+fn world_with_wide_and_narrow() -> World {
+    let mut world = World::new();
+    let mut reg = ProviderRegistry::new();
+    reg.register("wide".to_string(), Arc::new(FixedWindow(100_000)));
+    reg.register("narrow".to_string(), Arc::new(FixedWindow(20_000)));
+    world.insert_resource(Providers(reg));
+    world
+}
+
+fn pct_region(name: &str, percent: f64) -> leviath_core::layout::RegionDefinition {
+    leviath_core::layout::RegionDefinition::new(name.to_string(), RegionKind::Pinned, 0)
+        .with_budget(leviath_core::BudgetSpec::Percent {
+            percent,
+            min: None,
+            max: None,
+        })
+}
+
+fn wide_then_narrow_stages() -> Vec<ResolvedStage> {
+    vec![
+        ResolvedStage {
+            provider_name: "wide".to_string(),
+            model: "m".to_string(),
+            tools: vec![],
+            fallbacks: Vec::new(),
+            output: None,
+            notes: Vec::new(),
+        },
+        ResolvedStage {
+            provider_name: "narrow".to_string(),
+            model: "m".to_string(),
+            tools: vec![],
+            fallbacks: Vec::new(),
+            output: None,
+            notes: Vec::new(),
+        },
+    ]
+}
+
+#[test]
+fn spawn_sizes_a_region_against_the_smallest_window_that_actually_sees_it() {
+    // The footgun fix. A region only the wide stage reads (the narrow stage
+    // hides it) is sized against the wide window - not shrunk to the narrow
+    // stage that never sees it - and the narrow stage's working-room floor is
+    // judged over just the regions it does see, so the spawn succeeds.
+    let mut world = world_with_wide_and_narrow();
+    let layout = leviath_core::layout::ContextLayout::new(
+        vec![pct_region("big", 0.80), pct_region("small", 0.05)],
+        0,
+    );
+    let mk = |name: &str, provider: &str| {
+        leviath_core::Stage::new(
+            name.to_string(),
+            leviath_core::blueprint::ModelConfig::new(provider.to_string(), "m".to_string()),
+        )
+    };
+    let mut narrow = mk("b", "narrow");
+    // The narrow stage never reads the big region.
+    narrow.context_hide = vec!["big".to_string()];
+    let bp = leviath_core::Blueprint::new(
+        "t".to_string(),
+        "d".to_string(),
+        vec![mk("a", "wide"), narrow],
+        layout,
+    );
+    let e = spawn_agent(
+        &mut world,
+        "run".to_string(),
+        bp,
+        "task",
+        wide_then_narrow_stages(),
+        hints(true),
+    )
+    .expect("the narrow stage does not see the big region, so it fits");
+    let w = world.get::<ContextWindow>(e).expect("window");
+    // big: 80% of the wide window (100k), because only the wide stage sees it.
+    assert_eq!(w.get_region("big").unwrap().max_tokens, 80_000);
+    // small: 5% of the narrow window (20k), the smallest of the two stages that
+    // both see it.
+    assert_eq!(w.get_region("small").unwrap().max_tokens, 1_000);
+}
+
+#[test]
+fn spawn_fails_when_a_shared_region_starves_the_narrow_stage() {
+    // Now the narrow stage also sees a shared region sized at 80%. Against the
+    // narrow window (80% of 20k = 16k) that leaves the narrow stage only 4k
+    // working tokens. A wide-only region keeps the resolved total budget large
+    // enough that the single-window global validate() passes - so it is the
+    // per-stage floor, judged over just the narrow stage's visible regions,
+    // that catches the starvation. This is the branch the single-window check
+    // cannot make.
+    let mut world = world_with_wide_and_narrow();
+    let layout = leviath_core::layout::ContextLayout::new(
+        vec![pct_region("shared", 0.80), pct_region("wideonly", 0.10)],
+        0,
+    );
+    let mk = |name: &str, provider: &str| {
+        leviath_core::Stage::new(
+            name.to_string(),
+            leviath_core::blueprint::ModelConfig::new(provider.to_string(), "m".to_string()),
+        )
+    };
+    let mut narrow = mk("b", "narrow");
+    // The narrow stage never sees the wide-only region, so it does not count
+    // against its floor - only the shared region does.
+    narrow.context_hide = vec!["wideonly".to_string()];
+    let bp = leviath_core::Blueprint::new(
+        "t".to_string(),
+        "d".to_string(),
+        vec![mk("a", "wide"), narrow],
+        layout,
+    );
+    let err = spawn_agent(
+        &mut world,
+        "run".to_string(),
+        bp,
+        "task",
+        wide_then_narrow_stages(),
+        hints(true),
+    )
+    .expect_err("the narrow stage is starved by the shared region");
+    assert!(err.contains("working tokens"), "{err}");
+}
+
 #[test]
 fn collect_drops_outcome_for_non_awaiting_agent() {
     let (mut world, tx) = world_with_results();
@@ -3525,6 +4486,7 @@ fn collect_drops_outcome_for_non_awaiting_agent() {
     tx.send(InferenceOutcome {
         latency: std::time::Duration::ZERO,
         entity: e,
+        attempt_id: String::new(),
         result: Ok(resp("x")),
         pricing: None,
     })
@@ -3559,6 +4521,7 @@ fn collect_inference_accumulates_token_totals() {
     tx.send(InferenceOutcome {
         latency: std::time::Duration::ZERO,
         entity: e,
+        attempt_id: String::new(),
         result: Ok(r),
         pricing: None,
     })
@@ -3588,6 +4551,8 @@ fn infer_result(with_tools: bool) -> (StageInference, crate::components::Inferen
 
 fn infer_result_only(with_tools: bool) -> crate::components::InferenceResult {
     crate::components::InferenceResult {
+        parts: Vec::new(),
+        attempt_id: String::new(),
         response: "r".to_string(),
         tool_calls: if with_tools {
             vec![crate::components::ToolCall {
@@ -3667,6 +4632,7 @@ fn process_response_counts_edits_by_path() {
     let e = world
         .spawn((
             crate::components::InferenceResult {
+                attempt_id: String::new(),
                 response: "r".to_string(),
                 tool_calls: vec![
                     call("edit_file", Some("where.py")),
@@ -3679,6 +4645,7 @@ fn process_response_counts_edits_by_path() {
                 tokens_used: 0,
                 cut_off_at: None,
                 reasoning: None,
+                parts: Vec::new(),
             },
             StageProgress::default(),
             ProcessResponse,
@@ -3764,6 +4731,55 @@ fn empty_response_finishes_when_agent_made_tool_calls() {
     assert!(world.get::<ReadyForTransition>(e).is_none());
 }
 
+/// The reply and the nudge that answers it land in the same region one after
+/// the other, and the journal has to tell them apart: one is what the model
+/// said, the other is what the framework said back. A reader of the history
+/// otherwise sees two entries arrive in `conversation` with no way to know
+/// whose words they were.
+#[test]
+fn a_reply_and_the_nudge_answering_it_record_different_causes() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut window = ctx(&[("conversation", 10_000)]);
+    // Held for the test: a window's handle on the lane is weak, exactly so that
+    // it cannot keep the lane open past the world that owns it.
+    let stage = crate::pipeline::PersistenceStage(tx);
+    window.attach_journal("run-r", Some(&stage));
+    let mut world = World::new();
+    world.spawn((
+        window,
+        infer_result_only(false),
+        StageProgress::default(),
+        nudge_bp(false),
+        StageCursor { index: 0 },
+        ReadyForTransition,
+    ));
+    run_empty(&mut world);
+
+    let mut moved = Vec::new();
+    while let Ok(crate::persistence_bridge::PersistMsg::Append { record, .. }) = rx.try_recv() {
+        if let leviath_core::run_archive::RunRecord::ContextTransaction { regions, cause, .. } =
+            *record
+        {
+            for region in regions {
+                moved.push((region.region, cause));
+            }
+        }
+    }
+    assert_eq!(
+        moved,
+        vec![
+            (
+                "conversation".to_string(),
+                leviath_core::ContextCause::ModelReply
+            ),
+            (
+                "conversation".to_string(),
+                leviath_core::ContextCause::Framework
+            ),
+        ],
+    );
+}
+
 #[test]
 fn empty_response_finishes_after_max_nudges() {
     let mut world = World::new();
@@ -3785,6 +4801,54 @@ fn empty_response_finishes_after_max_nudges() {
         .id();
     run_empty(&mut world);
     assert!(world.get::<ResolveTransition>(e).is_some());
+}
+
+/// A reply that produced a part (a mesh from a 3D generator, an image from a
+/// drawing model) ends the stage even with no text and no tool call: the part
+/// is the answer. Without this a Meshy stage, whose whole output is the GLB it
+/// produced, would be nudged "use your tools" and loop, having no tool to call.
+#[test]
+fn empty_response_accepts_a_reply_that_produced_a_part() {
+    let mut world = World::new();
+    let (offers, mut infer) = infer_result(false);
+    infer.response = String::new();
+    infer.parts = vec![
+        leviath_core::mime::Part::stored(leviath_core::mime::BlobRef {
+            sha256: "c".repeat(64),
+            mime_type: leviath_core::mime::MimeType::parse("model/gltf-binary").unwrap(),
+            size: 4,
+            width: None,
+            height: None,
+            duration_ms: None,
+            tokens: 1,
+            stand_in: "[model/gltf-binary] model.glb".into(),
+        })
+        .named("model.glb"),
+    ];
+    let e = world
+        .spawn((
+            ctx(&[("conversation", 10_000)]),
+            (offers, infer),
+            StageProgress::default(), // no tool calls, no nudges yet
+            nudge_bp(false),          // autonomous, nudge enabled
+            StageCursor { index: 0 },
+            ReadyForTransition,
+        ))
+        .id();
+    run_empty(&mut world);
+    assert!(
+        world.get::<ResolveTransition>(e).is_some(),
+        "a produced part ends the stage"
+    );
+    assert!(
+        world.get::<ReadyToInfer>(e).is_none(),
+        "not sent round again with a nudge"
+    );
+    assert_eq!(
+        world.get::<StageProgress>(e).unwrap().text_only_nudges,
+        0,
+        "and not counted as a nudge"
+    );
 }
 
 /// A stage that presents its output for review is finished when it produces
@@ -3884,6 +4948,157 @@ fn empty_response_respects_a_stage_that_disables_its_nudge() {
     assert_eq!(world.get::<StageProgress>(e).unwrap().text_only_nudges, 0);
     // The reply is kept; no nudge follows it.
     assert_eq!(conversation_text(&world, e), "r");
+}
+
+// ── image stage: text-only when an image was expected ──
+
+/// A one-stage blueprint whose stage produces an image (declared through
+/// `output_routing`), so a text-only reply reads as a likely image-generation
+/// failure.
+fn image_bp() -> AgentBlueprint {
+    let mut stage = stage_named("draw", None, false, None);
+    stage
+        .output_routing
+        .insert("image/*".to_string(), "conversation".to_string());
+    AgentBlueprint(blueprint(vec![stage]))
+}
+
+/// A text-only reply that also carries one produced image part.
+fn infer_with_image() -> crate::components::InferenceResult {
+    let mut ir = infer_result_only(false);
+    ir.parts = vec![leviath_core::mime::Part::inline(
+        leviath_core::mime::MimeType::parse("image/png").unwrap(),
+        "x",
+    )];
+    ir
+}
+
+#[test]
+fn stage_expected_media_reads_format_and_routing() {
+    assert_eq!(stage_expected_media(None), None);
+    let plain = stage_named("a", None, false, None);
+    assert_eq!(stage_expected_media(Some(&plain)), None);
+
+    let mut routed = stage_named("b", None, false, None);
+    routed.output_routing.insert("image/*".into(), "r".into());
+    assert_eq!(stage_expected_media(Some(&routed)), Some("image"));
+
+    let mut fmt_image = stage_named("c", None, false, None);
+    fmt_image.output = Some(leviath_core::output::OutputSpec {
+        format: Some("image/*".into()),
+        ..Default::default()
+    });
+    assert_eq!(stage_expected_media(Some(&fmt_image)), Some("image"));
+
+    let mut fmt_text = stage_named("d", None, false, None);
+    fmt_text.output = Some(leviath_core::output::OutputSpec {
+        format: Some("markdown".into()),
+        ..Default::default()
+    });
+    assert_eq!(stage_expected_media(Some(&fmt_text)), None);
+
+    let mut video = stage_named("e", None, false, None);
+    video
+        .output_routing
+        .insert("video/mp4".into(), "clip".into());
+    assert_eq!(stage_expected_media(Some(&video)), Some("video"));
+    let mut speech = stage_named("f", None, false, None);
+    speech.output = Some(leviath_core::output::OutputSpec {
+        format: Some("audio/mpeg".into()),
+        ..Default::default()
+    });
+    assert_eq!(stage_expected_media(Some(&speech)), Some("audio"));
+}
+
+#[test]
+fn no_media_nudge_quotes_the_reply_names_the_family_and_truncates_a_long_one() {
+    assert!(no_media_nudge("   ", "image").contains("may have failed"));
+    let short = no_media_nudge("I cannot draw that", "image");
+    assert!(short.contains("I cannot draw that"));
+    assert!(short.contains("an image"));
+    assert!(!short.contains("..."));
+    let long = no_media_nudge(&"z".repeat(600), "video");
+    assert!(long.contains("..."), "a long reply is truncated: {long}");
+    assert!(long.contains("a video"));
+    assert!(no_media_nudge("", "audio").contains("produces audio"));
+}
+
+#[test]
+fn image_stage_nudges_when_the_reply_has_no_image() {
+    let mut world = World::new();
+    let e = world
+        .spawn((
+            ctx(&[("conversation", 10_000)]),
+            infer_result(false), // text "r", no image, no tool calls
+            StageProgress::default(),
+            image_bp(),
+            StageCursor { index: 0 },
+            ReadyForTransition,
+        ))
+        .id();
+    run_empty(&mut world);
+    // Sent round again, with the image nudge counted separately from the
+    // ordinary text-only one.
+    assert!(world.get::<ReadyToInfer>(e).is_some());
+    assert!(world.get::<ResolveTransition>(e).is_none());
+    let p = world.get::<StageProgress>(e).unwrap();
+    assert_eq!(p.no_image_nudges, 1);
+    assert_eq!(p.images_produced, 0);
+    assert_eq!(p.text_only_nudges, 0);
+    assert!(conversation_text(&world, e).contains("contained none"));
+}
+
+#[test]
+fn image_stage_does_not_nudge_when_the_reply_has_an_image() {
+    let mut world = World::new();
+    let e = world
+        .spawn((
+            ctx(&[("conversation", 10_000)]),
+            infer_with_image(),
+            StageProgress::default(),
+            image_bp(),
+            StageCursor { index: 0 },
+            ReadyForTransition,
+        ))
+        .id();
+    run_empty(&mut world);
+    let p = world.get::<StageProgress>(e).unwrap();
+    assert_eq!(p.images_produced, 1, "the produced image was counted");
+    assert_eq!(p.no_image_nudges, 0, "so the image guard did not fire");
+}
+
+#[test]
+fn image_stage_lets_go_once_its_image_nudge_budget_is_spent() {
+    // Budget spent and still no image: the guard steps aside so the stage can
+    // end rather than loop. The stage's nudge is off, so the fall-through
+    // resolves rather than nudging on text alone.
+    let mut bp = image_bp();
+    bp.0.stages[0].nudge = Some(leviath_core::NudgeConfig {
+        enabled: Some(false),
+        ..Default::default()
+    });
+    let progress = StageProgress {
+        no_image_nudges: MAX_NO_IMAGE_NUDGES,
+        ..Default::default()
+    };
+    let mut world = World::new();
+    let e = world
+        .spawn((
+            ctx(&[("conversation", 10_000)]),
+            infer_result(false),
+            progress,
+            bp,
+            StageCursor { index: 0 },
+            ReadyForTransition,
+        ))
+        .id();
+    run_empty(&mut world);
+    assert!(world.get::<ResolveTransition>(e).is_some());
+    assert_eq!(
+        world.get::<StageProgress>(e).unwrap().no_image_nudges,
+        MAX_NO_IMAGE_NUDGES,
+        "the guard did not fire again"
+    );
 }
 
 #[test]
@@ -4031,7 +5246,7 @@ impl ToolService for EchoService {
             Box::pin(async move {
                 calls
                     .into_iter()
-                    .map(|c| (c.id, format!("ran {}", c.name)))
+                    .map(|c| (c.id, format!("ran {}", c.name).into()))
                     .collect()
             })
         })
@@ -4162,6 +5377,194 @@ fn stage_inf(tools: &[&str]) -> StageInference {
         fallbacks: Vec::new(),
         output: None,
     }
+}
+
+/// A service whose scan directories are stale as often as it is asked.
+///
+/// The answer is scripted rather than read off a disk, because what the system
+/// owes is "ask, and act only on yes" - whether a `stat` says yes is the
+/// service's business and is tested where the stamping lives.
+struct StaleService {
+    stale: std::sync::atomic::AtomicBool,
+    asked: std::sync::atomic::AtomicUsize,
+}
+
+impl ToolService for StaleService {
+    fn exec_for(
+        &self,
+        _e: Entity,
+        _c: Vec<leviath_providers::ToolCall>,
+        _progress: ToolProgress,
+    ) -> BoxedToolExec {
+        Box::new(|| Box::pin(async { Vec::new() }))
+    }
+    fn refresh_tools(&self, _e: Entity, _idx: usize) -> Option<Vec<Tool>> {
+        Some(vec![Tool {
+            name: "just_written".to_string(),
+            description: String::new(),
+            parameters: serde_json::json!({}),
+        }])
+    }
+    fn scan_stale(&self, _e: Entity) -> bool {
+        self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.stale.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+fn run_rescan(world: &mut World) {
+    let mut schedule = Schedule::default();
+    schedule.add_systems(rescan_before_dispatch);
+    schedule.run(world);
+}
+
+/// A batch about to be dispatched by an agent that asked for a look first sees
+/// the tool that appeared since its turn began.
+///
+/// The advertised set is what dispatch refuses an unoffered call against, so
+/// rewriting it here is the difference between a tool that arrived mid-turn
+/// being callable in this batch and being refused until the next one.
+#[test]
+fn a_stale_scan_is_re_advertised_before_the_batch() {
+    let mut world = World::new();
+    world.insert_resource(ToolServiceRes(Arc::new(StaleService {
+        stale: std::sync::atomic::AtomicBool::new(true),
+        asked: std::sync::atomic::AtomicUsize::new(0),
+    })));
+    let entity = world
+        .spawn((
+            StageCursor { index: 0 },
+            stage_inf(&["old"]),
+            StageInferences(vec![stage_inf(&["old"]), stage_inf(&["other"])]),
+            ReadyForTools,
+            RescanBeforeDispatch,
+        ))
+        .id();
+
+    run_rescan(&mut world);
+
+    let live: Vec<String> = world
+        .get::<StageInference>(entity)
+        .unwrap()
+        .tools
+        .iter()
+        .map(|t| t.name.clone())
+        .collect();
+    assert_eq!(live, vec!["just_written".to_string()]);
+    // The catalog too, or re-entering this stage would silently advertise the
+    // set the run started with.
+    assert_eq!(
+        world.get::<StageInferences>(entity).unwrap().0[0].tools[0].name,
+        "just_written"
+    );
+    assert_eq!(
+        world.get::<StageInferences>(entity).unwrap().0[1].tools[0].name,
+        "other",
+        "another stage is not touched"
+    );
+    // No marker is consumed: the agent looks again before its next batch too.
+    assert!(world.get::<RescanBeforeDispatch>(entity).is_some());
+}
+
+/// Nothing changed on disk, so nothing is re-read - and the ordinary batch pays
+/// one question and no re-scan.
+#[test]
+fn an_unchanged_scan_leaves_the_advertised_set_alone() {
+    let mut world = World::new();
+    let service = Arc::new(StaleService {
+        stale: std::sync::atomic::AtomicBool::new(false),
+        asked: std::sync::atomic::AtomicUsize::new(0),
+    });
+    world.insert_resource(ToolServiceRes(service.clone()));
+    let entity = world
+        .spawn((
+            StageCursor { index: 0 },
+            stage_inf(&["old"]),
+            StageInferences(vec![stage_inf(&["old"])]),
+            ReadyForTools,
+            RescanBeforeDispatch,
+        ))
+        .id();
+
+    run_rescan(&mut world);
+
+    assert_eq!(
+        world.get::<StageInference>(entity).unwrap().tools[0].name,
+        "old"
+    );
+    assert_eq!(service.asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+/// An agent that did not ask for it is never even asked, and neither is one
+/// that asked but is not dispatching this tick.
+#[test]
+fn only_an_agent_that_asked_and_is_dispatching_is_looked_at() {
+    let mut world = World::new();
+    let service = Arc::new(StaleService {
+        stale: std::sync::atomic::AtomicBool::new(true),
+        asked: std::sync::atomic::AtomicUsize::new(0),
+    });
+    world.insert_resource(ToolServiceRes(service.clone()));
+    // Dispatching, but its blueprint never asked.
+    let ordinary = world
+        .spawn((
+            StageCursor { index: 0 },
+            stage_inf(&["old"]),
+            StageInferences(vec![stage_inf(&["old"])]),
+            ReadyForTools,
+        ))
+        .id();
+    // Asked, but between batches.
+    let idle = world
+        .spawn((
+            StageCursor { index: 0 },
+            stage_inf(&["old"]),
+            StageInferences(vec![stage_inf(&["old"])]),
+            RescanBeforeDispatch,
+        ))
+        .id();
+
+    run_rescan(&mut world);
+
+    assert_eq!(
+        service.asked.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "neither agent is a candidate, so the question is never asked"
+    );
+    for entity in [ordinary, idle] {
+        assert_eq!(
+            world.get::<StageInference>(entity).unwrap().tools[0].name,
+            "old"
+        );
+    }
+}
+
+/// A service that does not answer the staleness question turns the mode off
+/// rather than re-scanning every batch.
+///
+/// The default matters for an embedder: a host that drives the runtime with its
+/// own tool service should not start paying for a mode it never implemented,
+/// and a blueprint asking for it should not start behaving as though it had.
+#[test]
+fn a_service_without_a_staleness_check_never_rescans() {
+    let mut world = World::new();
+    world.insert_resource(ToolServiceRes(Arc::new(RefreshService(vec!["new_tool"]))));
+    let entity = world
+        .spawn((
+            StageCursor { index: 0 },
+            stage_inf(&["old"]),
+            StageInferences(vec![stage_inf(&["old"])]),
+            ReadyForTools,
+            RescanBeforeDispatch,
+        ))
+        .id();
+
+    run_rescan(&mut world);
+
+    assert_eq!(
+        world.get::<StageInference>(entity).unwrap().tools[0].name,
+        "old",
+        "the service said nothing changed, so nothing was re-read"
+    );
 }
 
 fn run_refresh(world: &mut World) {
@@ -4341,7 +5744,7 @@ async fn dispatch_tools_enqueues_runnable_job_and_advances() {
     assert_eq!(job.entity, e);
     // Run the produced closure (covers the service's exec path).
     let results = (job.exec)().await;
-    assert_eq!(results, vec![("t".to_string(), "ran n".to_string())]);
+    assert_eq!(results, vec![("t".to_string(), "ran n".into())]);
 }
 
 // ── batch journaling at dispatch ────────
@@ -4361,7 +5764,8 @@ impl ToolService for ReportingService {
                 calls
                     .into_iter()
                     .map(|c| {
-                        let r = format!("ran {}", c.name);
+                        let r: leviath_core::region::EntryContent =
+                            format!("ran {}", c.name).into();
                         progress(&c.id, &r);
                         (c.id, r)
                     })
@@ -4377,7 +5781,7 @@ fn append_msg(
 ) -> (
     String,
     leviath_core::run_archive::RunRecord,
-    Option<tokio::sync::oneshot::Sender<()>>,
+    Option<tokio::sync::oneshot::Sender<crate::persistence_bridge::Appended>>,
 ) {
     match msg {
         PersistMsg::Append {
@@ -4443,14 +5847,16 @@ async fn dispatch_journals_the_batch_then_each_completion() {
     assert_eq!(calls[1].result, None, "lane call pending");
     // Ack the record (standing in for the persistence worker) so the barrier
     // releases immediately instead of timing out.
-    ack.expect("dispatch requests an ack").send(()).unwrap();
+    ack.expect("dispatch requests an ack")
+        .send(crate::persistence_bridge::Appended::Landed { position: 128 })
+        .unwrap();
 
     // Running the batch reports the lane call's completion as a ToolCallDone.
     let job = jrx.try_recv().expect("lane job enqueued");
     let results = (job.exec)().await;
     assert_eq!(
         results,
-        vec![("c_lane".to_string(), "ran read_file".to_string())]
+        vec![("c_lane".to_string(), "ran read_file".into())]
     );
     let (_, record, ack) = append_msg(prx.try_recv().expect("completion journaled"));
     assert!(ack.is_none(), "per-call appends are fire-and-forget");
@@ -4468,22 +5874,150 @@ async fn dispatch_journals_the_batch_then_each_completion() {
     assert_eq!(result, "ran read_file");
 }
 
+/// The files a submission produced are journaled against the execution that
+/// produced them, one record per execution.
+///
+/// `output.json` keeps only the latest answer's files and says nothing about
+/// which call made any of them, so a submission a later one replaces leaves no
+/// trace there. This record is what keeps it attributable.
+#[test]
+fn produced_files_are_journaled_against_the_call_that_made_them() {
+    let (ptx, mut prx) = mpsc::unbounded_channel();
+    let stage = PersistenceStage(ptx);
+    let made = |name: &str| leviath_core::output::Artifact {
+        name: name.to_string(),
+        path: format!("out/{name}"),
+        mime_type: leviath_core::mime::MimeType::parse("text/plain").expect("a type"),
+        size: 12,
+        sha256: "abc".to_string(),
+    };
+    super::tools::journal_artifacts(
+        &stage,
+        "run-a",
+        &[
+            ("x-one".to_string(), vec![made("report"), made("chart")]),
+            ("x-two".to_string(), vec![made("revision")]),
+        ],
+    );
+
+    let mut produced = Vec::new();
+    while let Ok(PersistMsg::Append { run_id, record, .. }) = prx.try_recv() {
+        assert_eq!(run_id, "run-a");
+        if let leviath_core::run_archive::RunRecord::ArtifactsProduced {
+            execution_id,
+            artifacts,
+            ..
+        } = *record
+        {
+            produced.push((
+                execution_id,
+                artifacts.iter().map(|a| a.name.clone()).collect::<Vec<_>>(),
+            ));
+        }
+    }
+    assert_eq!(
+        produced,
+        vec![
+            (
+                "x-one".to_string(),
+                vec!["report".to_string(), "chart".to_string()]
+            ),
+            ("x-two".to_string(), vec!["revision".to_string()]),
+        ]
+    );
+    // Nothing produced is nothing written: a run whose answer named no file has
+    // no artifact records rather than an empty one.
+    super::tools::journal_artifacts(&stage, "run-a", &[]);
+    assert!(prx.try_recv().is_err());
+}
+
+/// A dispatched batch records the stay it belongs to, the trip to the provider
+/// whose answer asked for it, and the execution that committed each context
+/// change.
+///
+/// None of the three is recoverable afterwards. A stage entered three times has
+/// one index; the attempt number restarts at every call and a failover means the
+/// answer came from a provider the previous attempt did not go to; and nothing in
+/// a change record says which call made it unless the dispatcher writes it down.
 #[tokio::test]
-async fn dispatch_all_inline_batch_is_not_journaled() {
-    // A batch the dispatcher fully resolves inline never reaches the lane; its
-    // results land in the window, which the snapshot path persists - a batch
-    // record would be pure noise.
-    //
-    // Deliberate, and worth stating why, because it looks like an omission:
-    // `restore_pending_batch` replays a journaled batch by landing its recorded
-    // results in the conversation, and it does *not* re-apply a context tool's
-    // write. Journaling this batch would mean a crash between the append and
-    // the next snapshot restores a turn saying `context_write: ok` over a
-    // region that never got the content - a silent divergence far worse than
-    // the missing record. Unjournaled, the batch is simply re-issued.
-    //
-    // The observability half of that gap is closed by the `[tool]` lines the
-    // test below asserts, which carry no recovery meaning at all.
+async fn a_dispatched_batch_records_what_it_belongs_to() {
+    let (jtx, _jrx) = mpsc::unbounded_channel();
+    let (ptx, mut prx) = mpsc::unbounded_channel();
+    let mut world = World::new();
+    world.insert_resource(ToolServiceRes(Arc::new(EchoService)));
+    world.insert_resource(ToolStage::detached(jtx));
+    world.insert_resource(PersistenceStage(ptx.clone()));
+    let stage = PersistenceStage(ptx);
+    let mut state = agent_state();
+    state.current_visit = "v-second-stay".to_string();
+    let (offers, mut result) = infer_with(vec![ctx_call("c1", "notes", "hi")]);
+    result.attempt_id = "a-the-one-that-answered".to_string();
+    let mut window = notes_window();
+    window.attach_journal("run-c", Some(&stage));
+    world.spawn((
+        state,
+        offers,
+        result,
+        window,
+        StageCursor { index: 0 },
+        run_metadata(),
+        ReadyForTools,
+    ));
+    let mut s = Schedule::default();
+    s.add_systems(dispatch_tools);
+    s.run(&mut world);
+
+    let mut batch = None;
+    let mut committed = Vec::new();
+    while let Ok(PersistMsg::Append { record, .. }) = prx.try_recv() {
+        match *record {
+            leviath_core::run_archive::RunRecord::ToolBatch {
+                calls,
+                visit_id,
+                requested_by,
+                ..
+            } => batch = Some((calls, visit_id, requested_by)),
+            leviath_core::run_archive::RunRecord::ContextTransaction {
+                execution_id,
+                cause,
+                ..
+            } => committed.push((execution_id, cause)),
+            _ => {}
+        }
+    }
+    let (calls, visit_id, requested_by) = batch.expect("a batch record");
+    assert_eq!(visit_id, "v-second-stay");
+    assert_eq!(requested_by, "a-the-one-that-answered");
+    let execution = calls[0].execution_id.clone();
+    assert!(!execution.is_empty(), "the call was identified");
+    // The tool's own write names the call that made it. What the batch writes
+    // afterwards - the assistant turn, the routed result - names none, because
+    // those are the batch's work rather than any one call's, and an attribution
+    // wider than the call it belongs to would be a join nobody recorded.
+    assert_eq!(
+        committed,
+        vec![
+            (execution, leviath_core::ContextCause::ContextTool),
+            (String::new(), leviath_core::ContextCause::ModelReply),
+            (String::new(), leviath_core::ContextCause::ToolResult),
+        ]
+    );
+}
+
+/// A batch the dispatcher resolves entirely by itself is still journaled.
+///
+/// It never reaches the tool lane, and a run's executions have to be every call
+/// the model made rather than only the ones something ran asynchronously: a turn
+/// of nothing but `context_write` is a turn, and the transactions those writes
+/// commit name executions a reader must be able to find.
+///
+/// Safe because such a batch is not a *pending* batch. A replay lands recorded
+/// results in the conversation without redoing a context tool's write, so
+/// replaying one would restore a turn saying `context_write: ok` over a region
+/// that never got the content. `fold` refuses to make one pending for exactly
+/// that reason, and the batch is re-issued instead.
+#[tokio::test]
+async fn dispatch_journals_a_batch_it_resolved_itself() {
     let (jtx, mut jrx) = mpsc::unbounded_channel();
     let (ptx, mut prx) = mpsc::unbounded_channel();
     let mut world = World::new();
@@ -4504,8 +6038,22 @@ async fn dispatch_all_inline_batch_is_not_journaled() {
     s.add_systems(dispatch_tools);
     s.run(&mut world);
     assert!(world.get::<ReadyToInfer>(e).is_some());
-    assert!(jrx.try_recv().is_err());
-    assert!(prx.try_recv().is_err(), "no batch record for inline-only");
+    assert!(jrx.try_recv().is_err(), "nothing went to the lane");
+    let PersistMsg::Append { record, .. } = prx.try_recv().expect("a batch record") else {
+        panic!("the dispatcher appends, it does not snapshot")
+    };
+    let leviath_core::run_archive::RunRecord::ToolBatch { calls, .. } = *record else {
+        panic!("a batch record")
+    };
+    assert_eq!(calls.len(), 1);
+    assert!(
+        calls[0].result.is_some(),
+        "answered at dispatch, so nothing is waiting on it"
+    );
+    assert!(
+        !calls[0].execution_id.is_empty(),
+        "the call the window's transaction names is in the journal"
+    );
 }
 
 /// A batch of only inline-resolved calls still says what it did.
@@ -4654,19 +6202,61 @@ async fn gate_held_batch_is_not_journaled_until_it_dispatches() {
 #[tokio::test]
 async fn barrier_then_runs_after_the_ack() {
     let (tx, rx) = tokio::sync::oneshot::channel();
-    let exec: BoxedToolExec =
-        Box::new(|| Box::pin(async { vec![("c".to_string(), "r".to_string())] }));
-    tx.send(()).unwrap();
-    let wrapped = barrier_then(exec, rx, std::time::Duration::from_secs(5));
-    assert_eq!(wrapped().await, vec![("c".to_string(), "r".to_string())]);
+    let exec: BoxedToolExec = Box::new(|| Box::pin(async { vec![("c".to_string(), "r".into())] }));
+    tx.send(crate::persistence_bridge::Appended::Landed { position: 4096 })
+        .unwrap();
+    let wrapped = barrier_then(
+        exec,
+        rx,
+        std::time::Duration::from_secs(5),
+        "run-1".to_string(),
+    );
+    assert_eq!(wrapped().await, vec![("c".to_string(), "r".into())]);
+}
+
+/// Each answer the lane can give lets the batch run.
+///
+/// The batch running is not in question: the barrier is there to order the
+/// record ahead of the side effects, not to veto them. What each answer changes
+/// is what gets said about the run afterwards, and a world with no journal must
+/// stay as quiet as one whose record landed.
+#[tokio::test]
+async fn barrier_then_runs_the_batch_whatever_the_lane_answers() {
+    use crate::persistence_bridge::Appended;
+    for answer in [
+        Appended::Landed { position: 0 },
+        Appended::NoJournal,
+        Appended::Failed,
+    ] {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tx.send(answer).unwrap();
+        let exec: BoxedToolExec =
+            Box::new(|| Box::pin(async { vec![("c".to_string(), "r".into())] }));
+        let wrapped = barrier_then(
+            exec,
+            rx,
+            std::time::Duration::from_secs(5),
+            "run-1".to_string(),
+        );
+        assert_eq!(
+            wrapped().await,
+            vec![("c".to_string(), "r".into())],
+            "{answer:?}"
+        );
+    }
 }
 
 #[tokio::test]
 async fn barrier_then_proceeds_when_the_sender_is_dropped() {
-    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let (tx, rx) = tokio::sync::oneshot::channel::<crate::persistence_bridge::Appended>();
     drop(tx); // worker gone (shutdown) - the batch must still run
     let exec: BoxedToolExec = Box::new(|| Box::pin(async { Vec::new() }));
-    let wrapped = barrier_then(exec, rx, std::time::Duration::from_secs(5));
+    let wrapped = barrier_then(
+        exec,
+        rx,
+        std::time::Duration::from_secs(5),
+        "run-1".to_string(),
+    );
     assert!(wrapped().await.is_empty());
 }
 
@@ -4674,9 +6264,14 @@ async fn barrier_then_proceeds_when_the_sender_is_dropped() {
 async fn barrier_then_proceeds_on_timeout() {
     // The sender stays alive but never fires (a wedged persistence lane): the
     // bounded wait lapses and the batch runs anyway.
-    let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let (_tx, rx) = tokio::sync::oneshot::channel::<crate::persistence_bridge::Appended>();
     let exec: BoxedToolExec = Box::new(|| Box::pin(async { Vec::new() }));
-    let wrapped = barrier_then(exec, rx, std::time::Duration::from_millis(5));
+    let wrapped = barrier_then(
+        exec,
+        rx,
+        std::time::Duration::from_millis(5),
+        "run-1".to_string(),
+    );
     assert!(wrapped().await.is_empty());
 }
 
@@ -4731,11 +6326,13 @@ fn infer_with(
     (
         offers,
         crate::components::InferenceResult {
+            attempt_id: String::new(),
             response: "r".to_string(),
             tool_calls: calls,
             tokens_used: 0,
             cut_off_at: None,
             reasoning: None,
+            parts: Vec::new(),
         },
     )
 }
@@ -5086,7 +6683,12 @@ fn a_refreshing_region_holds_the_stage_until_its_seed_lands() {
     ));
     // What the previous stage left behind, so "kept" and "replaced" are
     // distinguishable rather than both looking like an empty region.
-    window.replace_region("environment", "--- current_time ---\nSTALE".to_string(), 10);
+    window.replace_region(
+        leviath_core::ContextCause::Seed,
+        "environment",
+        "--- current_time ---\nSTALE".to_string(),
+        10,
+    );
 
     let e = world
         .spawn((
@@ -5126,7 +6728,7 @@ fn a_refreshing_region_holds_the_stage_until_its_seed_lands() {
     // Applied through a system rather than by hand, because that is how
     // `collect_tools` calls it - including the deferred commands that release
     // the stage.
-    let results = vec![(pending.sites[0].id.clone(), "FRESH".to_string())];
+    let results = vec![(pending.sites[0].id.clone(), "FRESH".into())];
     let mut apply = Schedule::default();
     apply.add_systems(
         move |mut q: Query<(Entity, &PendingStageSeeds, &mut ContextWindow)>,
@@ -5195,7 +6797,7 @@ fn collect_tools_routes_a_seed_batch_to_its_region_not_to_the_conversation() {
     tx.send(ToolOutcome {
         elapsed: std::time::Duration::ZERO,
         entity: e,
-        results: vec![("stage-seed-0".to_string(), "NOW".to_string())],
+        results: vec![("stage-seed-0".to_string(), "NOW".into())],
     })
     .unwrap();
 
@@ -5378,6 +6980,142 @@ async fn dispatch_records_a_submitted_output_inline() {
     );
 }
 
+/// A world with a blob store hands the submission a sink, so the artifact
+/// lands in the store as well as on the answer.
+#[tokio::test]
+async fn a_submitted_artifact_is_stored_when_the_world_has_a_store() {
+    use crate::blob_store::{BlobStoreHandle, MimeRegistryHandle};
+    use leviath_core::mime::{BlobStore, MemoryBlobStore};
+    let (jtx, _jrx) = mpsc::unbounded_channel();
+    let dir = tempfile::tempdir().expect("temp dir");
+    std::fs::write(dir.path().join("dataset.csv"), "a,b\n1,2\n").expect("write");
+    let store = Arc::new(MemoryBlobStore::new());
+    let mut world = World::new();
+    world.insert_resource(ToolServiceRes(Arc::new(EchoService)));
+    world.insert_resource(ToolStage::detached(jtx));
+    world.insert_resource(BlobStoreHandle(store.clone()));
+    world.insert_resource(MimeRegistryHandle::default());
+    let call = crate::components::ToolCall {
+        tool_id: "o1".to_string(),
+        name: leviath_tools::SUBMIT_OUTPUT_TOOL.to_string(),
+        arguments: serde_json::json!({"content": "done", "artifacts": ["dataset.csv"]}),
+        thought_signature: None,
+    };
+    let mut metadata = run_metadata();
+    metadata.workdir = dir.path().to_string_lossy().to_string();
+    let e = world
+        .spawn((
+            agent_state(),
+            metadata,
+            infer_with(vec![call]),
+            output_window(),
+            ReadyForTools,
+        ))
+        .id();
+    let mut s = Schedule::default();
+    s.add_systems(dispatch_tools);
+    s.run(&mut world);
+    let recorded = world
+        .get::<crate::persistence::FinalOutput>(e)
+        .expect("recorded");
+    assert_eq!(recorded.0.artifacts[0].mime_type.as_str(), "text/csv");
+    assert!(store.has(&agent_state().agent_id, &recorded.0.artifacts[0].sha256));
+}
+
+/// Whether a produced part may replace a different file at the path it is
+/// submitted under: the stage's `overwrite_artifacts` when it says, else the
+/// operator's `[mime]` value, else no.
+#[tokio::test]
+async fn the_blueprint_overwrite_policy_wins_over_the_operators() {
+    use crate::blob_store::{BlobStoreHandle, MimeLimits, MimeRegistryHandle};
+    use leviath_core::mime::{Blob, BlobStore, MemoryBlobStore, MimeRegistry, MimeType, Part};
+    let cases = [
+        (None, None, false),
+        (None, Some(true), true),
+        (Some(false), Some(true), false),
+        (Some(true), Some(false), true),
+    ];
+    for (blueprint, operator, replaced) in cases {
+        let (jtx, _jrx) = mpsc::unbounded_channel();
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("mesh.glb"), "a previous run's mesh").expect("write");
+        let store = Arc::new(MemoryBlobStore::new());
+        let blob = Blob::new(
+            MimeType::parse("model/gltf-binary").unwrap(),
+            b"glTF new".to_vec(),
+        )
+        .named("mesh.glb");
+        let reference = store
+            .put(&agent_state().agent_id, &blob, &MimeRegistry::builtin())
+            .expect("stored");
+        let mut window = output_window();
+        let content = leviath_core::region::EntryContent::from_parts(vec![
+            Part::stored(reference).named("mesh.glb"),
+        ]);
+        let tokens = content.tokens(None);
+        window
+            .add_assistant_turn_content(
+                "conversation",
+                leviath_core::EntryKind::Text,
+                content,
+                tokens,
+                None,
+            )
+            .expect("the part lands");
+        let mut world = World::new();
+        world.insert_resource(ToolServiceRes(Arc::new(EchoService)));
+        world.insert_resource(ToolStage::detached(jtx));
+        world.insert_resource(BlobStoreHandle(store));
+        world.insert_resource(MimeRegistryHandle::default());
+        if let Some(overwrite_artifacts) = operator {
+            world.insert_resource(MimeLimits {
+                overwrite_artifacts,
+                ..MimeLimits::DEFAULT
+            });
+        }
+        let (mut offers, result) = infer_with(vec![crate::components::ToolCall {
+            tool_id: "o1".to_string(),
+            name: leviath_tools::SUBMIT_OUTPUT_TOOL.to_string(),
+            arguments: serde_json::json!({"content": "done", "artifacts": ["mesh.glb"]}),
+            thought_signature: None,
+        }]);
+        offers.output = Some(leviath_core::output::OutputSpec {
+            overwrite_artifacts: blueprint,
+            ..leviath_core::output::OutputSpec::default()
+        });
+        let e = world
+            .spawn((
+                agent_state(),
+                RunMetadata {
+                    workdir: dir.path().to_string_lossy().to_string(),
+                    ..run_metadata()
+                },
+                offers,
+                result,
+                window,
+                ReadyForTools,
+            ))
+            .id();
+        let mut s = Schedule::default();
+        s.add_systems(dispatch_tools);
+        s.run(&mut world);
+        let recorded = world
+            .get::<crate::persistence::FinalOutput>(e)
+            .expect("recorded");
+        let case = format!("blueprint {blueprint:?}, operator {operator:?}");
+        assert_eq!(
+            recorded.0.artifacts[0].path == "mesh.glb",
+            replaced,
+            "{case}"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("mesh.glb")).unwrap() == b"glTF new",
+            replaced,
+            "{case}"
+        );
+    }
+}
+
 /// Artifacts are resolved against the run's working directory, so a submission
 /// naming one only means something when the agent has a workdir to resolve it
 /// in. A path that escapes it is refused, because the answer is handed to a
@@ -5448,6 +7186,7 @@ async fn a_refused_submission_leaves_an_earlier_answer_alone() {
             agent_state(),
             offers,
             crate::components::InferenceResult {
+                attempt_id: String::new(),
                 response: "r".to_string(),
                 tool_calls: vec![
                     submit_call("o1", r#"{"answer":"good"}"#),
@@ -5456,6 +7195,7 @@ async fn a_refused_submission_leaves_an_earlier_answer_alone() {
                 tokens_used: 0,
                 cut_off_at: None,
                 reasoning: None,
+                parts: Vec::new(),
             },
             output_window(),
             ReadyForTools,
@@ -5762,6 +7502,7 @@ async fn dispatch_tools_refuses_arguments_that_fail_the_advertised_schema() {
     world.insert_resource(ToolServiceRes(Arc::new(EchoService)));
     world.insert_resource(ToolStage::detached(jtx));
     let result = crate::components::InferenceResult {
+        attempt_id: String::new(),
         response: "r".to_string(),
         tool_calls: vec![
             fcall("c1", "read_file", serde_json::json!({"path": 42})),
@@ -5770,6 +7511,7 @@ async fn dispatch_tools_refuses_arguments_that_fail_the_advertised_schema() {
         tokens_used: 0,
         cut_off_at: None,
         reasoning: None,
+        parts: Vec::new(),
     };
     let e = world
         .spawn((
@@ -5810,11 +7552,13 @@ async fn dispatch_tools_skips_validation_when_the_schema_does_not_compile() {
     world.insert_resource(ToolServiceRes(Arc::new(EchoService)));
     world.insert_resource(ToolStage::detached(jtx));
     let result = crate::components::InferenceResult {
+        attempt_id: String::new(),
         response: "r".to_string(),
         tool_calls: vec![fcall("c1", "typod", serde_json::json!({"whatever": true}))],
         tokens_used: 0,
         cut_off_at: None,
         reasoning: None,
+        parts: Vec::new(),
     };
     let e = world
         .spawn((
@@ -5856,11 +7600,13 @@ async fn dispatch_tools_validates_through_a_tool_alias() {
         "required": ["command"]
     });
     let result = crate::components::InferenceResult {
+        attempt_id: String::new(),
         response: "r".to_string(),
         tool_calls: vec![fcall("c1", canonical, serde_json::json!({}))],
         tokens_used: 0,
         cut_off_at: None,
         reasoning: None,
+        parts: Vec::new(),
     };
     let e = world
         .spawn((
@@ -5898,6 +7644,7 @@ async fn dispatch_tools_validates_an_mcp_style_schema() {
         "required": ["mode"]
     });
     let result = crate::components::InferenceResult {
+        attempt_id: String::new(),
         response: "r".to_string(),
         tool_calls: vec![
             fcall(
@@ -5914,6 +7661,7 @@ async fn dispatch_tools_validates_an_mcp_style_schema() {
         tokens_used: 0,
         cut_off_at: None,
         reasoning: None,
+        parts: Vec::new(),
     };
     let e = world
         .spawn((
@@ -5972,12 +7720,15 @@ fn tainted_conv_window() -> ContextWindow {
     let mut w = conv_window();
     w.enable_taint_tracking();
     let _ = w.typed_write(
-        crate::components::WriteOrigin::System,
-        "conversation",
-        leviath_core::EntryKind::UserMessage,
+        crate::components::TypedWrite {
+            cause: None,
+            origin: crate::components::WriteOrigin::System,
+            region: "conversation",
+            kind: leviath_core::EntryKind::UserMessage,
+            taint: Some(leviath_core::TaintLevel::Internal),
+        },
         "secret".to_string(),
         5,
-        Some(leviath_core::TaintLevel::Internal),
     );
     w
 }
@@ -6453,13 +8204,10 @@ fn taint_block_message_renders_blocked_and_falls_back() {
 fn merge_in_call_order_fills_missing_with_empty() {
     let calls = vec![tc("a", "x"), tc("b", "y")];
     // Only "a" has a result; "b" falls back to empty, in call order.
-    let merged = merge_in_call_order(&calls, &[("a".to_string(), "ra".to_string())]);
+    let merged = merge_in_call_order(&calls, &[("a".to_string(), "ra".into())]);
     assert_eq!(
         merged,
-        vec![
-            ("a".to_string(), "ra".to_string()),
-            ("b".to_string(), String::new()),
-        ]
+        vec![("a".to_string(), "ra".into()), ("b".to_string(), "".into()),]
     );
 }
 
@@ -6485,7 +8233,7 @@ fn tc(id: &str, name: &str) -> crate::components::ToolCall {
 fn routing(
     default: &str,
     overrides: &[(&str, &str)],
-    persist: bool,
+    keep_results: bool,
     max_result: Option<usize>,
 ) -> leviath_core::blueprint::ToolResultRouting {
     leviath_core::blueprint::ToolResultRouting {
@@ -6494,7 +8242,7 @@ fn routing(
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect(),
-        persist,
+        keep_results,
         max_result_tokens: max_result,
         tool_max_result_tokens: std::collections::HashMap::new(),
     }
@@ -6513,7 +8261,7 @@ fn routed_result(
         &mut w,
         "resp",
         &[tc("c1", tool)],
-        &[("c1".to_string(), text.to_string())],
+        &[("c1".to_string(), text.to_string().into())],
         Some(routing),
         None,
         None,
@@ -6523,7 +8271,7 @@ fn routed_result(
         .iter()
         .filter_map(|name| w.get_region(name))
         .flat_map(|r| r.content.iter())
-        .map(|e| e.content.clone())
+        .map(|e| e.content.to_string())
         .find(|c| c.starts_with("aaa"))
         .unwrap_or_default()
 }
@@ -6572,7 +8320,7 @@ fn apply_adds_assistant_turn_and_result_to_conversation() {
         &mut w,
         "resp",
         &[tc("c1", "read")],
-        &[("c1".to_string(), "result".to_string())],
+        &[("c1".to_string(), "result".into())],
         None,
         None,
         None,
@@ -6606,7 +8354,7 @@ fn thought_signature_survives_the_full_context_round_trip() {
         &mut w,
         "resp",
         &[call],
-        &[("c1".to_string(), "result".to_string())],
+        &[("c1".to_string(), "result".into())],
         None,
         None,
         None,
@@ -6642,7 +8390,7 @@ fn apply_falls_back_when_region_missing() {
         &mut w,
         "resp",
         &[tc("c1", "read")],
-        &[("c1".to_string(), "long result".to_string())],
+        &[("c1".to_string(), "long result".into())],
         None,
         None,
         None,
@@ -6657,7 +8405,7 @@ fn apply_routes_to_override_region() {
         &mut w,
         "resp",
         &[tc("c1", "read")],
-        &[("c1".to_string(), "x".to_string())],
+        &[("c1".to_string(), "x".into())],
         Some(&r),
         None,
         None,
@@ -6676,7 +8424,7 @@ fn routing_away_pointer_previews_and_truncates_long_results() {
         &mut w,
         "read",
         &[tc("c1", "read_file")],
-        &[("c1".to_string(), long.clone())],
+        &[("c1".to_string(), long.clone().into())],
         Some(&r),
         None,
         None,
@@ -6737,7 +8485,7 @@ fn routing_away_keeps_pair_in_conversation_and_text_in_region() {
         &mut w,
         "I'll read it.",
         &[tc("c1", "read_file")],
-        &[("c1".to_string(), "FULL FILE BODY".to_string())],
+        &[("c1".to_string(), "FULL FILE BODY".into())],
         Some(&r),
         None,
         None,
@@ -6803,7 +8551,7 @@ fn routing_override_matches_bash_alias_to_shell() {
         &mut w,
         "run tests",
         &[tc("c1", "shell")],
-        &[("c1".to_string(), "All tests passed".to_string())],
+        &[("c1".to_string(), "All tests passed".into())],
         Some(&r),
         None,
         None,
@@ -6826,7 +8574,7 @@ fn apply_default_region_when_no_override() {
         &mut w,
         "resp",
         &[tc("c1", "read")],
-        &[("c1".to_string(), "x".to_string())],
+        &[("c1".to_string(), "x".into())],
         Some(&r),
         None,
         None,
@@ -6842,7 +8590,7 @@ fn apply_routes_to_scratch_when_not_persist() {
         &mut w,
         "resp",
         &[tc("c1", "read")],
-        &[("c1".to_string(), "x".to_string())],
+        &[("c1".to_string(), "x".into())],
         Some(&r),
         None,
         None,
@@ -6858,7 +8606,7 @@ fn apply_not_persist_without_scratch_uses_base_region() {
         &mut w,
         "r",
         &[tc("c1", "read")],
-        &[("c1".to_string(), "x".to_string())],
+        &[("c1".to_string(), "x".into())],
         Some(&r),
         None,
         None,
@@ -6875,7 +8623,7 @@ fn apply_truncates_per_max_result_tokens() {
         &mut w,
         "resp",
         &[tc("c1", "read")],
-        &[("c1".to_string(), long)],
+        &[("c1".to_string(), long.into())],
         Some(&r),
         None,
         None,
@@ -6892,7 +8640,7 @@ fn apply_no_truncation_when_result_under_max() {
         &mut w,
         "r",
         &[tc("c1", "read")],
-        &[("c1".to_string(), "short".to_string())], // 5 chars - under budget
+        &[("c1".to_string(), "short".into())], // 5 chars - under budget
         Some(&r),
         None,
         None,
@@ -6909,7 +8657,7 @@ fn apply_tags_taint_when_sensitivities_present() {
         &mut w,
         "resp",
         &[tc("c1", "read")],
-        &[("c1".to_string(), "x".to_string())],
+        &[("c1".to_string(), "x".into())],
         None,
         Some(&sens),
         None,
@@ -6933,7 +8681,7 @@ fn apply_truncates_to_available_when_region_nearly_full() {
         &mut w,
         "r",
         &[tc("c1", "read")],
-        &[("c1".to_string(), big)],
+        &[("c1".to_string(), big.into())],
         None,
         None,
         None,
@@ -6958,11 +8706,13 @@ fn collect_tools_applies_and_loops_back_to_infer() {
         .spawn((
             ctx(&[("conversation", 10_000)]),
             crate::components::InferenceResult {
+                attempt_id: String::new(),
                 response: "r".to_string(),
                 tool_calls: vec![tc("c1", "read")],
                 tokens_used: 0,
                 cut_off_at: None,
                 reasoning: None,
+                parts: Vec::new(),
             },
             AwaitingTools,
         ))
@@ -6970,7 +8720,7 @@ fn collect_tools_applies_and_loops_back_to_infer() {
     tx.send(ToolOutcome {
         elapsed: std::time::Duration::ZERO,
         entity: e,
-        results: vec![("c1".to_string(), "res".to_string())],
+        results: vec![("c1".to_string(), "res".into())],
     })
     .unwrap();
 
@@ -6996,7 +8746,7 @@ fn collect_tools_merges_stashed_context_results() {
     tx.send(ToolOutcome {
         elapsed: std::time::Duration::ZERO,
         entity: e,
-        results: vec![("c2".to_string(), "file body".to_string())],
+        results: vec![("c2".to_string(), "file body".into())],
     })
     .unwrap();
 
@@ -7041,6 +8791,7 @@ fn msg(agent_id: &str, content: &str, region: Option<&str>) -> AgentMessage {
         agent_id: agent_id.to_string(),
         content: content.to_string(),
         target_region: region.map(String::from),
+        parts: Vec::new(),
     }
 }
 
@@ -7221,11 +8972,13 @@ fn setup() -> StageSetup {
             batch_tool_hint: false,
             shell_hint: false,
             request_timeout_secs: None,
+            as_text: Vec::new(),
         },
         routing: None,
         accepts_messages: true,
         context_layout: None,
         context_hide: Vec::new(),
+        context_reset: Vec::new(),
         system_prompt: None,
     }
 }
@@ -7519,6 +9272,97 @@ fn a_run_that_owed_no_output_still_completes() {
         world.get::<AgentState>(e).unwrap().status,
         AgentStatus::Complete
     ));
+}
+
+fn run_require_final_output(world: &mut World) {
+    let mut s = Schedule::default();
+    s.add_systems(require_final_output);
+    s.run(world);
+}
+
+#[test]
+fn a_stage_whose_routed_parts_satisfy_its_artifacts_needs_no_submit_output() {
+    // A pure "bytes in, bytes out" stage: it produced a mesh, routed it into
+    // the region its `output_routing` names, and declared that as its artifact.
+    // `require_final_output` records those parts as the run's answer with no
+    // `submit_output` call, so the agent needs no text model to hand its blob
+    // back - the whole point of the auto-emit path.
+    let mut stage = stage_named("build", None, false, None);
+    stage.require_output = true;
+    stage
+        .output_routing
+        .insert("model/*".to_string(), "model".to_string());
+    let bp = blueprint(vec![stage]);
+
+    // The routed mesh sits in the model region; the pinned final_output region
+    // is where the one-line answer is mirrored.
+    let mut window = ContextWindow::new(100_000);
+    window.add_region(Region::new(
+        "model".to_string(),
+        RegionKind::Pinned,
+        100_000,
+    ));
+    window.add_region(Region::new(
+        crate::output_tool::FINAL_OUTPUT_REGION.to_string(),
+        RegionKind::Pinned,
+        crate::output_tool::FINAL_OUTPUT_REGION_TOKENS,
+    ));
+    let reg = leviath_core::mime::MimeRegistry::builtin();
+    let blob = leviath_core::mime::Blob::new(
+        leviath_core::mime::MimeType::parse("model/gltf-binary").unwrap(),
+        vec![1, 2, 3, 4],
+    )
+    .named("hero.glb");
+    let part = leviath_core::mime::Part::stored(blob.describe(&reg)).named("hero.glb");
+    let content = leviath_core::region::EntryContent::from_parts(vec![part]);
+    let tokens = content.tokens(None);
+    window
+        .add_content_entry(
+            leviath_core::ContextCause::ProducedPart,
+            "model",
+            leviath_core::EntryKind::Text,
+            content,
+            tokens,
+        )
+        .unwrap();
+
+    // The resolved output spec is carried on StageInference, the way dispatch
+    // leaves it for the stage.
+    let mut stage_inf = si("build");
+    stage_inf.output = Some(leviath_core::output::OutputSpec {
+        artifacts: vec![leviath_core::output::ArtifactSpec {
+            name: "model".to_string(),
+            mime_type: "model/gltf-binary".to_string(),
+            required: true,
+            description: None,
+        }],
+        ..Default::default()
+    });
+
+    let mut world = World::new();
+    let e = world
+        .spawn((
+            AgentBlueprint(bp),
+            StageCursor { index: 0 },
+            agent_state(),
+            window,
+            stage_inf,
+            ResolveTransition,
+        ))
+        .id();
+
+    run_require_final_output(&mut world);
+
+    let output = world
+        .get::<crate::persistence::FinalOutput>(e)
+        .expect("auto-emit records a final output");
+    assert_eq!(output.0.stage, "build");
+    assert_eq!(output.0.artifacts.len(), 1);
+    assert_eq!(output.0.artifacts[0].name, "model");
+    assert_eq!(output.0.artifacts[0].path, "hero.glb");
+    assert!(!output.0.artifacts[0].sha256.is_empty());
+    // Not nudged back for a submit_output it never needed to call.
+    assert!(world.get::<ReadyToInfer>(e).is_none());
 }
 
 #[test]
@@ -7826,6 +9670,7 @@ fn enter_stage_injects_system_prompt_and_config() {
         batch_tool_hint: false,
         shell_hint: false,
         request_timeout_secs: None,
+        as_text: Vec::new(),
     };
     s.accepts_messages = false;
     let mut world = World::new();
@@ -8077,6 +9922,7 @@ fn collect_choice_errors_when_system_prompt_overflows() {
     tx.send(InferenceOutcome {
         latency: std::time::Duration::ZERO,
         entity: e,
+        attempt_id: String::new(),
         result: Ok(resp("b")),
         pricing: None,
     })
@@ -8102,7 +9948,51 @@ fn resolved(model: &str) -> ResolvedStage {
         tools: vec![],
         fallbacks: Vec::new(),
         output: None,
+        notes: Vec::new(),
     }
+}
+
+/// A resolved stage's notes are the first lines of that stage's operational
+/// log, tagged with the stage's index, so a substitution the user's model
+/// settings made is the first thing a reader of the log sees.
+#[test]
+fn spawn_agent_seeds_the_stage_log_with_each_stages_notes() {
+    let layout = leviath_core::layout::ContextLayout::new(vec![], 1000);
+    let s0 = leviath_core::Stage::new(
+        "plan".to_string(),
+        leviath_core::blueprint::ModelConfig::new("p".to_string(), "m".to_string()),
+    );
+    let s1 = leviath_core::Stage::new(
+        "fix".to_string(),
+        leviath_core::blueprint::ModelConfig::new("p".to_string(), "m".to_string()),
+    );
+    let bp = leviath_core::Blueprint::new("t".to_string(), "d".to_string(), vec![s0, s1], layout);
+    let mut noted = resolved("m");
+    noted.notes = vec![
+        "[model] stage 'fix' starts on p/m (override_model); blueprint asked for q/n".to_string(),
+    ];
+
+    let mut world = World::new();
+    let e = spawn_agent(
+        &mut world,
+        "agent-x".to_string(),
+        bp,
+        "the task",
+        vec![resolved("m"), noted],
+        hints(true),
+    )
+    .unwrap();
+
+    let buffer = world.get::<StageIoBuffer>(e).unwrap();
+    assert!(buffer.output.is_empty());
+    assert_eq!(
+        buffer.logs,
+        vec![(
+            1,
+            "[model] stage 'fix' starts on p/m (override_model); blueprint asked for q/n"
+                .to_string()
+        )]
+    );
 }
 
 #[test]
@@ -8507,6 +10397,42 @@ async fn compaction_dispatches_when_over_threshold() {
     assert!(world.get::<ReadyToInfer>(e).is_none());
 }
 
+/// Zero retention switched on under a running daemon: a compaction model
+/// that keeps something is not sent the run's context, on either lane.
+#[tokio::test]
+async fn compaction_is_skipped_for_a_model_zero_retention_refuses() {
+    let (mut world, _rx) = build_world(InferencePools::new(InferencePoolConfig::new()));
+    world.resource_mut::<Providers>().0.set_retention(
+        leviath_providers::retention::RetentionSettings {
+            zero_requested: true,
+            ..Default::default()
+        },
+    );
+    let e = world
+        .spawn((
+            compacting_window(),
+            compaction_settings("cfg", "m"),
+            agent_state(),
+            ReadyToInfer,
+        ))
+        .id();
+    run_dispatch_compaction(&mut world);
+    assert!(world.get::<AwaitingCompaction>(e).is_none());
+
+    let edge = world
+        .spawn((
+            scratch_window(),
+            PendingEdgeCompact(vec!["scratch".to_string()]),
+            compaction_settings("cfg", "m"),
+            agent_state(),
+            ReadyToInfer,
+        ))
+        .id();
+    run_dispatch_edge_compact(&mut world);
+    assert!(world.get::<AwaitingCompaction>(edge).is_none());
+    assert!(world.get::<PendingEdgeCompact>(edge).is_none());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_panicking_compaction_job_reports_an_error_instead_of_vanishing() {
     let (mut world, _rx) = build_world(InferencePools::new(InferencePoolConfig::new()));
@@ -8761,7 +10687,7 @@ fn edge_transforms_respect_custom_region_persistence() {
         "scratch_custom".to_string(),
         RegionKind::Custom {
             script: "s.rhai".to_string(),
-            persistent: false,
+            pinned: false,
         },
         500,
     );
@@ -8771,7 +10697,7 @@ fn edge_transforms_respect_custom_region_persistence() {
         "vault".to_string(),
         RegionKind::Custom {
             script: "v.rhai".to_string(),
-            persistent: true,
+            pinned: true,
         },
         500,
     );
@@ -9927,6 +11853,12 @@ fn unmet_required_regions_flags_empty_clears_when_filled_and_skips_without_tool(
         unmet_required_regions(&no_tool.0, &no_tool.0.stages[0], &window_with_plan(false))
             .is_empty()
     );
+    // A built-in group carries the writing tools without naming them.
+    let grouped = required_bp(&["@builtin"], None);
+    assert_eq!(
+        unmet_required_regions(&grouped.0, &grouped.0.stages[0], &window_with_plan(false)).len(),
+        1
+    );
     // A required region absent from the window entirely counts as unmet.
     let mut bare = ContextWindow::new(100_000);
     bare.add_region(Region::new(
@@ -10303,6 +12235,108 @@ fn a_zero_baseline_cannot_run_away() {
     assert!(!rec.runaway_warned);
 }
 
+/// A stage named with a hyphen is a stage the router could never pick: the
+/// reply was split on every non-word character, so `generate-more` became
+/// `generate` and `more`, matched nothing, and the run took the first edge
+/// declared - which in the bundled sprite agent was the build. Two runs built
+/// from too few views on exactly that path.
+#[test]
+fn a_hyphenated_target_is_matched_whole() {
+    use leviath_core::blueprint::TransitionCondition;
+    let edges = vec![
+        edge("build-model", TransitionCondition::LlmChoice).1,
+        edge("generate-more", TransitionCondition::LlmChoice).1,
+    ];
+    assert_eq!(
+        match_transition_choice("generate-more", &edges, false).as_deref(),
+        Some("generate-more")
+    );
+    assert_eq!(
+        match_transition_choice("Route to generate-more.", &edges, false).as_deref(),
+        Some("generate-more")
+    );
+    assert_eq!(
+        match_transition_choice("GENERATE-MORE", &edges, false).as_deref(),
+        Some("generate-more")
+    );
+}
+
+// ── transition gates: require_region_entries ─────────
+
+/// A window whose `views` region holds `n` entries.
+fn counted_window(n: usize) -> ContextWindow {
+    let mut w = ContextWindow::new(10_000);
+    w.add_region(Region::new("views".to_string(), RegionKind::Pinned, 5000));
+    for i in 0..n {
+        w.add_to_region("views", format!("view {i}"), 2).unwrap();
+    }
+    w
+}
+
+fn count_gate(at_least: usize, message: Option<&str>) -> leviath_core::blueprint::TransitionGate {
+    leviath_core::blueprint::TransitionGate {
+        require_region_entries: Some(leviath_core::blueprint::RegionCount {
+            region: "views".to_string(),
+            at_least,
+        }),
+        message: message.map(str::to_string),
+        ..Default::default()
+    }
+}
+
+/// Too few entries hold the stage, and the nudge says how many there are and
+/// how many it takes - what a drawing model needs to know to draw the rest.
+#[test]
+fn too_few_entries_block_the_edge_and_the_nudge_counts() {
+    let w = counted_window(1);
+    let stage = stage_named("draw", None, false, None);
+    let GateDecision::Block(nudge) = gate_blocks(
+        Some(&count_gate(4, None)),
+        &stage,
+        &StageProgress::default(),
+        &w,
+    ) else {
+        panic!("one of four must hold the stage");
+    };
+    assert!(nudge.contains("holds 1 of the 4"), "{nudge}");
+    // The gate's own message wins when it has one.
+    let GateDecision::Block(nudge) = gate_blocks(
+        Some(&count_gate(4, Some("draw the rest"))),
+        &stage,
+        &StageProgress::default(),
+        &w,
+    ) else {
+        panic!("still held");
+    };
+    assert_eq!(nudge, "draw the rest");
+}
+
+#[test]
+fn enough_entries_pass_and_a_missing_region_passes_with_a_warning() {
+    let stage = stage_named("draw", None, false, None);
+    assert!(matches!(
+        gate_blocks(
+            Some(&count_gate(4, None)),
+            &stage,
+            &StageProgress::default(),
+            &counted_window(4)
+        ),
+        GateDecision::Pass
+    ));
+    // No `views` region in this window at all: nothing could ever satisfy
+    // the count, so the transition goes through rather than stranding.
+    let bare = ContextWindow::new(10_000);
+    assert!(matches!(
+        gate_blocks(
+            Some(&count_gate(4, None)),
+            &stage,
+            &StageProgress::default(),
+            &bare
+        ),
+        GateDecision::Pass
+    ));
+}
+
 // ── transition gates: require_no_open_items ─────────
 
 /// A window whose checklist holds `open` open items and `done` closed ones.
@@ -10538,6 +12572,7 @@ fn gate(region: Option<&str>, message: Option<&str>) -> leviath_core::blueprint:
         require_region_updated: None,
         require_regions: Vec::new(),
         require_no_open_items: None,
+        require_region_entries: None,
     }
 }
 
@@ -10672,6 +12707,18 @@ fn gate_passes_a_stage_that_cannot_modify_anything() {
     assert!(
         block_message(gate_blocks(
             Some(&custom),
+            &stage,
+            &progress_with(0, 0, 0),
+            &conv_window()
+        ))
+        .is_some()
+    );
+    // ...or the stage grants the built-ins as a group, which carries the
+    // modifying tools without naming them.
+    stage.available_tools = vec!["@builtin".to_string()];
+    assert!(
+        block_message(gate_blocks(
+            Some(&g),
             &stage,
             &progress_with(0, 0, 0),
             &conv_window()
@@ -10881,8 +12928,8 @@ fn apply_file_tracking_tracks_reads_and_writes() {
         ),
     ];
     let mut merged = vec![
-        ("1".to_string(), "fn a() { /* long body */ }".to_string()),
-        ("2".to_string(), "written ok".to_string()),
+        ("1".to_string(), "fn a() { /* long body */ }".into()),
+        ("2".to_string(), "written ok".into()),
     ];
     apply_file_tracking(&mut w, &ft, &calls, &mut merged);
     assert!(merged[0].1.contains("Reference it there"));
@@ -10890,11 +12937,56 @@ fn apply_file_tracking_tracks_reads_and_writes() {
     assert_eq!(w.get_region("files").unwrap().content.len(), 2);
 }
 
+/// A file written in parts is tracked whole: each appended part goes after
+/// what the region already holds for the path, a first append with nothing
+/// tracked starts it, and a plain write replaces it.
+#[test]
+fn apply_file_tracking_keeps_appended_parts_together() {
+    let ft = ftc(false, true, None);
+    let mut w = hashmap_window();
+    let write = |id: &str, args: serde_json::Value| fcall(id, "write_file", args);
+    let track = |w: &mut ContextWindow, call: crate::components::ToolCall| {
+        let mut merged = vec![(call.tool_id.clone(), "Successfully wrote".into())];
+        apply_file_tracking(w, &ft, &[call], &mut merged);
+    };
+    let body = |w: &ContextWindow| {
+        w.get_region("files")
+            .unwrap()
+            .get_by_key("r.md")
+            .unwrap()
+            .content
+            .to_string()
+    };
+
+    track(
+        &mut w,
+        write(
+            "1",
+            serde_json::json!({"path": "r.md", "content": "# T\n", "append": true}),
+        ),
+    );
+    assert_eq!(body(&w), "# T\n");
+    track(
+        &mut w,
+        write(
+            "2",
+            serde_json::json!({"path": "r.md", "content": "part", "append": true}),
+        ),
+    );
+    assert_eq!(body(&w), "# T\npart");
+    track(
+        &mut w,
+        write("3", serde_json::json!({"path": "r.md", "content": "whole"})),
+    );
+    assert_eq!(body(&w), "whole");
+    assert_eq!(w.get_region("files").unwrap().content.len(), 1);
+}
+
 #[test]
 fn apply_file_tracking_noop_without_a_hashmap_region() {
     let ft = ftc(true, true, None);
     let calls = vec![fcall("1", "read_file", serde_json::json!({"path": "a"}))];
-    let mut merged = vec![("1".to_string(), "body".to_string())];
+    let mut merged = vec![("1".to_string(), "body".into())];
     // No "files" region at all.
     let mut w1 = ContextWindow::new(100_000);
     apply_file_tracking(&mut w1, &ft, &calls, &mut merged);
@@ -10929,14 +13021,14 @@ fn apply_file_tracking_skips_errors_missing_path_other_tools_and_flags() {
         ),
     ];
     let mut merged = vec![
-        ("1".to_string(), "[error] boom".to_string()),
-        ("2".to_string(), "body".to_string()),
-        ("3".to_string(), "listing".to_string()),
-        ("4".to_string(), "written".to_string()),
-        ("5".to_string(), "[denied] nope".to_string()),
+        ("1".to_string(), "[error] boom".into()),
+        ("2".to_string(), "body".into()),
+        ("3".to_string(), "listing".into()),
+        ("4".to_string(), "written".into()),
+        ("5".to_string(), "[denied] nope".into()),
         (
-            "6".to_string(),
-            "[unavailable] 'write_file' is not available in this stage.".to_string(),
+            "6".into(),
+            "[unavailable] 'write_file' is not available in this stage.".into(),
         ),
     ];
     apply_file_tracking(&mut w, &ft, &calls, &mut merged);
@@ -10956,8 +13048,8 @@ fn apply_file_tracking_skips_errors_missing_path_other_tools_and_flags() {
         ),
     ];
     let mut merged2 = vec![
-        ("1".to_string(), "body".to_string()),
-        ("2".to_string(), "written".to_string()),
+        ("1".to_string(), "body".into()),
+        ("2".to_string(), "written".into()),
     ];
     apply_file_tracking(&mut w, &off, &calls2, &mut merged2);
     for (_, r) in &merged2 {
@@ -11000,7 +13092,7 @@ fn collect_tools_applies_file_tracking_from_blueprint() {
     tx.send(ToolOutcome {
         elapsed: std::time::Duration::ZERO,
         entity: e,
-        results: vec![("c1".to_string(), "fn a() {}".to_string())],
+        results: vec![("c1".to_string(), "fn a() {}".into())],
     })
     .unwrap();
     run_collect_tools(&mut world);
@@ -11058,7 +13150,7 @@ fn count_modifications(
         results: calls
             .iter()
             .enumerate()
-            .map(|(i, (_, _, result))| (format!("c{i}"), (*result).to_string()))
+            .map(|(i, (_, _, result))| (format!("c{i}"), (*result).into()))
             .collect(),
     })
     .unwrap();
@@ -11216,12 +13308,12 @@ fn collect_tools_still_applies_results_without_stage_components() {
         elapsed: std::time::Duration::ZERO,
         entity: e,
         results: vec![
-            ("c1".to_string(), "wrote it".to_string()),
+            ("c1".to_string(), "wrote it".into()),
             // Both the counted and the blocked path must tolerate the
             // missing components.
             (
                 "c2".to_string(),
-                "[denied] User declined tool call 'edit_file'.".to_string(),
+                "[denied] User declined tool call 'edit_file'.".into(),
             ),
         ],
     })
@@ -11395,8 +13487,8 @@ fn collect_tools_injects_repetition_nudge_when_looping() {
         elapsed: std::time::Duration::ZERO,
         entity: e,
         results: vec![
-            ("c1".to_string(), "body".to_string()),
-            ("c2".to_string(), "body".to_string()),
+            ("c1".to_string(), "body".into()),
+            ("c2".to_string(), "body".into()),
         ],
     })
     .unwrap();
@@ -11599,6 +13691,54 @@ fn collect_compaction_stores_summary_and_clears_source() {
     assert!(w.get_region("history").unwrap().current_tokens > 0); // summary stored
     assert!(world.get::<ReadyToInfer>(e).is_some());
     assert!(world.get::<AwaitingCompaction>(e).is_none());
+}
+
+/// A summary is text: the stored parts the region's entries carried leave the
+/// window with them, named in the log, while the bytes stay in the store.
+#[test]
+fn collect_compaction_names_the_stored_parts_a_summary_replaced() {
+    use leviath_core::mime::{BlobRef, MimeType, Part};
+    let (mut world, tx) = world_with_compaction_results();
+    let mut window = compacting_window();
+    let blob = BlobRef {
+        sha256: "ab".repeat(32),
+        mime_type: MimeType::parse("image/png").unwrap(),
+        size: 3,
+        width: None,
+        height: None,
+        duration_ms: None,
+        tokens: 1,
+        stand_in: "[image/png, 3 B] hero.png".to_string(),
+    };
+    window
+        .get_region_mut("conv")
+        .unwrap()
+        .add_typed_entry(
+            leviath_core::region::EntryContent::from_parts(vec![
+                Part::text("see"),
+                Part::stored(blob.clone()).named("hero.png"),
+                Part::stored(blob),
+            ]),
+            2,
+            leviath_core::EntryKind::Text,
+        )
+        .unwrap();
+    let e = world.spawn((window, AwaitingCompaction)).id();
+    tx.send(CompactionOutcome {
+        entity: e,
+        usage: Vec::new(),
+        provider_name: "p".to_string(),
+        model: "m".to_string(),
+        result: Ok(vec![("conv".to_string(), "the summary".to_string())]),
+        pricing: None,
+    })
+    .unwrap();
+
+    run_collect_compaction(&mut world);
+
+    let w = world.get::<ContextWindow>(e).unwrap();
+    assert_eq!(w.get_region("conv").unwrap().stored_count(), 0);
+    assert!(w.get_region("history").unwrap().current_tokens > 0);
 }
 
 /// A summary with nothing in it is a compaction that failed, not one that found
@@ -11897,7 +14037,9 @@ fn run_metadata() -> RunMetadata {
         callback_secret: None,
         title: None,
         title_error: None,
+        blueprint_digest: None,
         unattended: false,
+        yolo_profile: None,
         read_paths: None,
         output_request: None,
         model_override: None,
@@ -11917,6 +14059,19 @@ fn snapshot_job(msg: PersistMsg) -> PersistJob {
         PersistMsg::Snapshot(job) => *job,
         PersistMsg::Append { .. } | PersistMsg::StageLines { .. } => {
             panic!("expected a snapshot on the lane")
+        }
+    }
+}
+
+/// The first snapshot on the lane, stepping over the appends a dispatch leaves.
+///
+/// A test that runs `dispatch_tools` before persisting has the batch record and
+/// any change records ahead of the snapshot, and it is the snapshot it is about.
+fn next_snapshot(rx: &mut mpsc::UnboundedReceiver<PersistMsg>) -> PersistJob {
+    loop {
+        match rx.try_recv().expect("a snapshot on the lane") {
+            PersistMsg::Snapshot(job) => return *job,
+            PersistMsg::Append { .. } | PersistMsg::StageLines { .. } => continue,
         }
     }
 }
@@ -12715,7 +14870,7 @@ fn a_routing_call_is_billed_to_the_stage_it_leaves_and_cuts_the_visit() {
         leviath_core::run_meta::StageRecord::new("a".to_string(), 0),
         leviath_core::run_meta::StageRecord::new("b".to_string(), 1),
     ]);
-    ledger.0[0].begin_visit(100);
+    ledger.0[0].begin_visit(100, leviath_core::execution::mint_visit_id());
     world.entity_mut(e).insert(ledger);
 
     let mut response = resp("b");
@@ -12723,6 +14878,7 @@ fn a_routing_call_is_billed_to_the_stage_it_leaves_and_cuts_the_visit() {
     tx.send(InferenceOutcome {
         latency: std::time::Duration::ZERO,
         entity: e,
+        attempt_id: String::new(),
         result: Ok(response),
         pricing: Some(leviath_providers::ModelPricing::flat(1_000_000.0, 0.0)),
     })
@@ -12759,12 +14915,13 @@ fn a_self_transition_starts_a_second_visit_of_the_same_stage() {
         "a".to_string(),
         0,
     )]);
-    ledger.0[0].begin_visit(100);
+    ledger.0[0].begin_visit(100, leviath_core::execution::mint_visit_id());
     world.entity_mut(e).insert(ledger);
 
     tx.send(InferenceOutcome {
         latency: std::time::Duration::ZERO,
         entity: e,
+        attempt_id: String::new(),
         result: Ok(resp("a")),
         pricing: None,
     })
@@ -12800,6 +14957,7 @@ fn collect_choice_holds_an_outcome_that_lands_on_a_paused_agent() {
     tx.send(InferenceOutcome {
         latency: std::time::Duration::ZERO,
         entity: e,
+        attempt_id: String::new(),
         result: Ok(resp("b")),
         pricing: None,
     })
@@ -12847,9 +15005,15 @@ fn collect_choice_parks_a_run_the_provider_could_not_be_reached_for() {
         vec![si("m0"), si("m1")],
         vec![plain_edge("b")],
     );
+    // Failed over mid-stage: the live component names the provider this call
+    // went to, and that is the one the pause names.
+    let mut live = si("m0");
+    live.provider_name = "fallback".to_string();
+    world.entity_mut(e).insert((live, StageIoBuffer::default()));
     tx.send(InferenceOutcome {
         latency: std::time::Duration::ZERO,
         entity: e,
+        attempt_id: String::new(),
         result: Err(leviath_providers::ProviderError::labelled(
             leviath_providers::FailureKind::Timeout,
             "sending the request",
@@ -12868,9 +15032,20 @@ fn collect_choice_parks_a_run_the_provider_could_not_be_reached_for() {
     let parked = world
         .get::<crate::pipeline::PausedForSetup>(e)
         .expect("parked rather than failed");
+    // Reached and slow, which is not the same as down, and says so.
     assert_eq!(
         parked.blocker,
-        leviath_core::run_meta::SetupBlocker::ProvidersUnavailable
+        leviath_core::run_meta::SetupBlocker::ProviderTimedOut
+    );
+    assert!(
+        parked
+            .remedy
+            .starts_with("'fallback' did not answer in time")
+    );
+    let logs = &world.get::<StageIoBuffer>(e).unwrap().logs;
+    assert!(
+        logs.iter()
+            .any(|(_, line)| line.starts_with("[paused] 'fallback'"))
     );
     // The routing choice is put back, not the stage: a resume asks where to go
     // next rather than re-running the stage that already answered.
@@ -12905,6 +15080,7 @@ fn collect_choice_still_fails_a_stage_on_an_error_nobody_can_resume_past() {
     tx.send(InferenceOutcome {
         latency: std::time::Duration::ZERO,
         entity: e,
+        attempt_id: String::new(),
         result: Err(leviath_providers::ProviderError::InvalidResponse(
             "not JSON".to_string(),
         )),
@@ -12937,6 +15113,7 @@ fn collect_choice_enters_chosen_stage() {
     tx.send(InferenceOutcome {
         latency: std::time::Duration::ZERO,
         entity: e,
+        attempt_id: String::new(),
         result: Ok(resp("b")),
         pricing: None,
     })
@@ -12982,6 +15159,7 @@ fn a_routing_call_is_counted_against_the_run() {
     tx.send(InferenceOutcome {
         latency: std::time::Duration::ZERO,
         entity: e,
+        attempt_id: String::new(),
         result: Ok(response),
         pricing: None,
     })
@@ -13021,6 +15199,7 @@ fn collect_choice_does_not_resurrect_or_complete_a_cancelled_run() {
         tx.send(InferenceOutcome {
             latency: std::time::Duration::ZERO,
             entity: e,
+            attempt_id: String::new(),
             result: Ok(resp(choice)),
             pricing: None,
         })
@@ -13060,6 +15239,7 @@ fn collect_choice_applies_the_chosen_edge_transform() {
     tx.send(InferenceOutcome {
         latency: std::time::Duration::ZERO,
         entity: e,
+        attempt_id: String::new(),
         result: Ok(resp("b")),
         pricing: None,
     })
@@ -13094,6 +15274,7 @@ fn collect_choice_holds_the_stage_when_the_chosen_edge_is_gated() {
     tx.send(InferenceOutcome {
         latency: std::time::Duration::ZERO,
         entity: e,
+        attempt_id: String::new(),
         result: Ok(resp("review")),
         pricing: None,
     })
@@ -13137,6 +15318,7 @@ fn collect_choice_records_a_forced_gate_and_enters_the_stage() {
         tx.send(InferenceOutcome {
             latency: std::time::Duration::ZERO,
             entity,
+            attempt_id: String::new(),
             result: Ok(resp("review")),
             pricing: None,
         })
@@ -13165,6 +15347,7 @@ fn collect_choice_done_completes() {
     tx.send(InferenceOutcome {
         latency: std::time::Duration::ZERO,
         entity: e,
+        attempt_id: String::new(),
         result: Ok(resp("DONE")),
         pricing: None,
     })
@@ -13190,6 +15373,7 @@ fn collect_choice_unknown_target_falls_back_to_first_stage() {
     tx.send(InferenceOutcome {
         latency: std::time::Duration::ZERO,
         entity: e,
+        attempt_id: String::new(),
         result: Ok(resp("ghost")),
         pricing: None,
     })
@@ -13210,6 +15394,7 @@ fn collect_choice_marks_error_on_failure() {
     tx.send(InferenceOutcome {
         latency: std::time::Duration::ZERO,
         entity: e,
+        attempt_id: String::new(),
         result: Err(leviath_providers::ProviderError::Other("boom".to_string())),
         pricing: None,
     })
@@ -13233,6 +15418,7 @@ fn collect_choice_drops_stale_outcome() {
     tx.send(InferenceOutcome {
         latency: std::time::Duration::ZERO,
         entity: ghost,
+        attempt_id: String::new(),
         result: Ok(resp("x")),
         pricing: None,
     })
@@ -13264,6 +15450,7 @@ fn collect_inference_records_activity_with_provider_and_latency() {
     tx.send(InferenceOutcome {
         latency: std::time::Duration::from_millis(1500),
         entity: e,
+        attempt_id: String::new(),
         result: Ok(resp("hi")),
         pricing: None,
     })
@@ -13302,6 +15489,7 @@ fn collect_inference_records_a_failed_call_without_stage_inference() {
     tx.send(InferenceOutcome {
         latency: std::time::Duration::from_millis(20),
         entity: e,
+        attempt_id: String::new(),
         result: Err(leviath_providers::ProviderError::Other("boom".to_string())),
         pricing: None,
     })
@@ -13334,11 +15522,13 @@ fn collect_tools_records_one_activity_per_call_with_error_detection() {
         .spawn((
             ctx(&[("conversation", 10_000)]),
             crate::components::InferenceResult {
+                attempt_id: String::new(),
                 response: "r".to_string(),
                 tool_calls: vec![tc("c1", "read_file"), tc("c2", "write_file")],
                 tokens_used: 0,
                 cut_off_at: None,
                 reasoning: None,
+                parts: Vec::new(),
             },
             AwaitingTools,
             crate::telemetry::StageActivity::default(),
@@ -13348,8 +15538,8 @@ fn collect_tools_records_one_activity_per_call_with_error_detection() {
         elapsed: std::time::Duration::from_millis(40),
         entity: e,
         results: vec![
-            ("c1".to_string(), "file body".to_string()),
-            ("c2".to_string(), "[error] denied".to_string()),
+            ("c1".to_string(), "file body".into()),
+            ("c2".to_string(), "[error] denied".into()),
         ],
     })
     .unwrap();
@@ -13505,6 +15695,7 @@ fn collect_choice_emits_a_stage_transition_event() {
     tx.send(InferenceOutcome {
         latency: std::time::Duration::ZERO,
         entity: e,
+        attempt_id: String::new(),
         result: Ok(resp("b")),
         pricing: None,
     })
@@ -13552,9 +15743,19 @@ async fn dispatch_tools_announces_lane_calls() {
     assert!(world.get::<AwaitingTools>(e).is_some());
     let _ = jrx.try_recv().expect("job enqueued");
     let ev = sink_rx.try_recv().expect("tool call started event");
+    // The id is minted here, so the test cannot name it. What it can check is
+    // that the announced id is the one the entity carries for that call: the
+    // finish event is matched to this start through that id alone, so the two
+    // disagreeing would split one execution into two.
+    let minted = world
+        .get::<crate::components::BatchExecutions>(e)
+        .expect("dispatch records what it minted")
+        .id_for("t");
+    assert!(minted.starts_with('x'), "{minted}");
     assert_eq!(
         ev,
         WorldEvent::ToolCallStarted {
+            execution_id: minted,
             run_id: "run-1".to_string(),
             agent_id: "a".to_string(),
             call_id: "t".to_string(),
@@ -13579,6 +15780,12 @@ fn collect_tools_reports_finished_lane_calls() {
             agent_state(),
             run_metadata(),
             AwaitingTools,
+            crate::components::BatchExecutions {
+                ids: [("c1", "xaaa"), ("c2", "xbbb")]
+                    .into_iter()
+                    .map(|(call, execution)| (call.to_string(), execution.to_string()))
+                    .collect(),
+            },
         ))
         .id();
     tx.send(ToolOutcome {
@@ -13587,9 +15794,9 @@ fn collect_tools_reports_finished_lane_calls() {
         // A success, a failure, and a result whose id matches no known call
         // (the tool name falls back to empty rather than panicking).
         results: vec![
-            ("c1".to_string(), "file body".to_string()),
-            ("c2".to_string(), "[error] denied".to_string()),
-            ("zz".to_string(), "stray".to_string()),
+            ("c1".to_string(), "file body".into()),
+            ("c2".to_string(), "[error] denied".into()),
+            ("zz".to_string(), "stray".into()),
         ],
     })
     .unwrap();
@@ -13599,6 +15806,7 @@ fn collect_tools_reports_finished_lane_calls() {
     assert_eq!(
         sink_rx.try_recv().expect("first finish"),
         WorldEvent::ToolCallFinished {
+            execution_id: "xaaa".to_string(),
             run_id: "run-1".to_string(),
             agent_id: "a".to_string(),
             call_id: "c1".to_string(),
@@ -13610,6 +15818,7 @@ fn collect_tools_reports_finished_lane_calls() {
     assert_eq!(
         sink_rx.try_recv().expect("second finish"),
         WorldEvent::ToolCallFinished {
+            execution_id: "xbbb".to_string(),
             run_id: "run-1".to_string(),
             agent_id: "a".to_string(),
             call_id: "c2".to_string(),
@@ -13621,6 +15830,9 @@ fn collect_tools_reports_finished_lane_calls() {
     assert_eq!(
         sink_rx.try_recv().expect("stray finish"),
         WorldEvent::ToolCallFinished {
+            // No call by this id was dispatched, so there is no execution to
+            // name. An invented id would correlate this result to nothing.
+            execution_id: String::new(),
             run_id: "run-1".to_string(),
             agent_id: "a".to_string(),
             call_id: "zz".to_string(),
@@ -13630,6 +15842,53 @@ fn collect_tools_reports_finished_lane_calls() {
         }
     );
     assert!(sink_rx.try_recv().is_err(), "no extra events");
+}
+
+/// A world that never minted execution ids reports finishes with none.
+///
+/// This is the shape a restore leaves: the ids live on the entity, so an agent
+/// rebuilt from a journal written before this existed has results to report and
+/// nothing to correlate them to. The finish still goes out, because the result
+/// itself is real. It carries no id rather than a made-up one, and a reader can
+/// tell the two apart.
+#[test]
+fn a_finish_with_no_minted_id_reports_an_empty_one() {
+    use crate::host::{WorldEvent, WorldEventSink};
+    let (tx, rx) = mpsc::unbounded_channel();
+    let mut world = World::new();
+    world.insert_resource(ToolResults(rx));
+    let (sink_tx, mut sink_rx) = tokio::sync::broadcast::channel(16);
+    world.insert_resource(WorldEventSink(sink_tx));
+    let e = world
+        .spawn((
+            ctx(&[("conversation", 10_000)]),
+            infer_with(vec![tc("c1", "read")]),
+            agent_state(),
+            run_metadata(),
+            AwaitingTools,
+        ))
+        .id();
+    tx.send(ToolOutcome {
+        elapsed: std::time::Duration::ZERO,
+        entity: e,
+        results: vec![("c1".to_string(), "file body".into())],
+    })
+    .unwrap();
+
+    run_collect_tools(&mut world);
+
+    assert_eq!(
+        sink_rx.try_recv().expect("the finish still goes out"),
+        WorldEvent::ToolCallFinished {
+            execution_id: String::new(),
+            run_id: "run-1".to_string(),
+            agent_id: "a".to_string(),
+            call_id: "c1".to_string(),
+            tool: "read".to_string(),
+            ok: true,
+            summary: "file body".to_string(),
+        }
+    );
 }
 
 // ── Final-output shape reaches the model ─────────────────────────────────────
@@ -13646,6 +15905,8 @@ fn stage_setup_from_folds_a_required_output_into_the_system_prompt() {
         schema: None,
         validator: None,
         on_validator_error: None,
+        overwrite_artifacts: None,
+        artifacts: Vec::new(),
     };
     let mut s = stage_named("summary", None, false, None);
     s.require_output = true;
@@ -14739,11 +17000,13 @@ fn spawn_after(world: &mut World, src: &str) -> Entity {
             StageCursor { index: 0 },
             ProcessResponse,
             crate::components::InferenceResult {
+                attempt_id: String::new(),
                 response: "the raw answer".to_string(),
                 tool_calls: vec![],
                 tokens_used: 7,
                 cut_off_at: None,
                 reasoning: None,
+                parts: Vec::new(),
             },
             hook_scripts(src, &["after_inference"]),
         ))
@@ -15053,6 +17316,7 @@ fn after_inference_sees_tool_call_names_but_cannot_change_them() {
             StageCursor { index: 0 },
             ProcessResponse,
             crate::components::InferenceResult {
+                attempt_id: String::new(),
                 response: String::new(),
                 tool_calls: vec![crate::components::ToolCall {
                     tool_id: "c1".to_string(),
@@ -15063,6 +17327,7 @@ fn after_inference_sees_tool_call_names_but_cannot_change_them() {
                 tokens_used: 0,
                 cut_off_at: None,
                 reasoning: None,
+                parts: Vec::new(),
             },
             hook_scripts(
                 r#"fn after_inference(ctx) { #{ action: "modify", value: ctx.tool_calls[0] } }"#,
@@ -15095,11 +17360,13 @@ fn after_inference_skips_an_out_of_range_stage() {
             StageCursor { index: 99 },
             ProcessResponse,
             crate::components::InferenceResult {
+                attempt_id: String::new(),
                 response: "x".to_string(),
                 tool_calls: vec![],
                 tokens_used: 0,
                 cut_off_at: None,
                 reasoning: None,
+                parts: Vec::new(),
             },
             hook_scripts(
                 r#"fn after_inference(ctx) { #{ action: "cancel" } }"#,
@@ -15126,11 +17393,13 @@ fn after_inference_skips_a_stage_that_declared_none() {
             StageCursor { index: 0 },
             ProcessResponse,
             crate::components::InferenceResult {
+                attempt_id: String::new(),
                 response: "x".to_string(),
                 tool_calls: vec![],
                 tokens_used: 0,
                 cut_off_at: None,
                 reasoning: None,
+                parts: Vec::new(),
             },
             hook_scripts(
                 r#"fn after_inference(ctx) { #{ action: "cancel" } }"#,
@@ -15206,11 +17475,13 @@ fn spawn_tool_hooked(
             StageCursor { index: 0 },
             ReadyForTools,
             crate::components::InferenceResult {
+                attempt_id: String::new(),
                 response: String::new(),
                 tool_calls: calls,
                 tokens_used: 0,
                 cut_off_at: None,
                 reasoning: None,
+                parts: Vec::new(),
             },
             hook_scripts(src, &["on_tool_call"]),
         ))
@@ -15335,11 +17606,13 @@ fn on_tool_call_cannot_mark_its_own_calls_approved() {
             StageCursor { index: 0 },
             ReadyForTools,
             crate::components::InferenceResult {
+                attempt_id: String::new(),
                 response: String::new(),
                 tool_calls: vec![call("shell", serde_json::json!({"command": "ls"}))],
                 tokens_used: 0,
                 cut_off_at: None,
                 reasoning: None,
+                parts: Vec::new(),
             },
             crate::taint::TaintGate::new(leviath_core::taint::SecurityConfig::default()),
             hook_scripts(
@@ -15537,11 +17810,13 @@ fn on_tool_call_skips_an_out_of_range_stage_and_a_stage_that_declared_none() {
             StageCursor { index: 99 },
             ReadyForTools,
             crate::components::InferenceResult {
+                attempt_id: String::new(),
                 response: String::new(),
                 tool_calls: vec![call("shell", serde_json::json!({}))],
                 tokens_used: 0,
                 cut_off_at: None,
                 reasoning: None,
+                parts: Vec::new(),
             },
             hook_scripts(
                 r#"fn on_tool_call(ctx) { #{ action: "cancel" } }"#,
@@ -15561,11 +17836,13 @@ fn on_tool_call_skips_an_out_of_range_stage_and_a_stage_that_declared_none() {
             StageCursor { index: 0 },
             ReadyForTools,
             crate::components::InferenceResult {
+                attempt_id: String::new(),
                 response: String::new(),
                 tool_calls: vec![call("shell", serde_json::json!({}))],
                 tokens_used: 0,
                 cut_off_at: None,
                 reasoning: None,
+                parts: Vec::new(),
             },
             hook_scripts(
                 r#"fn on_tool_call(ctx) { #{ action: "cancel" } }"#,
@@ -16066,6 +18343,44 @@ fn setup_carrying_prompt(prompt: &str) -> StageSetup {
     }
 }
 
+/// `context.reset` empties the named regions on entry, so a stage starts on a
+/// clean slate; a region left out of the list keeps its content.
+#[test]
+fn context_reset_empties_the_named_region_on_entry() {
+    let mut window = instructions_window(&["conversation", "task"]);
+    window
+        .add_to_region("conversation", "a turn from the last stage".to_string(), 5)
+        .expect("fits");
+    window
+        .add_to_region("task", "the task".to_string(), 2)
+        .expect("fits");
+
+    let setup = StageSetup {
+        // `ghost` is not in this window: a reset name the window does not carry
+        // is skipped, not an error.
+        context_reset: vec!["conversation".to_string(), "ghost".to_string()],
+        ..setup()
+    };
+    apply_stage_context(&setup, &mut window).expect("fits");
+
+    assert!(
+        window
+            .get_region("conversation")
+            .unwrap()
+            .content
+            .is_empty(),
+        "the reset region is emptied"
+    );
+    assert!(
+        window.get_region("ghost").is_none(),
+        "a reset name the window lacks is simply skipped"
+    );
+    assert!(
+        !window.get_region("task").unwrap().content.is_empty(),
+        "a region not named in reset keeps its content"
+    );
+}
+
 /// Without a declared region the prompt still lands in the first pinned one, so
 /// every blueprint written before this keeps working unchanged.
 #[test]
@@ -16269,7 +18584,10 @@ fn routed_to(region: &str) -> leviath_core::blueprint::ToolResultRouting {
     }
 }
 
-fn one_read_call() -> (Vec<crate::components::ToolCall>, Vec<(String, String)>) {
+fn one_read_call() -> (
+    Vec<crate::components::ToolCall>,
+    Vec<crate::tool_bridge::ToolResult>,
+) {
     (
         vec![crate::components::ToolCall {
             tool_id: "call-1".to_string(),
@@ -16277,7 +18595,7 @@ fn one_read_call() -> (Vec<crate::components::ToolCall>, Vec<(String, String)>) 
             arguments: serde_json::json!({"path": "manual.md"}),
             thought_signature: None,
         }],
-        vec![("call-1".to_string(), "the manual's full text".to_string())],
+        vec![("call-1".to_string(), "the manual's full text".into())],
     )
 }
 
@@ -16373,7 +18691,7 @@ fn add_scripted_region(window: &mut ContextWindow, name: &str, budget: usize, sr
         name.to_string(),
         leviath_core::RegionKind::Custom {
             script: "s.rhai".to_string(),
-            persistent: false,
+            pinned: false,
         },
         budget,
     ));
@@ -16466,7 +18784,7 @@ fn a_hook_that_refuses_the_truncated_fallback_is_reported_as_a_rejection() {
         arguments: serde_json::json!({"path": "manual.md"}),
         thought_signature: None,
     }];
-    let results = vec![("call-1".to_string(), "x".repeat(2000))];
+    let results = vec![("call-1".to_string(), "x".repeat(2000).into())];
     apply_tool_results(
         &mut window,
         "",
@@ -16519,9 +18837,8 @@ fn a_path_tool_aimed_at_a_region_is_told_it_is_a_region() {
             thought_signature: None,
         }];
         let mut merged = vec![(
-            "c1".to_string(),
-            "[error] Failed to read 'raw_findings': No such file or directory (os error 2)"
-                .to_string(),
+            "c1".into(),
+            "[error] Failed to read 'raw_findings': No such file or directory (os error 2)".into(),
         )];
         crate::pipeline::annotate_path_errors(&window, &calls, &mut merged);
         assert!(
@@ -16555,8 +18872,8 @@ fn the_batch_read_tool_gets_the_region_hint_too() {
         thought_signature: None,
     }];
     let mut merged = vec![(
-        "c1".to_string(),
-        "[error] Failed to read 'raw_findings': No such file or directory (os error 2)".to_string(),
+        "c1".into(),
+        "[error] Failed to read 'raw_findings': No such file or directory (os error 2)".into(),
     )];
     crate::pipeline::annotate_path_errors(&window, &calls, &mut merged);
     assert!(
@@ -16588,7 +18905,7 @@ fn a_partly_stored_result_reports_what_was_dropped() {
         arguments: serde_json::json!({ "path": "manual.md" }),
         thought_signature: None,
     }];
-    let results = vec![("call-1".to_string(), long)];
+    let results = vec![("call-1".to_string(), long.into())];
     apply_tool_results(
         &mut window,
         "",
@@ -16636,8 +18953,8 @@ fn a_directory_handed_to_read_file_names_list_dir() {
         thought_signature: None,
     }];
     let mut merged = vec![(
-        "c1".to_string(),
-        "[error] Failed to read '/Users/someone/papers': Is a directory (os error 21)".to_string(),
+        "c1".into(),
+        "[error] Failed to read '/Users/someone/papers': Is a directory (os error 21)".into(),
     )];
     crate::pipeline::annotate_path_errors(&window, &calls, &mut merged);
     assert!(merged[0].1.contains("use list_dir"), "{}", merged[0].1);
@@ -16656,7 +18973,7 @@ fn an_ordinary_missing_file_error_is_not_annotated() {
     }];
     let original =
         "[error] Failed to read 'notes.md': No such file or directory (os error 2)".to_string();
-    let mut merged = vec![("c1".to_string(), original.clone())];
+    let mut merged = vec![("c1".to_string(), original.clone().into())];
     crate::pipeline::annotate_path_errors(&window, &calls, &mut merged);
     assert_eq!(merged[0].1, original);
 }
@@ -16672,7 +18989,7 @@ fn a_successful_path_call_is_left_alone() {
         arguments: serde_json::json!({ "path": "raw_findings" }),
         thought_signature: None,
     }];
-    let mut merged = vec![("c1".to_string(), "the file's contents".to_string())];
+    let mut merged = vec![("c1".to_string(), "the file's contents".into())];
     crate::pipeline::annotate_path_errors(&window, &calls, &mut merged);
     assert_eq!(merged[0].1, "the file's contents");
 }
@@ -16689,8 +19006,8 @@ fn a_hidden_region_named_as_a_path_says_the_stage_does_not_carry_it() {
         thought_signature: None,
     }];
     let mut merged = vec![(
-        "c1".to_string(),
-        "[error] Failed to read 'raw_findings': No such file or directory (os error 2)".to_string(),
+        "c1".into(),
+        "[error] Failed to read 'raw_findings': No such file or directory (os error 2)".into(),
     )];
     crate::pipeline::annotate_path_errors(&window, &calls, &mut merged);
     assert!(
@@ -17397,8 +19714,14 @@ fn to_inference_result_records_where_a_cut_off_reply_stopped() {
     let mut response = resp("half a report");
     response.tokens_used.completion_tokens = 23_050;
     response.finish_reason = leviath_providers::FinishReason::TokenLimit;
-    assert_eq!(to_inference_result(&response).cut_off_at, Some(23_050));
-    assert_eq!(to_inference_result(&resp("done")).cut_off_at, None);
+    assert_eq!(
+        to_inference_result(&response, Vec::new(), "a1").cut_off_at,
+        Some(23_050)
+    );
+    assert_eq!(
+        to_inference_result(&resp("done"), Vec::new(), "a1").cut_off_at,
+        None
+    );
 }
 
 /// A cut-off reply arms the raised cap whether or not it carried tool calls:
@@ -17437,6 +19760,7 @@ fn build_request_raises_the_cap_to_the_model_maximum_after_a_cut_off() {
         batch_tool_hint: false,
         shell_hint: false,
         request_timeout_secs: None,
+        as_text: Vec::new(),
     };
     let si = stage("m", vec![], None);
     let raised = build_request(
@@ -17556,6 +19880,8 @@ async fn dispatch_tools_refuses_a_call_whose_arguments_were_cut_off() {
     world.insert_resource(ToolServiceRes(Arc::new(EchoService)));
     world.insert_resource(ToolStage::detached(jtx));
     let result = crate::components::InferenceResult {
+        attempt_id: String::new(),
+        parts: Vec::new(),
         response: String::new(),
         tool_calls: vec![fcall(
             "c1",
@@ -17585,26 +19911,342 @@ async fn dispatch_tools_refuses_a_call_whose_arguments_were_cut_off() {
     assert!(text.contains("51 characters arrived, ending `"), "{text}");
     assert!(text.contains("# Local LLM hardw`"), "{text}");
     assert!(jrx.try_recv().is_err(), "nothing reached the tool lane");
+    // No `StageProgress` on this agent: read as the first cut-off.
+    assert!(text.contains("Send the call again"), "{text}");
     assert!(call_had_no_effect(&cut_off_arguments_refusal(
         "write_file",
-        "{"
+        "{",
+        1
     )));
+}
+
+/// The refusal reads the stage's count of cut-offs in a row, so a model on
+/// its second one is told to split rather than resend.
+#[tokio::test]
+async fn dispatch_tools_escalates_the_refusal_with_the_cut_offs_in_a_row() {
+    let (jtx, _jrx) = mpsc::unbounded_channel();
+    let mut world = World::new();
+    world.insert_resource(ToolServiceRes(Arc::new(EchoService)));
+    world.insert_resource(ToolStage::detached(jtx));
+    let e = world
+        .spawn((
+            agent_state(),
+            offering(&["write_file"]),
+            cut_off_batch(serde_json::json!("{\"path\": \"a"), Some(64_000)),
+            conv_window(),
+            StageProgress {
+                cut_off_nudges: 2,
+                ..Default::default()
+            },
+            ReadyForTools,
+        ))
+        .id();
+    let mut s = Schedule::default();
+    s.add_systems(dispatch_tools);
+    s.run(&mut world);
+    let text = conversation_text(&world, e);
+    assert!(text.contains("That is 2 replies in a row"), "{text}");
+    assert!(text.contains("\"append\": true"), "{text}");
 }
 
 /// The tail quoted back is the last forty characters, or all of a shorter
 /// argument, and is cut on a character boundary.
 #[test]
 fn cut_off_arguments_refusal_quotes_the_tail() {
-    let short = cut_off_arguments_refusal("t", "{\"a\": 1");
+    let short = cut_off_arguments_refusal("t", "{\"a\": 1", 1);
     assert!(
         short.contains("(7 characters arrived, ending `{\"a\": 1`)"),
         "{short}"
     );
-    let long = cut_off_arguments_refusal("t", &format!("{}é", "x".repeat(60)));
+    let long = cut_off_arguments_refusal("t", &format!("{}é", "x".repeat(60)), 1);
     assert!(
         long.contains(&format!("ending `{}é`", "x".repeat(39))),
         "{long}"
     );
+}
+
+/// The first cut-off may be the stage's own cap, which the retry lifts, so
+/// the model may resend. From the second in a row the call cannot fit: the
+/// refusal says not to resend, says how to split this tool's call, and counts
+/// down to the stage error.
+#[test]
+fn cut_off_arguments_refusal_escalates_and_says_how_to_split() {
+    let first = cut_off_arguments_refusal("write_file", "{", 1);
+    assert!(
+        first.contains("may use up to the model's maximum output"),
+        "{first}"
+    );
+    assert!(first.contains("Send the call again"), "{first}");
+    assert!(
+        first.contains("then add each later part with write_file and \"append\": true"),
+        "{first}"
+    );
+    assert!(!first.contains("stage ends"), "{first}");
+
+    let second = cut_off_arguments_refusal("edit_file", "{", 2);
+    assert!(second.contains("That is 2 replies in a row"), "{second}");
+    assert!(
+        second.contains("Do not send it again as it was"),
+        "{second}"
+    );
+    assert!(second.contains("smaller piece of text"), "{second}");
+    assert!(
+        second.contains("ends with an error if your next 2 replies are cut off too"),
+        "{second}"
+    );
+
+    let last = cut_off_arguments_refusal("shell", "{", MAX_CUT_OFF_NUDGES);
+    assert!(
+        last.contains("spread the work over several calls"),
+        "{last}"
+    );
+    assert!(
+        last.contains("ends with an error if your next reply is cut off too"),
+        "{last}"
+    );
+}
+
+/// A refused cut-off call stays in the conversation beside its refusal, and
+/// the next request must still be one a provider accepts. Anthropic answers
+/// `tool_use.input: Input should be an object` to the partial text
+/// as a bare string, and every retry and resume sent that same request again,
+/// so the run could never recover.
+#[tokio::test]
+async fn a_refused_cut_off_call_assembles_as_an_object_the_provider_accepts() {
+    let (jtx, _jrx) = mpsc::unbounded_channel();
+    let mut world = World::new();
+    world.insert_resource(ToolServiceRes(Arc::new(EchoService)));
+    world.insert_resource(ToolStage::detached(jtx));
+    let raw = "{\"path\": \"report.md\", \"content\": \"# Local LLM hardw";
+    let result = crate::components::InferenceResult {
+        parts: Vec::new(),
+        attempt_id: String::new(),
+        response: String::new(),
+        tool_calls: vec![fcall("c1", "write_file", serde_json::json!(raw))],
+        tokens_used: 0,
+        cut_off_at: Some(24_000),
+        reasoning: None,
+    };
+    // A sliding window, the kind assembled as typed messages: a `Clearable`
+    // conversation renders as system text and would never show a `tool_use`.
+    let mut conversation = ContextWindow::new(10_000);
+    conversation.add_region(Region::new(
+        "conversation".to_string(),
+        RegionKind::SlidingWindow {
+            max_items: 20,
+            eviction_strategy: leviath_core::EvictionStrategy::PerItem,
+        },
+        5000,
+    ));
+    let e = world
+        .spawn((
+            agent_state(),
+            offering(&["write_file"]),
+            result,
+            conversation,
+            ReadyForTools,
+        ))
+        .id();
+
+    let mut s = Schedule::default();
+    s.add_systems(dispatch_tools);
+    s.run(&mut world);
+
+    let assembled = world.get::<ContextWindow>(e).unwrap().assemble();
+    let blocks: Vec<&leviath_providers::ContentBlock> = assembled
+        .messages
+        .iter()
+        .filter_map(|m| match &m.content {
+            leviath_providers::MessageContent::Blocks(blocks) => Some(blocks),
+            leviath_providers::MessageContent::Text(_) => None,
+        })
+        .flatten()
+        .collect();
+    let input = blocks
+        .iter()
+        .find_map(|b| match b {
+            leviath_providers::ContentBlock::ToolUse { input, .. } => Some(input.clone()),
+            _ => None,
+        })
+        .expect("the call is still in the request");
+    assert_eq!(input, serde_json::json!({ "_raw": raw }));
+    let refusal = blocks
+        .iter()
+        .find_map(|b| match b {
+            leviath_providers::ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                ..
+            } if tool_use_id == "c1" => Some(content.clone()),
+            _ => None,
+        })
+        .expect("the refusal is paired with the call");
+    assert!(refusal.contains("was not run"), "{refusal}");
+}
+
+/// A cut-off reply with tool calls, as `process_response` sees it.
+fn cut_off_batch(
+    arguments: serde_json::Value,
+    cut_off_at: Option<usize>,
+) -> crate::components::InferenceResult {
+    crate::components::InferenceResult {
+        parts: Vec::new(),
+        attempt_id: String::new(),
+        response: String::new(),
+        tool_calls: vec![fcall("c1", "write_file", arguments)],
+        tokens_used: 0,
+        cut_off_at,
+        reasoning: None,
+    }
+}
+
+/// A model that keeps sending a call too large for the model's own maximum
+/// is sent back with the refusal three times in a row, and then the stage
+/// ends as a stage ERROR: the run's status, the stage log and the outcome an
+/// `error` edge follows all carry the reason. An agent without a state or a
+/// log buffer still gets the outcome.
+#[test]
+fn process_response_ends_the_stage_after_the_cut_off_budget() {
+    let mut world = World::new();
+    let first = world
+        .spawn((
+            cut_off_batch(serde_json::json!("{\"path\": \"a"), Some(8_192)),
+            StageProgress::default(),
+            ProcessResponse,
+        ))
+        .id();
+    run_process(&mut world);
+    assert!(world.get::<ReadyForTools>(first).is_some());
+    assert_eq!(world.get::<StageProgress>(first).unwrap().cut_off_nudges, 1);
+
+    let spent = world
+        .spawn((
+            cut_off_batch(serde_json::json!("{\"path\": \"a"), Some(8_192)),
+            StageProgress {
+                cut_off_nudges: MAX_CUT_OFF_NUDGES,
+                ..Default::default()
+            },
+            ProcessResponse,
+        ))
+        .id();
+    let observed = world
+        .spawn((
+            cut_off_batch(serde_json::json!("{\"path\": \"a"), Some(8_192)),
+            StageProgress {
+                cut_off_nudges: MAX_CUT_OFF_NUDGES,
+                ..Default::default()
+            },
+            agent_state(),
+            StageIoBuffer::default(),
+            StageCursor { index: 2 },
+            ProcessResponse,
+        ))
+        .id();
+    run_process(&mut world);
+    let message = cut_off_stage_error(MAX_CUT_OFF_NUDGES + 1, &["write_file"]);
+    for e in [spent, observed] {
+        assert!(world.get::<ResolveTransition>(e).is_some());
+        assert!(world.get::<ReadyForTools>(e).is_none());
+        assert!(world.get::<ProcessResponse>(e).is_none());
+        assert_eq!(
+            world.get::<StageOutcome>(e),
+            Some(&StageOutcome::Errored(message.clone()))
+        );
+    }
+    assert_eq!(
+        world.get::<AgentState>(observed).unwrap().status,
+        AgentStatus::Error {
+            message: message.clone()
+        }
+    );
+    assert_eq!(
+        world.get::<StageIoBuffer>(observed).unwrap().logs,
+        vec![(2, format!("[error] {message}"))]
+    );
+    assert!(
+        message.starts_with("4 replies in a row were cut off by the output limit"),
+        "{message}"
+    );
+    assert!(message.contains("(write_file)"), "{message}");
+}
+
+/// Counted in a row, so ordinary work is never mistaken for a cut-off: a
+/// reply with any number of valid calls, a plain answer, or a reply the cap
+/// stopped after its calls were complete all clear the count. A cut-off text
+/// reply leaves it for `handle_empty_response` to count.
+#[test]
+fn process_response_counts_cut_offs_in_a_row() {
+    let mut world = World::new();
+    let two_so_far = || StageProgress {
+        cut_off_nudges: 2,
+        ..Default::default()
+    };
+    let mut many_valid = cut_off_batch(serde_json::json!({ "path": "a" }), None);
+    many_valid.tool_calls = (0..25)
+        .map(|i| {
+            fcall(
+                &format!("c{i}"),
+                "write_file",
+                serde_json::json!({ "path": "a", "content": "x", "append": true }),
+            )
+        })
+        .collect();
+    let valid = world
+        .spawn((many_valid, two_so_far(), ProcessResponse))
+        .id();
+    let answer = world
+        .spawn((infer_result_only(false), two_so_far(), ProcessResponse))
+        .id();
+    let complete_then_capped = world
+        .spawn((
+            cut_off_batch(serde_json::json!({ "path": "a" }), Some(8_192)),
+            two_so_far(),
+            ProcessResponse,
+        ))
+        .id();
+    let mut cut_text = infer_result_only(false);
+    cut_text.cut_off_at = Some(8_192);
+    let cut_off_text = world.spawn((cut_text, two_so_far(), ProcessResponse)).id();
+    run_process(&mut world);
+    for e in [valid, answer, complete_then_capped] {
+        assert_eq!(world.get::<StageProgress>(e).unwrap().cut_off_nudges, 0);
+        assert!(world.get::<StageOutcome>(e).is_none());
+    }
+    assert!(world.get::<ReadyForTools>(valid).is_some());
+    assert_eq!(
+        world
+            .get::<StageProgress>(cut_off_text)
+            .unwrap()
+            .cut_off_nudges,
+        2
+    );
+}
+
+/// Only a call whose arguments were cut off spends the budget: a cap that
+/// fell after a complete call, or text arguments with no cut-off (a torn
+/// journal record replayed on restore), dispatch as they always did.
+#[test]
+fn process_response_counts_only_calls_the_cap_cut_off() {
+    let mut world = World::new();
+    let complete = world
+        .spawn((
+            cut_off_batch(serde_json::json!({ "path": "a" }), Some(8_192)),
+            StageProgress::default(),
+            ProcessResponse,
+        ))
+        .id();
+    let torn = world
+        .spawn((
+            cut_off_batch(serde_json::json!("{\"path\": \"a"), None),
+            StageProgress::default(),
+            ProcessResponse,
+        ))
+        .id();
+    run_process(&mut world);
+    for e in [complete, torn] {
+        assert!(world.get::<ReadyForTools>(e).is_some());
+        assert_eq!(world.get::<StageProgress>(e).unwrap().cut_off_nudges, 0);
+    }
 }
 
 /// An accepted text-only reply stays in the conversation. Drop it and a gate
@@ -17665,6 +20307,7 @@ fn build_request_resolves_relative_output_caps() {
         batch_tool_hint: false,
         shell_hint: false,
         request_timeout_secs: None,
+        as_text: Vec::new(),
     };
     let si = stage("m", vec![], None);
     let w = ctx(&[("conversation", 10_000), ("claims", 3_000)]);
@@ -17711,6 +20354,7 @@ fn a_stage_hides_what_it_names_and_the_next_stage_starts_clean() {
     let _ = window.add_to_region("sources", "a page".to_string(), 2);
     let hiding = StageSetup {
         context_hide: vec!["sources".to_string(), "conversation".to_string()],
+        context_reset: Vec::new(),
         ..setup_carrying_prompt("polish")
     };
     apply_stage_context(&hiding, &mut window).expect("fits");
@@ -17758,6 +20402,7 @@ fn routing_request_shares_the_stage_prefix_and_forbids_tool_use() {
         batch_tool_hint: true,
         shell_hint: false,
         request_timeout_secs: None,
+        as_text: Vec::new(),
     };
     let w = ctx(&[("conversation", 10_000), ("notes", 2_000)]);
     let mut si = stage("m", vec![tool("read_file"), tool("write_file")], None);
@@ -17837,6 +20482,7 @@ fn collect_records_a_cut_off_reply_in_the_stage_ledger() {
     tx.send(InferenceOutcome {
         latency: std::time::Duration::ZERO,
         entity: e,
+        attempt_id: String::new(),
         result: Ok(response),
         pricing: None,
     })
@@ -17856,6 +20502,7 @@ fn collect_records_a_cut_off_reply_in_the_stage_ledger() {
     tx.send(InferenceOutcome {
         latency: std::time::Duration::ZERO,
         entity: plain,
+        attempt_id: String::new(),
         result: Ok(resp("done")),
         pricing: None,
     })
@@ -17891,4 +20538,674 @@ fn spawning_refuses_a_blueprint_with_no_stages_or_a_stage_count_mismatch() {
     )
     .unwrap_err();
     assert!(err.contains("0 resolved stages"), "{err}");
+}
+
+// ── message delivery with parts ──
+
+mod message_parts {
+    use super::*;
+    use crate::blob_store::{BlobStoreHandle, MimeLimits, MimeRegistryHandle};
+    use leviath_core::mime::{InboundPart, MemoryBlobStore};
+
+    fn png() -> Vec<u8> {
+        b"\x89PNG\r\n\x1a\nbody".to_vec()
+    }
+
+    fn world_with_store() -> (World, mpsc::UnboundedSender<AgentMessage>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut world = World::new();
+        world.insert_resource(MessageIntake(rx));
+        world.insert_resource(BlobStoreHandle(Arc::new(MemoryBlobStore::new())));
+        world.insert_resource(MimeRegistryHandle::default());
+        (world, tx)
+    }
+
+    fn with_parts(content: &str, parts: Vec<InboundPart>) -> AgentMessage {
+        AgentMessage {
+            agent_id: "a1".to_string(),
+            content: content.to_string(),
+            target_region: None,
+            parts,
+        }
+    }
+
+    #[test]
+    fn text_and_files_land_as_one_entry_and_a_named_region_gets_its_own() {
+        let (mut world, tx) = world_with_store();
+        let e = spawn_msg_agent(
+            &mut world,
+            true,
+            &[("conversation", 10_000), ("art", 10_000)],
+        );
+        tx.send(with_parts(
+            "see this",
+            vec![
+                InboundPart::from_bytes("hero.png", png()),
+                InboundPart::from_bytes("song.wav", vec![1, 2, 3]).in_region("art"),
+            ],
+        ))
+        .unwrap();
+        run_deliver(&mut world);
+        let window = world.get::<ContextWindow>(e).unwrap();
+        let conv = window.get_region("conversation").unwrap();
+        assert_eq!(conv.content.len(), 1);
+        assert_eq!(conv.content[0].content.parts().len(), 2);
+        assert_eq!(
+            conv.content[0].content.as_str(),
+            "see this\n[image/png, 12 B] hero.png"
+        );
+        assert_eq!(conv.content[0].kind, leviath_core::EntryKind::UserMessage);
+        let art = window.get_region("art").unwrap();
+        assert_eq!(art.stored_count(), 1);
+        assert_eq!(
+            art.content[0].content.parts()[0].name.as_deref(),
+            Some("song.wav")
+        );
+    }
+
+    #[test]
+    fn a_world_without_a_store_delivers_the_text_alone() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut world = World::new();
+        world.insert_resource(MessageIntake(rx));
+        let e = spawn_msg_agent(&mut world, true, &[("conversation", 10_000)]);
+        tx.send(with_parts(
+            "just words",
+            vec![InboundPart::from_bytes("hero.png", png())],
+        ))
+        .unwrap();
+        run_deliver(&mut world);
+        let conv = world
+            .get::<ContextWindow>(e)
+            .unwrap()
+            .get_region("conversation")
+            .unwrap()
+            .clone();
+        assert_eq!(conv.content.len(), 1);
+        assert_eq!(conv.content[0].content, "just words");
+        assert_eq!(conv.stored_count(), 0);
+    }
+
+    #[test]
+    fn a_part_the_run_cannot_take_is_dropped_and_the_text_still_lands() {
+        let (mut world, tx) = world_with_store();
+        world.insert_resource(MimeLimits {
+            max_part_bytes: 4,
+            ..MimeLimits::default()
+        });
+        let e = spawn_msg_agent(&mut world, true, &[("conversation", 10_000), ("tiny", 1)]);
+        // Over the ceiling in the message's own region; over the ceiling in
+        // a named one; a region nobody declared; a region with no room.
+        tx.send(with_parts(
+            "",
+            vec![
+                InboundPart::from_bytes("big.png", png()),
+                InboundPart::from_bytes("big2.png", png()).in_region("conversation"),
+                InboundPart::from_bytes("x.bin", vec![1]).in_region("ghost"),
+                InboundPart::from_bytes("y.png", vec![1])
+                    .typed(leviath_core::mime::MimeType::parse("image/png").unwrap())
+                    .in_region("tiny"),
+            ],
+        ))
+        .unwrap();
+        run_deliver(&mut world);
+        let window = world.get::<ContextWindow>(e).unwrap();
+        let conv = window.get_region("conversation").unwrap();
+        assert_eq!(conv.content.len(), 1);
+        assert_eq!(conv.content[0].content, "");
+        assert_eq!(conv.stored_count(), 0);
+        assert!(window.get_region("tiny").unwrap().content.is_empty());
+    }
+
+    #[test]
+    fn the_message_entry_itself_can_be_refused() {
+        let (mut world, tx) = world_with_store();
+        let e = spawn_msg_agent(&mut world, true, &[("conversation", 1)]);
+        tx.send(with_parts(
+            "too much for a one-token region",
+            vec![InboundPart::from_bytes("hero.png", png())],
+        ))
+        .unwrap();
+        run_deliver(&mut world);
+        let window = world.get::<ContextWindow>(e).unwrap();
+        assert!(
+            window
+                .get_region("conversation")
+                .unwrap()
+                .content
+                .is_empty()
+        );
+    }
+}
+
+// ── spawn with attached parts ──
+
+mod spawn_parts {
+    use super::*;
+    use std::collections::HashMap;
+
+    use crate::blob_store::{BlobStoreHandle, MimeRegistryHandle};
+    use crate::pipeline::spawn::{SeededSpawn, spawn_agent_seeded};
+    use leviath_core::mime::{InboundPart, MemoryBlobStore};
+
+    fn task_blueprint() -> leviath_core::Blueprint {
+        let layout = leviath_core::layout::ContextLayout::new(
+            vec![leviath_core::layout::RegionDefinition::new(
+                "task".to_string(),
+                RegionKind::Pinned,
+                4000,
+            )],
+            8000,
+        );
+        let s = leviath_core::Stage::new(
+            "start".to_string(),
+            leviath_core::blueprint::ModelConfig::new("p".to_string(), "m".to_string()),
+        );
+        leviath_core::Blueprint::new("t".to_string(), "d".to_string(), vec![s], layout)
+    }
+
+    fn seeded(parts: Vec<InboundPart>) -> SeededSpawn {
+        SeededSpawn {
+            agent_id: "run-parts".to_string(),
+            blueprint: task_blueprint(),
+            seeds: HashMap::from([("task".to_string(), "edit @hero.png".to_string())]),
+            parts,
+            stages: vec![resolved("m")],
+            global_hints: hints(true),
+            global_nudge: leviath_core::NudgeConfig::default(),
+            region_scripts: HashMap::new(),
+            mime_registry: None,
+        }
+    }
+
+    fn png() -> InboundPart {
+        InboundPart::from_bytes("hero.png", b"\x89PNG\r\n\x1a\nbody".to_vec())
+    }
+
+    #[test]
+    fn attached_parts_land_after_the_seeds_in_the_task_region() {
+        let mut world = World::new();
+        world.insert_resource(BlobStoreHandle(Arc::new(MemoryBlobStore::new())));
+        world.insert_resource(MimeRegistryHandle::default());
+        let e = spawn_agent_seeded(&mut world, seeded(vec![png()])).expect("spawn");
+        let task = world
+            .get::<ContextWindow>(e)
+            .unwrap()
+            .get_region("task")
+            .unwrap()
+            .clone();
+        assert_eq!(task.content.len(), 2);
+        assert_eq!(task.content[0].content, "edit @hero.png");
+        assert_eq!(task.content[1].content, "[image/png, 12 B] hero.png");
+        assert_eq!(task.stored_count(), 1);
+    }
+
+    #[test]
+    fn a_world_without_a_store_refuses_a_part_and_a_bad_part_refuses_the_spawn() {
+        let mut world = World::new();
+        let err = spawn_agent_seeded(&mut world, seeded(vec![png()])).unwrap_err();
+        assert!(err.contains("no blob store"), "{err}");
+        world.insert_resource(BlobStoreHandle(Arc::new(MemoryBlobStore::new())));
+        world.insert_resource(MimeRegistryHandle::default());
+        world.insert_resource(crate::blob_store::MimeLimits {
+            max_part_bytes: 2,
+            ..Default::default()
+        });
+        let err = spawn_agent_seeded(&mut world, seeded(vec![png()])).unwrap_err();
+        assert!(err.contains("over the 2 byte ceiling"), "{err}");
+        // No parts: the store is never consulted.
+        assert!(spawn_agent_seeded(&mut world, seeded(Vec::new())).is_ok());
+    }
+
+    /// A spawn builds the run's registry from the world's rows and the
+    /// blueprint's own, and types the attached parts by it; a host-built one
+    /// is taken as is, and rows that will not layer refuse the spawn.
+    #[test]
+    fn a_spawn_carries_the_blueprints_mime_rows_onto_the_run() {
+        use crate::blob_store::RunMimeRegistry;
+        use leviath_core::mime::{MimeRegistry, MimeType};
+        let mut world = World::new();
+        world.insert_resource(BlobStoreHandle(Arc::new(MemoryBlobStore::new())));
+        world.insert_resource(MimeRegistryHandle::default());
+        let mut spawn = seeded(vec![InboundPart::from_bytes(
+            "a.scene",
+            b"ACME\x00\x00\x00\x01".to_vec(),
+        )]);
+        spawn.blueprint.mime_types = toml::from_str(
+            "[\"application/x-acme-scene\"]\nfamily = \"model\"\nextensions = [\"scene\"]\n",
+        )
+        .unwrap();
+        let e = spawn_agent_seeded(&mut world, spawn).expect("spawn");
+        let scene = MimeType::parse("application/x-acme-scene").unwrap();
+        let run = world
+            .get::<RunMimeRegistry>(e)
+            .expect("the run has a registry");
+        assert_eq!(run.registry().info(&scene).source, "blueprint");
+        let task = world
+            .get::<ContextWindow>(e)
+            .unwrap()
+            .get_region("task")
+            .unwrap()
+            .clone();
+        assert_eq!(
+            task.content[1].content.stored().next().unwrap().mime_type,
+            scene,
+            "the attached part is typed by the blueprint's extension row"
+        );
+
+        // A host-built registry is used as handed over.
+        let rows: toml::Table = toml::from_str("[\"model/obj\"]\nfamily = \"scene\"\n").unwrap();
+        let mut spawn = seeded(Vec::new());
+        spawn.mime_registry =
+            Some(RunMimeRegistry::new(&MimeRegistry::builtin(), rows, Default::default()).unwrap());
+        let e = spawn_agent_seeded(&mut world, spawn).expect("spawn");
+        let obj = MimeType::parse("model/obj").unwrap();
+        assert_eq!(
+            world
+                .get::<RunMimeRegistry>(e)
+                .unwrap()
+                .registry()
+                .info(&obj)
+                .family,
+            "scene"
+        );
+
+        // Rows the registry refuses (an embedder's hand-built blueprint) are
+        // the spawn's error.
+        let mut spawn = seeded(Vec::new());
+        spawn.blueprint.mime_types = toml::from_str("[png]\nfamily = \"image\"\n").unwrap();
+        let err = spawn_agent_seeded(&mut world, spawn).unwrap_err();
+        assert!(err.starts_with("[mime_types]:"), "{err}");
+
+        // A world with no registry at all spawns without one.
+        let mut bare = World::new();
+        let e = spawn_agent_seeded(&mut bare, seeded(Vec::new())).expect("spawn");
+        assert!(bare.get::<RunMimeRegistry>(e).is_none());
+    }
+}
+
+// ── mime tools and typed tool results ──
+
+mod typed_tool_results {
+    use super::*;
+    use leviath_core::mime::{Blob, BlobStore, MemoryBlobStore, MimeRegistry, Part};
+    use leviath_core::region::EntryContent;
+
+    fn stored_png() -> Part {
+        let reg = MimeRegistry::builtin();
+        let blob = Blob::new(
+            leviath_core::mime::MimeType::parse("image/png").unwrap(),
+            b"\x89PNG\r\n\x1a\nabc".to_vec(),
+        )
+        .named("shot.png");
+        let r = MemoryBlobStore::new().put("r", &blob, &reg).unwrap();
+        Part::stored(r).named("shot.png")
+    }
+
+    #[test]
+    fn a_mime_tool_call_is_answered_inline_and_never_reaches_the_lane() {
+        let (mut world, mut jrx) = world_with_lane();
+        let mut call = tc("c1", "context_export");
+        call.arguments = serde_json::json!({});
+        let e = ready_for_tools(&mut world, vec![call]);
+        let mut s = Schedule::default();
+        s.add_systems(dispatch_tools);
+        s.run(&mut world);
+        assert!(jrx.try_recv().is_err(), "must not reach the tool lane");
+        let conv = world
+            .get::<ContextWindow>(e)
+            .unwrap()
+            .get_region("conversation")
+            .unwrap()
+            .clone();
+        let answer = conv
+            .content
+            .iter()
+            .find(|e| matches!(e.kind, leviath_core::EntryKind::ToolResult { .. }))
+            .expect("the answer landed as a tool result");
+        assert!(
+            answer.content.contains("no blob store"),
+            "{}",
+            answer.content
+        );
+        // With a blueprint on the agent, the stage's limit for the tool is
+        // looked up before the tool answers; the answer is the same here,
+        // since there is still no store to read from.
+        let mut stage = leviath_core::Stage::new(
+            "main".to_string(),
+            leviath_core::blueprint::ModelConfig::new("p".to_string(), "m".to_string()),
+        );
+        stage
+            .tool_accepts
+            .insert("context_export".to_string(), vec!["text/*".to_string()]);
+        let mut call = tc("c2", "context_export");
+        call.arguments = serde_json::json!({"name": "shot.png"});
+        let limited = ready_for_tools(&mut world, vec![call]);
+        world
+            .entity_mut(limited)
+            .insert(AgentBlueprint(blueprint(vec![stage])));
+        s.run(&mut world);
+        assert!(jrx.try_recv().is_err(), "must not reach the tool lane");
+        let conv = world
+            .get::<ContextWindow>(limited)
+            .unwrap()
+            .get_region("conversation")
+            .unwrap()
+            .clone();
+        let answer = conv
+            .content
+            .iter()
+            .find(|e| matches!(e.kind, leviath_core::EntryKind::ToolResult { .. }))
+            .expect("the answer landed as a tool result");
+        assert!(answer.content.contains("no blob store"));
+    }
+
+    #[test]
+    fn a_result_with_a_stored_part_keeps_the_part_and_prices_it() {
+        let mut w = ctx(&[("conversation", 1_000_000)]);
+        let part = stored_png();
+        // A stored part is charged its stand-in, not its native estimate.
+        let part_tokens = leviath_core::estimate_tokens(&part.blob().unwrap().stand_in);
+        let result = EntryContent::from_parts(vec![Part::text("here is the shot"), part]);
+        apply_tool_results(
+            &mut w,
+            "resp",
+            &[tc("c1", "shell")],
+            &[("c1".to_string(), result)],
+            None,
+            None,
+            None,
+        );
+        let conv = w.get_region("conversation").unwrap();
+        let entry = conv
+            .content
+            .iter()
+            .find(|e| matches!(e.kind, leviath_core::EntryKind::ToolResult { .. }))
+            .unwrap();
+        assert_eq!(entry.content.parts().len(), 2);
+        assert!(entry.content.has_stored());
+        assert_eq!(
+            entry.tokens,
+            leviath_core::estimate_tokens("here is the shot") + part_tokens
+        );
+        assert_eq!(
+            entry.content.as_str(),
+            "here is the shot\n[image/png, 11 B] shot.png"
+        );
+
+        // A capped result keeps its part whole and caps the text alone.
+        let mut w = ctx(&[("conversation", 1_000_000), ("shots", 1_000_000)]);
+        let long = "x".repeat(4_000);
+        let result = EntryContent::from_parts(vec![Part::text(long), stored_png()]);
+        let r = routing("shots", &[], true, Some(100));
+        apply_tool_results(
+            &mut w,
+            "resp",
+            &[tc("c1", "shell")],
+            &[("c1".to_string(), result)],
+            Some(&r),
+            None,
+            None,
+        );
+        let shots = w.get_region("shots").unwrap();
+        assert_eq!(shots.stored_count(), 1);
+        assert!(shots.content[0].content.as_str().contains("[...truncated]"));
+    }
+}
+
+/// Mime a model produced: stored on the run and written beside the reply,
+/// or described in the text when the run cannot keep it.
+mod model_parts {
+    use super::*;
+    use crate::blob_store::{BlobStoreHandle, MimeLimits, MimeParams, MimeRegistryHandle};
+    use crate::pipeline::response::{dropped_part_notes, reply_content, store_model_parts};
+    use crate::pipeline::tool_results::{Reply, apply_tool_results_with_parts};
+    use leviath_core::mime::{Blob, MemoryBlobStore, MimeType, Part};
+
+    fn png(name: &str) -> Blob {
+        Blob::new(
+            MimeType::parse("image/png").unwrap(),
+            b"\x89PNG\r\n\x1a\nbody".to_vec(),
+        )
+        .named(name)
+    }
+
+    #[test]
+    fn produced_mime_is_stored_named_and_capped() {
+        let mut world = World::new();
+        world.insert_resource(BlobStoreHandle(Arc::new(MemoryBlobStore::new())));
+        world.insert_resource(MimeRegistryHandle::default());
+        world.insert_resource(MimeLimits {
+            max_part_bytes: 16,
+            ..MimeLimits::default()
+        });
+        let entity = world.spawn(()).id();
+        let mut state = bevy_ecs::system::SystemState::<MimeParams>::new(&mut world);
+        let mime = state.get(&world).expect("the parameter validates");
+        // Byte-distinct from `hero.png` so the dedup does not fold them
+        // together: this row is here to prove the unnamed-blob naming, not
+        // duplicate handling (which has its own test).
+        let mut unnamed = Blob::new(
+            MimeType::parse("image/png").unwrap(),
+            b"\x89PNG\r\n\x1a\nother".to_vec(),
+        );
+        unnamed.name = None;
+        let big = Blob::new(MimeType::parse("image/png").unwrap(), vec![0; 64]);
+        let parts = store_model_parts(vec![png("hero.png"), unnamed, big], entity, "run-m", &mime);
+        assert_eq!(parts.len(), 3);
+        assert!(parts[0].is_stored());
+        assert_eq!(parts[0].name.as_deref(), Some("hero.png"));
+        assert_eq!(parts[0].mime_type.as_str(), "image/png");
+        assert_eq!(parts[1].name.as_deref(), Some("model-2"));
+        assert!(
+            parts[2]
+                .inline_text()
+                .unwrap()
+                .starts_with("[model output dropped:"),
+            "{:?}",
+            parts[2]
+        );
+        assert!(store_model_parts(Vec::new(), entity, "run-m", &mime).is_empty());
+    }
+
+    /// A model that hands back the same bytes twice in one reply (the
+    /// gemini image gateway does this) stores one part, not two - the store
+    /// is content-addressed, so the second is the same file.
+    #[test]
+    fn byte_identical_produced_mime_is_stored_once() {
+        let mut world = World::new();
+        world.insert_resource(BlobStoreHandle(Arc::new(MemoryBlobStore::new())));
+        world.insert_resource(MimeRegistryHandle::default());
+        world.insert_resource(MimeLimits::default());
+        let entity = world.spawn(()).id();
+        let mut state = bevy_ecs::system::SystemState::<MimeParams>::new(&mut world);
+        let mime = state.get(&world).expect("the parameter validates");
+        // `png` gives the same bytes whatever the name, so these two are
+        // byte-identical; a third, distinct blob is kept.
+        let other = Blob::new(
+            MimeType::parse("image/png").unwrap(),
+            b"\x89PNG\r\n\x1a\ndifferent".to_vec(),
+        )
+        .named("other.png");
+        let parts = store_model_parts(
+            vec![png("first.png"), png("second.png"), other],
+            entity,
+            "run-m",
+            &mime,
+        );
+        assert_eq!(parts.len(), 2, "the byte-identical repeat is dropped");
+        assert_eq!(parts[0].name.as_deref(), Some("first.png"));
+        assert_eq!(parts[1].name.as_deref(), Some("other.png"));
+    }
+
+    #[test]
+    fn a_world_without_a_store_describes_what_it_dropped() {
+        let mut world = World::new();
+        let entity = world.spawn(()).id();
+        let mut state = bevy_ecs::system::SystemState::<MimeParams>::new(&mut world);
+        let mime = state.get(&world).expect("the parameter validates");
+        let parts = store_model_parts(vec![png("hero.png")], entity, "run-m", &mime);
+        assert_eq!(parts.len(), 1);
+        assert_eq!(
+            parts[0].inline_text().unwrap(),
+            "[model output dropped: image/png of 12 B, this run has no blob store]"
+        );
+        // The note reaches the stage log, in the log's own voice; a kept part
+        // and ordinary text leave nothing there.
+        let mut parts = parts;
+        parts.push(leviath_core::mime::Part::text("here is the render"));
+        assert_eq!(
+            dropped_part_notes(&parts),
+            vec!["[mime] model output dropped: image/png of 12 B, this run has no blob store"]
+        );
+    }
+
+    #[test]
+    fn a_reply_is_its_text_and_its_parts_or_nothing() {
+        let stored =
+            Part::stored(png("a.png").describe(&leviath_core::mime::MimeRegistry::builtin()))
+                .named("a.png");
+        assert!(reply_content("  ", &[], None).is_none());
+        let text = reply_content("hi", &[], None).unwrap();
+        assert_eq!(text.parts().len(), 1);
+        let both = reply_content("hi", std::slice::from_ref(&stored), None).unwrap();
+        assert_eq!(both.parts().len(), 2);
+        assert_eq!(both.stored_count(), 1);
+        let alone = reply_content("", std::slice::from_ref(&stored), None).unwrap();
+        assert_eq!(alone.parts().len(), 1);
+    }
+
+    /// A reply over `[mime] inline_text_bytes` is stored and the turn carries
+    /// its stand-in; one under it stays inline.
+    #[test]
+    fn a_long_reply_is_stored_by_hash_and_a_short_one_stays_inline() {
+        let store = leviath_core::mime::MemoryBlobStore::new();
+        let registry = leviath_core::mime::MimeRegistry::builtin();
+        let sink = crate::context_setup::PartSink {
+            store: &store,
+            registry: &registry,
+            run_id: "run-1",
+            max_part_bytes: 1024,
+            inline_text_bytes: 16,
+        };
+        let short = reply_content("brief", &[], Some(&sink)).unwrap();
+        assert_eq!(short.stored_count(), 0);
+        assert_eq!(short.as_str(), "brief");
+        let long = reply_content(&"x".repeat(40), &[], Some(&sink)).unwrap();
+        assert_eq!(long.stored_count(), 1);
+        let part = long.stored().next().unwrap();
+        assert_eq!(part.mime_type.as_str(), "text/plain");
+        assert_eq!(part.name.as_deref(), Some("reply.txt"));
+        let sha = &part.blob().unwrap().sha256;
+        assert_eq!(
+            leviath_core::mime::BlobStore::read(&store, "run-1", sha)
+                .unwrap()
+                .len(),
+            40
+        );
+    }
+
+    /// A tool result over the inline ceiling lands in its region as a stored
+    /// `text/plain` part named after the tool, and the model's own turn is
+    /// untouched.
+    #[test]
+    fn a_long_tool_result_is_stored_by_hash() {
+        let store = leviath_core::mime::MemoryBlobStore::new();
+        let registry = leviath_core::mime::MimeRegistry::builtin();
+        let sink = crate::context_setup::PartSink {
+            store: &store,
+            registry: &registry,
+            run_id: "run-1",
+            max_part_bytes: 1024,
+            inline_text_bytes: 16,
+        };
+        let mut w = ctx(&[("conversation", 100_000)]);
+        apply_tool_results_with_parts(
+            &mut w,
+            Reply {
+                text: "listing",
+                parts: &[],
+                stage: None,
+                sink: Some(&sink),
+            },
+            &[tc("c1", "shell")],
+            &[("c1".to_string(), "line\n".repeat(20).into())],
+            None,
+            None,
+            None,
+        );
+        let entries = &w.get_region("conversation").unwrap().content;
+        assert_eq!(entries[0].content.stored_count(), 0);
+        let result = entries[1].content.stored().next().unwrap();
+        assert_eq!(result.mime_type.as_str(), "text/plain");
+        assert_eq!(result.name.as_deref(), Some("shell-result.txt"));
+    }
+
+    #[test]
+    fn the_assistant_turn_carries_the_mime_ahead_of_its_tool_results() {
+        let stored =
+            Part::stored(png("a.png").describe(&leviath_core::mime::MimeRegistry::builtin()))
+                .named("a.png");
+        let mut w = ctx(&[("conversation", 100_000)]);
+        apply_tool_results_with_parts(
+            &mut w,
+            Reply {
+                text: "drawn",
+                parts: std::slice::from_ref(&stored),
+                stage: None,
+                sink: None,
+            },
+            &[tc("c1", "render")],
+            &[("c1".to_string(), "ok".to_string().into())],
+            None,
+            None,
+            None,
+        );
+        let conv = w.get_region("conversation").unwrap();
+        assert_eq!(conv.content.len(), 2);
+        assert_eq!(conv.content[0].content.stored_count(), 1);
+        assert!(conv.content[0].content.as_str().starts_with("drawn"));
+        assert!(matches!(
+            conv.content[0].kind,
+            leviath_core::EntryKind::AssistantTurn { .. }
+        ));
+    }
+
+    #[test]
+    fn output_routing_sends_a_produced_image_to_its_region_not_the_conversation() {
+        let stored =
+            Part::stored(png("hero.png").describe(&leviath_core::mime::MimeRegistry::builtin()))
+                .named("hero.png");
+        let mut stage = leviath_core::blueprint::Stage::new(
+            "draw".to_string(),
+            leviath_core::blueprint::ModelConfig::new("openrouter".to_string(), "m".to_string()),
+        );
+        stage
+            .output_routing
+            .insert("image/*".to_string(), "artwork".to_string());
+
+        let mut w = ctx(&[("conversation", 100_000), ("artwork", 100_000)]);
+        apply_tool_results_with_parts(
+            &mut w,
+            Reply {
+                text: "drawn",
+                parts: std::slice::from_ref(&stored),
+                stage: Some(&stage),
+                sink: None,
+            },
+            &[tc("c1", "render")],
+            &[("c1".to_string(), "ok".to_string().into())],
+            None,
+            None,
+            None,
+        );
+        // The conversation keeps the text and the tool call, but not the image.
+        let conv = w.get_region("conversation").unwrap();
+        assert_eq!(conv.content[0].content.stored_count(), 0);
+        assert!(conv.content[0].content.as_str().starts_with("drawn"));
+        // The image lands in artwork instead.
+        let artwork = w.get_region("artwork").unwrap();
+        assert_eq!(artwork.content.len(), 1);
+        assert_eq!(artwork.content[0].content.stored_count(), 1);
+    }
 }

@@ -2,204 +2,39 @@
 //!
 //! Supersedes `GET /api/agents`, which returns every run ever recorded as one
 //! unbounded array and accepts only a status filter. That route stays exactly as
-//! it is, deprecated: it is the legacy spelling (the console says "runs"
+//! it is, deprecated: it is the older spelling (the console says "runs"
 //! everywhere), and it gets a replacement at a new path rather than a changed
 //! response shape, so nothing that calls it today breaks.
 //!
 //! What this adds over that: keyset pagination, sorting, server-side search with
 //! highlights, batch fetch by id, and field projection.
 //!
-//! **What it does not fix.** Every listing here still walks the runs directory
-//! and parses every `meta.json`, because that is the only index there is.
-//! Pagination bounds what crosses the wire and what the browser holds; it does
-//! not bound the server's work. The guard that does bound the damage is
-//! [`MAX_SEARCH_SCAN`], on the filesystem-reading half of search.
+//! Every listing here starts from the shared run index (`run_index`), which
+//! parses a `meta.json` only when its stat changes, so a page of fifty costs a
+//! stat per live run rather than a parse of every run on the machine.
+//! Pagination bounds what crosses the wire and what the browser holds. The
+//! guard that bounds the filesystem-reading half of search is
+//! [`MAX_SEARCH_SCAN`].
 //!
 //! Pruning is [`delete_run`] and [`delete_runs`], which is the other half of
 //! that story: the listing can now be made smaller, not only paged over.
 
 use std::collections::HashSet;
 
-use axum::extract::{Path as AxumPath, Query};
+use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use axum::response::Json;
 use serde::{Deserialize, Serialize};
 
-use super::cursor::{self, Cursor, CursorKey};
-use super::search;
+use super::core::error::{ServeError, as_api_error};
+use super::core::runs::{
+    self as run_core, MAX_IDS, MAX_LIMIT, ParentFilter, RunSpec, SortKey, Source,
+};
 use super::types::*;
 use crate::runstate::{self, RunMeta};
 
-mod matching;
-use matching::*;
-
 /// Page size when the client does not ask.
 const DEFAULT_LIMIT: usize = 50;
-/// Largest page size served. A larger `limit` is clamped rather than refused: a
-/// client asking for 1000 wants as much as it can get, and the real value is
-/// discoverable from `GET /api/config`.
-pub(super) const MAX_LIMIT: usize = 200;
-/// Most ids one batch fetch may name.
-pub(super) const MAX_IDS: usize = 200;
-/// How many runs a filesystem-reading search will examine before giving up.
-///
-/// `q_in=logs` over an unbounded, never-pruned run set is a self-inflicted
-/// denial of service: every request would read two files per stage per run, for
-/// every run that has ever existed. Stopping after a bounded prefix - taken in
-/// the requested sort order, so it is the newest runs - answers the common case
-/// and says so via `scan_truncated`, which is better than refusing the query or
-/// than quietly taking longer every month.
-pub(super) const MAX_SEARCH_SCAN: usize = 500;
-/// How much of each stage log a search reads, from the end.
-pub(super) const SEARCH_LOG_TAIL_BYTES: u64 = 256 * 1024;
-/// Most highlights attached to one item. A log with ten thousand matches must
-/// not become the response body.
-const MAX_HIGHLIGHTS: usize = 5;
-
-/// Which field a run is ordered by.
-///
-/// The shared `At` suffix is the point, not an accident: these are the three
-/// timestamps on a run, and each variant is named for the `RunMeta` field it
-/// reads and the query value that selects it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SortKey {
-    Started,
-    Updated,
-    LastProgress,
-}
-
-impl SortKey {
-    fn parse(raw: &str) -> Option<Self> {
-        match raw {
-            "started_at" => Some(SortKey::Started),
-            "updated_at" => Some(SortKey::Updated),
-            "last_progress_at" => Some(SortKey::LastProgress),
-            _ => None,
-        }
-    }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            SortKey::Started => "started_at",
-            SortKey::Updated => "updated_at",
-            SortKey::LastProgress => "last_progress_at",
-        }
-    }
-
-    /// This run's value for the key.
-    ///
-    /// `last_progress_at` is `Option`, and absent means "written by a daemon
-    /// older than the field, or before the first snapshot landed". The run
-    /// demonstrably started, so `started_at` is the honest floor - and it keeps
-    /// the key non-null, which the cursor needs.
-    fn value(self, meta: &RunMeta) -> i64 {
-        match self {
-            SortKey::Started => meta.started_at,
-            SortKey::Updated => meta.updated_at,
-            SortKey::LastProgress => meta.last_progress_at.unwrap_or(meta.started_at),
-        }
-    }
-}
-
-/// Where search looks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum Source {
-    /// Fields already parsed into `RunMeta`. No IO.
-    Meta,
-    /// The tracked modified-file paths. No IO.
-    Files,
-    /// The run's current context window, as raw unparsed bytes.
-    Context,
-    /// The tail of each stage's logs, as raw bytes.
-    Logs,
-    /// The run journal, as raw bytes.
-    Journal,
-}
-
-impl Source {
-    fn parse(raw: &str) -> Option<Self> {
-        match raw {
-            "meta" => Some(Source::Meta),
-            "files" => Some(Source::Files),
-            "context" => Some(Source::Context),
-            "logs" => Some(Source::Logs),
-            "journal" => Some(Source::Journal),
-            _ => None,
-        }
-    }
-
-    /// Does answering this source require reading files?
-    ///
-    /// Only these count against [`MAX_SEARCH_SCAN`] - the in-memory sources are
-    /// free and must not consume the budget.
-    fn reads_filesystem(self) -> bool {
-        matches!(self, Source::Context | Source::Logs | Source::Journal)
-    }
-}
-
-/// Which runs a listing is about.
-///
-/// A run's sub-agents are runs, so a console that draws them nested under the
-/// run that started them was paging by a unit it does not display: a page of
-/// fifty could be seven visible rows and forty-three workers hanging off them,
-/// and there was no way to ask for anything better. This is that way.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ParentFilter {
-    /// No `parent` given: every run, sub-agents included. What this route has
-    /// always returned, so an existing caller sees nothing change.
-    Any,
-    /// `parent=none`: only runs nobody started. What a top-level list wants,
-    /// and what makes `total` a count of the rows a client will actually draw.
-    Roots,
-    /// `parent=<run_id>`: that run's direct children. `GET
-    /// /api/agents/{id}/children` answers the same question in one unpaged,
-    /// unsorted array, which a fan-out of two hundred workers has no windowed
-    /// form of.
-    Of(String),
-}
-
-impl ParentFilter {
-    /// `none` is the only keyword. Nothing else can collide with it: a run id
-    /// is `<agent>-<timestamp>-<hash>`, so no run is ever called `none`.
-    ///
-    /// An empty value reads as absent rather than as a filter matching nothing,
-    /// which is what a client that built its query string from an empty box
-    /// meant. Anything else is taken as a run id, and a run id that names
-    /// nothing gives an empty page - the same answer `status=` gives for a
-    /// status nothing is in, rather than a 404 for a run that may simply have
-    /// no children yet.
-    fn parse(raw: Option<&str>) -> Self {
-        match raw.map(str::trim).filter(|s| !s.is_empty()) {
-            None => Self::Any,
-            Some("none") => Self::Roots,
-            Some(id) => Self::Of(id.to_string()),
-        }
-    }
-
-    /// Whether this run belongs in the listing.
-    fn keeps(&self, meta: &RunMeta) -> bool {
-        match self {
-            Self::Any => true,
-            Self::Roots => meta.parent_run_id.is_none(),
-            Self::Of(parent) => meta.parent_run_id.as_deref() == Some(parent.as_str()),
-        }
-    }
-
-    /// This filter's contribution to the cursor digest, so a walk cannot change
-    /// what it is filtering halfway through.
-    ///
-    /// `None` for [`Any`](Self::Any), which contributes nothing at all rather
-    /// than an empty part - an empty part is still a part, and would have
-    /// changed the digest of every unfiltered listing and so invalidated every
-    /// cursor a client was holding when it upgraded.
-    fn digest_part(&self) -> Option<&str> {
-        match self {
-            Self::Any => None,
-            Self::Roots => Some("none"),
-            Self::Of(parent) => Some(parent.as_str()),
-        }
-    }
-}
 
 /// Query parameters of `GET /api/runs`.
 #[derive(serde::Deserialize, Default)]
@@ -215,35 +50,19 @@ pub(super) struct RunsQuery {
     pub(super) ids: Option<String>,
     pub(super) since: Option<i64>,
     pub(super) parent: Option<String>,
+    /// `descendant_of=<run_id>`: that run's whole subtree, at any depth, and not
+    /// the run itself. The flat read of a fan-out, where `parent=` is one level.
+    pub(super) descendant_of: Option<String>,
+    /// `blueprint=<name>`: only runs of that blueprint, by recorded name.
+    pub(super) blueprint: Option<String>,
 }
 
-/// A validated query. Every 400 this route can produce is decided here, so the
-/// handler below is a straight-line composition and the error paths are all
-/// reachable from a plain unit test.
-struct Resolved {
-    limit: usize,
-    cursor: Option<Cursor>,
-    statuses: Vec<String>,
-    sort: SortKey,
-    descending: bool,
-    q: Option<String>,
-    sources: Vec<Source>,
-    fields: Option<HashSet<String>>,
-    ids: Option<Vec<String>>,
-    since: Option<i64>,
-    parent: ParentFilter,
-    digest: String,
-}
-
-impl Resolved {
-    /// Does any requested source read files?
-    fn searches_filesystem(&self) -> bool {
-        self.q.is_some() && self.sources.iter().any(|s| s.reads_filesystem())
-    }
-}
-
-fn bad_request(message: String) -> ApiError {
-    err(StatusCode::BAD_REQUEST, message)
+/// A request this route refuses to answer, as the shared failure type.
+///
+/// Both surfaces render it: REST as a 400 with the message in the body,
+/// GraphQL as an `errors` entry coded `BAD_USER_INPUT`.
+fn bad_request(message: String) -> ServeError {
+    ServeError::BadRequest(message)
 }
 
 /// Split a comma list, dropping empties so `a,,b` and a trailing comma are not
@@ -256,12 +75,25 @@ fn comma_list(raw: &str) -> Vec<String> {
         .collect()
 }
 
-fn resolve(query: &RunsQuery) -> Result<Resolved, ApiError> {
+fn resolve(query: &RunsQuery) -> Result<RunSpec, ServeError> {
     // `ids` is a batch fetch, not a filter: it names exactly what it wants, so
     // paging, ordering and filtering have nothing to act on. Rejecting the
     // combination is deliberate - a silently ignored parameter produces the
     // kind of bug report that takes a day to read.
-    let parent = ParentFilter::parse(query.parent.as_deref());
+    // One question about parentage per listing. `parent=` and `descendant_of=`
+    // ask two different ones, and the pair a caller meant is not recoverable
+    // from the pair they sent.
+    let parent = match (query.parent.as_deref(), query.descendant_of.as_deref()) {
+        (Some(_), Some(_)) => {
+            return Err(bad_request(
+                "`parent` names one run's children and `descendant_of` names a whole subtree, \
+                 so only one of them may be set"
+                    .to_string(),
+            ));
+        }
+        (_, Some(root)) => ParentFilter::Under(root.to_string()),
+        (parent, None) => ParentFilter::parse(parent),
+    };
     let ids = query.ids.as_deref().map(comma_list);
     if let Some(ref ids) = ids {
         let conflicts = [
@@ -272,6 +104,7 @@ fn resolve(query: &RunsQuery) -> Result<Resolved, ApiError> {
             // The resolved filter rather than the raw parameter, so `parent=`
             // is the no-op it looks like rather than a conflict.
             ("parent", parent != ParentFilter::Any),
+            ("blueprint", query.blueprint.is_some()),
         ];
         if let Some((name, _)) = conflicts.iter().find(|(_, present)| *present) {
             return Err(bad_request(format!(
@@ -336,7 +169,7 @@ fn resolve(query: &RunsQuery) -> Result<Resolved, ApiError> {
         None => None,
         Some(raw) => {
             let requested = comma_list(raw);
-            let known = known_meta_fields();
+            let known = known_fields();
             let unknown: Vec<&String> = requested
                 .iter()
                 .filter(|name| !known.contains(name.as_str()))
@@ -362,47 +195,24 @@ fn resolve(query: &RunsQuery) -> Result<Resolved, ApiError> {
 
     let statuses = query.status.as_deref().map(comma_list).unwrap_or_default();
 
-    // The filters, in a fixed order, so the same filter set always digests the
-    // same way.
-    let since_part = query.since.map(|s| s.to_string()).unwrap_or_default();
-    let mut parts = vec![
-        statuses.join(","),
-        q.clone().unwrap_or_default(),
-        sources_raw.to_string(),
-        since_part,
-    ];
-    // Appended only when it filters something. A digest identifies the filter
-    // *set*, and `Any` is the absence of this one - so a listing that does not
-    // use it digests exactly as it did before the parameter existed, and every
-    // cursor a client is already holding stays valid across the upgrade.
-    if let Some(part) = parent.digest_part() {
-        parts.push(part.to_string());
-    }
-    let refs: Vec<&str> = parts.iter().map(String::as_str).collect();
-    let digest = cursor::filter_digest(&refs);
-
-    let cursor = match query.cursor.as_deref() {
-        None => None,
-        Some(raw) => Some(
-            cursor::decode(raw, sort.as_str(), order_raw, &digest)
-                .map_err(|e| bad_request(e.message()))?,
-        ),
-    };
-
-    Ok(Resolved {
+    run_core::RunSelection {
         limit,
-        cursor,
         statuses,
         sort,
         descending,
         q,
         sources,
+        sources_raw: sources_raw.to_string(),
         fields,
         ids,
         since: query.since,
         parent,
-        digest,
-    })
+        blueprint: query.blueprint.clone(),
+        // The flat query parameters above are the whole filter this route
+        // takes; a composable predicate is the other surface's.
+        predicate: None,
+    }
+    .resolve(query.cursor.as_deref())
 }
 
 /// The top-level keys of a serialized `RunMeta`, for validating `fields`.
@@ -418,11 +228,11 @@ fn resolve(query: &RunsQuery) -> Result<Resolved, ApiError> {
 /// the sentence above true, and
 /// `every_skip_if_none_option_on_run_meta_is_filled_by_the_probe` in the tests
 /// reads the struct's source to catch the next one added without a line here.
-fn known_meta_fields() -> HashSet<String> {
+pub(super) fn known_fields() -> HashSet<String> {
     serialized_keys(&probe_meta())
 }
 
-/// A `RunMeta` with every `skip_serializing_if` option set, so that
+/// A `RunMeta` with every `skip_serializing_if` field filled, so that
 /// serializing it names every key a real run can carry.
 fn probe_meta() -> RunMeta {
     let mut probe = RunMeta::new(
@@ -439,6 +249,12 @@ fn probe_meta() -> RunMeta {
     probe.waiting_on = Some(leviath_core::run_meta::WaitReason::ToolApproval);
     probe.output_request = Some(Default::default());
     probe.model_override = Some(String::new());
+    probe.yolo_profile = Some(String::new());
+    probe.blueprint_digest = Some(String::new());
+    probe.stage_models = vec![leviath_core::run_meta::StageModelUse {
+        provider: String::new(),
+        model: String::new(),
+    }];
     probe
 }
 
@@ -462,125 +278,31 @@ fn serialized_keys(probe: &RunMeta) -> HashSet<String> {
 }
 
 /// `GET /api/runs`
+///
+/// Parses the query, hands the listing to the service layer, and renders the
+/// page. Filtering, ordering, searching and paging all live in
+/// [`run_core::list`], which the GraphQL `runs` field calls with a spec built
+/// from its own arguments.
 pub(super) async fn list_runs(
+    State(state): State<AppState>,
     Query(query): Query<RunsQuery>,
 ) -> Result<Json<Page<RunItem>>, ApiError> {
-    let resolved = resolve(&query)?;
-    let server_time = leviath_core::duration::now_secs();
-
-    // A batch fetch reads exactly the named runs, rather than scanning the
-    // whole directory and filtering it down to them.
-    if let Some(ref ids) = resolved.ids {
-        let mut items = Vec::new();
-        let mut missing = Vec::new();
-        for id in ids {
-            match runstate::read_meta(id) {
-                Ok(meta) => items.push(build_item(&meta, &resolved, None)),
-                Err(_) => missing.push(id.clone()),
-            }
-        }
-        let total = items.len();
-        let mut page = Page::new(items, None, Some(total), server_time);
-        page.missing = missing;
-        return Ok(Json(page));
-    }
-
-    let mut runs = runstate::list_runs();
-    // Before the sort and before `total`, like every other filter here, so the
-    // count describes what was asked for rather than what is on the machine.
-    runs.retain(|meta| resolved.parent.keeps(meta));
-    if !resolved.statuses.is_empty() {
-        runs.retain(|meta| {
-            resolved
-                .statuses
-                .iter()
-                .any(|filter| status_matches(&meta.status, filter))
-        });
-    }
-    if let Some(since) = resolved.since {
-        // Inclusive: at seconds granularity an exclusive comparison drops
-        // updates that land in the same second as the previous watermark, and a
-        // re-delivered item is recoverable where a lost one is not.
-        runs.retain(|meta| resolved.sort.value(meta) >= since);
-    }
-
-    // Sort before searching, so the scan budget is spent on the runs the client
-    // asked to see first.
-    sort_runs(&mut runs, &resolved);
-
-    let (runs, scan_truncated) = apply_search(runs, &resolved);
-    // Null when the scan was cut short: a count taken from a partial scan is
-    // worse than no count, because a UI renders it as fact.
-    let total = (!scan_truncated).then_some(runs.len());
-
-    let (page_runs, next_cursor) = paginate(runs, &resolved);
-    let items = page_runs
+    let spec = resolve(&query).map_err(|e| as_api_error(&e))?;
+    let listing = run_core::list(&state, &spec).await;
+    let items = listing
+        .hits
         .iter()
-        .map(|meta| {
-            let highlights = resolved
-                .q
-                .as_deref()
-                .map(|q| highlights_for(meta, q, &resolved.sources))
-                .unwrap_or_default();
-            build_item(meta, &resolved, Some(highlights))
-        })
+        .map(|hit| build_item(&hit.meta, &spec, Some(hit.highlights.clone())))
         .collect();
-
-    let mut page = Page::new(items, next_cursor, total, server_time);
-    page.scan_truncated = scan_truncated;
+    let mut page = Page::new(
+        items,
+        listing.next_cursor,
+        listing.total,
+        listing.server_time,
+    );
+    page.scan_truncated = listing.scan_truncated;
+    page.missing = listing.missing;
     Ok(Json(page))
-}
-
-/// Order by `(sort value, run_id)`, with the tie-break following the primary
-/// direction.
-///
-/// The tie-break is not decoration: two runs can start in the same second, and
-/// a keyset walk over a non-total order drops whichever colliding run it
-/// resumed past. Run ids are unique, so this makes the order total.
-fn sort_runs(runs: &mut [RunMeta], resolved: &Resolved) {
-    runs.sort_by(|a, b| {
-        let ka = (resolved.sort.value(a), a.run_id.as_str());
-        let kb = (resolved.sort.value(b), b.run_id.as_str());
-        if resolved.descending {
-            kb.cmp(&ka)
-        } else {
-            ka.cmp(&kb)
-        }
-    });
-}
-
-/// Take this page's runs and mint the cursor for the next one.
-///
-/// Takes `limit + 1` and keeps `limit`, so a cursor is only ever emitted when a
-/// further item is known to exist. Emitting one speculatively would make a
-/// client's "loop until null" run one empty request longer, every time.
-fn paginate(runs: Vec<RunMeta>, resolved: &Resolved) -> (Vec<RunMeta>, Option<String>) {
-    let mut after_cursor: Vec<RunMeta> = match resolved.cursor {
-        None => runs,
-        Some(ref cursor) => runs
-            .into_iter()
-            .filter(|meta| {
-                cursor.precedes(
-                    &CursorKey::Int(resolved.sort.value(meta)),
-                    &meta.run_id,
-                    resolved.descending,
-                )
-            })
-            .collect(),
-    };
-
-    let has_more = after_cursor.len() > resolved.limit;
-    after_cursor.truncate(resolved.limit);
-    let next = has_more.then(|| after_cursor.last()).flatten().map(|last| {
-        cursor::encode(
-            resolved.sort.as_str(),
-            if resolved.descending { "desc" } else { "asc" },
-            &resolved.digest,
-            CursorKey::Int(resolved.sort.value(last)),
-            &last.run_id,
-        )
-    });
-    (after_cursor, next)
 }
 
 /// One run as this server hands it out: redacted, and carrying the two spans a
@@ -605,7 +327,7 @@ pub(super) fn run_json(meta: &RunMeta, now: i64) -> serde_json::Value {
 ///
 /// The spans go on before the projection, so `?fields=working_secs` selects one
 /// the way it selects any other key.
-fn build_item(meta: &RunMeta, resolved: &Resolved, highlights: Option<Vec<Highlight>>) -> RunItem {
+fn build_item(meta: &RunMeta, resolved: &RunSpec, highlights: Option<Vec<Highlight>>) -> RunItem {
     let mut value = run_json(meta, leviath_core::duration::now_secs());
     if let (Some(fields), serde_json::Value::Object(map)) = (&resolved.fields, &mut value) {
         map.retain(|key, _| fields.contains(key));
@@ -660,91 +382,6 @@ pub(super) struct DeleteRunsQuery {
     pub(super) ids: Option<String>,
 }
 
-/// Whether a run may be removed, or the reason it may not.
-///
-/// One definition for the single and bulk routes, so a run that 409s on its own
-/// cannot be silently deleted as part of a sweep.
-///
-/// `force` covers only the last case below, and only the single-run route ever
-/// passes it.
-fn deletable(id: &str, force: bool) -> Result<(), (StatusCode, String)> {
-    let dir = runstate::run_dir(id);
-    if !dir.exists() {
-        return Err((StatusCode::NOT_FOUND, format!("Run '{id}' not found")));
-    }
-    // Judged from the run's own record, not by asking the daemon: a daemon that
-    // is down must not make every run undeletable.
-    match runstate::read_meta(id) {
-        Ok(meta) if runstate::is_terminal_status(&meta.status) => Ok(()),
-        Ok(meta) => Err((
-            StatusCode::CONFLICT,
-            format!(
-                "Run '{id}' is {}; cancel it before deleting it",
-                meta.status
-            ),
-        )),
-        // A run whose `meta.json` will not parse says nothing about whether it
-        // is finished, and "cannot read it" must not quietly read as "finished".
-        // An unparseable record is what a *live* run looks like to a binary
-        // whose `RunMeta` has moved on, and the failure mode there is deleting a
-        // running agent's directory and answering 204 - which is precisely what
-        // this route refuses to do for a run it *can* see is live.
-        //
-        // Such a run is still skipped by `list_runs`, which would leave it both
-        // invisible and permanent, so the escape hatch stays - as something the
-        // caller types rather than something that happens to them.
-        Err(_) if force => Ok(()),
-        Err(e) => Err((
-            StatusCode::CONFLICT,
-            format!(
-                "Run '{id}' has no readable record ({e}), so it cannot be shown \
-                 to be finished; pass force=true to delete it anyway"
-            ),
-        )),
-    }
-}
-
-/// Remove a run's directory, having already decided it may go.
-fn remove_run(id: &str) -> Result<(), (StatusCode, String)> {
-    std::fs::remove_dir_all(runstate::run_dir(id)).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to delete run '{id}': {e}"),
-        )
-    })
-}
-
-/// Whether every member of `ids` may go, or the reason one of them may not.
-///
-/// A live sub-agent blocks the whole delete rather than being skipped: half a
-/// tree is not a state anything downstream knows how to read, and removing the
-/// parent of a running agent is exactly what [`deletable`] refuses to do for
-/// the run named directly. The reason names the sub-agent, because "cancel it
-/// before deleting it" about a run the caller never mentioned is unactionable.
-fn deletable_family(root: &str, ids: &[String], force: bool) -> Result<(), (StatusCode, String)> {
-    for id in ids {
-        deletable(id, force).map_err(|(code, msg)| {
-            if id == root {
-                (code, msg)
-            } else {
-                (
-                    code,
-                    format!("{msg}. It is a sub-agent run of '{root}', deleted with it"),
-                )
-            }
-        })?;
-    }
-    Ok(())
-}
-
-/// Remove every run in `ids`, stopping at the first failure.
-fn remove_family(ids: &[String]) -> Result<(), (StatusCode, String)> {
-    for id in ids {
-        remove_run(id)?;
-    }
-    Ok(())
-}
-
 /// `DELETE /api/runs/{id}`: remove a finished run's record from disk.
 ///
 /// Separate from `DELETE /api/agents/{id}`, which cancels. The two verbs mean
@@ -776,9 +413,9 @@ pub(super) async fn delete_run(
     // `run_dir` maps an unsafe id to a path that cannot exist, so a traversal
     // attempt arrives here as an ordinary miss rather than a removed directory.
     let ids = runstate::family_of(&id);
-    deletable_family(&id, &ids, query.force.unwrap_or(false))
-        .map_err(|(code, msg)| err(code, msg))?;
-    remove_family(&ids).map_err(|(code, msg)| err(code, msg))?;
+    run_core::deletable_family(&id, &ids, query.force.unwrap_or(false))
+        .map_err(|e| as_api_error(&e))?;
+    run_core::remove_family(&ids).map_err(|e| as_api_error(&e))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -800,55 +437,33 @@ pub(super) async fn delete_run(
 /// predicate is much more likely to be a client that failed to build its query
 /// than an operator asking to erase the machine's entire history.
 pub(super) async fn delete_runs(
+    State(state): State<AppState>,
     Query(query): Query<DeleteRunsQuery>,
 ) -> Result<Json<DeleteRunsResp>, ApiError> {
-    let targets: Vec<String> = match (&query.ids, query.before) {
-        (Some(ids), _) => {
-            let ids = comma_list(ids);
-            if ids.len() > MAX_IDS {
-                return Err(err(
-                    StatusCode::BAD_REQUEST,
-                    format!(
-                        "`ids` names {} runs; at most {MAX_IDS} may be deleted at once",
-                        ids.len()
-                    ),
-                ));
-            }
-            ids
-        }
-        // Scoped to terminal runs at selection time as well as in `deletable`,
-        // so a sweep does not report every live run on the machine as skipped.
-        (None, Some(before)) => runstate::list_runs()
-            .into_iter()
-            .filter(|m| runstate::is_terminal_status(&m.status) && m.updated_at < before)
-            .map(|m| m.run_id)
-            .collect(),
+    let targets = match (&query.ids, query.before) {
+        (Some(ids), _) => run_core::DeleteTargets::Ids(comma_list(ids)),
+        (None, Some(before)) => run_core::DeleteTargets::Before(before),
         (None, None) => {
-            return Err(err(
-                StatusCode::BAD_REQUEST,
+            return Err(as_api_error(&ServeError::BadRequest(
                 "a bulk delete needs `before` or `ids`; refusing to delete every run".to_string(),
-            ));
+            )));
         }
     };
-
-    let mut deleted: Vec<String> = Vec::new();
-    let mut skipped = Vec::new();
-    for id in targets {
-        // A sweep by `before` selects a parent and its children independently,
-        // and naming a parent already took its children; either way the second
-        // mention is of a run this request has just removed, which is a
-        // deletion rather than the 404 `deletable` would report.
-        if deleted.contains(&id) {
-            continue;
-        }
-        let ids = runstate::family_of(&id);
-        // Never forced. A sweep names runs by a predicate rather than one at a
-        // time, so an unreadable record inside it is far likelier to be
-        // collateral than the thing the operator meant to clear.
-        match deletable_family(&id, &ids, false).and_then(|()| remove_family(&ids)) {
-            Ok(()) => deleted.extend(ids),
-            Err((_, reason)) => skipped.push(SkippedRun { id, reason }),
-        }
-    }
-    Ok(Json(DeleteRunsResp { deleted, skipped }))
+    // Never forced. A sweep names runs by a predicate rather than one at a
+    // time, so an unreadable record inside it is far likelier to be collateral
+    // than the thing the operator meant to clear.
+    let outcome = run_core::delete(&state, targets, false)
+        .await
+        .map_err(|e| as_api_error(&e))?;
+    Ok(Json(DeleteRunsResp {
+        deleted: outcome.deleted,
+        skipped: outcome
+            .skipped
+            .into_iter()
+            .map(|skipped| SkippedRun {
+                id: skipped.id,
+                reason: skipped.reason,
+            })
+            .collect(),
+    }))
 }

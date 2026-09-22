@@ -120,14 +120,19 @@ pub fn resolve_within(
 }
 
 impl BuiltinTools {
-    /// Execute a built-in tool by name (resolving aliases), returning the result
-    /// as a string.
-    pub async fn execute(&self, name: &str, args: Value) -> String {
+    /// The run's blob store as the tools see it, when the context has one.
+    pub fn mime(&self) -> Option<&ToolMime> {
+        self.ctx.mime.as_deref()
+    }
+
+    /// Execute a built-in tool by name (resolving aliases), returning the
+    /// result: text, plus any stored parts the tool produced.
+    pub async fn execute(&self, name: &str, args: Value) -> EntryContent {
         let canonical = canonical_tool_name(name);
         // A tool whose platform capabilities aren't met never advertises, but a
         // caller could still dispatch to it directly - reject it here too.
         if !self.available(canonical) {
-            return format!("[error] tool '{}' is not available on this platform", name);
+            return format!("[error] tool '{}' is not available on this platform", name).into();
         }
         // The environment tools do no awaiting of their own (see `env.rs`), so
         // they answer here rather than through five arms that each `.await`
@@ -135,10 +140,10 @@ impl BuiltinTools {
         // "is this one of mine" test and the dispatch are a single step -
         // a guard arm would need a fallback branch nothing can reach.
         if let Some(result) = self.execute_env_tool(canonical, &args) {
-            return result;
+            return result.into();
         }
-        match canonical {
-            "read_file" => self.read_file(&args).await,
+        let text = match canonical {
+            "read_file" => return self.read_file(&args).await,
             "read_files" => self.read_files(&args).await,
             "write_file" => self.write_file(&args).await,
             "edit_file" => self.edit_file(&args).await,
@@ -146,7 +151,8 @@ impl BuiltinTools {
             "shell" => self.shell(&args).await,
             // Synchronous like the environment tools: compile, then one
             // atomic write into the global tools directory (see `install.rs`).
-            "install_tool" => self.install_tool(&args),
+            "install_global_tool" => self.install_global_tool(&args),
+            "install_self_tool" => self.install_self_tool(&args),
             // Like the context tools, this one needs the live world: the stage,
             // iteration and token counts it reports exist only there.
             "runtime_info" => "[error] runtime_info must be handled by the runtime".to_string(),
@@ -164,7 +170,8 @@ impl BuiltinTools {
             // here so the world stays the only thing that can start a fan-out.
             FAN_OUT_TOOL => "[error] fan_out must be handled by the runtime".to_string(),
             _ => format!("[error] Unknown built-in tool: {}", name),
-        }
+        };
+        text.into()
     }
 
     /// Refuse to create anything when the working directory itself is gone.
@@ -296,19 +303,22 @@ impl BuiltinTools {
         }
     }
 
-    pub(crate) async fn read_file(&self, args: &Value) -> String {
+    pub(crate) async fn read_file(&self, args: &Value) -> EntryContent {
         let path_str = match args.get("path").and_then(|v| v.as_str()) {
             Some(p) => p,
-            None => return "[error] missing 'path' argument".to_string(),
+            None => return "[error] missing 'path' argument".into(),
         };
 
         let path = match self.resolve_read(path_str) {
             Ok(p) => p,
-            Err(e) => return format!("[error] {}", e),
+            Err(e) => return format!("[error] {}", e).into(),
         };
 
-        match std::fs::read_to_string(&path) {
-            Ok(content) => cap_file_content(&content, MAX_READ_FILE_BYTES),
+        let text = match std::fs::read(&path) {
+            Ok(bytes) => match String::from_utf8(bytes) {
+                Ok(content) => cap_file_content(&content, MAX_READ_FILE_BYTES),
+                Err(not_text) => return self.read_binary(path_str, &path, not_text.into_bytes()),
+            },
             // A directory is not a malformed path, it is the wrong tool: the
             // model wanted to see what is in there. The raw OS message ("Is a
             // directory (os error 21)") names the problem without naming the
@@ -327,6 +337,37 @@ impl BuiltinTools {
                 )
             }
             Err(e) => format!("[error] Failed to read '{}': {}", path_str, e),
+        };
+        text.into()
+    }
+
+    /// A file that is not UTF-8: stored as a part of its own type, so a model
+    /// that takes the type sees the bytes and one that does not sees the
+    /// stand-in. Without a store there is nowhere to put it, and the model
+    /// is told that rather than handed mojibake.
+    fn read_binary(&self, path_str: &str, path: &Path, bytes: Vec<u8>) -> EntryContent {
+        // A path that read as a file has a final component.
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let Some(mime) = &self.ctx.mime else {
+            return format!(
+                "[error] '{path_str}' is not a text file ({}), and this run has no blob store to \
+                 hold it as a part",
+                leviath_core::mime::human_size(bytes.len() as u64)
+            )
+            .into();
+        };
+        let mime_type = mime.type_of(None, Some(&name), &bytes);
+        match mime.store(leviath_core::mime::Blob::new(mime_type, bytes).named(name)) {
+            Ok(part) => EntryContent::from_parts(vec![
+                leviath_core::mime::Part::text(format!(
+                    "'{path_str}' is not text. It is attached to this result as a part:"
+                )),
+                part,
+            ]),
+            Err(e) => format!("[error] {e}").into(),
         }
     }
 
@@ -405,9 +446,23 @@ impl BuiltinTools {
             );
         }
 
-        match std::fs::write(&path, content) {
+        // `append` lets a model write a file too large for one reply in parts:
+        // a call cut off by the output cap is refused, and this is the way
+        // the refusal tells it to go on.
+        let append = args.get("append").and_then(|v| v.as_bool()) == Some(true);
+        let (written, verb) = if append {
+            let written = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .and_then(|mut file| std::io::Write::write_all(&mut file, content.as_bytes()));
+            (written, "appended")
+        } else {
+            (std::fs::write(&path, content), "wrote")
+        };
+        match written {
             Ok(()) => format!(
-                "Successfully wrote {} bytes to '{}'",
+                "Successfully {verb} {} bytes to '{}'",
                 content.len(),
                 path_str
             ),

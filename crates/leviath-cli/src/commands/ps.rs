@@ -5,7 +5,7 @@
 //! live in the binary behind [`crate::dispatch::RiskyExecutors`].
 
 use anyhow::bail;
-use leviath_core::run_meta::{RunMeta, RunStatus};
+use leviath_core::run_meta::{RunMeta, RunStatus, WaitReason};
 use leviath_runtime::components::AgentStatus;
 use leviath_runtime::control_socket::{ControlClient, ControlResponse};
 use leviath_runtime::host::{DaemonHealth, RunListEntry};
@@ -425,6 +425,21 @@ fn providers_footer(health: &DaemonHealth) -> Option<String> {
     ))
 }
 
+/// What the daemon has failed to write, when it has failed to write anything.
+///
+/// On its own line rather than folded into the lane footer, because it says
+/// something different from every other number here: those are about whether
+/// runs are moving, and this is about whether what the daemon says about them is
+/// being recorded at all. A listing whose rows all look fine while the journal
+/// refuses writes is the state most worth interrupting.
+fn journal_footer(health: &DaemonHealth) -> Option<String> {
+    let complaint = health.journal.complaint()?;
+    Some(format!(
+        "journal: {complaint}\n  the daemon cannot record what its runs do, and a run whose \
+         journal fails is stopped. Check the disk, then `lev doctor`"
+    ))
+}
+
 /// The READS cell: how many of the blueprint's `[read_paths]` entries the
 /// config granted, over how many it declared. `-` for a run that declared none,
 /// which is what nearly every agent does.
@@ -493,10 +508,14 @@ pub(crate) fn format_runs(
         // once even the finished records have aged out, and it reads as an idle
         // daemon rather than a factory that cannot start anything.
         // Say why the list is empty.
-        return match providers_footer(health) {
-            Some(footer) => format!("no agent runs active\n\n{footer}"),
-            None => "no agent runs active".to_string(),
-        };
+        let mut out = "no agent runs active".to_string();
+        for footer in [providers_footer(health), journal_footer(health)]
+            .into_iter()
+            .flatten()
+        {
+            out.push_str(&format!("\n\n{footer}"));
+        }
+        return out;
     }
     // READS only appears when some run has `[read_paths]` to report, which is
     // nearly never: an extra column of dashes on every ordinary listing would
@@ -571,19 +590,46 @@ pub(crate) fn format_runs(
     // The rows that will not move until somebody acts. Worth calling out under
     // the table: on a wide listing they are easy to lose among the healthy
     // `waiting: children(n)` rows.
+    //
+    // A run parked until the machine is fixed is not waiting for an answer:
+    // `lev respond` does nothing for it. It gets its own lines, each with
+    // what happened and what to do, because the table cell only has room for
+    // which kind of problem it is.
     let blocked = runs
         .iter()
-        .filter(|e| e.wait_reason.as_ref().is_some_and(|r| r.needs_a_person()))
+        .filter(|e| {
+            e.wait_reason
+                .as_ref()
+                .is_some_and(|r| r.needs_a_person() && !matches!(r, WaitReason::NeedsSetup { .. }))
+        })
         .count();
     let mut out = match blocked {
         0 => table,
         1 => format!("{table}\n\n1 run needs an answer: lev respond"),
         n => format!("{table}\n\n{n} runs need an answer: lev respond"),
     };
+    let parked: Vec<String> = runs
+        .iter()
+        .filter_map(|e| match &e.wait_reason {
+            Some(WaitReason::NeedsSetup { remedy, .. }) => {
+                Some(format!("  {}: {remedy}", e.run_id))
+            }
+            _ => None,
+        })
+        .collect();
+    if !parked.is_empty() {
+        out.push_str(&format!(
+            "\n\npaused until something is fixed:\n{}",
+            parked.join("\n")
+        ));
+    }
     if let Some(footer) = providers_footer(health) {
         out.push_str(&format!("\n\n{footer}"));
     }
     if let Some(footer) = health_footer(health) {
+        out.push_str(&format!("\n\n{footer}"));
+    }
+    if let Some(footer) = journal_footer(health) {
         out.push_str(&format!("\n\n{footer}"));
     }
     out

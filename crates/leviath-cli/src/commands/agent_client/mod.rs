@@ -29,6 +29,7 @@
 //!
 //! [acp]: https://agentclientprotocol.com
 
+mod links;
 mod session;
 mod translate;
 
@@ -39,8 +40,8 @@ use leviath_agent_client::{
     AgentCapabilities, AgentInfo, ContentBlock, InitializeParams, InitializeResult, JsonRpcMessage,
     PROTOCOL_VERSION, PromptCapabilities, RequestPermissionResult, SessionCancelParams,
     SessionNewParams, SessionNewResult, SessionPromptParams, SessionPromptResult, SessionUpdate,
-    SessionUpdateParams, StopReason, error_codes, flatten_prompt, is_permission_request,
-    parse_region_markers, permission_request,
+    SessionUpdateParams, StopReason, error_codes, flatten_prompt_with, is_permission_request,
+    parse_region_markers, permission_request, prompt_parts,
 };
 use leviath_core::interaction::{ApprovalScope, InteractionRequest, InteractionResponse};
 use leviath_core::run_meta::RunStatus;
@@ -79,8 +80,16 @@ pub struct AgentClientArgs {
 
     /// Approve every tool call without prompting (recommended when the host does
     /// not implement `session/request_permission`, e.g. Gas City).
-    #[arg(long)]
-    pub yolo: bool,
+    /// `--yolo=<profile>` runs under a named profile from `yolo.toml` instead;
+    /// the equals sign is required.
+    #[arg(
+        long,
+        value_name = "PROFILE",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = ""
+    )]
+    pub yolo: Option<String>,
 
     /// Allow a tool outright (repeatable).
     #[arg(long)]
@@ -280,8 +289,8 @@ impl Server {
             agent_capabilities: AgentCapabilities {
                 load_session: false,
                 prompt_capabilities: PromptCapabilities {
-                    image: false,
-                    audio: false,
+                    image: true,
+                    audio: true,
                     embedded_context: true,
                 },
             },
@@ -362,21 +371,33 @@ impl Server {
         let params: SessionPromptParams = params
             .and_then(|p| serde_json::from_value(p).ok())
             .unwrap_or_default();
-        let text = flatten_prompt(&params.prompt);
-        if text.is_empty() {
+        let mut parts = prompt_parts(&params.prompt);
+        // A `file://` link inside the working directory is read here and
+        // rides along as a part; the text says which links were followed.
+        let cwd = self.session.as_ref().expect("checked above").cwd.clone();
+        let (linked, fetched) = links::link_parts(&params.prompt, &cwd);
+        parts.extend(linked);
+        let mut text = flatten_prompt_with(&params.prompt, &fetched);
+        if text.is_empty() && parts.is_empty() {
             self.write(&JsonRpcMessage::error_response(
                 id,
                 error_codes::INVALID_PARAMS,
-                "prompt has no usable text content",
+                "prompt has no usable content",
             ))
             .await;
             return;
+        }
+        // A prompt that is only files still needs words the model can read
+        // the files against; naming them is the least that says something.
+        if text.is_empty() {
+            let names: Vec<&str> = parts.iter().map(|p| p.name.as_str()).collect();
+            text = format!("Attached: {}", names.join(", "));
         }
         // Parse `---region:<name>---` markers; with none, the whole text is the
         // `task` region (back-compat).
         let regions = parse_region_markers(&text);
         let task = regions.get("task").cloned().unwrap_or_default();
-        let stop_reason = self.run_turn(reader, task, regions).await;
+        let stop_reason = self.run_turn(reader, task, regions, parts).await;
         self.write(&JsonRpcMessage::response(
             id,
             &SessionPromptResult { stop_reason },
@@ -405,6 +426,7 @@ impl Server {
         reader: &mut BoxReader,
         task: String,
         regions: std::collections::HashMap<String, String>,
+        parts: Vec<leviath_core::mime::InboundPart>,
     ) -> StopReason {
         // Subscribe before spawning so no event between spawn and subscribe is
         // missed. An unreachable daemon ends the turn as a refusal.
@@ -418,7 +440,7 @@ impl Server {
             .expect("session present")
             .session_id
             .clone();
-        let run_id = match self.start_run(task, regions).await {
+        let run_id = match self.start_run(task, regions, parts).await {
             RunStart::Ready(run_id) => run_id,
             // The agent already finished and won't take another message - the
             // turn is simply over, not a failure.
@@ -549,11 +571,13 @@ impl Server {
 
     /// Spawn the agent on the first prompt, or deliver a message on later ones.
     /// `regions` seeds named caller-input regions on the first (spawning) prompt;
-    /// on later prompts the text is delivered as a message and `regions` is unused.
+    /// on later prompts the text is delivered as a message and `regions` is
+    /// unused. `parts` are the prompt's files, on the task either way.
     async fn start_run(
         &mut self,
         task: String,
         regions: std::collections::HashMap<String, String>,
+        parts: Vec<leviath_core::mime::InboundPart>,
     ) -> RunStart {
         let existing = self
             .session
@@ -569,6 +593,7 @@ impl Server {
                             agent_id: run_id.clone(),
                             content: task,
                             target_region: None,
+                            parts,
                         })
                         .await,
                     Ok(ControlResponse::Ok { ok: true })
@@ -581,8 +606,14 @@ impl Server {
             }
             None => {
                 let session = self.session.as_ref().expect("session present");
-                let spawn =
-                    spawn_args(&session.blueprint, &task, &session.cwd, &self.args, regions);
+                let spawn = spawn_args(
+                    &session.blueprint,
+                    &task,
+                    &session.cwd,
+                    &self.args,
+                    regions,
+                    parts,
+                );
                 match self.control.spawn(spawn).await {
                     Ok(ControlResponse::Spawned { run_id }) => {
                         self.session.as_mut().expect("session present").run_id =
@@ -708,6 +739,7 @@ impl Server {
             // The protocol's permission outcome is an option id and nothing
             // else, so a host cannot say why it refused.
             feedback: None,
+            parts: Vec::new(),
         };
         let _ = self
             .control
@@ -745,7 +777,7 @@ impl Server {
         let params = SessionUpdateParams {
             session_id: session_id.to_string(),
             update: SessionUpdate::AgentMessageChunk {
-                content: ContentBlock::text(text),
+                content: Box::new(ContentBlock::text(text)),
             },
         };
         self.write(&JsonRpcMessage::notification("session/update", &params))
@@ -779,6 +811,36 @@ impl Server {
         for chunk in split_chunks(&text) {
             self.emit_chunk(session_id, chunk).await;
         }
+        // The files the run produced, as links the host can open itself:
+        // the protocol's `resource_link` block, pointing into the session's
+        // working directory where the run wrote them - or, for a file that
+        // is not there (a model made it and nothing wrote it to disk), into
+        // the run's blob store, which holds it by hash.
+        let cwd = self
+            .session
+            .as_ref()
+            .map(|s| s.cwd.clone())
+            .unwrap_or_default();
+        let run_id = self
+            .session
+            .as_ref()
+            .and_then(|s| s.run_id.clone())
+            .unwrap_or_default();
+        for artifact in &output.artifacts {
+            let path = artifact_location(&cwd, &run_id, artifact);
+            let params = SessionUpdateParams {
+                session_id: session_id.to_string(),
+                update: SessionUpdate::AgentMessageChunk {
+                    content: Box::new(ContentBlock::resource_link(
+                        crate::commands::result::export::file_url(&path),
+                        artifact.name.clone(),
+                        artifact.mime_type.to_string(),
+                    )),
+                },
+            };
+            self.write(&JsonRpcMessage::notification("session/update", &params))
+                .await;
+        }
     }
 
     /// Emit one `usage_update` update.
@@ -809,6 +871,30 @@ impl Server {
         self.next_request_id += 1;
         self.next_request_id
     }
+}
+
+/// Where a host can open one of the run's files: the bytes the run stored,
+/// written under the run's export directory with the name and extension a
+/// host can open it by, which a bare hash in the blob store has neither of.
+/// The store comes first for the same reason `lev result` reads it first:
+/// a later stage may have overwritten the workdir copy. A file the run never
+/// stored is linked at its workdir path, which is the most a link can say.
+fn artifact_location(
+    cwd: &str,
+    run_id: &str,
+    artifact: &leviath_core::output::Artifact,
+) -> std::path::PathBuf {
+    use crate::commands::result::export;
+    let in_workdir = std::path::Path::new(cwd).join(&artifact.path);
+    if artifact.sha256.is_empty() {
+        return in_workdir;
+    }
+    crate::blobs::read(run_id, &artifact.sha256)
+        .ok()
+        .and_then(|bytes| {
+            export::write_into(&export::export_dir(run_id), &artifact.name, &bytes).ok()
+        })
+        .unwrap_or(in_workdir)
 }
 
 /// Read the persisted `RunStatus` for `run_id` from `<runs_dir>/<run_id>/meta.json`.

@@ -14,18 +14,31 @@ pub(crate) struct AwaitingTools;
 #[derive(Component, Debug, Clone, Copy)]
 pub(crate) struct ToolsNeedRefresh;
 
-/// Marker: this agent opted into `dynamic_tools`. Only such agents
-/// are polled by `poll_dynamic_tool_refresh` for a pending tool re-scan, so the
-/// default (static) agent pays nothing.
+/// Marker: this agent's blueprint asks for tools to be looked for again after
+/// the run starts. Only such agents are polled by `poll_dynamic_tool_refresh`
+/// for a pending tool re-scan, so the default (fixed) agent pays nothing.
 #[derive(Component, Debug, Clone, Copy)]
 pub struct DynamicTools;
+
+/// Marker: this agent's blueprint asks for the scanned directories to be looked
+/// at before *each* batch of tool calls, on top of the refresh before its next
+/// turn.
+///
+/// What it buys is noticing a tool nobody told the service about. The
+/// between-turns refresh fires on a dirty flag this agent's own `write_file`,
+/// `edit_file` or `install_tool` sets; a tool written by a shell command, by a
+/// script tool, or by another agent sharing the workdir sets nothing. Read by
+/// `rescan_before_dispatch` only, and its cost is a `stat` per scanned
+/// directory per batch.
+#[derive(Component, Debug, Clone, Copy)]
+pub struct RescanBeforeDispatch;
 
 /// Reports one tool call's result the moment it resolves, from inside the
 /// executor - `(tool_call_id, result)`. Dispatch builds one per batch to journal
 /// each completion as a `ToolCallDone` record, so a crash mid-batch loses only
 /// the calls that genuinely never finished. Implementors that don't
 /// journal get a no-op.
-pub type ToolProgress = Arc<dyn Fn(&str, &str) + Send + Sync>;
+pub type ToolProgress = Arc<dyn Fn(&str, &leviath_core::region::EntryContent) + Send + Sync>;
 
 /// A [`ToolProgress`] that reports nowhere - for worlds without a persistence
 /// lane and for `ToolService` impls under test.
@@ -53,6 +66,13 @@ pub trait ToolService: Send + Sync {
     /// Default no-op for services without per-stage policy.
     fn sync_stage(&self, _entity: Entity, _stage_index: usize, _stage_name: &str) {}
 
+    /// Hand the service the stored parts `entity`'s window holds, right
+    /// before a batch is dispatched, so a tool that takes a part by name can
+    /// find it off the tick. Called with the whole current list each time;
+    /// an empty list means the window holds none. Default no-op for services
+    /// whose tools take no parts.
+    fn offer_parts(&self, _entity: Entity, _parts: Vec<leviath_core::mime::Part>) {}
+
     /// Re-resolve `entity`'s advertised tool defs for the stage at `stage_index` -
     /// e.g. after new tools were discovered on disk. `None` means "no change"
     /// (the default, for services without dynamic tools); `Some(tools)` replaces
@@ -65,10 +85,23 @@ pub trait ToolService: Send + Sync {
         None
     }
 
-    /// Whether `entity` (a `dynamic_tools` agent) has pending tool changes that
+    /// Whether `entity` (an agent that rescans) has pending tool changes that
     /// warrant a re-scan + re-advertise. Polled by `poll_dynamic_tool_refresh`;
     /// implementors return (and clear) a per-agent dirty flag. Default `false`.
     fn wants_refresh(&self, _entity: Entity) -> bool {
+        false
+    }
+
+    /// Whether `entity`'s scanned directories have changed since they were last
+    /// read, asked once per batch of a `before_dispatch` agent.
+    ///
+    /// Separate from [`wants_refresh`](Self::wants_refresh) because it answers a
+    /// cheaper question and must not consume anything: the dirty flag is drained
+    /// by the poll that runs before the turn, and this runs in the middle of
+    /// one. Implementors compare a stamp of the directories rather than
+    /// re-reading them, so the common answer costs a few `stat` calls.
+    /// Default `false`, which turns the mode off for a service without one.
+    fn scan_stale(&self, _entity: Entity) -> bool {
         false
     }
 }
@@ -114,6 +147,14 @@ pub(crate) struct ContextToolResults(pub Vec<(String, String)>);
 /// Merge context + lane tool results into one `(id, result)` list in the
 /// original tool-call order (Anthropic requires a `tool_result` per `tool_use`,
 /// in order).
+/// Inline results, which are always text, in the shape the lane's carry.
+pub(crate) fn typed_results(results: &[(String, String)]) -> Vec<crate::tool_bridge::ToolResult> {
+    results
+        .iter()
+        .map(|(id, text)| (id.clone(), text.clone().into()))
+        .collect()
+}
+
 /// Collapse a possibly-multiline string to a single trimmed line capped at
 /// `max` characters (with an ellipsis when truncated), for one-line log entries.
 pub(crate) fn one_line(s: &str, max: usize) -> String {
@@ -127,8 +168,8 @@ pub(crate) fn one_line(s: &str, max: usize) -> String {
 
 pub(crate) fn merge_in_call_order(
     tool_calls: &[crate::components::ToolCall],
-    parts: &[(String, String)],
-) -> Vec<(String, String)> {
+    parts: &[crate::tool_bridge::ToolResult],
+) -> Vec<crate::tool_bridge::ToolResult> {
     tool_calls
         .iter()
         .map(|tc| {
@@ -208,36 +249,50 @@ pub(crate) fn unoffered_tool_refusal(stage: &StageInference, name: &str) -> Opti
 pub(crate) const BATCH_JOURNAL_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Wrap a tool-execution closure so it first waits (bounded) for the batch's
-/// journal-record ack. Both outcomes - acked, or timeout/dropped sender -
-/// proceed to run the batch.
+/// journal-record ack. Every outcome - landed, no journal, failed, timed out or
+/// a dropped sender - proceeds to run the batch.
+///
+/// What changes with the outcome is what gets said about it. A batch that runs
+/// after its record failed to land has side effects the journal does not
+/// mention, and a run debugger reading that journal would show the batch as
+/// never dispatched. That is worth a line in the log, and telling it apart from
+/// a world that keeps no journal at all is why the ack carries a state rather
+/// than a signal.
 pub(crate) fn barrier_then(
     exec: BoxedToolExec,
-    ack: tokio::sync::oneshot::Receiver<()>,
+    ack: tokio::sync::oneshot::Receiver<crate::persistence_bridge::Appended>,
     timeout: std::time::Duration,
+    run_id: String,
 ) -> BoxedToolExec {
+    use crate::persistence_bridge::Appended;
     Box::new(move || {
         Box::pin(async move {
-            let _ = tokio::time::timeout(timeout, ack).await;
+            match tokio::time::timeout(timeout, ack).await {
+                Ok(Ok(Appended::Landed { position })) => {
+                    tracing::debug!(run_id = %run_id, position, "tool batch record landed");
+                }
+                // No journal to land in, which is what an in-memory world is.
+                Ok(Ok(Appended::NoJournal)) => {}
+                Ok(Ok(Appended::Failed)) => {
+                    tracing::warn!(
+                        run_id = %run_id,
+                        "tool batch runs with no record of it: the journal append failed"
+                    );
+                }
+                // A dropped sender is the lane shutting down mid-dispatch.
+                Ok(Err(_)) => {
+                    tracing::debug!(run_id = %run_id, "tool batch record abandoned by the lane");
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        run_id = %run_id,
+                        "tool batch dispatched before its record: the journal lane is behind"
+                    );
+                }
+            }
             exec().await
         })
     })
-}
-
-/// The refusal for a tool call whose arguments were not JSON.
-///
-/// Names the size and the tail of what arrived, because that is what tells
-/// the model (and a person reading the log) that the call was cut off rather
-/// than mistyped: an argument string that ends mid-word at a round number of
-/// tokens is the output cap, every time.
-pub(crate) fn cut_off_arguments_refusal(name: &str, raw: &str) -> String {
-    let chars: Vec<char> = raw.chars().collect();
-    let tail: String = chars[chars.len().saturating_sub(40)..].iter().collect();
-    format!(
-        "[error] '{name}' was not run: its arguments were not valid JSON ({} characters \
-         arrived, ending `{tail}`). A reply that stops mid-argument has hit the output \
-         limit. Send a smaller call, or split the work across several calls.",
-        chars.len()
-    )
 }
 
 /// `Some(refusal)` when `name`'s arguments do not satisfy the schema the
@@ -318,6 +373,86 @@ type DispatchToolsQuery = (
     Option<&'static crate::pipeline::transition::AgentBlueprint>,
 );
 
+/// One dispatched batch, in the shape the journal records it.
+///
+/// Gathered once and borrowed, because two paths write the same record and
+/// neither can see the other's: a batch with lane work journals it with an ack
+/// the exec waits on, and a batch the dispatcher resolved entirely journals it
+/// on its way out. Two copies of the field list would be two chances for one of
+/// them to stop carrying something.
+struct BatchDispatch<'a> {
+    /// The calls, in the order the model asked for them.
+    calls: &'a [crate::components::ToolCall],
+    /// The execution id minted for each, by provider call id.
+    executions: &'a std::collections::HashMap<String, String>,
+    /// The results the dispatcher already has, by provider call id. A call with
+    /// one here never reaches the lane and no completion record will follow it.
+    inline: &'a [(String, String)],
+    /// The stage the batch was dispatched in.
+    stage_index: usize,
+    /// The stage-local iteration that produced it.
+    iteration: usize,
+    /// The stay in the stage it was dispatched during.
+    visit_id: &'a str,
+    /// The provider attempt whose answer asked for the calls.
+    requested_by: &'a str,
+    /// The assistant text of the turn that issued them.
+    response: &'a str,
+}
+
+impl BatchDispatch<'_> {
+    /// The record.
+    fn record(&self) -> leviath_core::run_archive::RunRecord {
+        leviath_core::run_archive::RunRecord::ToolBatch {
+            calls: self
+                .calls
+                .iter()
+                .map(|c| leviath_core::run_archive::ToolCallRecord {
+                    id: c.tool_id.clone(),
+                    execution_id: self.executions.get(&c.tool_id).cloned().unwrap_or_default(),
+                    name: c.name.clone(),
+                    arguments: c.arguments.to_string(),
+                    result: self
+                        .inline
+                        .iter()
+                        .find(|(id, _)| id == &c.tool_id)
+                        .map(|(_, r)| r.clone().into()),
+                    thought_signature: c.thought_signature.clone(),
+                })
+                .collect(),
+            at: chrono::Utc::now().timestamp(),
+            stage_index: self.stage_index,
+            iteration: self.iteration,
+            visit_id: self.visit_id.to_string(),
+            requested_by: self.requested_by.to_string(),
+            response: self.response.to_string(),
+        }
+    }
+}
+
+/// Journal the files each execution produced, one record per execution.
+///
+/// Fire and forget, like the change records: nothing waits on it, and a run with
+/// no lane writes nothing. Called from the same place the batch record is written
+/// so the artifacts cannot land before the dispatch that made them.
+pub(super) fn journal_artifacts(
+    persist: &PersistenceStage,
+    run_id: &str,
+    produced: &[(String, Vec<leviath_core::output::Artifact>)],
+) {
+    for (execution_id, artifacts) in produced {
+        let _ = persist.0.send(PersistMsg::Append {
+            run_id: run_id.to_string(),
+            record: Box::new(leviath_core::run_archive::RunRecord::ArtifactsProduced {
+                execution_id: execution_id.clone(),
+                artifacts: artifacts.clone(),
+                at: chrono::Utc::now().timestamp(),
+            }),
+            ack: None,
+        });
+    }
+}
+
 /// The resources the daemon installs, which a bare world does not have.
 ///
 /// Every field is optional because `lev run` drives these same systems with no
@@ -358,6 +493,7 @@ pub(crate) fn dispatch_tools(
     service: Res<ToolServiceRes>,
     stage: Res<ToolStage>,
     daemon: DaemonServices,
+    mime: crate::blob_store::MimeParams,
     mut commands: Commands,
 ) {
     let DaemonServices {
@@ -395,12 +531,22 @@ pub(crate) fn dispatch_tools(
     ) in agents.iter_mut()
     {
         crate::tick_scope::enter(entity);
+        // Where this run's produced files and oversized text are stored.
+        let (sources, _) = mime.hydration_inputs(entity);
+        let part_sink = crate::context_setup::PartSink::over(&sources, &state.agent_id, &mime);
         // `--yolo`: waive taint-gate enforcement so a headless run never blocks
         // on a gate prompt no one can answer (taint tracking still records).
         let auto_approve_gates = auto_gate.is_some();
         if state.status != AgentStatus::Active {
             continue; // paused / waiting / cancelled - don't start new work
         }
+
+        // This stage, for routing the parts a reply produces to regions of
+        // their own (`output_routing`). Computed once so both apply paths below
+        // share it.
+        let routing_stage = blueprint
+            .zip(cursor)
+            .and_then(|(bp, cur)| bp.0.stages.get(cur.index));
 
         // Apply context_* tools inline (they need world access); collect the rest
         // for the async lane. A taint-gated agent's outbound call that would leak
@@ -421,7 +567,33 @@ pub(crate) fn dispatch_tools(
             leviath_core::TaintLevel,
             leviath_core::TaintLevel,
         )> = Vec::new();
+        // One execution id per call, minted before anything runs. The provider's
+        // own id travels beside it: a provider may reuse one across a retry, and
+        // two attempts under one id cannot be told apart afterwards.
+        //
+        // Minted ahead of the loop rather than beside the journal write below,
+        // because the calls this dispatcher resolves itself need theirs while it
+        // is resolving them: a context tool's whole job is to move the window,
+        // and the transaction it commits says which execution moved it.
+        let executions: std::collections::HashMap<String, String> = result
+            .tool_calls
+            .iter()
+            .map(|c| {
+                (
+                    c.tool_id.clone(),
+                    leviath_core::execution::mint_execution_id(),
+                )
+            })
+            .collect();
+        // Files an accepted submission produced, by the execution that produced
+        // them. Journaled after the loop, which is also where the batch record
+        // that dispatched them goes.
+        let mut produced: Vec<(String, Vec<leviath_core::output::Artifact>)> = Vec::new();
         for c in &result.tool_calls {
+            // Everything this call commits to the window is this call's, and
+            // nothing after the loop is. Re-set per call, so a change can never
+            // be attributed to the call before it.
+            window.attribute_to(executions.get(&c.tool_id).map_or("", String::as_str));
             // Layer 1, enforced rather than merely advertised.
             //
             // A stage's `available_tools` was applied only when building the
@@ -450,7 +622,11 @@ pub(crate) fn dispatch_tools(
             // the text for exactly this reading). Refused with the cause, so
             // the model shrinks or splits the call instead of repeating it.
             if let serde_json::Value::String(raw) = &c.arguments {
-                context_results.push((c.tool_id.clone(), cut_off_arguments_refusal(&c.name, raw)));
+                let in_a_row = stage_progress.map_or(0, |p| p.cut_off_nudges);
+                context_results.push((
+                    c.tool_id.clone(),
+                    cut_off_arguments_refusal(&c.name, raw, in_a_row),
+                ));
                 continue;
             }
             // Layer 2: the call must satisfy the schema the model was shown.
@@ -490,6 +666,25 @@ pub(crate) fn dispatch_tools(
                     workdir: metadata.map(|m| m.workdir.as_str()),
                 };
                 let text = crate::runtime_info_tool::handle_runtime_info(&facts, &window);
+                context_results.push((c.tool_id.clone(), text));
+                continue;
+            }
+            if crate::mime_tools::is_mime_tool(&c.name) {
+                let text = crate::mime_tools::handle_mime_tool(
+                    &c.name,
+                    &c.arguments,
+                    &mut window,
+                    &crate::mime_tools::MimeToolContext {
+                        mime: &mime,
+                        entity,
+                        run_id: &state.agent_id,
+                        workdir: metadata.map(|m| std::path::Path::new(&m.workdir)),
+                        tool_limit: blueprint
+                            .zip(cursor)
+                            .and_then(|(bp, cur)| bp.0.stages.get(cur.index))
+                            .and_then(|s| s.tool_limit(&c.name)),
+                    },
+                );
                 context_results.push((c.tool_id.clone(), text));
                 continue;
             }
@@ -604,6 +799,12 @@ pub(crate) fn dispatch_tools(
                         stage: &state.current_stage,
                         stage_names: &stage_names,
                         workdir: metadata.map(|m| std::path::Path::new(&m.workdir)),
+                        sink: part_sink.as_ref(),
+                        overwrite_artifacts: stage_inf
+                            .output
+                            .as_ref()
+                            .and_then(|s| s.overwrite_artifacts)
+                            .unwrap_or_else(|| mime.overwrite_artifacts()),
                     },
                     chrono::Utc::now().timestamp(),
                     &mut window,
@@ -611,6 +812,16 @@ pub(crate) fn dispatch_tools(
                 // A refused submission leaves any earlier one alone: a bad
                 // correction must not erase a good answer.
                 if let Some(output) = output {
+                    // Recorded against this call while it is still in hand.
+                    // `output.json` keeps only the latest answer's files and says
+                    // nothing about which call made any of them, so a submission
+                    // a later one replaces would otherwise leave no trace.
+                    if !output.artifacts.is_empty() {
+                        produced.push((
+                            executions.get(&c.tool_id).cloned().unwrap_or_default(),
+                            output.artifacts.clone(),
+                        ));
+                    }
                     submitted = Some(output);
                 }
                 context_results.push((c.tool_id.clone(), text));
@@ -623,6 +834,10 @@ pub(crate) fn dispatch_tools(
                 thought_signature: c.thought_signature.clone(),
             });
         }
+        // Past the last call, so nothing the paths below write is attributed to
+        // one: the assistant turn, the routed results and the nudges are the
+        // batch's work, not any single call's.
+        window.attribute_to("");
 
         // Commit a submitted output before any of the paths below can take an
         // early exit, so an answer is recorded whether the rest of the batch
@@ -700,14 +915,19 @@ pub(crate) fn dispatch_tools(
             // request outright: "each tool_use must have a single result".
             // Deferring is safe because the agent parks on its workers, so no
             // request goes out carrying a `tool_use` that has no result yet.
-            let merged: Vec<(String, String)> =
-                merge_in_call_order(&result.tool_calls, &context_results)
+            let merged: Vec<crate::tool_bridge::ToolResult> =
+                merge_in_call_order(&result.tool_calls, &typed_results(&context_results))
                     .into_iter()
                     .filter(|(id, _)| id != &call_id)
                     .collect();
-            apply_tool_results(
+            super::tool_results::apply_tool_results_with_parts(
                 &mut window,
-                &result.response,
+                super::tool_results::Reply {
+                    text: &result.response,
+                    parts: &result.parts,
+                    stage: routing_stage,
+                    sink: part_sink.as_ref(),
+                },
                 &result.tool_calls,
                 &merged,
                 routing.map(|c| &c.routing),
@@ -721,9 +941,38 @@ pub(crate) fn dispatch_tools(
             continue;
         }
 
+        // What the journal is told about this batch, once, whoever runs it.
+        // Built here because both paths below need it and neither can see the
+        // other's copy: a batch with lane work waits on an ack, one without goes
+        // straight into the file.
+        let dispatch = BatchDispatch {
+            calls: &result.tool_calls,
+            executions: &executions,
+            inline: &context_results,
+            stage_index: cursor.map_or(0, |c| c.index),
+            iteration: state.iteration,
+            visit_id: &state.current_visit,
+            requested_by: &result.attempt_id,
+            response: &result.response,
+        };
+
         if lane_calls.is_empty() {
+            // Every call resolved without the lane: context tools, refusals,
+            // gate denials. Journaled all the same, so the run's executions are
+            // every call the model made rather than only the ones something ran
+            // asynchronously - and so a transaction a context tool committed
+            // names an execution a reader can find. No ack, because nothing is
+            // about to run that could outrace the record.
+            if let (Some(persist), Some(md)) = (persist.as_ref(), metadata) {
+                let _ = persist.0.send(PersistMsg::Append {
+                    run_id: md.run_id.clone(),
+                    record: Box::new(dispatch.record()),
+                    ack: None,
+                });
+                journal_artifacts(persist, &md.run_id, &produced);
+            }
             // Nothing async to run - apply the context results now and loop back.
-            let merged = merge_in_call_order(&result.tool_calls, &context_results);
+            let merged = merge_in_call_order(&result.tool_calls, &typed_results(&context_results));
             // Log the calls here, because this batch never reaches
             // `collect_tools` - the usual writer of `[tool]` lines - and would
             // otherwise leave no trace anywhere a person can read. A batch of
@@ -742,9 +991,14 @@ pub(crate) fn dispatch_tools(
                     ));
                 }
             }
-            apply_tool_results(
+            super::tool_results::apply_tool_results_with_parts(
                 &mut window,
-                &result.response,
+                super::tool_results::Reply {
+                    text: &result.response,
+                    parts: &result.parts,
+                    stage: routing_stage,
+                    sink: part_sink.as_ref(),
+                },
                 &result.tool_calls,
                 &merged,
                 routing.map(|c| &c.routing),
@@ -765,51 +1019,52 @@ pub(crate) fn dispatch_tools(
         // agents) dispatch unjournaled with a no-op progress.
         let (progress, ack) = match (persist.as_ref(), metadata) {
             (Some(persist), Some(md)) => {
-                let record = leviath_core::run_archive::RunRecord::ToolBatch {
-                    calls: result
-                        .tool_calls
-                        .iter()
-                        .map(|c| leviath_core::run_archive::ToolCallRecord {
-                            id: c.tool_id.clone(),
-                            name: c.name.clone(),
-                            arguments: c.arguments.to_string(),
-                            result: context_results
-                                .iter()
-                                .find(|(id, _)| id == &c.tool_id)
-                                .map(|(_, r)| r.clone()),
-                            thought_signature: c.thought_signature.clone(),
-                        })
-                        .collect(),
-                    at: chrono::Utc::now().timestamp(),
-                    stage_index: cursor.map_or(0, |c| c.index),
-                    iteration: state.iteration,
-                    response: result.response.clone(),
-                };
                 let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
                 let _ = persist.0.send(PersistMsg::Append {
                     run_id: md.run_id.clone(),
-                    record: Box::new(record),
+                    record: Box::new(dispatch.record()),
                     ack: Some(ack_tx),
                 });
+                journal_artifacts(persist, &md.run_id, &produced);
                 let sender = persist.0.clone();
                 let run_id = md.run_id.clone();
                 let iteration = state.iteration;
-                let progress: ToolProgress = Arc::new(move |call_id: &str, result: &str| {
+                let minted = executions.clone();
+                let progress: ToolProgress = Arc::new(move |call_id: &str, result| {
                     let _ = sender.send(PersistMsg::Append {
                         run_id: run_id.clone(),
                         record: Box::new(leviath_core::run_archive::RunRecord::ToolCallDone {
                             iteration,
                             call_id: call_id.to_string(),
-                            result: result.to_string(),
+                            // The attempt this completes, so a completion cannot
+                            // be attached to a different attempt that shared the
+                            // provider's id.
+                            execution_id: minted.get(call_id).cloned().unwrap_or_default(),
+                            result: result.clone(),
+                            // The structured verdict comes with the executor
+                            // contract; until then the completion says only that
+                            // the call finished, which is what it has always
+                            // said.
+                            outcome: None,
                             at: chrono::Utc::now().timestamp(),
                         }),
                         ack: None,
                     });
                 });
-                (progress, Some(ack_rx))
+                // The run id travels with the ack: an ack only exists when the
+                // batch was journaled for a known run, so pairing them here
+                // leaves the waiter below no impossible case to handle.
+                (progress, Some((ack_rx, md.run_id.clone())))
             }
             _ => (noop_progress(), None),
         };
+        // The attempt ids this batch is running under, so the completion system
+        // can say which attempt finished rather than which provider id did.
+        commands
+            .entity(entity)
+            .insert(crate::components::BatchExecutions {
+                ids: executions.clone(),
+            });
         // Announce each lane-bound call before it starts executing. Inline
         // results (context tools, refusals, blocks) never reach the lane and
         // are deliberately not announced.
@@ -819,13 +1074,24 @@ pub(crate) fn dispatch_tools(
                     run_id: md.run_id.clone(),
                     agent_id: state.agent_id.clone(),
                     call_id: call.id.clone(),
+                    execution_id: executions.get(&call.id).cloned().unwrap_or_default(),
                     tool: call.name.clone(),
                 });
             }
         }
+        // What a tool may read by name: every stored part the window holds
+        // right now, offered whole so a stale offer never outlives the entry
+        // it came from.
+        let offered: Vec<leviath_core::mime::Part> = window
+            .regions
+            .iter()
+            .flat_map(|r| r.content.iter())
+            .flat_map(|e| e.content.stored().cloned())
+            .collect();
+        service.0.offer_parts(entity, offered);
         let exec = service.0.exec_for(entity, lane_calls, progress);
         let exec = match ack {
-            Some(ack) => barrier_then(exec, ack, BATCH_JOURNAL_ACK_TIMEOUT),
+            Some((ack, run_id)) => barrier_then(exec, ack, BATCH_JOURNAL_ACK_TIMEOUT, run_id),
             None => exec,
         };
         let cancel = crate::cancel::CancelToken::new();

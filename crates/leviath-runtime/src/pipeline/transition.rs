@@ -44,6 +44,8 @@ pub(crate) struct StageSetup {
     pub context_layout: Option<leviath_core::ContextLayout>,
     /// Regions this stage leaves out of its prompt (`[stages.<name>.context] hide`).
     pub context_hide: Vec<String>,
+    /// Regions this stage empties on entry (`[stages.<name>.context] reset`).
+    pub context_reset: Vec<String>,
     /// Optional stage instructions injected as pinned context on entry.
     pub system_prompt: Option<String>,
 }
@@ -348,6 +350,13 @@ pub(crate) fn hold_for_gate(
 /// Not for conditions that are terminal by nature (a cancel, a completed run).
 /// This is for "this stage could not go on", which is exactly what an
 /// `error` edge exists to answer.
+///
+/// The one exception, which writes the status directly and says so where it does
+/// it: a run whose journal cannot be written (see
+/// [`fail_runs_with_unwritable_journals`](super::fail_runs_with_unwritable_journals)).
+/// A recovery stage is more work done on the same unwritable journal, and the
+/// recovery's own history would go unrecorded too, so that run stops rather than
+/// being routed.
 pub(crate) fn fail_stage(
     commands: &mut Commands,
     entity: Entity,
@@ -749,7 +758,13 @@ pub(crate) fn enter_stage(
             rec.close_visit(at);
         }
         if let Some(rec) = ledger.0.get_mut(idx) {
-            rec.begin_visit(at);
+            // Minted here, where the stay begins, and carried on the run so that
+            // everything dispatched during it records the visit it belongs to.
+            // A visit past the ledger's cap keeps no record of its own, and the
+            // id still names it: what it costs is in the stage's own totals.
+            let visit = leviath_core::execution::mint_visit_id();
+            state.current_visit = visit.clone();
+            rec.begin_visit(at, visit);
         }
     }
     cursor.index = idx;
@@ -890,6 +905,15 @@ pub(crate) fn apply_stage_context(
             window.hidden.insert(name.clone());
         }
     }
+    // `reset` empties a region as the stage is entered, so it starts on a clean
+    // slate - a describe stage reading its image from a region of its own with
+    // none of the drawing stage's conversation carried in. Emptied, not
+    // hidden: a later stage sees the fresh region, not the old turns.
+    for name in &setup.context_reset {
+        if let Some(region) = window.regions.iter_mut().find(|r| &r.name == name) {
+            region.clear();
+        }
+    }
 
     let target = stage_instructions_target(window);
     if let Some(region) = window.regions.iter_mut().find(|r| r.name == target) {
@@ -908,7 +932,12 @@ pub(crate) fn apply_stage_context(
         let content = format!("[Stage instructions: {sp}]");
         let tokens = leviath_core::estimate_tokens(&content);
         window
-            .add_to_region(&target, content, tokens)
+            .add_to_region_caused(
+                leviath_core::ContextCause::Transform,
+                &target,
+                content,
+                tokens,
+            )
             .map_err(|e| {
                 format!(
                     "stage system prompt (~{tokens} tokens) does not fit context region \

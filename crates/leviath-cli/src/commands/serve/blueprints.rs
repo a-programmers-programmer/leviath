@@ -8,6 +8,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::Json;
 
+use super::blueprint_types::{BlueprintDetail, RoutePair, StageRoutingInfo};
 use super::types::*;
 use leviath_core::manifest::parse_manifest;
 
@@ -18,7 +19,20 @@ use leviath_core::manifest::parse_manifest;
 /// write a *different* directory from the one `lev add` installs into
 /// whenever that override is set.
 pub(super) fn agents_dir() -> PathBuf {
+    #[cfg(test)]
+    if let Ok(dir) = TEST_AGENTS_DIR.try_with(Clone::clone) {
+        return dir;
+    }
     leviath_core::paths::agents_dir().unwrap_or_default()
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    /// Test override for [`agents_dir`]: the create, update and delete
+    /// routes have no path in their state, so without it their tests would
+    /// write into the developer's real `~/.leviath/agents`, and a test that
+    /// failed before its own clean-up left its blueprint there.
+    pub(crate) static TEST_AGENTS_DIR: PathBuf;
 }
 
 /// Resolve `<agents_dir>/<name>`, refusing a name that is not a single safe path
@@ -87,13 +101,25 @@ fn canonicalize(found: Vec<BlueprintInfo>) -> Vec<BlueprintInfo> {
 /// Every consumer goes through here (`list_blueprints`, `get_blueprint`,
 /// `spawn_agent`), so they all share one answer to "which blueprint is `x`".
 pub(super) fn discover_blueprints(config: &crate::config::Config) -> Vec<BlueprintInfo> {
+    discover_in(blueprint_roots(config))
+}
+
+/// The directories [`discover_blueprints`] scans: the installed agents dir,
+/// then every configured `agent_paths` entry.
+///
+/// Resolved apart from the scan so a handler can resolve them on its own task
+/// (where a test's agents-dir override is visible) and read them on the
+/// blocking pool, where a walk over every manifest belongs.
+pub(super) fn blueprint_roots(config: &crate::config::Config) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = vec![agents_dir()];
+    roots.extend(config.agent_paths.iter().cloned());
+    roots
+}
+
+/// [`discover_blueprints`] over the given roots.
+pub(super) fn discover_in(roots: Vec<PathBuf>) -> Vec<BlueprintInfo> {
     let mut results = Vec::new();
-    let agents = agents_dir();
-
-    let mut dirs_to_scan: Vec<PathBuf> = vec![agents];
-    dirs_to_scan.extend(config.agent_paths.iter().cloned());
-
-    for dir in dirs_to_scan {
+    for dir in roots {
         if !dir.exists() {
             continue;
         }
@@ -129,12 +155,15 @@ pub(super) fn read_blueprint_info(manifest_path: &Path, dir: &Path) -> Option<Bl
     let content = std::fs::read_to_string(manifest_path).ok()?;
     let bp = parse_manifest(&content).ok()?;
     Some(BlueprintInfo {
-        name: bp.name,
-        version: bp.version,
-        description: bp.description,
+        name: bp.name.clone(),
+        version: bp.version.clone(),
+        description: bp.description.clone(),
         path: dir.to_string_lossy().to_string(),
         stages: bp.stages.iter().map(|s| s.name.clone()).collect(),
         manifest: content,
+        // Kept rather than dropped: the whole manifest is already parsed here,
+        // and the GraphQL surface answers a blueprint object from it.
+        parsed: std::sync::Arc::new(bp),
     })
 }
 
@@ -203,7 +232,8 @@ pub(super) async fn list_blueprints(
         ),
     };
 
-    let mut found = discover_blueprints(&state.current_config());
+    let roots = blueprint_roots(&state.current_config());
+    let mut found = super::blocking::blocking(move || discover_in(roots)).await;
 
     // `q` shares the search primitive but not the framework: three in-memory
     // string fields do not need sources, phases or highlights.
@@ -284,7 +314,8 @@ pub(super) async fn get_blueprint(
     State(state): State<AppState>,
     AxumPath(name): AxumPath<String>,
 ) -> Result<Json<BlueprintDetail>, StatusCode> {
-    let blueprints = discover_blueprints(&state.current_config());
+    let roots = blueprint_roots(&state.current_config());
+    let blueprints = super::blocking::blocking(move || discover_in(roots)).await;
     let mut info = blueprints
         .into_iter()
         .find(|b| b.name == name)
@@ -312,12 +343,42 @@ pub(super) async fn get_blueprint(
         })
         .unwrap_or_default();
     let fan_outs = parsed.as_ref().map(fan_out_infos).unwrap_or_default();
+    let stage_routing = parsed.as_ref().map(stage_routing_infos).unwrap_or_default();
+    let dependencies = parsed
+        .as_ref()
+        .map(super::blueprint_types::dependency_infos)
+        .unwrap_or_default();
     Ok(Json(BlueprintDetail {
         info,
         regions,
         fan_outs,
+        stage_routing,
+        dependencies,
         manifest,
     }))
+}
+
+/// The stages that route produced parts (`output_routing`) or empty a region
+/// on entry (`context.reset`), so the detail route carries them structured. A
+/// stage that does neither is left out, the way `fan_out_infos` lists only
+/// fan-out stages.
+fn stage_routing_infos(bp: &leviath_core::blueprint::Blueprint) -> Vec<StageRoutingInfo> {
+    bp.stages
+        .iter()
+        .filter(|stage| !stage.output_routing.is_empty() || !stage.context_reset.is_empty())
+        .map(|stage| StageRoutingInfo {
+            stage: stage.name.clone(),
+            output_routing: stage
+                .output_routing
+                .iter()
+                .map(|(pattern, region)| RoutePair {
+                    pattern: pattern.clone(),
+                    region: region.clone(),
+                })
+                .collect(),
+            context_reset: stage.context_reset.clone(),
+        })
+        .collect()
 }
 
 /// The fan-out stages of a blueprint, with their limits resolved.
@@ -355,119 +416,45 @@ fn fan_out_infos(bp: &leviath_core::blueprint::Blueprint) -> Vec<FanOutInfo> {
 pub(super) async fn create_blueprint(
     Json(body): Json<CreateBlueprintReq>,
 ) -> Result<Json<BlueprintInfo>, ApiError> {
-    // Validate manifest first, keeping the parsed Blueprint so the response
-    // can be built from it directly below instead of re-reading the file we
-    // just wrote (re-reading would make the re-read's error arm a TOCTOU-only,
-    // untestable dead branch).
-    let bp = parse_manifest(&body.manifest).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: format!("Invalid manifest: {}", e),
-            }),
-        )
-    })?;
-
-    let dir = blueprint_dir(&body.name)?;
-    std::fs::create_dir_all(&dir).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("Failed to create directory: {}", e),
-            }),
-        )
-    })?;
-
-    let manifest_path = dir.join(leviath_core::files::MANIFEST_FILENAME);
-    std::fs::write(&manifest_path, &body.manifest).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("Failed to write manifest: {}", e),
-            }),
-        )
-    })?;
-
-    Ok(Json(BlueprintInfo {
-        name: bp.name,
-        version: bp.version,
-        description: bp.description,
-        path: dir.to_string_lossy().to_string(),
-        stages: bp.stages.iter().map(|s| s.name.clone()).collect(),
-        // The text just written. Not serialized on this route, which returns
-        // the catalog shape, but carried so the value is never a lie.
-        manifest: body.manifest,
-    }))
+    written(&body.name, body.manifest, false).map_err(|e| super::core::error::as_api_error(&e))
 }
 
 pub(super) async fn update_blueprint(
     AxumPath(name): AxumPath<String>,
     Json(body): Json<UpdateBlueprintReq>,
 ) -> Result<Json<BlueprintInfo>, ApiError> {
-    let bp = parse_manifest(&body.manifest).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: format!("Invalid manifest: {}", e),
-            }),
-        )
-    })?;
+    written(&name, body.manifest, true).map_err(|e| super::core::error::as_api_error(&e))
+}
 
-    let dir = blueprint_dir(&name)?;
-    let manifest_path = dir.join(leviath_core::files::MANIFEST_FILENAME);
-    if !manifest_path.exists() {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: format!("Blueprint '{}' not found", name),
-            }),
-        ));
-    }
-
-    std::fs::write(&manifest_path, &body.manifest).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("Failed to write manifest: {}", e),
-            }),
-        )
-    })?;
-
+/// Install or replace a blueprint, and describe what was written.
+fn written(
+    name: &str,
+    manifest: String,
+    replacing: bool,
+) -> Result<Json<BlueprintInfo>, super::core::error::ServeError> {
+    let written = super::core::blueprints::write_blueprint(name, manifest, replacing)?;
     Ok(Json(BlueprintInfo {
-        name: bp.name,
-        version: bp.version,
-        description: bp.description,
-        path: dir.to_string_lossy().to_string(),
-        stages: bp.stages.iter().map(|s| s.name.clone()).collect(),
-        // The text just written. Not serialized on this route, which returns
-        // the catalog shape, but carried so the value is never a lie.
-        manifest: body.manifest,
+        name: written.parsed.name.clone(),
+        version: written.parsed.version.clone(),
+        description: written.parsed.description.clone(),
+        path: written.dir.to_string_lossy().to_string(),
+        stages: written
+            .parsed
+            .stages
+            .iter()
+            .map(|stage| stage.name.clone())
+            .collect(),
+        manifest: written.manifest.text,
+        parsed: written.parsed,
     }))
 }
 
 pub(super) async fn delete_blueprint(
     AxumPath(name): AxumPath<String>,
 ) -> Result<StatusCode, ApiError> {
-    let dir = blueprint_dir(&name)?;
-    if !dir.exists() {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: format!("Blueprint '{}' not found", name),
-            }),
-        ));
-    }
-
-    std::fs::remove_dir_all(&dir).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("Failed to delete blueprint: {}", e),
-            }),
-        )
-    })?;
-
-    Ok(StatusCode::NO_CONTENT)
+    super::core::blueprints::remove_blueprint(&name)
+        .map(|()| StatusCode::NO_CONTENT)
+        .map_err(|e| super::core::error::as_api_error(&e))
 }
 
 /// `POST /api/blueprints/validate`: parse, validate and lint a manifest.
@@ -502,7 +489,7 @@ pub(super) async fn validate_blueprint(
 /// A manifest typed from nothing has no directory to offer, and then the lint
 /// runs against the built-in tool set alone, which is the most that can be
 /// said about it.
-fn validate_manifest_text(manifest: &str, dir: &Path) -> ValidateResponse {
+pub(super) fn validate_manifest_text(manifest: &str, dir: &Path) -> ValidateResponse {
     let bp = match parse_manifest(manifest) {
         Ok(bp) => bp,
         Err(e) => return ValidateResponse::invalid(vec![e.to_string()]),
@@ -589,6 +576,8 @@ system_prompt = "do it"
     async fn page(dir: &tempfile::TempDir, extra: &str) -> (StatusCode, serde_json::Value) {
         let (tx, _) = broadcast::channel(64);
         let state = AppState {
+            caches: Default::default(),
+            signer: Default::default(),
             update_check: Default::default(),
             update_jobs: Default::default(),
             config: crate::commands::serve::testutil::fixed_config(Config {
@@ -608,7 +597,15 @@ system_prompt = "do it"
             .uri(format!("/api/blueprints{extra}"))
             .body(Body::empty())
             .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+        // The listing scans the installed agents dir as well as `agent_paths`,
+        // so without this a developer's real `~/.leviath/agents` leaks into the
+        // catalog and the pagination fixtures land on a page past the last one
+        // the test reads. Point the installed dir at an empty scope.
+        let empty = tempfile::tempdir().unwrap();
+        let resp = TEST_AGENTS_DIR
+            .scope(empty.path().to_path_buf(), app.oneshot(req))
+            .await
+            .unwrap();
         let status = resp.status();
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
@@ -767,6 +764,14 @@ mod canonicalize_tests {
             path: path.to_string(),
             stages: vec![],
             manifest: String::new(),
+            // These tests are about which row wins a name clash, so the
+            // manifest behind the row is the emptiest one that exists.
+            parsed: std::sync::Arc::new(leviath_core::Blueprint::new(
+                name.to_string(),
+                String::new(),
+                Vec::new(),
+                leviath_core::layout::ContextLayout::new(Vec::new(), 0),
+            )),
         }
     }
 
@@ -824,6 +829,8 @@ mod tests {
     fn test_state_with_path(path: PathBuf) -> AppState {
         let (tx, _) = broadcast::channel(64);
         AppState {
+            caches: Default::default(),
+            signer: Default::default(),
             update_check: Default::default(),
             update_jobs: Default::default(),
             config: crate::commands::serve::testutil::fixed_config(Config {
@@ -1090,6 +1097,66 @@ findings = { kind = "clearable", max_tokens = 4000 }
         );
     }
 
+    /// The detail route reports each stage's produced-part routing and its
+    /// entry resets, so a console shows them without parsing the manifest. A
+    /// stage that does neither (here, none of the fan-out blueprint's) is left
+    /// out.
+    #[tokio::test]
+    async fn the_detail_route_reports_stage_routing() {
+        let manifest = r#"
+[agent]
+name = "drawer"
+
+[context.regions]
+artwork = { kind = "pinned" }
+conversation = { kind = "sliding_window" }
+
+[stages.draw]
+system_prompt = "Draw"
+
+[stages.draw.output_routing]
+"image/*" = "artwork"
+
+[stages.describe]
+system_prompt = "Describe"
+
+[stages.describe.context]
+reset = ["conversation"]
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().join("drawer");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(agent_dir.join("agent.leviath"), manifest).unwrap();
+
+        let state = test_state_with_path(dir.path().to_path_buf());
+        let app = Router::new()
+            .route("/api/blueprints/{name}", get(get_blueprint))
+            .with_state(state);
+        let req = Request::builder()
+            .uri("/api/blueprints/drawer")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let bp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            bp["stage_routing"],
+            serde_json::json!([
+                {
+                    "stage": "draw",
+                    "output_routing": [{ "pattern": "image/*", "region": "artwork" }],
+                },
+                {
+                    "stage": "describe",
+                    "context_reset": ["conversation"],
+                },
+            ])
+        );
+    }
+
     /// A blueprint that never fans out reports an empty list, so a client can
     /// tell "no fan-out here" from a daemon too old to say.
     #[tokio::test]
@@ -1186,9 +1253,9 @@ findings = { kind = "clearable", max_tokens = 4000 }
         assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
     }
 
-    /// Unique blueprint name so tests operating against the real
-    /// `~/.leviath/agents` dir (create/update/delete have no path DI seam)
-    /// don't collide with each other or with a developer's real agents.
+    /// A blueprint name that says which test made it. Every write test runs
+    /// under [`TEST_AGENTS_DIR`] in a temp dir of its own, so the name need
+    /// not be unique; it only has to be readable in a failure.
     fn unique_bp_name(prefix: &str) -> String {
         use std::time::{SystemTime, UNIX_EPOCH};
         let nanos = SystemTime::now()
@@ -1202,9 +1269,12 @@ findings = { kind = "clearable", max_tokens = 4000 }
 
     #[tokio::test]
     async fn create_blueprint_valid_manifest_returns_ok() {
-        let name = unique_bp_name("create");
-        let manifest = format!(
-            r#"
+        let agents = tempfile::tempdir().unwrap();
+        TEST_AGENTS_DIR
+            .scope(agents.path().to_path_buf(), async {
+                let name = unique_bp_name("create");
+                let manifest = format!(
+                    r#"
 [agent]
 name = "{name}"
 version = "1.0.0"
@@ -1213,26 +1283,28 @@ description = "Created via API"
 [stages.plan]
 system_prompt = "Plan the work"
 "#
-        );
+                );
 
-        let app = Router::new().route("/api/blueprints", post(create_blueprint));
-        let body = serde_json::json!({ "name": name, "manifest": manifest });
-        let req = Request::builder()
-            .method("POST")
-            .uri("/api/blueprints")
-            .header("content-type", "application/json")
-            .body(Body::from(serde_json::to_string(&body).unwrap()))
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), axum::http::StatusCode::OK);
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let info: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(info["name"].as_str().unwrap(), name);
-        assert_eq!(info["stages"].as_array().unwrap().len(), 1);
+                let app = Router::new().route("/api/blueprints", post(create_blueprint));
+                let body = serde_json::json!({ "name": name, "manifest": manifest });
+                let req = Request::builder()
+                    .method("POST")
+                    .uri("/api/blueprints")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
+                    .unwrap();
+                let resp = app.oneshot(req).await.unwrap();
+                assert_eq!(resp.status(), axum::http::StatusCode::OK);
+                let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let info: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(info["name"].as_str().unwrap(), name);
+                assert_eq!(info["stages"].as_array().unwrap().len(), 1);
 
-        let _ = std::fs::remove_dir_all(agents_dir().join(&name));
+                let _ = std::fs::remove_dir_all(agents_dir().join(&name));
+            })
+            .await;
     }
 
     /// `POST /api/blueprints` with a traversing name created a directory and
@@ -1306,31 +1378,36 @@ system_prompt = "p"
 
     #[tokio::test]
     async fn create_blueprint_dir_creation_failure_returns_500() {
-        // Force `create_dir_all` to fail deterministically by pre-creating a
-        // regular *file* at the target path - a directory can't be created
-        // where a non-directory entry already exists. This is cross-platform:
-        // both Unix (ENOTDIR/EEXIST) and Windows (ERROR_ALREADY_EXISTS) refuse
-        // to create a directory at a path that's already occupied by a file.
-        let name = unique_bp_name("create-fail");
-        let dir = agents_dir().join(&name);
-        std::fs::create_dir_all(agents_dir()).unwrap();
-        std::fs::write(&dir, b"blocking file").unwrap();
+        let agents = tempfile::tempdir().unwrap();
+        TEST_AGENTS_DIR
+            .scope(agents.path().to_path_buf(), async {
+                // Force `create_dir_all` to fail deterministically by pre-creating a
+                // regular *file* at the target path - a directory can't be created
+                // where a non-directory entry already exists. This is cross-platform:
+                // both Unix (ENOTDIR/EEXIST) and Windows (ERROR_ALREADY_EXISTS) refuse
+                // to create a directory at a path that's already occupied by a file.
+                let name = unique_bp_name("create-fail");
+                let dir = agents_dir().join(&name);
+                std::fs::create_dir_all(agents_dir()).unwrap();
+                std::fs::write(&dir, b"blocking file").unwrap();
 
-        let app = Router::new().route("/api/blueprints", post(create_blueprint));
-        let manifest = format!(
-            "\n[agent]\nname = \"{name}\"\nversion = \"1.0.0\"\ndescription = \"d\"\n\n[stages.plan]\nsystem_prompt = \"p\"\n"
-        );
-        let body = serde_json::json!({ "name": name, "manifest": manifest });
-        let req = Request::builder()
-            .method("POST")
-            .uri("/api/blueprints")
-            .header("content-type", "application/json")
-            .body(Body::from(serde_json::to_string(&body).unwrap()))
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+                let app = Router::new().route("/api/blueprints", post(create_blueprint));
+                let manifest = format!(
+                    "\n[agent]\nname = \"{name}\"\nversion = \"1.0.0\"\ndescription = \"d\"\n\n[stages.plan]\nsystem_prompt = \"p\"\n"
+                );
+                let body = serde_json::json!({ "name": name, "manifest": manifest });
+                let req = Request::builder()
+                    .method("POST")
+                    .uri("/api/blueprints")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
+                    .unwrap();
+                let resp = app.oneshot(req).await.unwrap();
+                assert_eq!(resp.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
 
-        let _ = std::fs::remove_file(&dir);
+                let _ = std::fs::remove_file(&dir);
+            })
+            .await;
     }
 
     #[tokio::test]
@@ -1352,83 +1429,96 @@ system_prompt = "p"
 
     #[tokio::test]
     async fn create_blueprint_manifest_write_failure_returns_500() {
-        // Distinct from `create_blueprint_dir_creation_failure_returns_500`:
-        // here `create_dir_all` succeeds (the blueprint dir doesn't already
-        // exist as a blocking file), but the manifest *file* write fails --
-        // forced by pre-creating a directory at the exact path
-        // `<dir>/agent.leviath`, so `std::fs::write` hits EISDIR.
-        let name = unique_bp_name("create-manifest-write-fail");
-        let dir = agents_dir().join(&name);
-        std::fs::create_dir_all(dir.join("agent.leviath")).unwrap();
+        let agents = tempfile::tempdir().unwrap();
+        TEST_AGENTS_DIR
+            .scope(agents.path().to_path_buf(), async {
+                // Distinct from `create_blueprint_dir_creation_failure_returns_500`:
+                // here `create_dir_all` succeeds (the blueprint dir doesn't already
+                // exist as a blocking file), but the manifest *file* write fails --
+                // forced by pre-creating a directory at the exact path
+                // `<dir>/agent.leviath`, so `std::fs::write` hits EISDIR.
+                let name = unique_bp_name("create-manifest-write-fail");
+                let dir = agents_dir().join(&name);
+                std::fs::create_dir_all(dir.join("agent.leviath")).unwrap();
 
-        let app = Router::new().route("/api/blueprints", post(create_blueprint));
-        let manifest = format!(
-            "\n[agent]\nname = \"{name}\"\nversion = \"1.0.0\"\ndescription = \"d\"\n\n[stages.plan]\nsystem_prompt = \"p\"\n"
-        );
-        let body = serde_json::json!({ "name": name, "manifest": manifest });
-        let req = Request::builder()
-            .method("POST")
-            .uri("/api/blueprints")
-            .header("content-type", "application/json")
-            .body(Body::from(serde_json::to_string(&body).unwrap()))
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+                let app = Router::new().route("/api/blueprints", post(create_blueprint));
+                let manifest = format!(
+                    "\n[agent]\nname = \"{name}\"\nversion = \"1.0.0\"\ndescription = \"d\"\n\n[stages.plan]\nsystem_prompt = \"p\"\n"
+                );
+                let body = serde_json::json!({ "name": name, "manifest": manifest });
+                let req = Request::builder()
+                    .method("POST")
+                    .uri("/api/blueprints")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
+                    .unwrap();
+                let resp = app.oneshot(req).await.unwrap();
+                assert_eq!(resp.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
 
-        let _ = std::fs::remove_dir_all(&dir);
+                let _ = std::fs::remove_dir_all(&dir);
+            })
+            .await;
     }
 
     // ─── update_blueprint ─────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn update_blueprint_write_failure_returns_500() {
-        use axum::routing::put;
+        let agents = tempfile::tempdir().unwrap();
+        TEST_AGENTS_DIR
+            .scope(agents.path().to_path_buf(), async {
+                use axum::routing::put;
 
-        // Force `std::fs::write` to fail deterministically: the manifest
-        // file exists (so the not-found check passes) but is read-only, so
-        // overwriting it fails. `set_readonly` is cross-platform (Unix
-        // clears/sets the owner-write bit; Windows toggles the FILE_ATTRIBUTE
-        // _READONLY flag), and both platforms' `std::fs::write` honor it.
-        let name = unique_bp_name("update-fail");
-        let dir = agents_dir().join(&name);
-        std::fs::create_dir_all(&dir).unwrap();
-        let manifest_path = dir.join("agent.leviath");
-        std::fs::write(&manifest_path, test_manifest()).unwrap();
-        let original = std::fs::metadata(&manifest_path).unwrap().permissions();
-        let mut perms = original.clone();
-        perms.set_readonly(true);
-        std::fs::set_permissions(&manifest_path, perms).unwrap();
+                // Force `std::fs::write` to fail deterministically: the manifest
+                // file exists (so the not-found check passes) but is read-only, so
+                // overwriting it fails. `set_readonly` is cross-platform (Unix
+                // clears/sets the owner-write bit; Windows toggles the FILE_ATTRIBUTE
+                // _READONLY flag), and both platforms' `std::fs::write` honor it.
+                let name = unique_bp_name("update-fail");
+                let dir = agents_dir().join(&name);
+                std::fs::create_dir_all(&dir).unwrap();
+                let manifest_path = dir.join("agent.leviath");
+                std::fs::write(&manifest_path, test_manifest()).unwrap();
+                let original = std::fs::metadata(&manifest_path).unwrap().permissions();
+                let mut perms = original.clone();
+                perms.set_readonly(true);
+                std::fs::set_permissions(&manifest_path, perms).unwrap();
 
-        let app = Router::new().route("/api/blueprints/{name}", put(update_blueprint));
-        let body = serde_json::json!({ "manifest": test_manifest() });
-        let req = Request::builder()
-            .method("PUT")
-            .uri(format!("/api/blueprints/{}", name))
-            .header("content-type", "application/json")
-            .body(Body::from(serde_json::to_string(&body).unwrap()))
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+                let app = Router::new().route("/api/blueprints/{name}", put(update_blueprint));
+                let body = serde_json::json!({ "manifest": test_manifest() });
+                let req = Request::builder()
+                    .method("PUT")
+                    .uri(format!("/api/blueprints/{}", name))
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
+                    .unwrap();
+                let resp = app.oneshot(req).await.unwrap();
+                assert_eq!(resp.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
 
-        // Put the original permissions back so the directory can be removed on
-        // Windows, where a read-only file cannot be deleted. Restoring what was
-        // there beats `set_readonly(false)`, which on Unix sets *every* write
-        // bit and would hand back a mode the file never had.
-        let _ = std::fs::set_permissions(&manifest_path, original);
-        let _ = std::fs::remove_dir_all(&dir);
+                // Put the original permissions back so the directory can be removed on
+                // Windows, where a read-only file cannot be deleted. Restoring what was
+                // there beats `set_readonly(false)`, which on Unix sets *every* write
+                // bit and would hand back a mode the file never had.
+                let _ = std::fs::set_permissions(&manifest_path, original);
+                let _ = std::fs::remove_dir_all(&dir);
+            })
+            .await;
     }
 
     #[tokio::test]
     async fn update_blueprint_existing_returns_ok() {
-        use axum::routing::put;
+        let agents = tempfile::tempdir().unwrap();
+        TEST_AGENTS_DIR
+            .scope(agents.path().to_path_buf(), async {
+                use axum::routing::put;
 
-        let name = unique_bp_name("update");
-        let dir = agents_dir().join(&name);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("agent.leviath"),
-            format!(
-                r#"
+                let name = unique_bp_name("update");
+                let dir = agents_dir().join(&name);
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(
+                    dir.join("agent.leviath"),
+                    format!(
+                        r#"
 [agent]
 name = "{name}"
 version = "1.0.0"
@@ -1437,13 +1527,13 @@ description = "Original"
 [stages.plan]
 system_prompt = "Plan"
 "#
-            ),
-        )
-        .unwrap();
+                    ),
+                )
+                .unwrap();
 
-        let app = Router::new().route("/api/blueprints/{name}", put(update_blueprint));
-        let updated_manifest = format!(
-            r#"
+                let app = Router::new().route("/api/blueprints/{name}", put(update_blueprint));
+                let updated_manifest = format!(
+                    r#"
 [agent]
 name = "{name}"
 version = "2.0.0"
@@ -1455,24 +1545,26 @@ system_prompt = "Plan"
 [stages.implement]
 system_prompt = "Implement"
 "#
-        );
-        let body = serde_json::json!({ "manifest": updated_manifest });
-        let req = Request::builder()
-            .method("PUT")
-            .uri(format!("/api/blueprints/{}", name))
-            .header("content-type", "application/json")
-            .body(Body::from(serde_json::to_string(&body).unwrap()))
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), axum::http::StatusCode::OK);
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let info: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(info["version"].as_str().unwrap(), "2.0.0");
-        assert_eq!(info["stages"].as_array().unwrap().len(), 2);
+                );
+                let body = serde_json::json!({ "manifest": updated_manifest });
+                let req = Request::builder()
+                    .method("PUT")
+                    .uri(format!("/api/blueprints/{}", name))
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
+                    .unwrap();
+                let resp = app.oneshot(req).await.unwrap();
+                assert_eq!(resp.status(), axum::http::StatusCode::OK);
+                let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let info: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(info["version"].as_str().unwrap(), "2.0.0");
+                assert_eq!(info["stages"].as_array().unwrap().len(), 2);
 
-        let _ = std::fs::remove_dir_all(&dir);
+                let _ = std::fs::remove_dir_all(&dir);
+            })
+            .await;
     }
 
     #[tokio::test]
@@ -1558,30 +1650,35 @@ system_prompt = "Run"
     #[cfg(unix)]
     #[tokio::test]
     async fn delete_blueprint_removal_failure_returns_500() {
-        use axum::routing::delete;
-        use std::os::unix::fs::PermissionsExt;
+        let agents = tempfile::tempdir().unwrap();
+        TEST_AGENTS_DIR
+            .scope(agents.path().to_path_buf(), async {
+                use axum::routing::delete;
+                use std::os::unix::fs::PermissionsExt;
 
-        // Force `remove_dir_all` to fail deterministically: the blueprint
-        // dir exists (so the not-found check passes) but is made read-only
-        // and non-executable, so unlinking its contents fails with EACCES.
-        let name = unique_bp_name("delete-fail");
-        let dir = agents_dir().join(&name);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("agent.leviath"), test_manifest()).unwrap();
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+                // Force `remove_dir_all` to fail deterministically: the blueprint
+                // dir exists (so the not-found check passes) but is made read-only
+                // and non-executable, so unlinking its contents fails with EACCES.
+                let name = unique_bp_name("delete-fail");
+                let dir = agents_dir().join(&name);
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(dir.join("agent.leviath"), test_manifest()).unwrap();
+                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
 
-        let app = Router::new().route("/api/blueprints/{name}", delete(delete_blueprint));
-        let req = Request::builder()
-            .method("DELETE")
-            .uri(format!("/api/blueprints/{}", name))
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+                let app = Router::new().route("/api/blueprints/{name}", delete(delete_blueprint));
+                let req = Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/blueprints/{}", name))
+                    .body(Body::empty())
+                    .unwrap();
+                let resp = app.oneshot(req).await.unwrap();
+                assert_eq!(resp.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
 
-        // Restore perms so cleanup (and any subsequent test) can remove it.
-        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755));
-        let _ = std::fs::remove_dir_all(&dir);
+                // Restore perms so cleanup (and any subsequent test) can remove it.
+                let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755));
+                let _ = std::fs::remove_dir_all(&dir);
+            })
+            .await;
     }
 
     /// Windows twin of `delete_blueprint_removal_failure_returns_500`.
@@ -1603,65 +1700,75 @@ system_prompt = "Run"
     #[cfg(windows)]
     #[tokio::test]
     async fn delete_blueprint_removal_failure_returns_500_windows() {
-        use axum::routing::delete;
-        use std::fs::OpenOptions;
-        use std::os::windows::fs::OpenOptionsExt;
+        let agents = tempfile::tempdir().unwrap();
+        TEST_AGENTS_DIR
+            .scope(agents.path().to_path_buf(), async {
+                use axum::routing::delete;
+                use std::fs::OpenOptions;
+                use std::os::windows::fs::OpenOptionsExt;
 
-        let name = unique_bp_name("delete-fail-win");
-        let dir = agents_dir().join(&name);
-        std::fs::create_dir_all(&dir).unwrap();
-        let manifest_path = dir.join("agent.leviath");
+                let name = unique_bp_name("delete-fail-win");
+                let dir = agents_dir().join(&name);
+                std::fs::create_dir_all(&dir).unwrap();
+                let manifest_path = dir.join("agent.leviath");
 
-        // Create the manifest THROUGH an exclusive (no-share) handle and hold
-        // it open for the duration of the delete attempt below, so
-        // `remove_dir_all` hits a sharing violation trying to unlink
-        // `manifest_path`. Writing the file first and reopening it exclusively
-        // was a CI flake: Windows Defender / the indexer briefly opens a
-        // just-written file, and then it is OUR exclusive open that gets the
-        // sharing violation. Creating it exclusively from the start leaves no
-        // closed-file window for a scanner to grab.
-        let mut locked = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .share_mode(0)
-            .open(&manifest_path)
-            .unwrap();
-        std::io::Write::write_all(&mut locked, test_manifest().as_bytes()).unwrap();
-        let _locked = locked;
+                // Create the manifest THROUGH an exclusive (no-share) handle and hold
+                // it open for the duration of the delete attempt below, so
+                // `remove_dir_all` hits a sharing violation trying to unlink
+                // `manifest_path`. Writing the file first and reopening it exclusively
+                // was a CI flake: Windows Defender / the indexer briefly opens a
+                // just-written file, and then it is OUR exclusive open that gets the
+                // sharing violation. Creating it exclusively from the start leaves no
+                // closed-file window for a scanner to grab.
+                let mut locked = OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .share_mode(0)
+                    .open(&manifest_path)
+                    .unwrap();
+                std::io::Write::write_all(&mut locked, test_manifest().as_bytes()).unwrap();
+                let _locked = locked;
 
-        let app = Router::new().route("/api/blueprints/{name}", delete(delete_blueprint));
-        let req = Request::builder()
-            .method("DELETE")
-            .uri(format!("/api/blueprints/{}", name))
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+                let app = Router::new().route("/api/blueprints/{name}", delete(delete_blueprint));
+                let req = Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/blueprints/{}", name))
+                    .body(Body::empty())
+                    .unwrap();
+                let resp = app.oneshot(req).await.unwrap();
+                assert_eq!(resp.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
 
-        drop(_locked);
-        let _ = std::fs::remove_dir_all(&dir);
+                drop(_locked);
+                let _ = std::fs::remove_dir_all(&dir);
+            })
+            .await;
     }
 
     #[tokio::test]
     async fn delete_blueprint_existing_returns_no_content() {
-        use axum::routing::delete;
+        let agents = tempfile::tempdir().unwrap();
+        TEST_AGENTS_DIR
+            .scope(agents.path().to_path_buf(), async {
+                use axum::routing::delete;
 
-        let name = unique_bp_name("delete");
-        let dir = agents_dir().join(&name);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("agent.leviath"), test_manifest()).unwrap();
-        assert!(dir.exists());
+                let name = unique_bp_name("delete");
+                let dir = agents_dir().join(&name);
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(dir.join("agent.leviath"), test_manifest()).unwrap();
+                assert!(dir.exists());
 
-        let app = Router::new().route("/api/blueprints/{name}", delete(delete_blueprint));
-        let req = Request::builder()
-            .method("DELETE")
-            .uri(format!("/api/blueprints/{}", name))
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), axum::http::StatusCode::NO_CONTENT);
-        assert_dir_removed(&dir);
+                let app = Router::new().route("/api/blueprints/{name}", delete(delete_blueprint));
+                let req = Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/blueprints/{}", name))
+                    .body(Body::empty())
+                    .unwrap();
+                let resp = app.oneshot(req).await.unwrap();
+                assert_eq!(resp.status(), axum::http::StatusCode::NO_CONTENT);
+                assert_dir_removed(&dir);
+            })
+            .await;
     }
 
     fn assert_dir_removed(dir: &std::path::Path) {

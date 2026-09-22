@@ -16,6 +16,7 @@ pub(crate) struct MessageIntake(pub UnboundedReceiver<AgentMessage>);
 pub(crate) fn deliver_messages(
     mut intake: ResMut<MessageIntake>,
     mut agents: Query<(Entity, &AgentState, &mut MessageInbox, &mut ContextWindow)>,
+    mime: crate::blob_store::MimeParams,
 ) {
     crate::tick_scope::clear();
     // Route inbound channel messages to their target agent's inbox.
@@ -41,14 +42,109 @@ pub(crate) fn deliver_messages(
             continue; // hold until a stage that accepts messages
         }
         for msg in inbox.drain_all() {
-            let region = msg.target_region.as_deref().unwrap_or("conversation");
-            let tokens = leviath_core::estimate_tokens(&msg.content);
-            let _ = window.add_typed_entry(
-                region,
-                leviath_core::EntryKind::UserMessage,
-                msg.content.clone(),
-                tokens,
-            );
+            let region = msg
+                .target_region
+                .clone()
+                .unwrap_or_else(|| "conversation".to_string());
+            if msg.parts.is_empty() {
+                let tokens = leviath_core::estimate_tokens(&msg.content);
+                let _ = window.add_typed_entry_caused(
+                    leviath_core::ContextCause::Message,
+                    &region,
+                    leviath_core::EntryKind::UserMessage,
+                    msg.content.clone(),
+                    tokens,
+                );
+                continue;
+            }
+            deliver_with_parts(&mut window, entity, &state.agent_id, &region, msg, &mime);
+        }
+    }
+}
+
+/// Deliver a message that carries files: the text and every part bound for
+/// the message's own region land as one entry, and a part naming another
+/// region lands there on its own. A part the run cannot take (no store, over
+/// the size ceiling, a region that refuses its type) is logged and dropped;
+/// the text is still delivered, so the sender's words are never lost to a
+/// bad attachment.
+fn deliver_with_parts(
+    window: &mut ContextWindow,
+    entity: Entity,
+    run_id: &str,
+    region: &str,
+    msg: AgentMessage,
+    mime: &crate::blob_store::MimeParams,
+) {
+    let (sources, _) = mime.hydration_inputs(entity);
+    let Some((store, registry)) = sources else {
+        tracing::warn!(
+            run_id,
+            "[mime] this world has no blob store; delivering the message text without its {} part(s)",
+            msg.parts.len()
+        );
+        let tokens = leviath_core::estimate_tokens(&msg.content);
+        let _ = window.add_typed_entry_caused(
+            leviath_core::ContextCause::Message,
+            region,
+            leviath_core::EntryKind::UserMessage,
+            msg.content.clone(),
+            tokens,
+        );
+        return;
+    };
+    let sink = crate::context_setup::PartSink {
+        store: store.as_ref(),
+        registry: &registry,
+        run_id,
+        max_part_bytes: mime.max_part_bytes(),
+        inline_text_bytes: mime.inline_text_bytes(),
+    };
+    let (mine, elsewhere): (Vec<_>, Vec<_>) = msg
+        .parts
+        .into_iter()
+        .partition(|p| p.region.as_deref().is_none_or(|r| r == region));
+    let mut parts = Vec::new();
+    if !msg.content.trim().is_empty() {
+        parts.push(leviath_core::mime::Part::text(msg.content.clone()));
+    }
+    for inbound in &mine {
+        match sink.store_part(inbound) {
+            Ok(part) => parts.push(part),
+            Err(e) => tracing::warn!(run_id, "[mime] dropped an attached part: {e}"),
+        }
+    }
+    if parts.is_empty() {
+        parts.push(leviath_core::mime::Part::text(msg.content));
+    }
+    let content = leviath_core::region::EntryContent::from_parts(parts);
+    let tokens = sink.tokens_for(&content);
+    if let Err(e) = window.add_content_entry(
+        leviath_core::ContextCause::Message,
+        region,
+        leviath_core::EntryKind::UserMessage,
+        content,
+        tokens,
+    ) {
+        tracing::warn!(run_id, region, "[mime] message refused: {e}");
+    }
+    for inbound in elsewhere {
+        let target = inbound.region.clone().unwrap_or_default();
+        let entry = sink.entry_for(&inbound);
+        let landed = entry.and_then(|content| {
+            let tokens = sink.tokens_for(&content);
+            window
+                .add_content_entry(
+                    leviath_core::ContextCause::Message,
+                    &target,
+                    leviath_core::EntryKind::UserMessage,
+                    content,
+                    tokens,
+                )
+                .map_err(|e| e.to_string())
+        });
+        if let Err(e) = landed {
+            tracing::warn!(run_id, region = %target, "[mime] dropped an attached part: {e}");
         }
     }
 }

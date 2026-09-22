@@ -6,13 +6,13 @@
 //! test rather than a mocked stand-in for it.
 
 use super::*;
-use crate::commands::auth::codex::tests::{browser_that_redirects, id_token};
+use crate::commands::auth::oauth::tests::{browser_that_redirects, id_token};
 use axum::Router;
 use axum::body::Body;
 use axum::http::Request;
 use axum::routing::{get, post};
 use leviath_providers::ProviderGrant;
-use leviath_providers::codex::ProviderAuthStore;
+use leviath_providers::oauth::ProviderAuthStore;
 use tokio::sync::broadcast;
 use tower::ServiceExt as _;
 
@@ -31,10 +31,10 @@ fn fixed_now() -> u64 {
 fn admin(issuer: String, opener: leviath_mcp::BrowserOpener) -> ProviderAdmin {
     ProviderAdmin {
         opener,
-        issuer,
+        issuer: Some(issuer),
         // The registered ports are the production value; a test that bound
         // them would fight whatever the developer has signed in.
-        ports: vec![0],
+        ports: Some(vec![0]),
         in_flight: Arc::new(Mutex::new(HashMap::new())),
         now: fixed_now,
         usage_url: None,
@@ -52,8 +52,22 @@ fn quiet_admin() -> ProviderAdmin {
 
 /// App state carrying `admin`, with the rest stubbed.
 fn state_with(admin: ProviderAdmin, config: Config) -> AppState {
+    state_with_quota(admin, config, Default::default())
+}
+
+/// [`state_with`], with the subscription readings coming from `quota` rather
+/// than from the accounts.
+fn state_with_quota(
+    admin: ProviderAdmin,
+    config: Config,
+    quota: crate::commands::serve::quota_cache::QuotaCache,
+) -> AppState {
     let (tx, _) = broadcast::channel(16);
     AppState {
+        caches: crate::commands::serve::caches::ServeCaches {
+            provider_quota: quota,
+            ..Default::default()
+        },
         update_check: Default::default(),
         update_jobs: Default::default(),
         config: crate::commands::serve::testutil::fixed_config(config),
@@ -62,6 +76,7 @@ fn state_with(admin: ProviderAdmin, config: Config) -> AppState {
         mcp: crate::commands::serve::mcp::McpAdmin::default(),
         providers: admin,
         limits: Default::default(),
+        signer: Default::default(),
     }
 }
 
@@ -83,6 +98,16 @@ fn app_at(dir: &std::path::Path, state: AppState) -> Router {
 }
 
 async fn send(app: &Router, method: &str, uri: &str) -> (StatusCode, serde_json::Value) {
+    let (status, _, json) = send_full(app, method, uri).await;
+    (status, json)
+}
+
+/// [`send`], keeping the response headers too.
+async fn send_full(
+    app: &Router,
+    method: &str,
+    uri: &str,
+) -> (StatusCode, HeaderMap, serde_json::Value) {
     let req = Request::builder()
         .method(method)
         .uri(uri)
@@ -90,6 +115,7 @@ async fn send(app: &Router, method: &str, uri: &str) -> (StatusCode, serde_json:
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     let status = resp.status();
+    let headers = resp.headers().clone();
     let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -98,7 +124,7 @@ async fn send(app: &Router, method: &str, uri: &str) -> (StatusCode, serde_json:
     } else {
         serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
     };
-    (status, json)
+    (status, headers, json)
 }
 
 /// The issuer's token response, for a sign-in that is meant to succeed.
@@ -377,7 +403,7 @@ async fn a_sign_out_that_cannot_read_the_store_is_an_error() {
 async fn a_login_that_never_starts_reports_why() {
     let dir = tempfile::tempdir().unwrap();
     let mut admin = quiet_admin();
-    admin.ports = Vec::new();
+    admin.ports = Some(Vec::new());
     let app = app_at(dir.path(), state_with(admin, Config::default()));
 
     let (status, body) = send(&app, "POST", "/api/providers/codex/login").await;
@@ -487,14 +513,22 @@ async fn checking_an_unknown_provider_is_a_404() {
 /// field somebody could set.
 #[test]
 fn the_default_admin_points_at_this_machine() {
-    let admin = ProviderAdmin::default();
-    assert_eq!(admin.issuer, leviath_providers::codex::ISSUER);
-    assert_eq!(admin.ports, leviath_providers::codex::CALLBACK_PORTS);
-    let authorizer = admin.authorizer();
-    assert_eq!(
-        authorizer.store_path,
-        Some(crate::commands::serve::mcp::admin_paths().grants)
-    );
+    // Both paths below come from `LEVIATH_HOME` at the moment they are read.
+    // Held under `temp_env`, which serializes every env-changing test in the
+    // process, so a neighbour moving the home between the two reads cannot
+    // make them disagree.
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let admin = temp_env::with_var("LEVIATH_HOME", Some(dir.path()), || {
+        let admin = ProviderAdmin::default();
+        let authorizer = admin.authorizer();
+        assert_eq!(
+            authorizer.store_path,
+            Some(crate::commands::serve::mcp::admin_paths().grants)
+        );
+        admin
+    });
+    assert_eq!(admin.issuer, None);
+    assert_eq!(admin.ports, None);
     assert!(
         leviath_core::sync::lock(&admin.in_flight).is_empty(),
         "nothing is in flight before anything is asked"
@@ -526,5 +560,140 @@ async fn a_check_reports_the_models_the_plan_can_reach() {
     assert!(
         !models.iter().any(|m| m == "gpt-5.3-codex-spark"),
         "a pro-only model reached a plus account: {body}"
+    );
+}
+
+/// A signed-in subscription's usage rides on the listing when asked for,
+/// under headers saying how old the reading is and whether every account
+/// answered. A listing that did not ask for quota carries neither.
+#[tokio::test]
+async fn the_listing_carries_quota_and_its_headers_only_when_asked() {
+    use crate::commands::serve::quota_cache::{QUOTA_AGE, QUOTA_COMPLETE, QuotaCache};
+    use crate::test_fixtures::{QuotaAnswer, Subscription, quota_report, subscriptions};
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = Config::default();
+    config.providers.codex_enabled = true;
+    config.providers.grok_enabled = true;
+    // Codex reports, grok has nothing to say: a provider absent from the
+    // reading is a provider with no `quota` field, not an error.
+    let quota = QuotaCache::with_builder(Arc::new(|accounts| {
+        // Clients for the accounts asked about and no others, as the live
+        // builder makes them: with nothing signed in there is nothing to ask.
+        Some(subscriptions(
+            [
+                Subscription {
+                    name: "codex",
+                    answer: QuotaAnswer::Report(quota_report(false)),
+                },
+                Subscription {
+                    name: "grok",
+                    answer: QuotaAnswer::Nothing,
+                },
+            ]
+            .into_iter()
+            .filter(|s| accounts.asked().iter().any(|a| a.id == s.name))
+            .collect(),
+        ))
+    }));
+    let state = state_with_quota(quiet_admin(), config, quota);
+    let app = app_at(dir.path(), state);
+
+    // Nothing is signed in, so nothing is asked and the reading is empty.
+    let (status, headers, body) = send_full(&app, "GET", "/api/providers?quota=true").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["providers"][0]["quota"].is_null());
+    assert_eq!(headers.get(QUOTA_AGE).unwrap(), "0");
+    assert_eq!(headers.get(QUOTA_COMPLETE).unwrap(), "true");
+
+    let (_, headers, body) = send_full(&app, "GET", "/api/providers").await;
+    assert!(body["providers"][0]["quota"].is_null());
+    assert!(headers.get(QUOTA_AGE).is_none(), "no reading, no age");
+    assert!(headers.get(QUOTA_COMPLETE).is_none());
+}
+
+/// An account that could not be read says so twice: in its own `quota`, and
+/// in the header that tells a console whether asking again might help.
+#[tokio::test]
+async fn an_account_that_could_not_be_read_leaves_the_reading_incomplete() {
+    use crate::commands::serve::quota_cache::{QUOTA_COMPLETE, QuotaCache};
+    use crate::test_fixtures::{QuotaAnswer, Subscription, subscriptions};
+
+    let dir = tempfile::tempdir().unwrap();
+    store_grant(dir.path());
+    let mut config = Config::default();
+    config.providers.codex_enabled = true;
+    let quota = QuotaCache::with_builder(Arc::new(|_| {
+        Some(subscriptions(vec![Subscription {
+            name: "codex",
+            answer: QuotaAnswer::Fails("HTTP 401".into()),
+        }]))
+    }));
+    let app = app_at(dir.path(), state_with_quota(quiet_admin(), config, quota));
+
+    let (_, headers, body) = send_full(&app, "GET", "/api/providers?quota=true").await;
+    assert_eq!(body["providers"][0]["quota"]["error"], "HTTP 401");
+    assert_eq!(
+        headers.get(QUOTA_COMPLETE).unwrap(),
+        "false",
+        "the reading is not complete"
+    );
+}
+
+/// The reading is served from memory, and `?refresh=1` takes a new one.
+///
+/// This is what the parameter exists for: a console asking on every page open
+/// pays one round trip, not one per open.
+#[tokio::test(start_paused = true)]
+async fn the_listing_serves_the_reading_it_has_until_asked_to_look_again() {
+    use crate::commands::serve::quota_cache::{QUOTA_AGE, QuotaCache};
+    use crate::test_fixtures::{QuotaAnswer, Subscription, quota_report, subscriptions};
+
+    let dir = tempfile::tempdir().unwrap();
+    store_grant(dir.path());
+    let mut config = Config::default();
+    config.providers.codex_enabled = true;
+
+    let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = Arc::clone(&reads);
+    let quota = QuotaCache::with_builder(Arc::new(move |accounts| {
+        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(accounts.asked()[0].id, "codex", "the signed-in account");
+        Some(subscriptions(vec![Subscription {
+            name: "codex",
+            answer: QuotaAnswer::Report(quota_report(false)),
+        }]))
+    }));
+    let app = app_at(dir.path(), state_with_quota(quiet_admin(), config, quota));
+
+    let (_, _, body) = send_full(&app, "GET", "/api/providers?quota=true").await;
+    assert_eq!(body["providers"][0]["quota"]["report"]["plan"], "plus");
+    assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    tokio::time::advance(std::time::Duration::from_secs(7)).await;
+    let (_, headers, _) = send_full(&app, "GET", "/api/providers?quota=true").await;
+    assert_eq!(headers.get(QUOTA_AGE).unwrap(), "7");
+    assert_eq!(
+        reads.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "served from memory"
+    );
+
+    // `refresh=1`, which is what the guide documents and what a console writes.
+    // A `bool` parsed by `str::parse` would have made this a 400.
+    let (status, headers, body) =
+        send_full(&app, "GET", "/api/providers?quota=true&refresh=1").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(headers.get(QUOTA_AGE).unwrap(), "0");
+    assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+    // And a flag that says no is off rather than an error, so a mistyped one
+    // leaves the cheap answer in place instead of failing the request.
+    let (status, _, body) = send_full(&app, "GET", "/api/providers?quota=true&refresh=0").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        reads.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "refresh=0 is not a refresh"
     );
 }

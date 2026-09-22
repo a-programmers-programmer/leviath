@@ -32,11 +32,12 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use axum::extract::{Path as AxumPath, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Json};
 use serde::{Deserialize, Serialize};
 
-use super::types::{AppState, err};
+use super::quota_cache::{Accounts, Asked, QUOTA_AGE, QUOTA_COMPLETE};
+use super::types::AppState;
 use crate::commands::setup::signin::{LiveAuthorizer, ProviderAuthorizer};
 
 /// The seams and the shared state the provider routes need.
@@ -49,8 +50,7 @@ use crate::commands::setup::signin::{LiveAuthorizer, ProviderAuthorizer};
 /// anything reachable from a handler's parameters is request data as far as a
 /// scanner is concerned, and a file location that is request data is a
 /// path-injection finding. The grant store comes from
-/// [`admin_paths`](super::mcp::admin_paths) inside each handler instead. It
-/// did live here, and CodeQL was right to say so.
+/// [`admin_paths`](super::mcp::admin_paths) inside each handler instead.
 ///
 /// [`AdminPaths`]: super::mcp::AdminPaths
 #[derive(Clone)]
@@ -59,10 +59,11 @@ pub(crate) struct ProviderAdmin {
     pub(crate) opener: leviath_mcp::BrowserOpener,
     /// The OAuth issuer, and the loopback ports its client id is registered
     /// against. Overridden only by tests, which point them at a local mock and
-    /// port zero so a whole sign-in runs without a browser or a fixed port.
-    pub(crate) issuer: String,
+    /// port zero so a whole sign-in runs without a browser or a fixed port;
+    /// `None` is each provider's own.
+    pub(crate) issuer: Option<String>,
     /// See [`Self::issuer`].
-    pub(crate) ports: Vec<u16>,
+    pub(crate) ports: Option<Vec<u16>>,
     /// What each provider's sign-in is doing, for the poll to read.
     pub(crate) in_flight: Arc<Mutex<HashMap<String, Progress>>>,
     /// Current Unix time; a fn so a long-lived server stays current.
@@ -80,8 +81,8 @@ impl Default for ProviderAdmin {
     fn default() -> Self {
         Self {
             opener: Arc::new(leviath_sys::open_url),
-            issuer: leviath_providers::codex::ISSUER.to_string(),
-            ports: leviath_providers::codex::CALLBACK_PORTS.to_vec(),
+            issuer: None,
+            ports: None,
             in_flight: Arc::new(Mutex::new(HashMap::new())),
             now: super::mcp::system_now,
             usage_url: None,
@@ -93,9 +94,8 @@ impl ProviderAdmin {
     /// The authorizer for this request.
     ///
     /// Built per call rather than held, so the grant store and the credential
-    /// backend are both read from where they are *now*: a `[security]
-    /// credential_store` change used to need a restart of `lev serve` to take
-    /// effect, because the backend was resolved once at start-up.
+    /// backend are both read from where they are *now*, and a `[security]
+    /// credential_store` change takes effect without restarting `lev serve`.
     fn authorizer(&self) -> LiveAuthorizer {
         let paths = super::mcp::admin_paths();
         let mut authorizer = LiveAuthorizer::real(self.opener.clone(), &paths.config);
@@ -159,12 +159,32 @@ pub(crate) struct ProviderInfo {
     /// neither.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) signin: Option<serde_json::Value>,
+    /// What the subscription has left, read live from the account, when the
+    /// request asked for it with `?quota=true` and the provider is enabled
+    /// and signed in: `{"report": {...}}` or `{"error": "..."}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) quota: Option<serde_json::Value>,
 }
 
-/// The providers that sign in with a browser.
+/// `GET /api/providers` query parameters.
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct ListQuery {
+    /// Read each signed-in subscription's usage too. Off by default: it is a
+    /// network read per provider, and a console polls this route while a
+    /// sign-in is waiting.
+    #[serde(default, deserialize_with = "super::types::flag")]
+    pub(super) quota: bool,
+    /// Ask the accounts again and wait for them, rather than answering from
+    /// the reading the server keeps. Only meaningful beside `quota`; for a
+    /// console's "check again".
+    #[serde(default, deserialize_with = "super::types::flag")]
+    pub(super) refresh: bool,
+}
+
+/// The providers that sign in with a browser, as the setup catalog lists them.
 ///
-/// One entry today. A list rather than a `codex` key so a second one is a
-/// table entry rather than a new route and a console change.
+/// A list rather than one key per provider, so each is a table entry rather
+/// than a new route and a console change.
 fn signin_providers() -> Vec<(&'static str, &'static str)> {
     crate::commands::setup::catalog::providers()
         .into_iter()
@@ -178,7 +198,7 @@ fn describe(
     id: &str,
     display: &str,
     config: &crate::config::Config,
-    store: Option<&leviath_providers::codex::ProviderAuthStore>,
+    store: Option<&leviath_providers::oauth::ProviderAuthStore>,
     in_flight: &HashMap<String, Progress>,
 ) -> ProviderInfo {
     let grant = store.and_then(|store| store.get(id).cloned());
@@ -186,7 +206,7 @@ fn describe(
     ProviderInfo {
         id: id.to_string(),
         display: display.to_string(),
-        enabled: config.providers.codex_enabled,
+        enabled: crate::commands::setup::catalog::signin_enabled(config, id),
         signed_in: grant.is_some(),
         account: grant
             .as_ref()
@@ -198,27 +218,93 @@ fn describe(
             .or_else(|| claims.as_ref().and_then(|c| c.plan_type.clone())),
         expires_at: grant
             .as_ref()
-            .and_then(|g| leviath_providers::codex::claims::expiry(&g.access_token)),
+            .and_then(|g| leviath_providers::oauth::claims::expiry(&g.access_token)),
         signin: in_flight
             .get(id)
             .map(|p| serde_json::to_value(p).unwrap_or(serde_json::Value::Null)),
+        quota: None,
     }
 }
 
 /// `GET /api/providers` - every browser-sign-in provider and its state.
-pub(super) async fn list_providers(State(state): State<AppState>) -> impl IntoResponse {
+pub(super) async fn list_providers(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<ListQuery>,
+) -> impl IntoResponse {
+    listing_with(&state, &query).await
+}
+
+/// Every provider this machine can reach, with what is configured and what is
+/// signed in. No quota: reading that costs a provider call, so it is asked for
+/// separately.
+///
+/// Both surfaces build their rows here, so "which providers are there" cannot
+/// have two answers.
+pub(super) fn provider_infos(state: &AppState) -> Vec<ProviderInfo> {
     let config = state.current_config();
     // Read once, not once per row: this is a file, and the answer is the same
-    // for every provider in it. The location comes from `admin_paths` rather
-    // than from `state`; see `ProviderAdmin`.
-    let store =
-        leviath_providers::codex::ProviderAuthStore::load(&super::mcp::admin_paths().grants).ok();
+    // for every provider in it.
+    let paths = super::mcp::admin_paths();
+    let store = leviath_providers::oauth::ProviderAuthStore::load(&paths.grants).ok();
     let in_flight = leviath_core::sync::lock(&state.providers.in_flight).clone();
-    let providers: Vec<ProviderInfo> = signin_providers()
+    signin_providers()
         .into_iter()
         .map(|(id, display)| describe(id, display, &config, store.as_ref(), &in_flight))
-        .collect();
-    Json(serde_json::json!({ "providers": providers })).into_response()
+        .collect()
+}
+
+/// [`list_providers`], callable from a test without a request.
+///
+/// With `?quota=true` the answer carries `X-Leviath-Quota-Age` and
+/// `X-Leviath-Quota-Complete`; without it neither, since an age describing a
+/// reading that is not in the response is worse than no header at all.
+pub(super) async fn listing_with(
+    state: &AppState,
+    query: &ListQuery,
+) -> (HeaderMap, Json<serde_json::Value>) {
+    let config = state.current_config();
+    let mut providers: Vec<ProviderInfo> = provider_infos(state);
+    let mut headers = HeaderMap::new();
+    if query.quota {
+        // Built from the rows above rather than from a second look at the
+        // grant store, so what the reading is keyed on and what the body says
+        // about who is signed in cannot come apart.
+        let asked = providers
+            .iter()
+            .filter(|p| p.enabled && p.signed_in)
+            .map(|p| Asked {
+                id: p.id.clone(),
+                account: p.account.clone(),
+            })
+            .collect();
+        // The grant store's location comes from `admin_paths` rather than from
+        // `state`; see `ProviderAdmin`.
+        let grants = super::mcp::admin_paths().grants;
+        let (reading, _) = state
+            .caches
+            .provider_quota
+            .report(Accounts::new(config, grants, asked), query.refresh)
+            .await;
+        let mut read: HashMap<&str, serde_json::Value> = reading
+            .value
+            .iter()
+            .map(|usage| {
+                (
+                    usage.provider,
+                    crate::commands::providers::quota::entry(usage),
+                )
+            })
+            .collect();
+        for provider in &mut providers {
+            provider.quota = read.remove(provider.id.as_str());
+        }
+        headers.insert(QUOTA_AGE, HeaderValue::from(reading.age_secs()));
+        headers.insert(
+            QUOTA_COMPLETE,
+            HeaderValue::from_static(if reading.complete { "true" } else { "false" }),
+        );
+    }
+    (headers, Json(serde_json::json!({ "providers": providers })))
 }
 
 /// The catalog's own id for `name`, or the refusal for a name nothing signs
@@ -234,18 +320,23 @@ pub(super) async fn list_providers(State(state): State<AppState>) -> impl IntoRe
 /// The refusal is boxed because an axum response is a large value and this
 /// returns a small one beside it.
 fn resolve(name: &str) -> Result<&'static str, Box<axum::response::Response>> {
+    canonical(name).map_err(|e| Box::new(super::core::error::as_api_error(&e).into_response()))
+}
+
+/// The canonical name of a provider that can be signed in to in a browser.
+///
+/// The table's own id, not the caller's string: everything downstream keys on
+/// the id, and a caller's spelling that merely matched would key a grant under a
+/// name nothing reads back.
+pub(super) fn canonical(name: &str) -> Result<&'static str, super::core::error::ServeError> {
     signin_providers()
         .iter()
         .find(|(id, _)| *id == name)
         .map(|(id, _)| *id)
         .ok_or_else(|| {
-            Box::new(
-                err(
-                    StatusCode::NOT_FOUND,
-                    format!("no browser sign-in provider named '{name}'"),
-                )
-                .into_response(),
-            )
+            super::core::error::ServeError::NotFound(format!(
+                "no browser sign-in provider named '{name}'"
+            ))
         })
 }
 
@@ -261,19 +352,63 @@ pub(super) async fn login(
         Ok(id) => id,
         Err(response) => return *response,
     };
+    match sign_in_started(&state, name).await {
+        // Already waiting: the same 409 as before, carrying the URL, because a
+        // client that asked twice still needs the window it is waiting on.
+        Ok(started) if started.already_waiting => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!("a sign-in to '{name}' is already waiting"),
+                "authorize_url": started.authorize_url,
+            })),
+        )
+            .into_response(),
+        Ok(started) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({
+                "status": "waiting",
+                "provider": started.provider,
+                "authorize_url": started.authorize_url,
+            })),
+        )
+            .into_response(),
+        Err(e) => super::core::error::as_api_error(&e).into_response(),
+    }
+}
+
+/// A sign-in that is waiting for the person to finish it in a browser.
+#[derive(Debug, Clone)]
+pub(super) struct SignInStarted {
+    /// The provider, by its canonical name.
+    pub(super) provider: String,
+    /// Where the person has to go. On the serving host: the flow listens on a
+    /// loopback port there, so a browser anywhere else cannot complete it.
+    pub(super) authorize_url: String,
+    /// Whether this is the sign-in somebody already started rather than a new
+    /// one. One runs at a time, because the flow owns a fixed loopback port that
+    /// a second could not bind, and two browser windows asking the same question
+    /// help nobody.
+    pub(super) already_waiting: bool,
+}
+
+/// Start a sign-in, for whichever surface asked, and answer with the URL.
+///
+/// Returns as soon as there is a URL to go to. What happens after that is the
+/// person's business and the flow's: read `providers` to see whether it landed.
+pub(super) async fn sign_in_started(
+    state: &AppState,
+    name: &'static str,
+) -> Result<SignInStarted, super::core::error::ServeError> {
     // One at a time: the flow owns a fixed loopback port that a second could
     // not bind, and two browser windows asking the same question help nobody.
     if let Some(Progress::Waiting { authorize_url, .. }) =
         leviath_core::sync::lock(&state.providers.in_flight).get(name)
     {
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "error": format!("a sign-in to '{name}' is already waiting"),
-                "authorize_url": authorize_url,
-            })),
-        )
-            .into_response();
+        return Ok(SignInStarted {
+            provider: name.to_string(),
+            authorize_url: authorize_url.clone(),
+            already_waiting: true,
+        });
     }
 
     // One channel for both answers: the URL when the flow gets that far, and
@@ -286,7 +421,7 @@ pub(super) async fn login(
     // most once.
     let slot = Arc::new(Mutex::new(Some(started_tx)));
     let announce_slot = Arc::clone(&slot);
-    let announce: crate::commands::auth::codex::Announce = Arc::new(move |url: &str| {
+    let announce: crate::commands::auth::oauth::Announce = Arc::new(move |url: &str| {
         // `Option::map` rather than `if let`: an `if let` with no else leaves
         // a region only a second announce could reach, and there is not one.
         let _ = leviath_core::sync::lock(&announce_slot)
@@ -347,17 +482,13 @@ pub(super) async fn login(
                     started_at: (state.providers.now)(),
                 },
             );
-            (
-                StatusCode::ACCEPTED,
-                Json(serde_json::json!({
-                    "status": "waiting",
-                    "provider": name,
-                    "authorize_url": url,
-                })),
-            )
-                .into_response()
+            Ok(SignInStarted {
+                provider: name.to_string(),
+                authorize_url: url,
+                already_waiting: false,
+            })
         }
-        Err(message) => err(StatusCode::BAD_GATEWAY, message).into_response(),
+        Err(message) => Err(super::core::error::ServeError::Upstream(message)),
     }
 }
 
@@ -374,13 +505,31 @@ pub(super) async fn logout(
         Ok(id) => id,
         Err(response) => return *response,
     };
-    match state.providers.authorizer().sign_out(name).await {
+    match signed_out(&state, name).await {
         Ok(()) => {
-            leviath_core::sync::lock(&state.providers.in_flight).remove(name);
             Json(serde_json::json!({ "status": "signed_out", "provider": name })).into_response()
         }
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => super::core::error::as_api_error(&e).into_response(),
     }
+}
+
+/// Forget one provider's stored grant, for whichever surface asked.
+///
+/// The config is deliberately untouched, the same as `lev auth logout`: signing
+/// out is not turning the provider off, and doing both would surprise anybody who
+/// meant to sign in again.
+pub(super) async fn signed_out(
+    state: &AppState,
+    name: &str,
+) -> Result<(), super::core::error::ServeError> {
+    state
+        .providers
+        .authorizer()
+        .sign_out(name)
+        .await
+        .map_err(|e| super::core::error::ServeError::Internal(e.to_string()))?;
+    leviath_core::sync::lock(&state.providers.in_flight).remove(name);
+    Ok(())
 }
 
 /// `POST /api/providers/{name}/check` - prove the stored sign-in works.
@@ -396,8 +545,29 @@ pub(super) async fn check(
         Ok(id) => id,
         Err(response) => return *response,
     };
+    match checked(&state, name).await {
+        Ok(models) => Json(serde_json::json!({
+            "status": "ok",
+            "provider": name,
+            "models": models,
+        }))
+        .into_response(),
+        Err(e) => super::core::error::as_api_error(&e).into_response(),
+    }
+}
+
+/// Ask one provider whether the stored sign-in works, for whichever surface
+/// asked.
+///
+/// The same check `lev setup` runs, through the same code: it asks the account
+/// rather than reading a compiled table, so a green answer means the subscription
+/// really did agree. The models it names are what that account may use.
+pub(super) async fn checked(
+    state: &AppState,
+    name: &str,
+) -> Result<Vec<String>, super::core::error::ServeError> {
     let config = state.current_config();
-    let mut options = crate::commands::run::session::codex_options(&config);
+    let mut options = crate::commands::run::session::signin_options(&config, name);
     // The authorizer's path, not the default one it usually resolves to: the
     // sign-in wrote there, and a check that read somewhere else would report
     // a provider with no grant a moment after storing one.
@@ -427,15 +597,10 @@ pub(super) async fn check(
     // `--no-verify` backend does, and that one is not wired here - so a
     // `Skipped` arm would be a branch nothing could reach.
     let outcome = crate::commands::setup::verify::verify_via_registry(&creds).await;
-    if outcome.is_failure() {
-        return err(StatusCode::BAD_GATEWAY, outcome.summary()).into_response();
+    match outcome.is_failure() {
+        true => Err(super::core::error::ServeError::Upstream(outcome.summary())),
+        false => Ok(outcome.models().to_vec()),
     }
-    Json(serde_json::json!({
-        "status": "ok",
-        "provider": name,
-        "models": outcome.models(),
-    }))
-    .into_response()
 }
 
 #[cfg(test)]

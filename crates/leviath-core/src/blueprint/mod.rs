@@ -9,7 +9,7 @@ use crate::error::ValidationError;
 use crate::layout::{ContextLayout, RegionSeed};
 use crate::lifecycle::CompactionConfig;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// Regions every stage can see, whatever its own `[context.regions]` says.
 ///
@@ -24,6 +24,74 @@ pub const ALWAYS_VISIBLE_REGIONS: [&str; 4] = [
     "final_output",
     crate::layout::STAGE_INSTRUCTIONS_REGION,
 ];
+
+/// When a run looks for tools again after it started.
+///
+/// Discovery happens either way: what this decides is whether it happens more
+/// than once, and how eagerly. Each value is strictly more eager than the one
+/// before it, so a later value does everything an earlier one does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolRescan {
+    /// The set is fixed when the run starts. The default, and the only value
+    /// where an agent cannot grow its own toolchain.
+    #[default]
+    AtSpawn,
+    /// A `.rhai` written into a scanned directory makes the run look again
+    /// before its next turn, so the tool is advertised to the model.
+    AfterWrites,
+    /// As `AfterWrites`, and the run also looks at the scanned directories
+    /// themselves before each batch of tool calls it dispatches.
+    ///
+    /// The difference is *what* it notices. `AfterWrites` is told about a tool
+    /// only when this agent writes one with `write_file`, `edit_file` or
+    /// `install_tool`. A tool that appears any other way - written by a shell
+    /// command, by a script tool, by a sub-agent or fan-out worker sharing this
+    /// workdir, or by a person - is invisible to it for the rest of the run.
+    /// This value looks at the directories instead of waiting to be told, so it
+    /// sees all of those, and sees a tool that was edited or removed too.
+    ///
+    /// The cost is a `stat` per scanned directory per batch, and a re-scan only
+    /// when one of them changed.
+    BeforeDispatch,
+}
+
+impl ToolRescan {
+    /// Whether a run on this setting looks for tools again at all.
+    ///
+    /// What decides whether the workdir's `tools/` joins the scan set, and
+    /// whether the runtime watches the agent for a pending re-scan.
+    pub fn rescans(self) -> bool {
+        !matches!(self, Self::AtSpawn)
+    }
+
+    /// Whether a run on this setting looks again before dispatching a batch.
+    pub fn before_dispatch(self) -> bool {
+        matches!(self, Self::BeforeDispatch)
+    }
+
+    /// The word a manifest writes for this value.
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::AtSpawn => "at_spawn",
+            Self::AfterWrites => "after_writes",
+            Self::BeforeDispatch => "before_dispatch",
+        }
+    }
+
+    /// Read a manifest's word, or `None` for one nothing here names.
+    pub fn parse(word: &str) -> Option<Self> {
+        Some(match word {
+            "at_spawn" => Self::AtSpawn,
+            "after_writes" => Self::AfterWrites,
+            "before_dispatch" => Self::BeforeDispatch,
+            _ => return None,
+        })
+    }
+
+    /// Every value, in order of eagerness, for a refusal that lists them.
+    pub const ALL: [Self; 3] = [Self::AtSpawn, Self::AfterWrites, Self::BeforeDispatch];
+}
 
 /// An agent blueprint - the complete definition of an agent type.
 ///
@@ -98,12 +166,18 @@ pub struct Blueprint {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox: Option<crate::sandbox::ToolSandboxConfig>,
 
-    /// Opt-in escape hatch: when `true`, the agent may add tools to
-    /// its own `tools/` directory mid-run and have them re-discovered and
-    /// re-advertised for its next turn. **Off by default** - tools are otherwise
-    /// discovered once at spawn and an agent cannot grow its own toolchain.
+    /// When a run looks for tools again after it started.
+    ///
+    /// Anything but [`ToolRescan::AtSpawn`] puts the run workdir's `tools/`
+    /// directory in the scan set, so a script the agent writes there mid-run
+    /// can be found. The directory is the *workdir's*, not the blueprint's:
+    /// anything else running in that workdir sees the same tools, and a
+    /// sub-agent inherits the workdir verbatim.
+    ///
+    /// Defaults to [`ToolRescan::AtSpawn`], where the set is fixed when the run
+    /// starts and an agent cannot grow its own toolchain.
     #[serde(default)]
-    pub dynamic_tools: bool,
+    pub tool_rescan: ToolRescan,
 
     /// Read paths this agent *declares* beyond its workdir - directories a
     /// planner-style agent needs to see, like run archives or design docs.
@@ -135,6 +209,22 @@ pub struct Blueprint {
     /// producing no output: a stage may still ask for one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<crate::output::OutputSpec>,
+
+    /// Rows this agent adds to the mime registry, `[mime_types]` in the
+    /// manifest: the types its tools produce and take, layered over the
+    /// operator's rows for this agent's runs only. Validated at parse; an
+    /// empty table is the common case and is not written back.
+    #[serde(default, skip_serializing_if = "toml::Table::is_empty")]
+    pub mime_types: toml::Table,
+
+    /// Things that must be in place before this agent can run, declared as
+    /// `[[dependencies]]` in the manifest: an MCP server, an environment
+    /// variable, a program on `PATH`, or a condition a Rhai script checks.
+    /// Declared, never granted. The operator is shown what is missing and how
+    /// to fix it, and an unmet required dependency fails the spawn before the
+    /// first billed inference. See [`Dependency`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dependencies: Vec<Dependency>,
 }
 
 /// The `[safe_commands]` section of a manifest.
@@ -172,6 +262,158 @@ pub struct ReadPathsConfig {
     pub allow: Vec<String>,
 }
 
+/// One `[[dependencies]]` entry: something that must be in place before an
+/// agent can run. Declared in the manifest, never granted - every surface that
+/// reports it (`lev validate`, `lev deps`, the spawn gate, the API) shows what
+/// is missing and the `remedy` for fixing it.
+///
+/// The `kind` field selects what must be present and carries its own fields
+/// (see [`DependencyKind`]); the optional [`install`](Self::install) block says
+/// how `lev deps install` can put it in place, and is never run automatically.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Dependency {
+    /// A short identifier, unique within the blueprint.
+    pub name: String,
+
+    /// What must be present, and the fields describing it.
+    #[serde(flatten)]
+    pub kind: DependencyKind,
+
+    /// Whether an unmet dependency blocks the run. `true` (the default) fails
+    /// the spawn; `false` downgrades a miss to a warning the run proceeds past.
+    #[serde(default = "default_dependency_required")]
+    pub required: bool,
+
+    /// A human sentence telling the user how to satisfy the dependency, shown
+    /// wherever a miss is reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remedy: Option<String>,
+
+    /// A one-line note on why the agent needs it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+
+    /// How `lev deps install` can put this dependency in place. Optional and
+    /// never run automatically: installing runs commands or writes config on
+    /// the user's machine and always asks first. See [`DependencyInstall`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install: Option<DependencyInstall>,
+}
+
+/// The default for [`Dependency::required`]: a declared dependency blocks the
+/// run unless the manifest says otherwise.
+fn default_dependency_required() -> bool {
+    true
+}
+
+/// What a [`Dependency`] requires, selected by the manifest's `kind` field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DependencyKind {
+    /// An MCP server that must be configured in the user's config, plus any
+    /// environment variables or secrets it needs. The check confirms the named
+    /// server exists and every `env` var is set and non-empty.
+    McpServer {
+        /// The server name that must appear in the user's `[[mcp_servers]]`.
+        server: String,
+        /// Environment variables / secrets the server needs. Values are
+        /// prompted for at install, never stored in the blueprint.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        env: Vec<String>,
+    },
+    /// An environment variable that must be set and non-empty.
+    Env {
+        /// The variable name.
+        var: String,
+    },
+    /// A program that must resolve on `PATH`.
+    Binary {
+        /// The program name, e.g. `blender`.
+        command: String,
+    },
+    /// A condition a Rhai script decides. The `check` script returns
+    /// `#{ ok: bool, remedy: string }`; the optional installer lives in
+    /// [`DependencyInstall::script`].
+    Script {
+        /// Path to the Rhai check script, relative to the blueprint directory.
+        check: String,
+    },
+}
+
+impl DependencyKind {
+    /// The manifest `kind` string for this variant (`"mcp_server"`, `"env"`,
+    /// `"binary"`, `"script"`), matching the serialized tag.
+    pub fn tag(&self) -> &'static str {
+        match self {
+            DependencyKind::McpServer { .. } => "mcp_server",
+            DependencyKind::Env { .. } => "env",
+            DependencyKind::Binary { .. } => "binary",
+            DependencyKind::Script { .. } => "script",
+        }
+    }
+}
+
+/// How a [`Dependency`] can be installed by `lev deps install`.
+///
+/// Every field is optional; a dependency may declare any combination. Nothing
+/// here runs without an explicit `lev deps install` and a confirmation, because
+/// each option changes the user's machine: running a command, executing a
+/// script, or writing an MCP server into their config.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DependencyInstall {
+    /// A shell command that installs the dependency on any platform, e.g.
+    /// `"pip install trimesh"`. Run only after the user confirms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+
+    /// Per-OS shell commands, keyed by `"macos"`, `"linux"` or `"windows"`,
+    /// preferred over [`command`](Self::command) on a matching host.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub commands: BTreeMap<String, String>,
+
+    /// A Rhai install script (relative to the blueprint), run with the script
+    /// I/O surface and gated exactly like a script tool. For a `script`
+    /// dependency this is its installer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script: Option<String>,
+
+    /// For an `mcp_server` dependency: the non-user-specific server settings the
+    /// installer writes into the user's config. Secrets are never placed here -
+    /// they are named in the dependency's `env` and prompted for securely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<McpServerTemplate>,
+}
+
+/// The non-secret settings for an MCP server that a blueprint can ship so
+/// `lev deps install` can write it into the user's config. Mirrors the
+/// installable half of the CLI's MCP server config; the user-specific secrets
+/// (header and env values) are prompted for and stored separately.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpServerTemplate {
+    /// `"stdio"` or `"http"`. Inferred from `command`/`url` when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
+    /// The program to launch for a stdio server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// The endpoint for an http server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Arguments passed to `command`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    /// Non-secret headers, for an http server. A value may reference a secret
+    /// with `${VAR}`, where `VAR` is named in the dependency's `env`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+    /// Environment for a stdio server's child process. A value may reference a
+    /// secret with `${VAR}` (expanded from the environment at connect time, so
+    /// the secret stays out of the config file), where `VAR` is named in the
+    /// dependency's `env`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+}
+
 impl Blueprint {
     /// Create a new blueprint with the specified configuration.
     pub fn new(
@@ -198,10 +440,12 @@ impl Blueprint {
             repetition_detection: None,
             file_tracking: None,
             sandbox: None,
-            dynamic_tools: false,
+            tool_rescan: ToolRescan::AtSpawn,
             read_paths: None,
             safe_commands: None,
             output: None,
+            mime_types: toml::Table::new(),
+            dependencies: Vec::new(),
         }
     }
 
@@ -219,8 +463,51 @@ impl Blueprint {
             .any(|r| matches!(&r.seed, Some(RegionSeed::CallerInput { name }) if name == "task"))
     }
 
+    /// Whether a run cannot start without a task: the region seeded from it is
+    /// `required`. An optional task region is what lets a blueprint driven by
+    /// its other inputs (`--diff`, an attachment) run with no task at all, and
+    /// still take one from a fan-out that spawns it as its own worker.
+    pub fn requires_task(&self) -> bool {
+        self.context_layout.regions.iter().any(|r| {
+            r.required
+                && matches!(&r.seed, Some(RegionSeed::CallerInput { name }) if name == "task")
+        })
+    }
+
     /// The caller input keys this blueprint does read, in declaration order.
     ///
+    /// The mime type patterns `stage` takes as parts: its own
+    /// `[input] accepts` when it declares one, else the union of `accepts`
+    /// across the regions it sees. Text is always taken and never listed, so
+    /// an empty answer means "text only, unless a region takes anything".
+    /// A visible region with no `accepts` takes anything, and is reported as
+    /// `*/*`.
+    pub fn stage_inputs(&self, stage: &Stage) -> Vec<String> {
+        if !stage.input_accepts.is_empty() {
+            return stage.input_accepts.clone();
+        }
+        let layout = stage
+            .context_layout
+            .as_ref()
+            .unwrap_or(&self.context_layout);
+        let mut out: Vec<String> = Vec::new();
+        for region in &layout.regions {
+            if stage.context_hide.contains(&region.name) {
+                continue;
+            }
+            let patterns: Vec<String> = match region.accepts.is_empty() {
+                true => vec!["*/*".to_string()],
+                false => region.accepts.clone(),
+            };
+            for p in patterns {
+                if !p.starts_with("text/") && !out.contains(&p) {
+                    out.push(p);
+                }
+            }
+        }
+        out
+    }
+
     /// Used to turn "that agent takes no task" into a message naming what it
     /// takes instead, which is the difference between a dead end and a fix.
     pub fn caller_inputs(&self) -> Vec<&str> {
@@ -304,6 +591,83 @@ impl Blueprint {
 
         self.validate_region_references()?;
 
+        self.validate_dependencies()?;
+
+        Ok(())
+    }
+
+    /// Check every `[[dependencies]]` entry is well-formed. This validates the
+    /// declaration only - names are unique and non-empty, each kind's fields are
+    /// present, and an `install` block is shaped for its kind. Whether the
+    /// dependency is actually satisfied (the server exists, the var is set, the
+    /// binary is on `PATH`) is checked at spawn and by `lev deps check`, which
+    /// see the machine this crate does not touch.
+    fn validate_dependencies(&self) -> std::result::Result<(), ValidationError> {
+        let mut seen = std::collections::HashSet::new();
+        for dep in &self.dependencies {
+            let name = dep.name.trim();
+            if name.is_empty() {
+                return Err(ValidationError::Dependency {
+                    name: dep.name.clone(),
+                    message: "a dependency needs a non-empty name".to_string(),
+                });
+            }
+            if !seen.insert(name) {
+                return Err(ValidationError::Dependency {
+                    name: name.to_string(),
+                    message: "two dependencies share this name".to_string(),
+                });
+            }
+            let require = |field: &str, value: &str| -> std::result::Result<(), ValidationError> {
+                if value.trim().is_empty() {
+                    return Err(ValidationError::Dependency {
+                        name: name.to_string(),
+                        message: format!(
+                            "a '{}' dependency needs a non-empty '{field}'",
+                            dep.kind.tag()
+                        ),
+                    });
+                }
+                Ok(())
+            };
+            match &dep.kind {
+                DependencyKind::McpServer { server, .. } => require("server", server)?,
+                DependencyKind::Env { var } => require("var", var)?,
+                DependencyKind::Binary { command } => require("command", command)?,
+                DependencyKind::Script { check } => require("check", check)?,
+            }
+            if let Some(install) = &dep.install {
+                if install.server.is_some() && !matches!(dep.kind, DependencyKind::McpServer { .. })
+                {
+                    return Err(ValidationError::Dependency {
+                        name: name.to_string(),
+                        message: "install.server is only valid for a 'mcp_server' dependency"
+                            .to_string(),
+                    });
+                }
+                if let Some(transport) =
+                    install.server.as_ref().and_then(|s| s.transport.as_deref())
+                    && !matches!(transport, "stdio" | "http")
+                {
+                    return Err(ValidationError::Dependency {
+                        name: name.to_string(),
+                        message: format!(
+                            "install.server.transport must be \"stdio\" or \"http\", got \"{transport}\""
+                        ),
+                    });
+                }
+                for os in install.commands.keys() {
+                    if !matches!(os.as_str(), "macos" | "linux" | "windows") {
+                        return Err(ValidationError::Dependency {
+                            name: name.to_string(),
+                            message: format!(
+                                "install.commands key '{os}' must be \"macos\", \"linux\" or \"windows\""
+                            ),
+                        });
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -337,11 +701,18 @@ impl Blueprint {
     ///
     /// Its own `[context.regions]` when it declares one, the blueprint's
     /// otherwise, plus the regions the runtime carries visible whatever a stage
-    /// says. Narrower than [`known_region_names`](Self::known_region_names),
-    /// which asks only whether a name exists somewhere - the difference being
+    /// says. Narrower than `known_region_names`, which asks only whether a name
+    /// exists somewhere - the difference being
     /// that a region another stage declares exists, and is still not readable
     /// from here.
-    fn regions_visible_to<'a>(&'a self, stage: &'a Stage) -> std::collections::HashSet<&'a str> {
+    ///
+    /// Public so the runtime can size each region's percentage budget against
+    /// the smallest window among the stages that actually see it - a region a
+    /// narrow-window stage never reads must not be shrunk to fit that stage.
+    pub fn regions_visible_to<'a>(
+        &'a self,
+        stage: &'a Stage,
+    ) -> std::collections::HashSet<&'a str> {
         let layout = stage
             .context_layout
             .as_ref()
@@ -405,23 +776,15 @@ impl Blueprint {
                 }
             }
 
-            if let StageMode::FanOut { config } = &stage.mode
-                && let Some(region) = &config.items_region
-                && !known.contains(region.as_str())
-            {
-                return Err(bad(format!(
-                    "fan_out items_region names region '{region}', which no layout in this blueprint declares"
-                )));
-            }
-            if let Some(region) = stage.transition_region.as_deref().map(str::trim) {
-                if region.is_empty() {
-                    return Err(bad(
-                        "transition_region must be a non-empty region name".to_string(),
-                    ));
-                }
-                if !known.contains(region) {
+            // `reset` empties a region on entry. `conversation` and the other
+            // always-visible regions can be reset (that is the point - a stage
+            // starting on a clean conversation), but a name no layout declares
+            // is the same silent typo `hide` guards against.
+            for name in &stage.context_reset {
+                if !known.contains(name.as_str()) {
                     return Err(bad(format!(
-                        "transition_region names region '{region}', which no layout in this blueprint declares"
+                        "context.reset names region '{name}', which no layout in this \
+                         blueprint declares"
                     )));
                 }
             }
@@ -456,6 +819,24 @@ impl Blueprint {
                 }
             }
 
+            // `output_routing` sends the model's produced parts to a region a
+            // *later* stage usually reads, so unlike `tool_routing` above it is
+            // checked against every region the blueprint declares, not only the
+            // ones this stage can see. A target no layout declares is still a
+            // dead drop - the part would land nowhere - so it is refused.
+            for (pattern, region) in &stage.output_routing {
+                if !known.contains(region.as_str()) {
+                    return Err(ValidationError::Stage {
+                        stage: stage.name.clone(),
+                        message: format!(
+                            "output_routing.\"{pattern}\" sends produced parts to region \
+                             '{region}', which no layout in this blueprint declares. Add it to a \
+                             [context.regions] table, or route to a region that exists."
+                        ),
+                    });
+                }
+            }
+
             for edge in stage.transitions.iter().flat_map(|t| t.values()) {
                 let Some(gate) = &edge.gate else { continue };
                 for (key, region) in [
@@ -465,6 +846,10 @@ impl Blueprint {
                         gate.require_region_updated.as_ref(),
                     ),
                     ("require_no_open_items", gate.require_no_open_items.as_ref()),
+                    (
+                        "require_region_entries",
+                        gate.require_region_entries.as_ref().map(|c| &c.region),
+                    ),
                 ] {
                     let Some(region) = region else { continue };
                     if !known.contains(region.as_str()) {
@@ -603,10 +988,11 @@ impl Blueprint {
                     if !gate.require_modifications {
                         continue;
                     }
-                    let can_modify = stage.available_tools.iter().any(|t| {
-                        MODIFYING_TOOLS.contains(&t.as_str())
-                            || gate.tools.iter().any(|extra| extra == t)
-                    });
+                    let can_modify = stage.grants_all_builtins()
+                        || stage.available_tools.iter().any(|t| {
+                            MODIFYING_TOOLS.contains(&t.as_str())
+                                || gate.tools.iter().any(|extra| extra == t)
+                        });
                     if !can_modify {
                         return Err(ValidationError::Transition {
                             from: stage.name.clone(),
@@ -734,6 +1120,8 @@ mod stage;
 pub use stage::*;
 mod transition;
 pub use transition::*;
+mod tool_groups;
+pub use tool_groups::*;
 
 #[cfg(test)]
 mod tests {
@@ -772,11 +1160,28 @@ model = {{ provider = "anthropic", model = "m" }}
         assert!(bp_with_regions(r#"task = { kind = "pinned", max_tokens = 10 }"#).accepts_task());
     }
 
+    /// `requires_task` is the `required` flag on the task region, and nothing
+    /// else: an optional task region takes one without insisting.
+    #[test]
+    fn a_blueprint_requires_a_task_only_when_its_task_region_is_required() {
+        assert!(
+            bp_with_regions(r#"task = { kind = "pinned", max_tokens = 10, required = true }"#)
+                .requires_task()
+        );
+        let optional = bp_with_regions(
+            r#"task = { kind = "pinned", max_tokens = 10 }
+diff = { kind = "pinned", max_tokens = 10, seed = "diff", required = true }"#,
+        );
+        assert!(optional.accepts_task());
+        assert!(!optional.requires_task());
+    }
+
     #[test]
     fn a_blueprint_taking_other_caller_input_does_not_accept_a_task() {
         let bp = bp_with_regions(r#"diff = { kind = "pinned", max_tokens = 10, seed = "diff" }"#);
         assert!(!bp.accepts_task());
         assert_eq!(bp.caller_inputs(), ["diff"]);
+        assert!(!bp.requires_task());
     }
 
     #[test]
@@ -1338,6 +1743,11 @@ criteria = { kind = "pinned", max_tokens = 10, seed = "criteria" }"#,
         assert!(err.to_string().contains("no file-modifying tool"));
         // A built-in write tool satisfies it...
         assert!(gated(&["read_file", "edit_file"], &[]).validate().is_ok());
+        // ...so does a group that carries one, with neither name written...
+        assert!(gated(&["@builtin"], &[]).validate().is_ok());
+        assert!(gated(&["@all"], &[]).validate().is_ok());
+        // ...but not a group that carries none.
+        assert!(gated(&["@scripts"], &[]).validate().is_err());
         // ...as does one the gate itself declares (MCP / script toolchains).
         assert!(
             gated(&["read_file", "patch_file"], &["patch_file"])
@@ -1675,6 +2085,51 @@ criteria = { kind = "pinned", max_tokens = 10, seed = "criteria" }"#,
         bp.validate().expect("the tool is on offer");
     }
 
+    /// With a group in the list the membership question belongs to the
+    /// install, so validation takes the author's word and the lint checks.
+    #[test]
+    fn validate_accepts_a_required_tool_a_group_could_cover() {
+        let mut stage = Stage::new("plan".to_string(), make_model());
+        stage.available_tools = vec!["@builtin".to_string()];
+        stage.required_tools = vec!["ask_user_text".to_string()];
+        let bp = Blueprint::new("t".into(), "".into(), vec![stage], make_layout());
+
+        bp.validate().expect("the group may cover it");
+    }
+
+    #[test]
+    fn validate_rejects_a_group_shaped_entry_that_names_no_group() {
+        let mut stage = Stage::new("plan".to_string(), make_model());
+        stage.available_tools = vec!["read_file".to_string(), "@builtins".to_string()];
+        let bp = Blueprint::new("t".into(), "".into(), vec![stage], make_layout());
+
+        let err = bp.validate().expect_err("not a group");
+        let text = format!("{err:?}");
+        assert!(text.contains("@builtins"), "names the entry: {text}");
+        assert!(text.contains("@builtin,"), "lists the groups: {text}");
+    }
+
+    #[test]
+    fn stage_reports_its_groups_and_named_tools_separately() {
+        let mut stage = Stage::new("plan".to_string(), make_model());
+        stage.available_tools = vec![
+            "read_file".to_string(),
+            "@scripts".to_string(),
+            "github__create_issue".to_string(),
+        ];
+        assert_eq!(stage.tool_groups(), vec![ToolGroup::Scripts]);
+        assert!(stage.grants_group(ToolGroup::Scripts));
+        assert!(!stage.grants_group(ToolGroup::Mcp));
+        assert!(!stage.grants_all_builtins());
+        let named: Vec<&String> = stage.named_tools().collect();
+        assert_eq!(named, vec!["read_file", "github__create_issue"]);
+
+        stage.available_tools = vec!["@all".to_string()];
+        assert!(stage.grants_all_builtins());
+        assert!(stage.grants_group(ToolGroup::Mcp));
+        assert_eq!(stage.named_tools().count(), 0);
+    }
+
     /// A stage required to produce an output, without the tool that produces
     /// one, would spend its whole re-entry budget being nudged toward a tool it
     /// was never offered and then give up. Caught at load instead.
@@ -1889,7 +2344,7 @@ criteria = { kind = "pinned", max_tokens = 10, seed = "criteria" }"#,
     fn test_tool_result_routing_default() {
         let routing = ToolResultRouting::default();
         assert_eq!(routing.default_region, "tool_results");
-        assert!(routing.persist);
+        assert!(routing.keep_results);
         assert!(routing.tool_overrides.is_empty());
         assert!(routing.max_result_tokens.is_none());
     }
@@ -1904,7 +2359,7 @@ criteria = { kind = "pinned", max_tokens = 10, seed = "criteria" }"#,
     fn test_tool_result_routing_serde_roundtrip() {
         let mut routing = ToolResultRouting {
             default_region: "custom_region".to_string(),
-            persist: false,
+            keep_results: false,
             max_result_tokens: Some(4096),
             ..Default::default()
         };
@@ -1916,7 +2371,7 @@ criteria = { kind = "pinned", max_tokens = 10, seed = "criteria" }"#,
         let back: ToolResultRouting = serde_json::from_str(&json).unwrap();
 
         assert_eq!(back.default_region, "custom_region");
-        assert!(!back.persist);
+        assert!(!back.keep_results);
         assert_eq!(back.max_result_tokens, Some(4096));
         assert_eq!(
             back.tool_overrides.get("read_file").map(String::as_str),
@@ -1931,7 +2386,7 @@ criteria = { kind = "pinned", max_tokens = 10, seed = "criteria" }"#,
             s.tool_result_routing = Some(ToolResultRouting {
                 default_region: "results".to_string(),
                 tool_overrides: HashMap::new(),
-                persist: true,
+                keep_results: true,
                 max_result_tokens: Some(2048),
                 tool_max_result_tokens: HashMap::new(),
             });
@@ -1946,7 +2401,7 @@ criteria = { kind = "pinned", max_tokens = 10, seed = "criteria" }"#,
             .as_ref()
             .expect("tool_result_routing should be Some");
         assert_eq!(routing.default_region, "results");
-        assert!(routing.persist);
+        assert!(routing.keep_results);
         assert_eq!(routing.max_result_tokens, Some(2048));
         assert!(routing.tool_overrides.is_empty());
     }
@@ -1962,7 +2417,6 @@ criteria = { kind = "pinned", max_tokens = 10, seed = "criteria" }"#,
             max_workers: 3,
             on_worker_failure: WorkerFailurePolicy::Continue,
             split_prompt: "split".to_string(),
-            items_region: None,
             results_region: None,
             max_items: None,
             max_attempts: None,

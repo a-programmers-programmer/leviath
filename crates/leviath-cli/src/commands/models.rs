@@ -1,5 +1,7 @@
 //! `lev models` - Inspect available models and their capabilities.
 
+mod marks;
+
 use clap::{Args, Subcommand};
 use leviath_providers::capabilities::builtin_catalog;
 use leviath_providers::{ModelCapabilities, ModelInfo, ModelPricing};
@@ -29,7 +31,8 @@ pub enum ModelsCommand {
 /// Arguments for `lev models list`.
 #[derive(Args)]
 pub struct ListArgs {
-    /// Filter by provider name (anthropic, openai, ollama, openrouter)
+    /// Filter by provider name (anthropic, openai, google, openrouter,
+    /// bedrock, xai, grok, meta, codex, ollama)
     #[arg(short, long)]
     pub provider: Option<String>,
     /// Accepted for scripts written before the listing went live by default;
@@ -46,6 +49,14 @@ pub struct ListArgs {
     /// Report the table as JSON, one object per model.
     #[arg(long)]
     pub json: bool,
+    /// Keep only models that accept this mime type in a request, written
+    /// as `image/png` or `image/*`.
+    #[arg(long, value_name = "MIME_TYPE")]
+    pub accepts: Option<String>,
+    /// Keep only models that can hand back this mime type, written as
+    /// `video/mp4` or `video/*`.
+    #[arg(long, value_name = "MIME_TYPE")]
+    pub produces: Option<String>,
 }
 
 /// One model in `lev models list --json`.
@@ -74,6 +85,20 @@ struct ModelRow {
     retires: Option<String>,
     /// USD per million tokens, when the provider's listing quotes a rate.
     pricing: Option<ModelPricing>,
+    /// Mime type patterns the model takes and can hand back.
+    mime: leviath_providers::ModelMime,
+    /// What the provider keeps of this model's requests, with the config's
+    /// settings on top.
+    retention: leviath_providers::retention::RetentionPolicy,
+    /// Why this model's retention conflicts with the config, when it does:
+    /// zero retention is on and the model keeps something, or a
+    /// `[model_capabilities]` entry declares zero and the provider's own
+    /// account says otherwise.
+    retention_conflict: Option<String>,
+    /// Why this row's provider could not be asked, when it could not: the row
+    /// then comes from this build's table, not from the provider.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    listing_error: Option<String>,
 }
 
 /// Arguments for `lev models show`.
@@ -122,7 +147,7 @@ pub(crate) async fn execute(args: ModelsArgs) -> anyhow::Result<()> {
 /// sample, and a script provider defines its own catalog at run time. Naming
 /// a model those hosts have and this build has not heard of is normal, so
 /// they are never checked offline.
-const CLOSED_CATALOG_PROVIDERS: &[&str] = &["anthropic", "openai", "google"];
+const CLOSED_CATALOG_PROVIDERS: &[&str] = &["anthropic", "openai", "google", "meshy"];
 
 /// The `(provider, model)` rows [`crate::lint`] checks a blueprint's model
 /// references against, limited to the providers with a closed catalog.
@@ -161,7 +186,10 @@ fn catalogue_rows() -> Vec<ModelInfo> {
     builtin_catalog()
         .into_iter()
         .map(|e| {
-            ModelInfo::new(e.id, e.provider, e.capabilities).named(Some(e.display_name.to_string()))
+            let mime = leviath_providers::mime_tables::builtin_mime(e.provider, e.id);
+            ModelInfo::new(e.id, e.provider, e.capabilities)
+                .named(Some(e.display_name.to_string()))
+                .with_mime(mime)
         })
         .collect()
 }
@@ -252,8 +280,16 @@ async fn list_with_registry_within(
     // serves. A provider that cannot be asked keeps its catalogue
     // rows, and the trailing line says which is which.
     let mut live_providers: Vec<String> = Vec::new();
+    // What each provider said, for the shared record of provider checks.
+    let mut answers: Vec<(String, Result<Vec<String>, String>)> = Vec::new();
+    // Every provider that could not be asked, and why, in the words
+    // `lev setup` and `lev doctor` use for the same failure.
+    let mut failures: Vec<(String, String)> = Vec::new();
     if !args.offline {
         registry.prime_capabilities(prime_within, &[]).await;
+        // What a provider reads about retention from its account (Bedrock's
+        // mode, a Grok account's setting), so a conflict is judged by it.
+        let _ = tokio::time::timeout(prime_within, registry.refresh_retention()).await;
         // `resolvable_names`, not `provider_names`: a script provider is
         // reachable only through `get`, so a sweep built on the registered
         // names alone silently omits every one of them.
@@ -278,29 +314,43 @@ async fn list_with_registry_within(
             };
             match tokio::time::timeout(prime_within, provider.list_models()).await {
                 Ok(Ok(live)) => {
+                    answers.push((
+                        provider_name.clone(),
+                        Ok(live.iter().map(|m| m.id.clone()).collect()),
+                    ));
                     // The listing is the whole answer for this provider: a
                     // catalogue row it does not carry is a model it does not
                     // serve, and keeping it would list a model nothing can run.
                     entries.retain(|e| e.provider != provider_name);
-                    entries.extend(live);
+                    entries.extend(live.into_iter().map(|m| {
+                        let mime = provider.mime(&m.id);
+                        m.with_mime(mime)
+                    }));
                     live_providers.push(provider_name);
                 }
                 Ok(Err(e)) => {
-                    eprintln!(
-                        "Warning: could not fetch models from '{}': {}; showing this build's table",
-                        provider_name, e
-                    );
+                    answers.push((provider_name.clone(), Err(e.describe())));
+                    failures.push((provider_name, e.describe()));
                 }
-                Err(_) => {
-                    eprintln!(
-                        "Warning: '{}' did not list its models within {}s; showing this build's table",
-                        provider_name,
+                Err(_) => failures.push((
+                    provider_name,
+                    format!(
+                        "[timeout] did not list its models within {}s",
                         prime_within.as_secs()
-                    );
-                }
+                    ),
+                )),
             }
         }
     }
+
+    // A timeout is not recorded: it says nothing about the credential, and
+    // it must not overwrite a check that did get an answer.
+    record_checks(
+        leviath_core::paths::capability_cache_path().as_deref(),
+        &config,
+        &answers,
+        chrono::Utc::now().timestamp(),
+    );
 
     // A `--provider` naming something neither registered natively nor present
     // in the catalogue is a script provider (or a typo). Ask the script
@@ -328,7 +378,36 @@ async fn list_with_registry_within(
     for entry in entries.iter_mut() {
         if let Some(user_caps) = config.model_capabilities.get(&entry.id) {
             entry.capabilities = user_caps.apply_to(entry.capabilities.clone());
+            entry.mime = user_caps.apply_mime(entry.mime.clone());
         }
+    }
+
+    // `--accepts image/png` keeps the models a stage holding such a part could
+    // send it to. After the overrides, so a `[model_capabilities]` entry that
+    // teaches a local model to see counts.
+    if let Some(wanted) = &args.accepts {
+        let pattern = wanted.trim().to_ascii_lowercase();
+        if !pattern.contains('/') {
+            anyhow::bail!(
+                "--accepts takes a mime type such as image/png or image/*, not '{wanted}'"
+            );
+        }
+        entries.retain(|e| {
+            e.mime
+                .input
+                .iter()
+                .any(|have| leviath_providers::capabilities::pattern_covers(have, &pattern))
+        });
+    }
+
+    if let Some(wanted) = &args.produces {
+        let pattern = wanted.trim().to_ascii_lowercase();
+        if !pattern.contains('/') {
+            anyhow::bail!(
+                "--produces takes a mime type such as video/mp4 or image/*, not '{wanted}'"
+            );
+        }
+        entries.retain(|e| marks::produces(&e.mime, &pattern));
     }
 
     // Provider, then newest first, then id: a live listing runs to hundreds
@@ -342,10 +421,23 @@ async fn list_with_registry_within(
 
     // JSON before the emptiness guard: an empty catalog is an empty array, not
     // an error, and a caller polling this should not have to parse a nudge.
+    let settings = crate::commands::run::session::retention_settings(&config);
+    let retention: Vec<_> = entries
+        .iter()
+        .map(|e| marks::retention_of(&registry, &settings, &e.provider, &e.id))
+        .collect();
+
     if args.json {
         let rows: Vec<ModelRow> = entries
             .into_iter()
-            .map(|e| ModelRow {
+            .zip(retention)
+            .map(|(e, (retention, retention_conflict))| ModelRow {
+                listing_error: failures
+                    .iter()
+                    .find(|(name, _)| name == &e.provider)
+                    .map(|(_, why)| why.clone()),
+                retention,
+                retention_conflict,
                 capabilities_overridden: overridden.contains(&e.id),
                 released_on: e.released.map(leviath_providers::learned::civil_date),
                 id: e.id,
@@ -356,6 +448,7 @@ async fn list_with_registry_within(
                 released: e.released,
                 retires: e.retires,
                 pricing: e.pricing,
+                mime: e.mime,
             })
             .collect();
         // Owned scalars with no map keys to reject, so this cannot fail.
@@ -363,7 +456,7 @@ async fn list_with_registry_within(
             "{}",
             serde_json::to_string_pretty(&rows).expect("a model listing serializes")
         );
-        return Ok(());
+        return every_listing_failed(&failures, &live_providers);
     }
 
     if entries.is_empty() {
@@ -384,27 +477,98 @@ async fn list_with_registry_within(
                  model Leviath knows about)"
             );
         }
-        return Ok(());
+        marks::print_failures(&failures);
+        return every_listing_failed(&failures, &live_providers);
     }
 
-    print_listing(&entries, &overridden, &live_providers);
-    Ok(())
+    let conflicts: Vec<Option<String>> = retention.into_iter().map(|(_, c)| c).collect();
+    print_listing(&entries, &overridden, &live_providers, &conflicts);
+    marks::print_failures(&failures);
+    every_listing_failed(&failures, &live_providers)
+}
+
+/// The exit status once the listing has printed: an error when providers were
+/// asked and not one of them answered, so a script or CI check sees a broken
+/// setup rather than a healthy-looking table built from this binary.
+fn every_listing_failed(failures: &[(String, String)], live: &[String]) -> anyhow::Result<()> {
+    match failures.is_empty() || !live.is_empty() {
+        true => Ok(()),
+        false => anyhow::bail!(
+            "no provider could list its models ({}); the rows shown come from this \
+             build's table",
+            failures
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
 }
 
 /// The listing as a table, with a trailing line saying which rows are the
 /// provider's own answer and which are this build's.
+/// Record what each provider's listing said in the shared capability cache,
+/// so `lev setup` and every other surface open on it. Nothing is written when
+/// nothing answered, or when the home did not resolve; a file that cannot be
+/// written is a warning, since the listing itself already printed.
+fn record_checks(
+    path: Option<&std::path::Path>,
+    config: &Config,
+    answers: &[(String, Result<Vec<String>, String>)],
+    now: i64,
+) {
+    let Some(path) = path.filter(|_| !answers.is_empty()) else {
+        return;
+    };
+    let fingerprints = crate::provider_checks::fingerprints(Some(path), config);
+    let mut cache = leviath_providers::CapabilityCache::load_or_new(path, now);
+    for (name, answer) in answers {
+        let outcome = match answer {
+            Ok(ids) => {
+                cache.set_model_ids(name, ids);
+                leviath_providers::CheckOutcome::Reachable { models: ids.len() }
+            }
+            Err(message) => leviath_providers::CheckOutcome::Failed {
+                message: message.clone(),
+            },
+        };
+        cache.record_check(
+            name,
+            leviath_providers::ProviderCheck {
+                checked_at: now,
+                credential: fingerprints.get(name).cloned(),
+                outcome,
+            },
+        );
+    }
+    if let Err(e) = cache.save(path) {
+        eprintln!("Warning: could not record the provider checks: {e}");
+    }
+}
+
 fn print_listing(
     entries: &[ModelInfo],
     overridden: &std::collections::HashSet<String>,
     live_providers: &[String],
+    conflicts: &[Option<String>],
 ) {
     println!(
-        "{:<12} {:<44} {:<5} {:<6} {:<7} {:<7} {:<11} {:>8} {:>8}",
-        "PROVIDER", "MODEL ID", "TEMP", "TOOLS", "CTX", "OUTPUT", "RELEASED", "IN $/M", "OUT $/M"
+        "{:<12} {:<44} {:<5} {:<6} {:<7} {:<7} {:<15} {:<11} {:>8} {:>8}",
+        "PROVIDER",
+        "MODEL ID",
+        "TEMP",
+        "TOOLS",
+        "CTX",
+        "OUTPUT",
+        "MIME",
+        "RELEASED",
+        "IN $/M",
+        "OUT $/M"
     );
-    println!("{}", "-".repeat(118));
+    println!("{}", "-".repeat(134));
 
-    for entry in entries {
+    let mut tiered = false;
+    for (index, entry) in entries.iter().enumerate() {
         let provider_col = if overridden.contains(&entry.id) {
             format!("*{}", entry.provider)
         } else {
@@ -422,17 +586,20 @@ fn print_listing(
         let rates = entry
             .pricing
             .or_else(|| leviath_providers::pricing::published_rates(&entry.provider, &entry.id));
+        tiered |= rates.is_some_and(|p| p.long_context.is_some());
         // `n/a` rather than a blank: a blank reads as "free" or "forgot", and
         // a run on this model reports its cost as unavailable, which is what
         // the column should say too.
-        let (input, output) = match rates {
-            Some(p) => (fmt_rate(p.input_per_mtok), fmt_rate(p.output_per_mtok)),
-            None => (UNPRICED.to_owned(), UNPRICED.to_owned()),
+        let (input, output) = marks::price_columns(rates);
+        let id = match conflicts.get(index).is_some_and(Option::is_some) {
+            true => format!("!{}", entry.id),
+            false => entry.id.clone(),
         };
 
+        let mime = mime_label(&entry.mime);
         println!(
-            "{:<12} {:<44} {:<5} {:<6} {:<7} {:<7} {:<11} {:>8} {:>8}",
-            provider_col, entry.id, temp, tools, ctx, out, released, input, output
+            "{:<12} {:<44} {:<5} {:<6} {:<7} {:<7} {:<15} {:<11} {:>8} {:>8}",
+            provider_col, id, temp, tools, ctx, out, mime, released, input, output
         );
     }
 
@@ -458,6 +625,27 @@ fn print_listing(
         .any(|id| entries.iter().any(|e| &e.id == id))
     {
         println!("* = capabilities overridden via [model_capabilities] in config");
+    }
+    if tiered {
+        println!("{}", marks::TIER_FOOTNOTE);
+    }
+    let conflicting: Vec<String> = entries
+        .iter()
+        .zip(conflicts)
+        .filter_map(|(e, c)| {
+            c.as_ref()
+                .map(|reason| format!("  {}/{}: {reason}", e.provider, e.id))
+        })
+        .collect();
+    if !conflicting.is_empty() {
+        println!(
+            "! {} model{} conflict with the retention settings in config:",
+            conflicting.len(),
+            if conflicting.len() == 1 { "" } else { "s" }
+        );
+        for line in conflicting {
+            println!("{line}");
+        }
     }
 }
 
@@ -499,6 +687,8 @@ async fn merge_script_provider(
         .await
         .map_err(|e| anyhow::anyhow!("provider '{name}' could not list its models: {e}"))?;
     for rm in models {
+        let mime = provider.mime(&rm.id);
+        let rm = rm.with_mime(mime);
         match entries.iter_mut().find(|e| e.id == rm.id) {
             Some(existing) => *existing = rm,
             None => entries.push(rm),
@@ -581,7 +771,8 @@ async fn show_with_registry_within(
                 Ok(Err(e)) => {
                     eprintln!(
                         "Warning: could not fetch models from '{}': {}",
-                        provider_name, e
+                        provider_name,
+                        e.describe()
                     );
                 }
                 Err(_) => {
@@ -606,17 +797,27 @@ async fn show_with_registry_within(
     //    was found, so it is merged last. Printing the override alone would
     //    report `Default` for every field the operator did not mention, which
     //    is not what the run will use.
+    // What the provider keeps of this model's requests, with the operator's
+    // settings on top: the documented answer, since a listing here is a
+    // fresh provider that has not read its account.
+    let settings = crate::commands::run::session::retention_settings(&config);
+    let no_accounts = leviath_runtime::ProviderRegistry::new();
+    let retention_of =
+        |provider: &str| marks::retention_of(&no_accounts, &settings, provider, model_id);
     match (found, user_caps) {
         (Some(info), Some(user_caps)) => {
             let caps = user_caps.apply_to(info.capabilities);
-            print_model_detail(
-                model_id,
-                info.display_name.as_deref(),
-                &info.provider,
-                &caps,
-                Source::Override,
-                info.pricing,
-            );
+            let mime = user_caps.apply_mime(info.mime);
+            print_model_detail(ModelDetail {
+                id: model_id,
+                display_name: info.display_name.as_deref(),
+                provider: &info.provider,
+                caps: &caps,
+                mime: &mime,
+                source: Source::Override,
+                listed_pricing: info.pricing,
+                retention: &retention_of(&info.provider),
+            });
         }
         (Some(info), None) => {
             let source = if info.learned {
@@ -624,24 +825,28 @@ async fn show_with_registry_within(
             } else {
                 Source::Table
             };
-            print_model_detail(
-                model_id,
-                info.display_name.as_deref(),
-                &info.provider,
-                &info.capabilities,
+            print_model_detail(ModelDetail {
+                id: model_id,
+                display_name: info.display_name.as_deref(),
+                provider: &info.provider,
+                caps: &info.capabilities,
+                mime: &info.mime,
                 source,
-                info.pricing,
-            );
+                listed_pricing: info.pricing,
+                retention: &retention_of(&info.provider),
+            });
         }
         (None, Some(user_caps)) => {
-            print_model_detail(
-                model_id,
-                None,
-                "config (user override)",
-                &user_caps.apply_to(ModelCapabilities::default()),
-                Source::Override,
-                None,
-            );
+            print_model_detail(ModelDetail {
+                id: model_id,
+                display_name: None,
+                provider: "config (user override)",
+                caps: &user_caps.apply_to(ModelCapabilities::default()),
+                mime: &user_caps.apply_mime(leviath_providers::ModelMime::text_only()),
+                source: Source::Override,
+                listed_pricing: None,
+                retention: &retention_of("config"),
+            });
         }
         (None, None) => {
             // 4. Not found anywhere - print a helpful message with a TOML snippet.
@@ -677,6 +882,38 @@ enum Source {
     Table,
     /// A `[model_capabilities]` entry, merged onto one of the above.
     Override,
+}
+
+/// The mime column: what the model takes beyond text, then what it hands
+/// back beyond text after an arrow. `img,pdf` for a vision model, `->img` for
+/// an image generator, blank for text in and text out.
+fn mime_label(mime: &leviath_providers::ModelMime) -> String {
+    fn short(patterns: &[String]) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        for p in patterns {
+            let label = match p.split_once('/') {
+                Some(("text", _)) => continue,
+                Some(("image", _)) => "img",
+                Some(("audio", _)) => "aud",
+                Some(("video", _)) => "vid",
+                Some(("application", "pdf")) => "pdf",
+                Some(("model", _)) => "3d",
+                _ => "other",
+            };
+            if !out.contains(&label) {
+                out.push(label);
+            }
+        }
+        out
+    }
+    let input = short(&mime.input).join(",");
+    let output = short(&mime.output).join(",");
+    match (input.is_empty(), output.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => input,
+        (true, false) => format!("->{output}"),
+        (false, false) => format!("{input}->{output}"),
+    }
 }
 
 fn bool_icon(b: bool) -> &'static str {
@@ -737,6 +974,12 @@ fn print_model_pricing(provider: &str, model: &str, listed: Option<ModelPricing>
     println!("  Cached input:   ${:.4}", p.cached_input_per_mtok);
     println!("  Cache write:    ${:.4}", p.cache_write_per_mtok);
     println!("  Output:         ${:.4}", p.output_per_mtok);
+    if let Some(line) = marks::tier_line(&p) {
+        println!("  Long context:   {line}");
+    }
+    if let Some(line) = marks::unit_line(&p) {
+        println!("  Per unit:       {line}");
+    }
     if !published {
         println!("  Source:         the provider's own listing, read just now");
         return;
@@ -771,14 +1014,33 @@ fn describe_source(source: &str) -> &str {
 }
 
 /// Print a detailed capability sheet for a single model.
-fn print_model_detail(
-    id: &str,
-    display_name: Option<&str>,
-    provider: &str,
-    caps: &ModelCapabilities,
+/// Everything one `lev models show` entry prints, gathered so the renderer
+/// takes a name for each thing rather than eight positions.
+struct ModelDetail<'a> {
+    id: &'a str,
+    display_name: Option<&'a str>,
+    provider: &'a str,
+    caps: &'a ModelCapabilities,
+    mime: &'a leviath_providers::ModelMime,
     source: Source,
     listed_pricing: Option<ModelPricing>,
-) {
+    retention: &'a (
+        leviath_providers::retention::RetentionPolicy,
+        Option<String>,
+    ),
+}
+
+fn print_model_detail(detail: ModelDetail<'_>) {
+    let ModelDetail {
+        id,
+        display_name,
+        provider,
+        caps,
+        mime,
+        source,
+        listed_pricing,
+        retention,
+    } = detail;
     println!("Model:    {}", id);
     if let Some(name) = display_name {
         println!("Name:     {}", name);
@@ -804,11 +1066,19 @@ fn print_model_detail(
         caps.max_context_tokens,
         fmt_tokens(caps.max_context_tokens)
     );
+    println!("  Input types:    {}", mime.input.join(", "));
+    println!("  Output types:   {}", mime.output.join(", "));
     println!(
         "  Max output:     {} tokens ({})",
         caps.max_output_tokens,
         fmt_tokens(caps.max_output_tokens)
     );
+    let (retention, conflict) = retention;
+    println!("  Retention:      {}", retention.summary());
+    println!("                  {}", retention.note);
+    if let Some(conflict) = conflict {
+        println!("  \u{26a0}  conflicts with config: {conflict}");
+    }
 
     print_model_pricing(provider, id, listed_pricing);
 }
@@ -853,14 +1123,16 @@ mod tests {
     /// nothing else; an open provider in this list would flag every model
     /// it happens not to name.
     #[test]
-    fn the_closed_catalogue_names_the_three_providers_that_publish_one() {
+    fn the_closed_catalogue_names_the_providers_that_publish_one() {
         let rows = closed_catalog_models();
         assert!(!rows.is_empty());
         let providers: std::collections::BTreeSet<&str> =
             rows.iter().map(|(p, _)| p.as_str()).collect();
+        // The three text vendors plus Meshy, whose 3D operations are a fixed,
+        // compiled catalogue just as their model line-ups are.
         assert_eq!(
             providers.into_iter().collect::<Vec<_>>(),
-            ["anthropic", "google", "openai"]
+            ["anthropic", "google", "meshy", "openai"]
         );
     }
 
@@ -930,22 +1202,77 @@ mod tests {
             limits_source: LimitsSource::Builtin,
         };
         // Should not panic
-        print_model_detail(
-            "test-model",
-            Some("Test Model"),
-            "test",
-            &caps,
-            Source::Table,
-            None,
+        let mime = leviath_providers::ModelMime::new(&["text/*", "image/*"], &["text/*"]);
+        print_model_detail(ModelDetail {
+            id: "test-model",
+            display_name: Some("Test Model"),
+            provider: "test",
+            caps: &caps,
+            mime: &mime,
+            source: Source::Table,
+            listed_pricing: None,
+            retention: &(
+                leviath_providers::retention::builtin("test", "test-model"),
+                Some("zero_retention is on".to_string()),
+            ),
+        });
+        print_model_detail(ModelDetail {
+            id: "test-model",
+            display_name: None,
+            provider: "test",
+            caps: &caps,
+            mime: &mime,
+            source: Source::Override,
+            listed_pricing: None,
+            retention: &(
+                leviath_providers::retention::builtin("test", "test-model"),
+                Some("zero_retention is on".to_string()),
+            ),
+        });
+        print_model_detail(ModelDetail {
+            id: "test-model",
+            display_name: None,
+            provider: "test",
+            caps: &caps,
+            mime: &mime,
+            source: Source::Listing,
+            listed_pricing: Some(ModelPricing::flat(0.5, 1.5)),
+            retention: &(
+                leviath_providers::retention::builtin("test", "test-model"),
+                Some("zero_retention is on".to_string()),
+            ),
+        });
+    }
+
+    #[test]
+    fn mime_label_names_what_goes_beyond_text() {
+        use leviath_providers::ModelMime;
+        assert_eq!(mime_label(&ModelMime::text_only()), "");
+        assert_eq!(
+            mime_label(&ModelMime::new(
+                &["text/*", "image/*", "application/pdf"],
+                &["text/*"]
+            )),
+            "img,pdf"
         );
-        print_model_detail("test-model", None, "test", &caps, Source::Override, None);
-        print_model_detail(
-            "test-model",
-            None,
-            "test",
-            &caps,
-            Source::Listing,
-            Some(ModelPricing::flat(0.5, 1.5)),
+        assert_eq!(
+            mime_label(&ModelMime::new(&["text/*"], &["image/*"])),
+            "->img"
+        );
+        assert_eq!(
+            mime_label(&ModelMime::new(
+                &[
+                    "text/*",
+                    "audio/*",
+                    "video/mp4",
+                    "model/obj",
+                    "x/y",
+                    "image/png",
+                    "image/jpeg"
+                ],
+                &["text/*", "audio/*"]
+            )),
+            "aud,vid,3d,other,img->aud"
         );
     }
 
@@ -985,6 +1312,8 @@ mod tests {
                         offline: false,
                         all: false,
                         json: false,
+                        accepts: None,
+                        produces: None,
                     }),
                 };
                 // Should succeed: prints the builtin table
@@ -1007,6 +1336,8 @@ mod tests {
                         offline: false,
                         all: false,
                         json: false,
+                        accepts: None,
+                        produces: None,
                     }),
                 };
                 let result = execute(args).await;
@@ -1028,6 +1359,8 @@ mod tests {
                         offline: false,
                         all: false,
                         json: false,
+                        accepts: None,
+                        produces: None,
                     }),
                 };
                 // Nothing registered, nothing in the built-in table, no script
@@ -1148,6 +1481,8 @@ mod tests {
                         offline: false,
                         all: false,
                         json: false,
+                        accepts: None,
+                        produces: None,
                     }),
                 };
                 let result = execute(args).await;
@@ -1171,6 +1506,8 @@ mod tests {
                         offline: false,
                         all: false,
                         json: false,
+                        accepts: None,
+                        produces: None,
                     }),
                 };
                 let result = execute(args).await;
@@ -1260,28 +1597,38 @@ mod tests {
             limits_source: LimitsSource::Builtin,
         };
         // Should not panic with all features disabled
-        print_model_detail(
-            "test-model",
-            Some("Test"),
-            "test",
-            &caps,
-            Source::Table,
-            None,
-        );
+        print_model_detail(ModelDetail {
+            id: "test-model",
+            display_name: Some("Test"),
+            provider: "test",
+            caps: &caps,
+            mime: &leviath_providers::ModelMime::text_only(),
+            source: Source::Table,
+            listed_pricing: None,
+            retention: &(
+                leviath_providers::retention::builtin("test", "test-model"),
+                Some("zero_retention is on".to_string()),
+            ),
+        });
     }
 
     #[test]
     fn print_model_detail_user_override_source() {
         let caps = ModelCapabilities::default();
         // Should not panic with user override flag set
-        print_model_detail(
-            "override-model",
-            None,
-            "custom",
-            &caps,
-            Source::Override,
-            None,
-        );
+        print_model_detail(ModelDetail {
+            id: "override-model",
+            display_name: None,
+            provider: "custom",
+            caps: &caps,
+            mime: &leviath_providers::ModelMime::text_only(),
+            source: Source::Override,
+            listed_pricing: None,
+            retention: &(
+                leviath_providers::retention::builtin("test", "test-model"),
+                Some("zero_retention is on".to_string()),
+            ),
+        });
     }
 
     // ─── fmt_tokens additional ──────────────────────────────────────────
@@ -1332,6 +1679,8 @@ mod tests {
                     provider: None,
                     all: false,
                     json: false,
+                    accepts: None,
+                    produces: None,
                 };
                 let result = list_with_registry(args, &build_provider_registry_from_config).await;
                 assert!(result.is_ok());
@@ -1359,6 +1708,8 @@ mod tests {
                     provider: Some("openai".to_string()),
                     all: false,
                     json: true,
+                    accepts: None,
+                    produces: None,
                 };
                 let result = list_with_registry(args, &build_provider_registry_from_config).await;
                 assert!(result.is_ok());
@@ -1378,6 +1729,8 @@ mod tests {
                     provider: None,
                     all: true,
                     json: true,
+                    accepts: None,
+                    produces: None,
                 };
                 let result = list_with_registry(args, &build_provider_registry_from_config).await;
                 assert!(result.is_ok());
@@ -1402,15 +1755,27 @@ mod tests {
             released_on: Some("1970-01-02".to_string()),
             retires: None,
             pricing: Some(ModelPricing::flat(1.0, 2.0)),
+            mime: leviath_providers::ModelMime::new(&["text/*", "image/*"], &["text/*"]),
+            retention: leviath_providers::retention::builtin("p", "m"),
+            retention_conflict: None,
+            listing_error: None,
         };
         let value: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&row).unwrap()).unwrap();
         assert_eq!(value["id"], serde_json::json!("m"));
+        assert!(
+            value.get("listing_error").is_none(),
+            "absent when the listing answered"
+        );
         assert_eq!(value["capabilities_overridden"], serde_json::json!(true));
         assert!(value["capabilities"]["supports_tools"].is_boolean());
         assert_eq!(value["learned"], serde_json::json!(true));
         assert_eq!(value["released_on"], serde_json::json!("1970-01-02"));
         assert_eq!(value["pricing"]["output_per_mtok"], serde_json::json!(2.0));
+        assert_eq!(
+            value["mime"]["input"],
+            serde_json::json!(["text/*", "image/*"])
+        );
     }
 
     #[tokio::test]
@@ -1424,6 +1789,8 @@ mod tests {
                     provider: Some("anthropic".to_string()),
                     all: false,
                     json: false,
+                    accepts: None,
+                    produces: None,
                 };
                 let result = list_with_registry(args, &build_provider_registry_from_config).await;
                 assert!(result.is_ok());
@@ -1443,6 +1810,8 @@ mod tests {
                     provider: Some("no-such-provider".to_string()),
                     all: false,
                     json: false,
+                    accepts: None,
+                    produces: None,
                 };
                 let err = list_with_registry(args, &build_provider_registry_from_config)
                     .await
@@ -1597,6 +1966,76 @@ mod tests {
         }
     }
 
+    fn live_args() -> ListArgs {
+        ListArgs {
+            provider: None,
+            remote: false,
+            offline: false,
+            all: false,
+            json: false,
+            accepts: None,
+            produces: None,
+        }
+    }
+
+    /// A live listing is a check: what each provider said lands in the shared
+    /// capability cache under the home, so `lev setup` opens on it. A listing
+    /// that failed is recorded as a failure with the wizard's wording.
+    #[tokio::test]
+    async fn a_live_listing_records_each_providers_answer() {
+        crate::config::with_isolated_config_path_async(
+            "models-records-checks",
+            |home| async move {
+                let listed = ModelInfo::new(
+                    "mock-recorded".to_string(),
+                    "mock".to_string(),
+                    ModelCapabilities::default(),
+                );
+                list_with_registry(live_args(), &mock_registry("mock", vec![listed], false))
+                    .await
+                    .expect("the listing prints");
+                let path = home.join(".leviath").join("model_capabilities.json");
+                let cache = leviath_providers::CapabilityCache::load(&path).expect("recorded");
+                let check = cache.check("mock").expect("the provider answered");
+                assert_eq!(
+                    check.outcome,
+                    leviath_providers::CheckOutcome::Reachable { models: 1 }
+                );
+                assert_eq!(cache.model_ids("mock"), ["mock-recorded"]);
+
+                let err = list_with_registry(live_args(), &mock_registry("mock", vec![], true))
+                    .await
+                    .expect_err("every listing failed, so the command does too");
+                assert!(err.to_string().contains("no provider could list"), "{err}");
+                let cache = leviath_providers::CapabilityCache::load(&path).expect("recorded");
+                assert_eq!(
+                    cache.check("mock").expect("recorded").outcome,
+                    leviath_providers::CheckOutcome::Failed {
+                        message: "mock provider failure".to_string()
+                    }
+                );
+            },
+        )
+        .await;
+    }
+
+    /// Nothing answered, or nowhere to write: no file. A file that cannot be
+    /// written is a warning, not an error.
+    #[test]
+    fn recording_writes_nothing_without_answers_or_a_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("caps.json");
+        let config = Config::default();
+        record_checks(Some(&path), &config, &[], 1);
+        assert!(!path.exists());
+        let answers = [("mock".to_string(), Ok(vec![]))];
+        record_checks(None, &config, &answers, 1);
+        assert!(!path.exists());
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, "x").unwrap();
+        record_checks(Some(&blocker.join("caps.json")), &config, &answers, 1);
+    }
+
     #[tokio::test]
     async fn list_remote_merges_new_model_from_provider() {
         crate::config::with_isolated_config_path_async(
@@ -1608,6 +2047,8 @@ mod tests {
                     provider: Some("mock".to_string()),
                     all: false,
                     json: false,
+                    accepts: None,
+                    produces: None,
                 };
                 let new_model = ModelInfo::new(
                     "mock-brand-new-model".to_string(),
@@ -1638,6 +2079,8 @@ mod tests {
                     provider: None,
                     all: false,
                     json: false,
+                    accepts: None,
+                    produces: None,
                 };
                 let new_model = ModelInfo::new(
                     "mock-brand-new-model".to_string(),
@@ -1665,6 +2108,8 @@ mod tests {
                     provider: Some("mock".to_string()),
                     all: false,
                     json: false,
+                    accepts: None,
+                    produces: None,
                 };
                 let overriding_model =
                     ModelInfo::new(known_id, "mock".to_string(), ModelCapabilities::default())
@@ -1693,6 +2138,8 @@ mod tests {
                     provider: None,
                     all: false,
                     json: false,
+                    accepts: None,
+                    produces: None,
                 };
                 // A registry with exactly one provider that the builtin table
                 // also knows: its rows survive, everything else is filtered.
@@ -1726,6 +2173,8 @@ mod tests {
                     provider: None,
                     all: false,
                     json: false,
+                    accepts: None,
+                    produces: None,
                 };
                 let result =
                     list_with_registry(args, &mock_registry("anthropic", remote, false)).await;
@@ -1748,6 +2197,8 @@ mod tests {
                     provider: None,
                     all: true,
                     json: false,
+                    accepts: None,
+                    produces: None,
                 };
                 let result = list_with_registry(args, &mock_registry("mock", vec![], false)).await;
                 assert!(result.is_ok());
@@ -1777,6 +2228,8 @@ mod tests {
                     provider: None,
                     all: false,
                     json: false,
+                    accepts: None,
+                    produces: None,
                 };
                 // The provider's own listing carries the model, so the row is
                 // live and the override is merged onto it and marked.
@@ -1823,10 +2276,13 @@ mod tests {
         .await;
     }
 
+    /// A provider that cannot list is reported, and when it was the only one
+    /// asked the command fails, so a broken setup is not a healthy-looking
+    /// table with exit status 0. The JSON rows still print and carry why.
     #[tokio::test]
-    async fn list_remote_provider_error_warns_and_continues() {
+    async fn list_remote_provider_error_is_reported_and_fails_the_command() {
         crate::config::with_isolated_config_path_async(
-            "models-list_remote_provider_error_warns_and_continues",
+            "models-list_remote_provider_error_is_reported",
             |_fake_dir| async move {
                 let args = ListArgs {
                     remote: true,
@@ -1834,9 +2290,35 @@ mod tests {
                     provider: Some("mock".to_string()),
                     all: false,
                     json: false,
+                    accepts: None,
+                    produces: None,
+                };
+                // Anthropic has rows in this build's table, so its rows are
+                // the ones that say why they were not asked.
+                let json = ListArgs {
+                    remote: true,
+                    offline: false,
+                    provider: Some("anthropic".to_string()),
+                    all: false,
+                    json: true,
+                    accepts: None,
+                    produces: None,
                 };
                 let result = list_with_registry(args, &mock_registry("mock", vec![], true)).await;
-                assert!(result.is_ok());
+                assert!(result.is_err());
+                let result =
+                    list_with_registry(json, &mock_registry("anthropic", vec![], true)).await;
+                assert!(result.is_err());
+                assert!(!every_listing_failed(&[], &[]).is_err());
+                assert!(
+                    every_listing_failed(
+                        &[("a".to_string(), "down".to_string())],
+                        &["b".to_string()]
+                    )
+                    .is_ok(),
+                    "one provider answering is a usable listing"
+                );
+                marks::print_failures(&[("a".to_string(), "down".to_string())]);
             },
         )
         .await;
@@ -1859,6 +2341,8 @@ mod tests {
                     provider: Some("openai".to_string()),
                     all: false,
                     json: false,
+                    accepts: None,
+                    produces: None,
                 };
                 let result = list_with_registry(args, &mock_registry("mock", vec![], false)).await;
                 assert!(result.is_ok());
@@ -1976,6 +2460,8 @@ mod tests {
                     provider: Some("scripted".to_string()),
                     all: false,
                     json: true,
+                    accepts: None,
+                    produces: None,
                 };
                 let result = list_with_registry(args, &script_registry(dir)).await;
                 assert!(result.is_ok());
@@ -2014,6 +2500,8 @@ mod tests {
                     provider: None,
                     all: false,
                     json: true,
+                    accepts: None,
+                    produces: None,
                 };
                 let result = list_with_registry(args, &script_registry(dir)).await;
                 assert!(result.is_ok(), "one broken script does not fail the sweep");
@@ -2044,6 +2532,8 @@ mod tests {
                     provider: Some("once".to_string()),
                     all: false,
                     json: true,
+                    accepts: None,
+                    produces: None,
                 };
                 let result = list_with_registry(args, &script_registry(dir)).await;
                 assert!(result.is_ok());
@@ -2073,6 +2563,8 @@ mod tests {
                     provider: Some("quiet".to_string()),
                     all: false,
                     json: false,
+                    accepts: None,
+                    produces: None,
                 };
                 let result = list_with_registry(args, &script_registry(dir)).await;
                 assert!(result.is_ok());
@@ -2104,6 +2596,8 @@ mod tests {
                     provider: Some("angry".to_string()),
                     all: false,
                     json: false,
+                    accepts: None,
+                    produces: None,
                 };
                 let err = list_with_registry(args, &script_registry(dir))
                     .await
@@ -2147,6 +2641,8 @@ mod tests {
                     provider: Some("mirror".to_string()),
                     all: true,
                     json: true,
+                    accepts: None,
+                    produces: None,
                 };
                 let result = list_with_registry(args, &script_registry(dir)).await;
                 assert!(result.is_ok());
@@ -2174,6 +2670,8 @@ mod tests {
                     provider: Some("openai".to_string()),
                     all: true,
                     json: false,
+                    accepts: None,
+                    produces: None,
                 };
                 let result = list_with_registry(args, &script_registry(dir)).await;
                 assert!(result.is_ok());
@@ -2305,6 +2803,8 @@ mod tests {
                     provider: None,
                     all: false,
                     json: false,
+                    accepts: None,
+                    produces: None,
                 };
                 let result = list_with_registry(args, &mock_registry("mock", vec![], false)).await;
                 assert!(result.is_ok());
@@ -2399,6 +2899,8 @@ mod tests {
                     provider: None,
                     all: false,
                     json: false,
+                    accepts: None,
+                    produces: None,
                 };
                 let result = list_with_registry(args, &mock_registry("mock", vec![], false)).await;
                 assert!(result.is_err());
@@ -2468,6 +2970,8 @@ mod tests {
             offline: false,
             all: false,
             json: false,
+            accepts: None,
+            produces: None,
         }));
     }
 
@@ -2575,6 +3079,8 @@ mod tests {
                     provider: None,
                     all: false,
                     json: false,
+                    accepts: None,
+                    produces: None,
                 };
                 let err = list_with_registry(args, &cannot_build)
                     .await
@@ -2695,6 +3201,8 @@ mod live_listing_tests {
             offline,
             all: false,
             json,
+            accepts: None,
+            produces: None,
         }
     }
 
@@ -2710,6 +3218,73 @@ mod live_listing_tests {
             let result =
                 list_with_registry(list_args(false, false), &registry_with(models, false)).await;
             assert!(result.is_ok(), "{result:?}");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn accepts_keeps_the_models_that_take_the_type_and_refuses_a_bare_word() {
+        crate::config::with_isolated_config_path_async("models-accepts", |_| async move {
+            let args = ListArgs {
+                all: true,
+                accepts: Some("image/png".to_string()),
+                produces: None,
+                ..list_args(true, false)
+            };
+            let models = vec![learned_model("mock-live", Some(1), Some(1.0))];
+            let result = list_with_registry(args, &registry_with(models.clone(), false)).await;
+            assert!(result.is_ok(), "{result:?}");
+
+            let json = ListArgs {
+                all: true,
+                accepts: Some("audio/*".to_string()),
+                produces: None,
+                ..list_args(true, true)
+            };
+            let result = list_with_registry(json, &registry_with(models.clone(), false)).await;
+            assert!(result.is_ok(), "{result:?}");
+
+            let bare = ListArgs {
+                accepts: Some("png".to_string()),
+                produces: None,
+                ..list_args(true, false)
+            };
+            let err = list_with_registry(bare, &registry_with(models, false))
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("--accepts takes a mime type"),
+                "{err}"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn produces_keeps_the_models_that_make_the_type_and_refuses_a_bare_word() {
+        crate::config::with_isolated_config_path_async("models-produces", |_| async move {
+            let models = vec![learned_model("mock-live", Some(1), Some(1.0))];
+            let args = ListArgs {
+                all: true,
+                produces: Some("video/*".to_string()),
+                ..list_args(true, false)
+            };
+            assert!(
+                list_with_registry(args, &registry_with(models.clone(), false))
+                    .await
+                    .is_ok()
+            );
+            let bare = ListArgs {
+                produces: Some("video".to_string()),
+                ..list_args(true, false)
+            };
+            let err = list_with_registry(bare, &registry_with(models, false))
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("--produces takes a mime type"),
+                "{err}"
+            );
         })
         .await;
     }
@@ -2862,12 +3437,57 @@ mod live_listing_tests {
         let overridden = std::collections::HashSet::new();
         let table = ModelInfo::new("t", "anthropic", ModelCapabilities::default());
         let live = learned_model("l", None, None);
-        print_listing(std::slice::from_ref(&table), &overridden, &[]);
+        print_listing(std::slice::from_ref(&table), &overridden, &[], &[None]);
         print_listing(
             std::slice::from_ref(&live),
             &overridden,
             &["mock".to_string()],
+            &[None],
         );
-        print_listing(&[table, live], &overridden, &["mock".to_string()]);
+        print_listing(&[table, live], &overridden, &["mock".to_string()], &[]);
+    }
+
+    #[test]
+    fn a_tiered_price_and_a_retention_conflict_are_marked_and_explained() {
+        let overridden = std::collections::HashSet::new();
+        let mut tiered = ModelInfo::new("grok-4.3", "xai", ModelCapabilities::default());
+        tiered.pricing = Some(ModelPricing {
+            long_context: Some(leviath_providers::pricing::PriceTier {
+                threshold_tokens: 200_000,
+                input_per_mtok: 2.5,
+                cached_input_per_mtok: 0.4,
+                cache_write_per_mtok: 2.5,
+                output_per_mtok: 5.0,
+            }),
+            ..ModelPricing::flat(1.25, 2.5)
+        });
+        let contributor = ModelInfo::new(
+            "muse-spark-1.3-contributor",
+            "meta",
+            ModelCapabilities::default(),
+        );
+        print_listing(
+            &[tiered.clone(), contributor.clone()],
+            &overridden,
+            &[],
+            &[None, Some("Meta trains on it".to_string())],
+        );
+        print_listing(
+            &[contributor.clone(), contributor],
+            &overridden,
+            &[],
+            &[Some("a".to_string()), Some("b".to_string())],
+        );
+        print_model_pricing("xai", "grok-4.3", tiered.pricing);
+        print_model_pricing(
+            "xai",
+            "grok-imagine-image",
+            Some(ModelPricing::per_unit(
+                leviath_providers::pricing::UnitPrice {
+                    usd: 0.02,
+                    unit: leviath_providers::pricing::PriceUnit::Image,
+                },
+            )),
+        );
     }
 }

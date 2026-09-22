@@ -4,23 +4,38 @@
 //! HTTP. No web UI - the frontend lives in a separate repo.
 
 mod agents;
+mod args;
+mod artifact_types;
 mod auth;
+mod blobs;
+mod blocking;
+mod blueprint_types;
 mod blueprints;
+mod caches;
 mod config;
 mod config_health;
 mod config_types;
+mod core;
 mod cursor;
 mod doctor;
 mod events;
 mod fs;
+mod graphql;
 mod interactions;
 mod mcp;
+mod mime;
+mod model_catalog;
 mod polling;
 mod providers;
+mod quota_cache;
+mod refreshing;
 mod request_limits;
+mod run_index;
 mod runs;
 mod scripts;
+mod scripts_mime;
 mod search;
+mod signed_url;
 #[cfg(test)]
 mod testutil;
 mod tls;
@@ -30,16 +45,19 @@ mod types;
 mod update;
 mod update_cache;
 mod update_job;
+mod upload;
 mod websocket;
+mod yolo;
 
 #[cfg(test)]
 #[path = "event_seam_tests.rs"]
 mod event_seam_tests;
 
+pub use args::ServeArgs;
 pub(crate) use config::list_model_ids;
 pub(crate) use events::ServerEvent;
+pub(crate) use mcp::list_mcp_tools;
 pub(crate) use types::AppState;
-pub use types::ServeArgs;
 use types::ServeLimits;
 
 use std::net::SocketAddr;
@@ -48,7 +66,9 @@ use std::sync::Arc;
 use axum::Router;
 use axum::routing::{delete, get, post, put};
 use tokio::sync::broadcast;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::compression::predicate::{NotForContentType, SizeAbove};
+use tower_http::compression::{CompressionLayer, CompressionLevel, Predicate};
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
 use crate::config::Config;
 
@@ -62,6 +82,21 @@ struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
 impl<T> Drop for AbortOnDrop<T> {
     fn drop(&mut self) {
         self.0.abort();
+    }
+}
+
+/// The stem of this server's log file: `--name`, else the port.
+pub fn log_name(args: &ServeArgs) -> String {
+    args.name.clone().unwrap_or_else(|| args.port.to_string())
+}
+
+/// `--name` as a value parser: it becomes a file name, so it is held to the
+/// same characters a run id is.
+pub fn parse_log_name(value: &str) -> Result<String, String> {
+    if leviath_core::paths::is_safe_path_component(value) {
+        Ok(value.to_string())
+    } else {
+        Err("a server name is letters, digits, `.`, `_` and `-` only".to_string())
     }
 }
 
@@ -85,6 +120,15 @@ pub async fn execute(
         None,
     )
     .await
+}
+
+/// The GraphQL schema this build serves, as SDL.
+///
+/// `lev serve --print-graphql-schema` prints this, and that is how
+/// `docs/schema/leviath.graphql` is regenerated. A test holds the two
+/// together, so the published schema cannot drift from the served one.
+pub fn graphql_schema() -> String {
+    graphql::sdl()
 }
 
 /// Every API route with its production handlers - the single route table,
@@ -130,6 +174,10 @@ fn api_router() -> Router<AppState> {
             get(agents::agent_context_history),
         )
         .route("/api/agents/{id}/files", get(agents::agent_file))
+        .route("/api/agents/{id}/files/raw", get(blobs::raw_file))
+        .route("/api/agents/{id}/blobs", get(blobs::list_blobs))
+        .route("/api/agents/{id}/blobs/{sha256}", get(blobs::get_blob))
+        .route("/api/agents/{id}/artifacts/{name}", get(blobs::artifact))
         .route("/api/agents/{id}/logs", get(agents::agent_logs))
         .route("/api/agents/{id}/result", get(agents::agent_result))
         .route("/api/agents/{id}/stages", get(agents::agent_stages))
@@ -152,6 +200,14 @@ fn api_router() -> Router<AppState> {
         // Doctor - the offline half of the checks `lev doctor` runs, returned
         // as data. The billed half is behind `--allow-admin` too.
         .route("/api/doctor", get(doctor::run_doctor))
+        // Yolo profiles - what `--yolo=<name>` can name, and what each would
+        // decide. Reads only; the write is mounted under `--allow-admin`.
+        .route("/api/yolo", get(yolo::list_profiles))
+        .route("/api/yolo/test", post(yolo::test_profile))
+        .route("/api/yolo/{name}", get(yolo::get_profile))
+        // The effective mime registry, so a console can name a type's
+        // family and extensions the way the daemon will.
+        .route("/api/mime", get(blobs::list_mime))
         // Update - how this copy was installed, and what upgrades it. The
         // console has no other way to know, and printed a macOS-only command
         // to everyone because of it.
@@ -172,6 +228,19 @@ fn api_router() -> Router<AppState> {
         .route("/api/config", get(config::get_config))
         .route("/api/config/validate", post(config::validate_config_key))
         .route("/api/models", get(config::get_models))
+        // The bytes an export wrote. A byte route, so a signed link opens it:
+        // an export is fetched by a browser, which cannot header a download.
+        .route("/api/exports/{id}", get(blobs::export_file))
+        // GraphQL. One endpoint where the request body names the fields it
+        // wants, over the same core the REST routes above call. Mounted here
+        // rather than beside them in a module of its own so this file stays
+        // the one place a route is registered.
+        .route("/graphql", post(graphql::http))
+        // Subscriptions. Under `/ws/` because that is the prefix the auth layer
+        // takes a `?token=` on and the request limits exempt from the deadline:
+        // a browser cannot header a WebSocket, and a subscription is meant to
+        // stay open.
+        .route("/ws/graphql", get(graphql::ws))
         // WebSocket
         .route("/ws", get(websocket::ws_global))
         .route("/ws/agents/{id}", get(websocket::ws_agent))
@@ -365,6 +434,8 @@ async fn execute_with_shutdown(
     let (event_tx, _) = broadcast::channel::<ServerEvent>(256);
 
     let state = AppState {
+        caches: Default::default(),
+        signer: Default::default(),
         update_check: Default::default(),
         update_jobs: update_job::UpdateJobs::with_runner(upgrade),
         config: Arc::new(crate::daemon::config_reload::ConfigReloader::new(
@@ -383,6 +454,21 @@ async fn execute_with_shutdown(
             allow_local_network,
         }),
     };
+
+    // Fill the run index before the first request asks for it, so the console
+    // opening onto a thousand runs finds them parsed rather than paying for
+    // the parse itself. Off the bind path: a slow disk delays the warm-up, not
+    // the "listening" line. Guarded like the loops below, for the same reason.
+    let warm_state = state.clone();
+    let _warm_guard = AbortOnDrop(tokio::spawn(async move {
+        warm_state.caches.run_index.snapshot().await;
+    }));
+    // And the model catalogue, which otherwise costs the first opener of the
+    // model picker every provider's answer.
+    state
+        .caches
+        .model_catalog
+        .request_refresh(state.current_config(), false);
 
     // Background world-event consumer: subscribes to the daemon's pushed
     // `WorldEvent` stream and forwards each event to WebSocket subscribers.
@@ -414,19 +500,7 @@ async fn execute_with_shutdown(
     // browser that any page may talk to this server.
     let cors = match args.cors.as_deref() {
         None => None,
-        Some("*") => Some(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                // `Access-Control-Allow-Headers: *` does NOT cover
-                // `Authorization` per the Fetch spec, so a browser sending the
-                // required bearer token would be blocked. List the headers the
-                // API actually needs explicitly.
-                .allow_headers([
-                    axum::http::header::AUTHORIZATION,
-                    axum::http::header::CONTENT_TYPE,
-                ]),
-        ),
+        Some("*") => Some(cors_layer(Any)),
         Some(origin) => {
             // An unparseable value must not fall back to `*` - that silently
             // turns a typo into "allow everything", the opposite of what was
@@ -434,19 +508,7 @@ async fn execute_with_shutdown(
             let value = origin.parse::<axum::http::HeaderValue>().map_err(|_| {
                 anyhow::anyhow!("--cors value '{origin}' is not a valid origin header")
             })?;
-            Some(
-                CorsLayer::new()
-                    .allow_origin(value)
-                    .allow_methods(Any)
-                    // `Access-Control-Allow-Headers: *` does NOT cover
-                    // `Authorization` per the Fetch spec, so a browser sending the
-                    // required bearer token would be blocked. List the headers the
-                    // API actually needs explicitly.
-                    .allow_headers([
-                        axum::http::header::AUTHORIZATION,
-                        axum::http::header::CONTENT_TYPE,
-                    ]),
-            )
+            Some(cors_layer(value))
         }
     };
 
@@ -485,6 +547,17 @@ async fn execute_with_shutdown(
             // Config-write persists provider secrets to disk, so it is gated the
             // same way as MCP admin: unmounted (404) unless --allow-admin.
             .route("/api/config", put(config::put_config))
+            // A yolo profile is a grant of permissions, so writing the file is
+            // the same category of act as writing the config.
+            .route("/api/yolo", put(yolo::put_profiles))
+            // Writing a mime row rewrites `mime_types.toml` beside the config,
+            // the same category of act, and gated the same way: the read half
+            // (`GET /api/mime`) is always mounted, these writes need
+            // `--allow-admin`, and a client learns that from the capability.
+            .route(
+                "/api/mime",
+                put(mime::put_mime_row).delete(mime::delete_mime_row),
+            )
             // The probe makes this host open a connection to any address the
             // caller names, the same act as testing an MCP server, and it
             // exists to precede the write above. Gated with it; there is no
@@ -509,11 +582,30 @@ async fn execute_with_shutdown(
         false => app,
     };
 
+    // How large a body any route takes: the multipart spawn and message
+    // routes carry files, and the default 2 MiB would refuse a modest image.
+    // One ceiling for every route, since a limit that varied per route would
+    // be one more thing `GET /api/config` had to explain.
+    let body_limit = axum::extract::DefaultBodyLimit::max(
+        usize::try_from(request_limits.max_upload_bytes).unwrap_or(usize::MAX),
+    );
+    // Built once, shared by every request: the type registry and the query
+    // limits do not change, and what does change per request travels in the
+    // execution context instead.
+    let app = app.layer(axum::extract::Extension(graphql::build_schema(
+        state.clone(),
+        args.allow_admin,
+    )));
+
     let app = app
+        .layer(body_limit)
         // Require a valid token on every route; CORS stays outermost so browser
         // preflight (OPTIONS) is answered before the auth check.
         .layer(axum::middleware::from_fn_with_state(
-            auth_token,
+            auth::AuthState {
+                token: auth_token,
+                signer: std::sync::Arc::clone(&state.signer),
+            },
             auth::require_auth,
         ))
         .with_state(state);
@@ -536,6 +628,22 @@ async fn execute_with_shutdown(
         request_limits::Gate::new(request_limits),
         request_limits::limit_requests,
     ));
+    // Compressed bodies for a client that says it takes them. The fastest
+    // setting rather than the codec's default: a run listing is JSON with a
+    // great deal of repetition, so even the quick pass takes it to roughly a
+    // tenth, and the console on loopback should not wait on a slow one. Small
+    // bodies are left alone; so are byte ranges, images and event streams,
+    // and a body already carrying a `Content-Encoding`.
+    let app = app.layer(
+        CompressionLayer::new()
+            .quality(CompressionLevel::Fastest)
+            .compress_when(
+                SizeAbove::new(1024)
+                    .and(NotForContentType::GRPC)
+                    .and(NotForContentType::IMAGES)
+                    .and(NotForContentType::SSE),
+            ),
+    );
     // Applied by branching on the router rather than layering an `Option`:
     // `Option<CorsLayer>` is not a `Layer`, and a permissive-but-unused layer
     // would be exactly the default this change removes.
@@ -656,6 +764,37 @@ async fn serve_tls(
     // with a shutdown signal wired up this resolves to `Ok(())`, and an
     // unreachable `Err` branch is a region the coverage gate cannot forgive.
     let _ = server.handle(handle).serve(app.into_make_service()).await;
+}
+
+/// The CORS rules for `--cors`, whatever origin they are for.
+///
+/// Every request the console makes carries a bearer token, so every one is a
+/// preflighted request; without a `max-age` the browser asks permission again
+/// roughly every five seconds, which doubles the round trips a page costs.
+/// An hour is what Chrome will honour at most. The catalogue headers are
+/// exposed because a cross-origin script cannot read a response header it is
+/// not told about, and `Access-Control-Allow-Private-Network` answers the
+/// question a browser asks before letting a public page reach a loopback
+/// address.
+fn cors_layer(origin: impl Into<AllowOrigin>) -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(origin)
+        .allow_methods(Any)
+        // `Access-Control-Allow-Headers: *` does NOT cover `Authorization` per
+        // the Fetch spec, so a browser sending the required bearer token would
+        // be blocked. List the headers the API actually needs explicitly.
+        .allow_headers([
+            axum::http::header::AUTHORIZATION,
+            axum::http::header::CONTENT_TYPE,
+        ])
+        .expose_headers([
+            model_catalog::CATALOG_AGE,
+            model_catalog::CATALOG_COMPLETE,
+            quota_cache::QUOTA_AGE,
+            quota_cache::QUOTA_COMPLETE,
+        ])
+        .max_age(std::time::Duration::from_secs(3600))
+        .allow_private_network(true)
 }
 
 /// The unauthenticated page at `GET /`.
@@ -817,12 +956,15 @@ mod tests {
     /// The production half of every module that owns a handler, by name.
     const HANDLER_SOURCES: &[(&str, &str)] = &[
         ("agents", include_str!("agents.rs")),
+        ("blobs", include_str!("blobs.rs")),
         ("blueprints", include_str!("blueprints.rs")),
         ("config", include_str!("config.rs")),
         ("doctor", include_str!("doctor.rs")),
         ("fs", include_str!("fs.rs")),
+        ("graphql", include_str!("graphql/mod.rs")),
         ("interactions", include_str!("interactions.rs")),
         ("mcp", include_str!("mcp.rs")),
+        ("mime", include_str!("mime.rs")),
         ("providers", include_str!("providers.rs")),
         ("runs", include_str!("runs.rs")),
         ("scripts", include_str!("scripts.rs")),
@@ -830,6 +972,7 @@ mod tests {
         ("tree", include_str!("tree.rs")),
         ("update", include_str!("update.rs")),
         ("websocket", include_str!("websocket.rs")),
+        ("yolo", include_str!("yolo.rs")),
     ];
 
     /// The `StatusCode::` constants a handler can name, as numbers. A
@@ -855,15 +998,118 @@ mod tests {
         ("GATEWAY_TIMEOUT", 504),
     ];
 
+    /// The service-layer modules a handler can answer through, by the name it
+    /// calls them under.
+    ///
+    /// A handler that hands its work to `serve::core` names no
+    /// `StatusCode::` itself, so without this the scan below would read every
+    /// such route as answering nothing and the spec could quietly list a
+    /// status no longer reachable, or miss one that is.
+    const CORE_SOURCES: &[(&str, &str)] = &[
+        ("lifecycle", include_str!("core/lifecycle.rs")),
+        ("spawn_core", include_str!("core/spawn.rs")),
+        ("run_core", include_str!("core/runs.rs")),
+    ];
+
+    /// The statuses a service-layer function can answer with, from the
+    /// `ServeError` variants its body names.
+    fn core_status_codes(module: &str, function: &str) -> Vec<u16> {
+        let (_, source) = CORE_SOURCES
+            .iter()
+            .find(|(name, _)| *name == module)
+            .expect("a core module with a source entry");
+        let source = source.replace("\r\n", "\n");
+        let production = source
+            .split("\nmod tests {")
+            .next()
+            .unwrap_or(&source)
+            .to_string();
+        let Some((_, rest)) = production.split_once(&format!("fn {function}(")) else {
+            return Vec::new();
+        };
+        let body = rest.split("\n}\n").next().unwrap_or(rest);
+        let mut codes: Vec<u16> = body
+            .split("ServeError::")
+            .skip(1)
+            .map(|rest| {
+                rest.chars()
+                    .take_while(|c| c.is_ascii_alphabetic())
+                    .collect::<String>()
+            })
+            .filter_map(|variant| {
+                SERVE_ERROR_STATUSES
+                    .iter()
+                    .find(|(known, _)| *known == variant)
+                    .map(|(_, code)| *code)
+            })
+            .collect();
+        codes.sort_unstable();
+        codes.dedup();
+        codes
+    }
+
+    /// Each `ServeError` variant's status, so the scan can read a handler that
+    /// answers through the service layer. The numbers are
+    /// `ServeError::status`'s, and `every_serve_error_variant_is_in_the_status_table`
+    /// holds the two together.
+    const SERVE_ERROR_STATUSES: &[(&str, u16)] = &[
+        ("BadRequest", 400),
+        ("NotFound", 404),
+        ("Conflict", 409),
+        ("Forbidden", 403),
+        ("DaemonUnavailable", 503),
+        ("DaemonIncompatible", 502),
+        ("Upstream", 502),
+        ("Unprocessable", 422),
+        ("RangeNotSatisfiable", 416),
+        ("UnsupportedMedia", 415),
+        ("Internal", 500),
+    ];
+
     /// Every `StatusCode::` constant named in the body of `function` in
-    /// `module`: the text from `async fn <function>(` to the first
-    /// column-zero `}`.
+    /// `module`, plus the statuses of any service-layer call it makes: the
+    /// text from `async fn <function>(` to the first column-zero `}`.
     fn handler_status_codes(module: &str, function: &str) -> Vec<u16> {
         let (_, source) = HANDLER_SOURCES
             .iter()
             .find(|(name, _)| *name == module)
             .expect("a handler module with a source entry");
-        status_codes_in(source, function)
+        let mut codes = status_codes_in(source, function);
+        codes.extend(delegated_status_codes(source, function));
+        codes.sort_unstable();
+        codes.dedup();
+        codes
+    }
+
+    /// The statuses a handler answers with through the service layer.
+    ///
+    /// Reads the handler's body for `<core module>::<function>(` calls and
+    /// asks the core module what those can fail with. One level deep on
+    /// purpose: a chain the reader cannot follow is a chain the spec should
+    /// not be trusted against, and the assertion allows the spec to list
+    /// more than this finds.
+    fn delegated_status_codes(source: &str, function: &str) -> Vec<u16> {
+        let source = source.replace("\r\n", "\n");
+        let production = source
+            .split("\nmod tests {")
+            .next()
+            .unwrap_or(&source)
+            .to_string();
+        let Some((_, rest)) = production.split_once(&format!("async fn {function}(")) else {
+            return Vec::new();
+        };
+        let body = rest.split("\n}\n").next().unwrap_or(rest);
+        let mut codes = Vec::new();
+        for (name, _) in CORE_SOURCES {
+            for call in body.split(&format!("{name}::")).skip(1) {
+                let called: String = call
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                codes.extend(core_status_codes(name, &called));
+            }
+        }
+        codes
     }
 
     /// [`handler_status_codes`] over source text a test can write. The text
@@ -950,6 +1196,97 @@ mod tests {
             .filter(|(_, undocumented)| !undocumented.is_empty())
             .collect();
         assert_eq!(problems, Vec::new());
+    }
+
+    /// `lev serve --print-graphql-schema` prints what this build serves.
+    ///
+    /// The flag exists so the checked-in copy can be regenerated on a machine
+    /// with no daemon, so this covers the one function behind it.
+    #[test]
+    fn the_printed_schema_is_the_served_one() {
+        let printed = graphql_schema();
+        assert!(printed.contains("type Run "), "{printed}");
+        assert_eq!(printed, graphql::sdl());
+    }
+
+    /// A service-layer function the scan cannot find contributes no statuses.
+    ///
+    /// Reached when a handler names a core module and the reader looks for a
+    /// function that is not in it, which is what a rename looks like: the
+    /// answer is "nothing found", not a panic, and the spec check then holds
+    /// the route to what it can see.
+    #[test]
+    fn the_core_scan_finds_nothing_for_a_function_that_is_not_there() {
+        assert_eq!(
+            core_status_codes("lifecycle", "no_such_function"),
+            Vec::<u16>::new()
+        );
+    }
+
+    /// A handler the delegation scan cannot find contributes no statuses.
+    ///
+    /// The same answer as a missing core function, one level up: a renamed
+    /// handler reads as "nothing found" rather than as a panic, and the spec
+    /// check then holds the route to what it can see.
+    #[test]
+    fn the_delegation_scan_finds_nothing_for_a_handler_that_is_not_there() {
+        assert_eq!(
+            delegated_status_codes("pub(super) async fn other(", "no_such_handler"),
+            Vec::<u16>::new()
+        );
+    }
+
+    /// The scan's `ServeError` table is the same mapping `ServeError::status`
+    /// makes. Two copies of a mapping is exactly how a spec check comes to
+    /// pass while describing something else.
+    #[test]
+    fn every_serve_error_variant_is_in_the_status_table() {
+        use crate::commands::serve::core::error::ServeError;
+        let variants = [
+            ("BadRequest", ServeError::BadRequest(String::new())),
+            ("NotFound", ServeError::NotFound(String::new())),
+            ("Conflict", ServeError::Conflict(String::new())),
+            ("Forbidden", ServeError::Forbidden(String::new())),
+            (
+                "DaemonUnavailable",
+                ServeError::DaemonUnavailable(String::new()),
+            ),
+            (
+                "DaemonIncompatible",
+                ServeError::DaemonIncompatible(String::new()),
+            ),
+            ("Upstream", ServeError::Upstream(String::new())),
+            ("Unprocessable", ServeError::Unprocessable(String::new())),
+            (
+                "RangeNotSatisfiable",
+                ServeError::RangeNotSatisfiable(String::new()),
+            ),
+            (
+                "UnsupportedMedia",
+                ServeError::UnsupportedMedia(String::new()),
+            ),
+            ("Internal", ServeError::Internal(String::new())),
+        ];
+        assert_eq!(variants.len(), SERVE_ERROR_STATUSES.len());
+        for (name, error) in variants {
+            let (_, code) = SERVE_ERROR_STATUSES
+                .iter()
+                .find(|(known, _)| *known == name)
+                .expect("the variant is in the table");
+            assert_eq!(*code, error.status().as_u16(), "{name}");
+        }
+    }
+
+    /// A handler that hands its work to the service layer still has its
+    /// statuses read, through the core function it calls.
+    #[test]
+    fn the_scan_follows_a_handler_into_the_service_layer() {
+        let codes = handler_status_codes("agents", "pause_agent");
+        assert!(codes.contains(&204), "the handler's own status: {codes:?}");
+        assert!(codes.contains(&409), "a finished run conflicts: {codes:?}");
+        assert!(codes.contains(&404), "the daemon's refusal: {codes:?}");
+        // 503 is not here: it comes from a helper one level further in, and
+        // the layer rule already requires it of every non-websocket route.
     }
 
     /// The same source with Windows line ends scans the same: a handler's
@@ -1190,6 +1527,8 @@ mod tests {
     fn test_state() -> AppState {
         let (tx, _) = broadcast::channel(64);
         AppState {
+            caches: Default::default(),
+            signer: Default::default(),
             update_check: Default::default(),
             update_jobs: Default::default(),
             config: crate::commands::serve::testutil::fixed_config(Config::default()),
@@ -1227,6 +1566,329 @@ mod tests {
     /// admin routes are absent, exactly as `api_router` leaves them.
     fn test_app() -> Router {
         crate::commands::serve::mcp::scoped(api_router().with_state(test_state()), test_paths())
+    }
+
+    /// The GraphQL endpoint answers over HTTP, through the same router and the
+    /// same layers every REST route sits behind.
+    ///
+    /// The resolvers are exercised directly elsewhere; what this covers is the
+    /// endpoint itself: a request body carrying a query, and an answer in the
+    /// `{"data": ...}` envelope a GraphQL client expects.
+    #[tokio::test]
+    async fn the_graphql_endpoint_answers_over_http() {
+        let state = test_state();
+        let app = api_router()
+            .layer(axum::extract::Extension(graphql::build_schema(
+                state.clone(),
+                false,
+            )))
+            .with_state(state);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/graphql")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({ "query": "{ __typename }" }).to_string(),
+            ))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["data"]["__typename"], "Query");
+    }
+
+    /// `--allow-admin` is what opens the GraphQL mutations that change the
+    /// machine, and the flag has to reach the schema for that to be true.
+    ///
+    /// The gate is inside the schema, so nothing about the router says whether
+    /// it was armed: a schema built without the flag refuses every admin
+    /// mutation, which reads exactly like a server started without it. This
+    /// asks the same server both ways.
+    #[tokio::test]
+    async fn allow_admin_opens_the_admin_mutations_over_graphql() {
+        for allow_admin in [false, true] {
+            let state = test_state();
+            let app = api_router()
+                .layer(axum::extract::Extension(graphql::build_schema(
+                    state.clone(),
+                    allow_admin,
+                )))
+                .with_state(state);
+            let req = Request::builder()
+                .method("POST")
+                .uri("/graphql")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "query": "{ __type(name: \"Mutation\") { fields { name } } }"
+                    })
+                    .to_string(),
+                ))
+                .unwrap();
+
+            let resp = app.oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(resp.into_body(), 256 * 1024)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let names: Vec<String> = json["data"]["__type"]["fields"]
+                .as_array()
+                .expect("the mutation fields")
+                .iter()
+                .map(|field| field["name"].as_str().unwrap_or_default().to_string())
+                .collect();
+            assert!(
+                names.iter().any(|name| name == "spawnRun"),
+                "the ordinary mutations are always there: {names:?}"
+            );
+            assert_eq!(
+                names.iter().any(|name| name == "addMcpServer"),
+                allow_admin,
+                "the admin mutations follow the flag (allow_admin: {allow_admin})"
+            );
+        }
+    }
+
+    /// A query the schema refuses still answers 200, with the failure in
+    /// `errors`. That is the GraphQL contract, and it is what lets one bad
+    /// field travel beside forty-nine good ones.
+    #[tokio::test]
+    async fn a_refused_graphql_query_answers_two_hundred_with_errors() {
+        let state = test_state();
+        let app = api_router()
+            .layer(axum::extract::Extension(graphql::build_schema(
+                state.clone(),
+                false,
+            )))
+            .with_state(state);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/graphql")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({ "query": "{ noSuchField }" }).to_string(),
+            ))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json["errors"][0]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("noSuchField"),
+            "{json}"
+        );
+    }
+
+    /// A signed URL fetches bytes with no token at all, and nothing else.
+    ///
+    /// This is the whole point of minting one: a browser cannot put a header on
+    /// an `<img src>`, so the link has to carry its own permission. What it must
+    /// not do is carry permission to anything else, which is the second half of
+    /// this test.
+    #[tokio::test]
+    async fn a_signed_url_fetches_bytes_without_a_token() {
+        crate::runstate::with_isolated_runs_dir_async("signed-url-bytes", |_d| async move {
+            let workdir = tempfile::tempdir().expect("a workdir");
+            std::fs::write(workdir.path().join("out.txt"), "the bytes").expect("file written");
+            let mut meta = crate::runstate::RunMeta::new(
+                "run-signed".to_string(),
+                "agent".to_string(),
+                "/p".to_string(),
+                "t".to_string(),
+                None,
+                workdir.path().to_string_lossy().to_string(),
+                1,
+            );
+            meta.status = crate::runstate::RunStatus::Complete;
+            crate::runstate::create_run(&meta).expect("run written");
+
+            let state = test_state();
+            let auth = auth::AuthState {
+                token: Arc::new("secret".to_string()),
+                signer: Arc::clone(&state.signer),
+            };
+            let app = crate::commands::serve::mcp::scoped(
+                api_router()
+                    .layer(axum::middleware::from_fn_with_state(
+                        auth,
+                        auth::require_auth,
+                    ))
+                    .with_state(state.clone()),
+                test_paths(),
+            );
+
+            let now = leviath_core::duration::now_secs();
+            let url = signed_url::signed_path(
+                &state.signer,
+                "/api/agents/run-signed/files/raw",
+                &[("path", "out.txt")],
+                now,
+            );
+            let signed = Request::builder()
+                .uri(&url)
+                .body(Body::empty())
+                .expect("a request");
+            let resp = app.clone().oneshot(signed).await.expect("a response");
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .expect("the bytes");
+            assert_eq!(&body[..], b"the bytes");
+
+            // The same grant, pointed at a listing: refused. A signed URL opens
+            // one file, not the API.
+            let query = url.split_once('?').expect("a query").1;
+            let elsewhere = Request::builder()
+                .uri(format!("/api/runs?{query}"))
+                .body(Body::empty())
+                .expect("a request");
+            let resp = app.clone().oneshot(elsewhere).await.expect("a response");
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+            // And without any grant at all: refused.
+            let bare = Request::builder()
+                .uri("/api/agents/run-signed/files/raw?path=out.txt")
+                .body(Body::empty())
+                .expect("a request");
+            let resp = app.oneshot(bare).await.expect("a response");
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        })
+        .await;
+    }
+
+    /// The export route answers for each state a job can be in, and takes a
+    /// signed link the same way the byte routes do.
+    ///
+    /// The three answers are different on purpose: an id nobody knows is 404,
+    /// one that is not written yet is 409 with the state in the message, and a
+    /// finished one is the file. A client that cannot tell "not yet" from "never"
+    /// either gives up early or polls forever.
+    #[tokio::test]
+    async fn the_export_route_answers_for_each_state_of_a_job() {
+        crate::runstate::with_isolated_runs_dir_async("export-route", |_d| async move {
+            let state = test_state();
+            let auth = auth::AuthState {
+                token: Arc::new("secret".to_string()),
+                signer: Arc::clone(&state.signer),
+            };
+            let app = crate::commands::serve::mcp::scoped(
+                api_router()
+                    .layer(axum::middleware::from_fn_with_state(
+                        auth,
+                        auth::require_auth,
+                    ))
+                    .with_state(state.clone()),
+                test_paths(),
+            );
+            let fetch = |app: axum::Router, path: String| async move {
+                let req = Request::builder()
+                    .uri(path)
+                    .header("Authorization", "Bearer secret")
+                    .body(Body::empty())
+                    .expect("a request");
+                app.oneshot(req).await.expect("a response")
+            };
+
+            // Nobody started this one.
+            let resp = fetch(app.clone(), "/api/exports/export-1-1".to_string()).await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+            // One that is written: the file, as JSONL.
+            let dir = core::export::exports_dir();
+            std::fs::create_dir_all(&dir).expect("the exports directory");
+            let done = core::export::test_job(
+                &state,
+                core::export::ExportStatus::Complete,
+                "{\"run_id\":\"run-a\"}\n",
+            );
+            let resp = fetch(app.clone(), format!("/api/exports/{done}")).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .expect("the bytes");
+            assert_eq!(&body[..], b"{\"run_id\":\"run-a\"}\n");
+
+            // And a signed link opens it with no token at all, which is what a
+            // download button needs.
+            let url = signed_url::signed_path(
+                &state.signer,
+                &format!("/api/exports/{done}"),
+                &[],
+                leviath_core::duration::now_secs(),
+            );
+            let req = Request::builder()
+                .uri(&url)
+                .body(Body::empty())
+                .expect("a request");
+            let resp = app.clone().oneshot(req).await.expect("a response");
+            assert_eq!(resp.status(), StatusCode::OK);
+
+            // One still being written, and one that broke: both 409, because
+            // the job is where the answer is.
+            for status in [
+                core::export::ExportStatus::Queued,
+                core::export::ExportStatus::Running,
+                core::export::ExportStatus::Failed,
+            ] {
+                let word = status.wire();
+                let id = core::export::test_job(&state, status, "");
+                let resp = fetch(app.clone(), format!("/api/exports/{id}")).await;
+                assert_eq!(resp.status(), StatusCode::CONFLICT, "{word}");
+            }
+
+            // A range of the file, which is what a resumed download asks for.
+            let ranged = Request::builder()
+                .uri(format!("/api/exports/{done}"))
+                .header("Authorization", "Bearer secret")
+                .header("Range", "bytes=0-3")
+                .body(Body::empty())
+                .expect("a request");
+            let resp = app.clone().oneshot(ranged).await.expect("a response");
+            assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+            let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .expect("the bytes");
+            assert_eq!(&body[..], b"{\"ru", "the four bytes it asked for");
+
+            // A failure with no reason recorded: the status and the reason are
+            // two writes, so a record read between them has the first only.
+            let quiet =
+                core::export::test_job_with(&state, core::export::ExportStatus::Failed, "", None);
+            let resp = fetch(app.clone(), format!("/api/exports/{quiet}")).await;
+            assert_eq!(resp.status(), StatusCode::CONFLICT);
+            let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .expect("the body");
+            let json: serde_json::Value = serde_json::from_slice(&body).expect("an error body");
+            assert!(
+                json["error"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("no reason recorded")),
+                "it says the reason is missing rather than leaving a gap: {json}"
+            );
+
+            // Complete, with the file taken away underneath it: the record says
+            // there is something to fetch and there is not, which is this
+            // server's own fault rather than the client's.
+            let orphan = core::export::test_job(&state, core::export::ExportStatus::Complete, "x");
+            std::fs::remove_file(core::export::export_path(&orphan)).expect("the file goes");
+            let resp = fetch(app.clone(), format!("/api/exports/{orphan}")).await;
+            assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -1529,7 +2191,8 @@ model = "claude-sonnet-4-6"
             },
         ];
 
-        let tree = tree::build_tree_status(&runs, None);
+        let snapshot = run_index::RunSnapshot::new(runs.into_iter().map(Arc::new).collect());
+        let tree = tree::build_tree_status(&snapshot, None);
         assert_eq!(tree.len(), 1);
         assert_eq!(tree[0].run_id, "parent-1");
         assert_eq!(tree[0].children.len(), 1);
@@ -1678,10 +2341,12 @@ system_prompt = "Run"
     fn test_serve_args_defaults() {
         let args = ServeArgs {
             port: 3000,
+            name: None,
             host: "127.0.0.1".to_string(),
             cors: None,
             token: Some("test-token".to_string()),
             allow_admin: false,
+            print_graphql_schema: false,
             workdir_root: None,
             no_remote_yolo: false,
             tls_cert: None,
@@ -1781,10 +2446,12 @@ system_prompt = "Run"
                 // of execute()'s bootstrap logic.
                 let args = ServeArgs {
                     port: 0,
+                    name: None,
                     host: "127.0.0.1".to_string(),
                     cors: None,
                     token: Some("test-token".to_string()),
                     allow_admin: false,
+                    print_graphql_schema: false,
                     workdir_root: None,
                     no_remote_yolo: false,
                     tls_cert: None,
@@ -1859,10 +2526,12 @@ system_prompt = "Run"
 
             let args = ServeArgs {
                 port: 0,
+                name: None,
                 host: "127.0.0.1".to_string(),
                 cors: None,
                 token: Some("test-token".to_string()),
                 allow_admin: false,
+                print_graphql_schema: false,
                 workdir_root: None,
                 no_remote_yolo: false,
                 tls_cert: Some(cert),
@@ -1939,10 +2608,12 @@ system_prompt = "Run"
 
                 let base = ServeArgs {
                     port: 0,
+                    name: None,
                     host: "127.0.0.1".to_string(),
                     cors: None,
                     token: Some("test-token".to_string()),
                     allow_admin: false,
+                    print_graphql_schema: false,
                     workdir_root: None,
                     no_remote_yolo: false,
                     tls_cert: None,
@@ -1954,6 +2625,7 @@ system_prompt = "Run"
 
                 // One flag without the other.
                 let lone = ServeArgs {
+                    name: None,
                     tls_cert: Some(cert.clone()),
                     ..base.clone()
                 };
@@ -1972,6 +2644,7 @@ system_prompt = "Run"
                 let key = dir.path().join("key.pem");
                 std::fs::write(&key, tls::tests::TEST_KEY).expect("write");
                 let unreadable = ServeArgs {
+                    name: None,
                     tls_cert: Some(cert),
                     tls_key: Some(key),
                     ..base
@@ -2011,10 +2684,12 @@ system_prompt = "Run"
 
                 let args = ServeArgs {
                     port: 0,
+                    name: None,
                     host: "127.0.0.1".to_string(),
                     cors: None,
                     token: Some("test-token".to_string()),
                     allow_admin: false,
+                    print_graphql_schema: false,
                     workdir_root: None,
                     no_remote_yolo: false,
                     tls_cert: Some(cert),
@@ -2063,10 +2738,12 @@ system_prompt = "Run"
                 with_tracing(|| {});
                 let args = ServeArgs {
                     port: 0,
+                    name: None,
                     host: "127.0.0.1".to_string(),
                     cors: Some("*".to_string()),
                     token: Some("test-token".to_string()),
                     allow_admin: false,
+                    print_graphql_schema: false,
                     workdir_root: None,
                     no_remote_yolo: false,
                     tls_cert: None,
@@ -2094,6 +2771,7 @@ system_prompt = "Run"
                           Origin: https://leviath.dev\r\n\
                           Access-Control-Request-Method: GET\r\n\
                           Access-Control-Request-Headers: authorization\r\n\
+                          Access-Control-Request-Private-Network: true\r\n\
                           Connection: close\r\n\r\n",
                     )
                     .await
@@ -2105,6 +2783,118 @@ system_prompt = "Run"
                     lower.contains("access-control-allow-headers")
                         && lower.contains("authorization"),
                     "preflight must allow the Authorization header, got:\n{lower}"
+                );
+                // One preflight an hour, not one every request; the catalogue
+                // headers readable from a page; a public page allowed to reach
+                // this loopback address.
+                assert!(
+                    lower.contains("access-control-max-age: 3600"),
+                    "preflight must be cacheable, got:\n{lower}"
+                );
+                assert!(
+                    lower.contains("access-control-allow-private-network: true"),
+                    "a private-network preflight must be answered, got:\n{lower}"
+                );
+
+                // The exposure travels on the answer itself, which is where a
+                // page reads a header from.
+                let mut actual = tokio::net::TcpStream::connect(addr).await.unwrap();
+                actual
+                    .write_all(
+                        b"GET /api/config HTTP/1.1\r\nHost: localhost\r\n\
+                          Origin: https://leviath.dev\r\n\
+                          Authorization: Bearer test-token\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+                let mut resp = Vec::new();
+                actual.read_to_end(&mut resp).await.unwrap();
+                let lower = String::from_utf8_lossy(&resp).to_lowercase();
+                assert!(
+                    lower.contains("access-control-expose-headers")
+                        && lower.contains("x-leviath-catalog-age")
+                        && lower.contains("x-leviath-quota-age"),
+                    "the catalogue and quota headers must be exposed, got:\n{lower}"
+                );
+
+                handle.abort();
+            },
+        )
+        .await;
+    }
+
+    /// A client that says it takes gzip gets a body over a kilobyte compressed;
+    /// one that says nothing gets it as is.
+    #[tokio::test]
+    async fn execute_compresses_a_body_for_a_client_that_accepts_it() {
+        crate::config::with_isolated_config_path_async(
+            "serve-mod-compression",
+            |_fake_dir| async move {
+                with_tracing(|| {});
+                let args = ServeArgs {
+                    name: None,
+                    port: 0,
+                    host: "127.0.0.1".to_string(),
+                    cors: None,
+                    token: Some("test-token".to_string()),
+                    allow_admin: false,
+                    print_graphql_schema: false,
+                    workdir_root: None,
+                    no_remote_yolo: false,
+                    tls_cert: None,
+                    tls_key: None,
+                    no_remote_seed_commands: false,
+                    max_concurrent_requests: None,
+                    request_timeout_secs: None,
+                };
+                let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+                let handle = tokio::spawn(serve_for_test(
+                    args,
+                    no_daemon_control(),
+                    Box::pin(std::future::pending()),
+                    Some(ready_tx),
+                ));
+                let addr = ready_rx
+                    .await
+                    .expect("server should report its bound address");
+
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+                stream
+                    .write_all(
+                        b"GET /api/config HTTP/1.1\r\nHost: localhost\r\n\
+                          Authorization: Bearer test-token\r\n\
+                          Accept-Encoding: gzip\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+                let mut resp = Vec::new();
+                stream.read_to_end(&mut resp).await.unwrap();
+                let lower = String::from_utf8_lossy(&resp).to_lowercase();
+                assert!(lower.starts_with("http/1.1 200"), "{lower}");
+                assert!(
+                    lower.contains("content-encoding: gzip"),
+                    "the config body is over a kilobyte and must come back gzipped, got:\n{lower}"
+                );
+                assert!(
+                    lower.contains("vary: accept-encoding"),
+                    "a compressed answer must say it varies on the request, got:\n{lower}"
+                );
+
+                let mut plain = tokio::net::TcpStream::connect(addr).await.unwrap();
+                plain
+                    .write_all(
+                        b"GET /api/config HTTP/1.1\r\nHost: localhost\r\n\
+                          Authorization: Bearer test-token\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+                let mut resp = Vec::new();
+                plain.read_to_end(&mut resp).await.unwrap();
+                let lower = String::from_utf8_lossy(&resp).to_lowercase();
+                assert!(
+                    !lower.contains("content-encoding"),
+                    "a client that did not ask gets the body as is, got:\n{lower}"
                 );
 
                 handle.abort();
@@ -2120,10 +2910,12 @@ system_prompt = "Run"
             |_fake_dir| async move {
                 let args = ServeArgs {
                     port: 0,
+                    name: None,
                     host: "127.0.0.1".to_string(),
                     cors: Some("https://example.com".to_string()),
                     token: Some("test-token".to_string()),
                     allow_admin: false,
+                    print_graphql_schema: false,
                     workdir_root: None,
                     no_remote_yolo: false,
                     tls_cert: None,
@@ -2159,10 +2951,12 @@ system_prompt = "Run"
             // fail, exercising execute()'s `?` on the SocketAddr parse.
             let args = ServeArgs {
                 port: 0,
+                name: None,
                 host: "not a valid host".to_string(),
                 cors: None,
                 token: Some("test-token".to_string()),
                 allow_admin: false,
+                print_graphql_schema: false,
                 workdir_root: None,
                 no_remote_yolo: false,
                 tls_cert: None,
@@ -2200,10 +2994,12 @@ system_prompt = "Run"
 
                 let args = ServeArgs {
                     port: 0,
+                    name: None,
                     host: "127.0.0.1".to_string(),
                     cors: None,
                     token: Some("test-token".to_string()),
                     allow_admin: false,
+                    print_graphql_schema: false,
                     workdir_root: None,
                     no_remote_yolo: false,
                     tls_cert: None,
@@ -2236,10 +3032,12 @@ system_prompt = "Run"
 
         let args = ServeArgs {
             port: 0,
+            name: None,
             host: "127.0.0.1".to_string(),
             cors: None,
             token: Some("test-token".to_string()),
             allow_admin: false,
+            print_graphql_schema: false,
             workdir_root: None,
             no_remote_yolo: false,
                     tls_cert: None,
@@ -2293,10 +3091,12 @@ system_prompt = "Run"
             |_fake_dir| async move {
                 let args = ServeArgs {
                     port: 8080,
+                    name: None,
                     host: "192.0.2.1".to_string(),
                     cors: None,
                     token: Some("test-token".to_string()),
                     allow_admin: false,
+                    print_graphql_schema: false,
                     workdir_root: None,
                     no_remote_yolo: false,
                     tls_cert: None,
@@ -2334,10 +3134,12 @@ system_prompt = "Run"
             |_fake_dir| async move {
                 let args = ServeArgs {
                     port,
+                    name: None,
                     host: "127.0.0.1".to_string(),
                     cors: None,
                     token: Some("test-token".to_string()),
                     allow_admin: false,
+                    print_graphql_schema: false,
                     workdir_root: None,
                     no_remote_yolo: false,
                     tls_cert: None,
@@ -2366,10 +3168,12 @@ system_prompt = "Run"
         temp_env::async_with_vars([("LEVIATH_API_TOKEN", None::<&str>)], async {
             let args = ServeArgs {
                 port: 0,
+                name: None,
                 host: "127.0.0.1".to_string(),
                 cors: None,
                 token: None,
                 allow_admin: false,
+                print_graphql_schema: false,
                 workdir_root: None,
                 no_remote_yolo: false,
                 tls_cert: None,
@@ -2393,10 +3197,12 @@ system_prompt = "Run"
             |_fake_dir| async move {
                 let args = ServeArgs {
                     port: 0,
+                    name: None,
                     host: "127.0.0.1".to_string(),
                     cors: None,
                     token: Some("test-token".to_string()),
                     allow_admin: false,
+                    print_graphql_schema: false,
                     workdir_root: None,
                     no_remote_yolo: false,
                     tls_cert: None,
@@ -2446,10 +3252,12 @@ system_prompt = "Run"
             |_fake_dir| async move {
                 let args = ServeArgs {
                     port: 0,
+                    name: None,
                     host: "127.0.0.1".to_string(),
                     cors: None,
                     token: Some("test-token".to_string()),
                     allow_admin: false,
+                    print_graphql_schema: false,
                     workdir_root: None,
                     no_remote_yolo: false,
                     tls_cert: None,
@@ -2496,10 +3304,12 @@ system_prompt = "Run"
             fn args_with(cors: Option<&str>) -> ServeArgs {
                 ServeArgs {
                     port: 0,
+                    name: None,
                     host: "127.0.0.1".to_string(),
                     cors: cors.map(str::to_string),
                     token: Some("t".to_string()),
                     allow_admin: false,
+                    print_graphql_schema: false,
                     workdir_root: None,
                     no_remote_yolo: false,
                     tls_cert: None,
@@ -2568,10 +3378,12 @@ system_prompt = "Run"
                 let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
                 let args = ServeArgs {
                     port: 0,
+                    name: None,
                     host: "127.0.0.1".to_string(),
                     cors: None,
                     token: Some("t".to_string()),
                     allow_admin,
+                    print_graphql_schema: false,
                     workdir_root: None,
                     no_remote_yolo: false,
                     tls_cert: None,
@@ -2643,10 +3455,12 @@ system_prompt = "Run"
                     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
                     let args = ServeArgs {
                         port: 0,
+                        name: None,
                         host: "127.0.0.1".to_string(),
                         cors: None,
                         token: Some("t".to_string()),
                         allow_admin,
+                        print_graphql_schema: false,
                         workdir_root: None,
                         no_remote_yolo: false,
                         tls_cert: None,
@@ -2745,10 +3559,12 @@ system_prompt = "Run"
                 let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
                 let args = ServeArgs {
                     port: 0,
+                    name: None,
                     host: "127.0.0.1".to_string(),
                     cors: None,
                     token: Some("t".to_string()),
                     allow_admin,
+                    print_graphql_schema: false,
                     workdir_root: None,
                     no_remote_yolo: false,
                     tls_cert: None,
@@ -2802,10 +3618,12 @@ system_prompt = "Run"
                 let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
                 let args = ServeArgs {
                     port: 0,
+                    name: None,
                     host: "127.0.0.1".to_string(),
                     cors: None,
                     token: Some("t".to_string()),
                     allow_admin,
+                    print_graphql_schema: false,
                     workdir_root: None,
                     no_remote_yolo: false,
                     tls_cert: None,
@@ -2867,10 +3685,12 @@ system_prompt = "Run"
     fn limits_args() -> ServeArgs {
         ServeArgs {
             port: 0,
+            name: None,
             host: "127.0.0.1".to_string(),
             cors: None,
             token: Some("test-token".to_string()),
             allow_admin: false,
+            print_graphql_schema: false,
             workdir_root: None,
             no_remote_yolo: false,
             tls_cert: None,
@@ -2928,6 +3748,7 @@ system_prompt = "Run"
                 )
                 .unwrap();
                 let (addr, handle) = boot(ServeArgs {
+                    name: None,
                     request_timeout_secs: Some(3),
                     ..limits_args()
                 })
@@ -2977,6 +3798,7 @@ system_prompt = "Run"
             |_fake_dir| async move {
                 with_tracing(|| {});
                 let (addr, handle) = boot(ServeArgs {
+                    name: None,
                     request_timeout_secs: Some(1),
                     max_concurrent_requests: Some(1),
                     ..limits_args()
@@ -3013,5 +3835,35 @@ system_prompt = "Run"
             },
         )
         .await;
+    }
+}
+
+#[cfg(test)]
+mod log_name_tests {
+    use super::{ServeArgs, log_name, parse_log_name};
+    use clap::Parser;
+
+    /// The args as `lev serve` parses them, so `--name` goes through the
+    /// value parser rather than around it.
+    #[derive(Parser)]
+    struct Cli {
+        #[command(flatten)]
+        serve: ServeArgs,
+    }
+
+    #[test]
+    fn a_server_is_named_by_flag_or_by_port() {
+        let named = Cli::parse_from(["lev", "--name", "api-1", "--port", "4000"]).serve;
+        assert_eq!(log_name(&named), "api-1");
+        let unnamed = Cli::parse_from(["lev", "--port", "4000"]).serve;
+        assert_eq!(log_name(&unnamed), "4000");
+    }
+
+    #[test]
+    fn a_name_that_cannot_be_a_file_name_is_refused() {
+        assert_eq!(parse_log_name("api.v2_x").unwrap(), "api.v2_x");
+        let err = parse_log_name("../etc").unwrap_err();
+        assert!(err.contains("letters, digits"), "{err}");
+        assert!(Cli::try_parse_from(["lev", "--name", "a/b"]).is_err());
     }
 }

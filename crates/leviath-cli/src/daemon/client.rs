@@ -6,12 +6,12 @@
 use std::collections::HashMap;
 
 use anyhow::bail;
-use leviath_core::run_meta::RunStatus;
 use leviath_runtime::control_socket::{ControlClient, ControlResponse};
 use leviath_runtime::host::SpawnArgs;
 
+use crate::commands::run::attach::{self, RegionInput};
 use crate::commands::run::manifest::find_manifest;
-use crate::commands::run::task::{read_region_value, resolve_task};
+use crate::commands::run::task::resolve_task;
 use crate::runstate::new_run_id;
 
 /// Everything a spawn request needs from the agent's own files.
@@ -75,9 +75,13 @@ pub(crate) fn load_agent_source(path: &str) -> anyhow::Result<AgentSource> {
 fn resolve_regions(
     blueprint: &leviath_core::Blueprint,
     regions: HashMap<String, String>,
-) -> anyhow::Result<HashMap<String, String>> {
+    cwd: &std::path::Path,
+) -> anyhow::Result<RegionSeeds> {
     let declared = blueprint.caller_inputs();
+    let registry = attach::cli_registry();
     let mut out = HashMap::new();
+    let mut parts = Vec::new();
+    let mut unresolved = Vec::new();
     for (name, raw) in regions {
         if !declared.contains(&name.as_str()) {
             bail!(
@@ -89,9 +93,89 @@ fn resolve_regions(
                 }
             );
         }
-        out.insert(name, read_region_value(&raw)?);
+        let RegionInput {
+            text,
+            parts: found,
+            unresolved: missing,
+        } = attach::read_region_input(&name, &raw, cwd, &registry)?;
+        if !text.is_empty() {
+            out.insert(name, text);
+        }
+        parts.extend(found);
+        unresolved.extend(missing);
     }
-    Ok(out)
+    Ok(RegionSeeds {
+        text: out,
+        parts,
+        unresolved,
+    })
+}
+
+/// What the `--<region>` flags resolved to.
+struct RegionSeeds {
+    /// Text seeds, keyed by region.
+    text: HashMap<String, String>,
+    /// Files, each bound for its region.
+    parts: Vec<leviath_core::mime::InboundPart>,
+    /// `@path` tokens that named no file.
+    unresolved: Vec<String>,
+}
+
+/// Refuse a part bound for a region the blueprint does not declare, or one
+/// whose `accepts` excludes the type the user named for it, before anything
+/// is dialled.
+///
+/// The daemon checks the same things and its refusal comes back as the
+/// spawn error, but by then the user may have spent twenty minutes in an
+/// editor writing the task. A part with no region goes where the task text
+/// goes, so it is checked against that region. An untyped part is not
+/// checked against `accepts`: only the daemon's registry, with the user's
+/// `[mime_types]` in it, can say what it is.
+fn check_parts(
+    blueprint: &leviath_core::Blueprint,
+    parts: &[leviath_core::mime::InboundPart],
+) -> anyhow::Result<()> {
+    let regions = &blueprint.context_layout.regions;
+    let task_region = regions
+        .iter()
+        .find(|r| r.name == "task" && r.kind == leviath_core::RegionKind::Pinned)
+        .or_else(|| {
+            regions
+                .iter()
+                .find(|r| r.kind == leviath_core::RegionKind::Pinned)
+        })
+        .map(|r| r.name.as_str());
+    for part in parts {
+        let name = match part.region.as_deref().or(task_region) {
+            Some(n) => n,
+            None => bail!(
+                "'{}' names no region and this agent has no task region to put it in",
+                part.name
+            ),
+        };
+        let Some(region) = regions.iter().find(|r| r.name == name) else {
+            bail!(
+                "'{}' names region '{name}', which this agent does not declare; its regions are: {}",
+                part.name,
+                regions
+                    .iter()
+                    .map(|r| r.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        };
+        if let Some(t) = &part.mime_type
+            && !region.accepts.is_empty()
+            && !t.matches_any(&region.accepts)
+        {
+            bail!(
+                "region '{name}' does not accept {t} ('{}'); it accepts: {}",
+                part.name,
+                region.accepts.join(", ")
+            );
+        }
+    }
+    Ok(())
 }
 
 /// The stdin probe for callers that build a spawn request from inside the
@@ -125,6 +209,9 @@ pub struct LaunchRequest<'a> {
     pub workdir: &'a str,
     /// `--yolo`: run unattended.
     pub yolo: bool,
+    /// `--yolo=<name>`: the profile that says which parts of unattended a
+    /// person still wants. `None` is the bare flag.
+    pub yolo_profile: Option<String>,
     /// `--allow`: tools permitted outright.
     pub allow: Vec<String>,
     /// `--max-depth`: sub-agent tree cap.
@@ -135,6 +222,9 @@ pub struct LaunchRequest<'a> {
     pub no_seed_commands: bool,
     /// The output shape the caller asked for, overriding the blueprint's.
     pub output_request: Option<leviath_core::output::OutputSpec>,
+    /// Files attached with `--attach`, already read: their paths were
+    /// relative to where the command ran, which only the caller knows.
+    pub parts: Vec<leviath_core::mime::InboundPart>,
 }
 
 /// Resolve the local inputs of a spawn request: find and parse the manifest,
@@ -159,19 +249,35 @@ pub fn resolve_spawn_args(req: LaunchRequest<'_>) -> anyhow::Result<SpawnArgs> {
         model,
         workdir,
         yolo,
+        yolo_profile,
         allow,
         max_depth,
         regions,
         no_seed_commands,
         output_request,
+        parts: attached,
     } = req;
     let source = load_agent_source(path)?;
-    let resolved_regions = resolve_regions(&source.blueprint, regions)?;
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let RegionSeeds {
+        text: resolved_regions,
+        mut parts,
+        mut unresolved,
+    } = resolve_regions(&source.blueprint, regions, &cwd)?;
+    parts.extend(attached);
     // An agent driven by named regions takes no task, so neither demanding one
     // nor opening an editor to write one would make sense - `lev run reviewer
     // --diff @x.patch` is a complete command line. Handing it one anyway is the
     // error, and it is the same message the daemon would give.
+    //
+    // The same command line stays complete when the blueprint *can* take a
+    // task but does not insist on one: a caller who named a region or attached
+    // a file has said what the run is for, and the reviewer's task region
+    // exists so its own fan-out workers can be handed their work item, not to
+    // make every `--diff` run stop for a prompt.
+    let handed_in = !resolved_regions.is_empty() || !parts.is_empty();
     let task = match source.blueprint.accepts_task() {
+        true if task.is_none() && handed_in && !source.blueprint.requires_task() => String::new(),
         true => resolve_task(
             task,
             &source.blueprint.name,
@@ -183,24 +289,53 @@ pub fn resolve_spawn_args(req: LaunchRequest<'_>) -> anyhow::Result<SpawnArgs> {
             _ => anyhow::bail!(source.blueprint.task_refusal()),
         },
     };
+    // A file the task names where it mentions it: `edit @hero.png`.
+    let (task, named, missing) = attach::inline_parts(&task, None, &cwd)?;
+    parts.extend(named);
+    unresolved.extend(missing);
+    // The dashboard resolves a task's `@path` against its own workdir and hands
+    // the part over, then the line above resolves the same token again against
+    // the current directory - which, for a dashboard whose workdir is where it
+    // was launched, is the same file. Drop the exact repeat (same region, name
+    // and bytes), which no caller ever means; a file attached to two regions,
+    // or two different files, still differs in one of the three.
+    let mut deduped: Vec<leviath_core::mime::InboundPart> = Vec::with_capacity(parts.len());
+    for part in parts {
+        let dup = deduped
+            .iter()
+            .any(|k| k.region == part.region && k.name == part.name && k.data == part.data);
+        if !dup {
+            deduped.push(part);
+        }
+    }
+    let parts = deduped;
+    check_parts(&source.blueprint, &parts)?;
+    attach::warn_unresolved(&unresolved);
 
     Ok(SpawnArgs {
         run_id: new_run_id(&source.run_stem),
         blueprint_path: source.manifest.to_string_lossy().to_string(),
         task,
         regions: resolved_regions,
+        parts,
         model,
         workdir: workdir.to_string(),
         metadata: Default::default(),
         callback_url: None,
         callback_secret: None,
         yolo,
+        yolo_profile,
         no_seed_commands,
         allow,
         max_depth,
         // A top-level run (sub-agents/fan-out set this on the host side).
         parent_run_id: None,
+        worker_stage: None,
         output: output_request,
+        // `lev run` carries no flag for it. A capture is an operator decision
+        // about a machine, taken in `[observability] capture_model_input`, or a
+        // caller's decision about one run, taken over the API.
+        capture_model_input: false,
     })
 }
 
@@ -224,11 +359,10 @@ fn warn_ungranted_read_paths(spawn_args: &SpawnArgs) {
 /// The warning for a spawn request, read from the real manifest and config.
 /// Empty when there is nothing to say, and empty when either file cannot be
 /// read: see [`warn_ungranted_read_paths`] for why that is not an error here.
-pub(crate) fn read_path_warning_for_spawn(spawn_args: &SpawnArgs) -> Vec<String> {
-    let Ok(content) = std::fs::read_to_string(&spawn_args.blueprint_path) else {
-        return Vec::new();
-    };
-    let Ok(blueprint) = leviath_core::manifest::parse_manifest(&content) else {
+fn read_path_warning_for_spawn(spawn_args: &SpawnArgs) -> Vec<String> {
+    let Some(blueprint) = crate::commands::run::manifest::blueprint_at(std::path::Path::new(
+        &spawn_args.blueprint_path,
+    )) else {
         return Vec::new();
     };
     let Ok(config) = crate::config::Config::load() else {
@@ -294,6 +428,31 @@ fn broken_config_warning(path: &std::path::Path) -> Vec<String> {
     ]
 }
 
+/// Refuse `--yolo=<name>` for a profile the file does not have before the
+/// daemon is asked, and say what the profile keeps for a person.
+///
+/// Not best-effort like the warnings beside it: the person named a specific
+/// set of rules, and the daemon would refuse the same spawn a moment later
+/// with the same words. Failing here saves the round trip and the placeholder
+/// run directory. The bare flag and an attended run say nothing.
+pub(crate) fn yolo_profile_preflight(spawn_args: &SpawnArgs) -> anyhow::Result<Vec<String>> {
+    let profile =
+        crate::yolo::resolve_for_spawn(spawn_args.yolo, spawn_args.yolo_profile.as_deref())?;
+    let Some(profile) = profile.filter(|p| !p.is_builtin_default()) else {
+        return Ok(Vec::new());
+    };
+    let holds = profile.holds();
+    if holds.is_empty() {
+        return Ok(vec![format!(
+            "--yolo={} allows everything the config does not deny; it keeps nothing for you",
+            profile.name
+        )]);
+    }
+    let mut lines = vec![format!("--yolo={} keeps these for you:", profile.name)];
+    lines.extend(holds.into_iter().map(|line| format!("  {line}")));
+    Ok(lines)
+}
+
 /// Say, before the run starts, that `--yolo` will still stop for a person.
 ///
 /// `--yolo` means "run without me", so a run that stops anyway reads as a hang.
@@ -317,12 +476,9 @@ fn warn_held_checkpoints(spawn_args: &SpawnArgs) {
 /// behind is worth saying however the run was launched, and it is the reason
 /// this exists: nothing said it at the moment it mattered, so a run could keep
 /// using an old blueprint long after the fix had shipped.
-pub(crate) fn held_checkpoint_warning_for_spawn(spawn_args: &SpawnArgs) -> Vec<String> {
+fn held_checkpoint_warning_for_spawn(spawn_args: &SpawnArgs) -> Vec<String> {
     let path = std::path::Path::new(&spawn_args.blueprint_path);
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    let Ok(blueprint) = leviath_core::manifest::parse_manifest(&content) else {
+    let Some(blueprint) = crate::commands::run::manifest::blueprint_at(path) else {
         return Vec::new();
     };
     let mut lines: Vec<String> =
@@ -355,20 +511,12 @@ fn warn_retired_output_checks(spawn_args: &SpawnArgs) {
 }
 
 /// The retirement warning for a spawn request, read from the real manifest.
-/// Empty when nothing is retired, and empty when the manifest cannot be read
-/// or parsed: best-effort for the same reason as
-/// [`warn_ungranted_read_paths`].
+/// Best-effort for the same reason as [`warn_ungranted_read_paths`].
 fn retired_check_warning_for_spawn(spawn_args: &SpawnArgs) -> Vec<String> {
-    if spawn_args.output.is_none() {
-        return Vec::new();
-    }
-    let Ok(content) = std::fs::read_to_string(&spawn_args.blueprint_path) else {
-        return Vec::new();
-    };
-    let Ok(blueprint) = leviath_core::manifest::parse_manifest(&content) else {
-        return Vec::new();
-    };
-    leviath_core::output::retired_check_warnings(&blueprint, spawn_args.output.as_ref())
+    crate::commands::run::manifest::retired_check_warnings_at(
+        std::path::Path::new(&spawn_args.blueprint_path),
+        spawn_args.output.as_ref(),
+    )
 }
 
 /// What `lev run --json` prints on a successful spawn.
@@ -439,7 +587,13 @@ pub(crate) async fn send_spawn(
     spawn_args: SpawnArgs,
     json: bool,
 ) -> anyhow::Result<()> {
-    warn_before_spawn(&spawn_args);
+    warn_broken_config();
+    warn_ungranted_read_paths(&spawn_args);
+    for line in yolo_profile_preflight(&spawn_args)? {
+        eprintln!("{line}");
+    }
+    warn_held_checkpoints(&spawn_args);
+    warn_retired_output_checks(&spawn_args);
     let spawned = spawn_once(client, spawn_args).await?;
     println!("{}", spawn_report(&spawned, json));
     Ok(())
@@ -471,7 +625,13 @@ pub async fn send_spawn_batch(
     }
     // The warnings describe the blueprint and the machine, not the individual
     // run: once.
-    warn_before_spawn(&spawn_args);
+    warn_broken_config();
+    warn_ungranted_read_paths(&spawn_args);
+    for line in yolo_profile_preflight(&spawn_args)? {
+        eprintln!("{line}");
+    }
+    warn_held_checkpoints(&spawn_args);
+    warn_retired_output_checks(&spawn_args);
     let mut spawned = Vec::with_capacity(count);
     for _ in 0..count {
         let mut args = spawn_args.clone();
@@ -490,13 +650,7 @@ pub async fn send_spawn_batch(
 }
 
 /// One spawn exchange with the daemon, warnings and printing left to callers.
-///
-/// `pub(crate)` for the MCP server, which prints nothing on stdout and reports
-/// the outcome in its own shape.
-pub(crate) async fn spawn_once(
-    client: &ControlClient,
-    spawn_args: SpawnArgs,
-) -> anyhow::Result<SpawnedRun> {
+async fn spawn_once(client: &ControlClient, spawn_args: SpawnArgs) -> anyhow::Result<SpawnedRun> {
     let blueprint_path = spawn_args.blueprint_path.clone();
     let workdir = spawn_args.workdir.clone();
     let yolo = spawn_args.yolo;
@@ -510,128 +664,6 @@ pub(crate) async fn spawn_once(
         Ok(ControlResponse::Error { message }) => bail!("spawn failed: {message}"),
         Ok(other) => bail!("unexpected daemon response: {other:?}"),
         Err(e) => bail!("the leviath daemon is not reachable ({e}); start it with `lev daemon`"),
-    }
-}
-
-/// Print every pre-flight warning for a spawn request, on stderr.
-fn warn_before_spawn(spawn_args: &SpawnArgs) {
-    warn_broken_config();
-    warn_ungranted_read_paths(spawn_args);
-    warn_held_checkpoints(spawn_args);
-    warn_retired_output_checks(spawn_args);
-}
-
-/// `--wait` follows one run, so a batch cannot be waited on: refuse the
-/// combination before anything is spawned rather than wait on the first run
-/// and leave the others unmentioned.
-pub fn refuse_wait_with_count(count: usize, wait: bool) -> anyhow::Result<()> {
-    if wait && count > 1 {
-        bail!("--wait follows a single run; drop it or use --count 1");
-    }
-    Ok(())
-}
-
-/// `lev run --wait`: spawn the run and stay until it finishes, then print its
-/// answer once.
-///
-/// One composition here rather than in the binary, because the pieces it joins
-/// (`spawn_once`, the wait loop, `lev result`'s rendering) are crate-private
-/// and because `send_spawn` prints the spawn report: with `--json` that would
-/// put two JSON documents on stdout. Exactly one thing is printed: with `json`
-/// the object `{run_id, status, final_output}`, otherwise what
-/// `lev result <run-id>` prints (or one line saying there is no answer).
-/// Returns `Err` when the run ended in error or was cancelled, when it parked
-/// on a question nobody at this terminal is being asked, or when the daemon
-/// could not be followed, so the exit code says how it went.
-pub async fn spawn_and_wait(
-    client: &ControlClient,
-    spawn_args: SpawnArgs,
-    json: bool,
-    runs_dir: &std::path::Path,
-) -> anyhow::Result<()> {
-    spawn_and_wait_with(client, spawn_args, json, runs_dir, None).await
-}
-
-/// [`spawn_and_wait`] with a deadline on the wait, after which the run is left
-/// running and the command fails saying so. `lev run --wait` has no deadline
-/// flag today; the parameter exists so the deadline arm is a tested path
-/// rather than a dead one.
-pub(crate) async fn spawn_and_wait_with(
-    client: &ControlClient,
-    spawn_args: SpawnArgs,
-    json: bool,
-    runs_dir: &std::path::Path,
-    timeout: Option<std::time::Duration>,
-) -> anyhow::Result<()> {
-    warn_before_spawn(&spawn_args);
-    // Subscribe before spawning so no event between the two is missed.
-    let stream = match client.subscribe().await {
-        Ok(stream) => stream,
-        Err(e) => bail!("the leviath daemon is not reachable ({e}); start it with `lev daemon`"),
-    };
-    let spawned = spawn_once(client, spawn_args).await?;
-    let run_id = spawned.run_id;
-    let outcome = crate::daemon::wait::wait_for_run(
-        client,
-        stream,
-        &run_id,
-        runs_dir,
-        timeout,
-        &mut |_event| {},
-    )
-    .await;
-    use crate::daemon::wait::WaitOutcome;
-    match outcome {
-        WaitOutcome::Finished {
-            status,
-            final_output,
-            error,
-            ..
-        } => {
-            let text = match json {
-                true => {
-                    let report = serde_json::json!({
-                        "run_id": run_id,
-                        "status": status.wire(),
-                        "final_output": final_output,
-                    });
-                    format!(
-                        "{}\n",
-                        serde_json::to_string_pretty(&report).expect("a report serializes")
-                    )
-                }
-                false => {
-                    crate::commands::result::render(&run_id, final_output.as_ref(), false, false)
-                        .unwrap_or_else(|| {
-                            format!(
-                                "run '{run_id}' finished with status {status} and no final output\n"
-                            )
-                        })
-                }
-            };
-            print!("{text}");
-            match status {
-                RunStatus::Error | RunStatus::Cancelled => bail!(
-                    "run '{run_id}' ended with status {status}{}",
-                    error.map(|e| format!(": {e}")).unwrap_or_default()
-                ),
-                _ => Ok(()),
-            }
-        }
-        WaitOutcome::Interaction {
-            run_id: asker,
-            request,
-        } => bail!(
-            "run '{asker}' is waiting for an answer to interaction '{}' ({}); answer it with \
-             `lev respond {}` and read the result with `lev result {run_id}`",
-            request.id,
-            request.prompt,
-            request.id
-        ),
-        WaitOutcome::TimedOut { .. } => bail!("stopped waiting for run '{run_id}'; it continues"),
-        WaitOutcome::Lost { reason } => {
-            bail!("lost track of run '{run_id}' ({reason}); it may still be running - see `lev ps`")
-        }
     }
 }
 
@@ -665,11 +697,13 @@ mod tests {
             model: Some("m".to_string()),
             workdir: "/work",
             yolo: false,
+            yolo_profile: None,
             allow: Vec::new(),
             max_depth: None,
             regions: HashMap::new(),
             no_seed_commands: false,
             output_request: None,
+            parts: Vec::new(),
         })
         .unwrap();
         assert!(args.run_id.contains("my-agent"));
@@ -723,11 +757,13 @@ mod tests {
             model: None,
             workdir: "/work",
             yolo: false,
+            yolo_profile: None,
             allow: Vec::new(),
             max_depth: None,
             regions: HashMap::new(),
             no_seed_commands: false,
             output_request: None,
+            parts: Vec::new(),
         })
         .unwrap();
         assert!(
@@ -748,11 +784,13 @@ mod tests {
                 model: None,
                 workdir: "/work",
                 yolo: false,
+                yolo_profile: None,
                 allow: Vec::new(),
                 max_depth: None,
                 regions: HashMap::new(),
                 no_seed_commands: false,
                 output_request: None,
+                parts: Vec::new(),
             })
             .is_err()
         );
@@ -776,11 +814,13 @@ mod tests {
             model: None,
             workdir: "/work",
             yolo: false,
+            yolo_profile: None,
             allow: Vec::new(),
             max_depth: None,
             regions: HashMap::new(),
             no_seed_commands: false,
             output_request: None,
+            parts: Vec::new(),
         })
         .unwrap();
         assert_eq!(args.task, "summarize the README");
@@ -802,11 +842,13 @@ mod tests {
             model: None,
             workdir: "/work",
             yolo: false,
+            yolo_profile: None,
             allow: Vec::new(),
             max_depth: None,
             regions: HashMap::new(),
             no_seed_commands: false,
             output_request: None,
+            parts: Vec::new(),
         })
         .unwrap_err();
         assert!(err.to_string().contains("No task provided"), "got: {err}");
@@ -837,6 +879,94 @@ conversation = { kind = "sliding_window", max_items = 20, max_tokens = 10000 }
         dir.join("agent.leviath")
     }
 
+    /// A blueprint that takes a task without insisting on one, and a `diff`
+    /// region: the bundled reviewer's shape, whose task region exists for the
+    /// fan-out workers it spawns from itself.
+    fn write_optional_task_manifest(dir: &std::path::Path) -> std::path::PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join("agent.leviath"),
+            r#"
+[agent]
+name = "diff-or-task"
+
+[stages.main]
+mode = "autonomous"
+
+[stages.main.model]
+provider = "anthropic"
+model = "claude-sonnet-5"
+
+[context.regions]
+task = { kind = "pinned", max_tokens = 4000, seed = "task" }
+diff = { kind = "pinned", max_tokens = 4000, seed = "diff" }
+conversation = { kind = "sliding_window", max_items = 20, max_tokens = 10000 }
+"#,
+        )
+        .unwrap();
+        dir.join("agent.leviath")
+    }
+
+    fn launch<'a>(
+        manifest: &'a std::path::Path,
+        task: Option<&'a str>,
+        regions: HashMap<String, String>,
+    ) -> LaunchRequest<'a> {
+        LaunchRequest {
+            path: manifest.to_str().unwrap(),
+            task,
+            stdin_is_terminal: &never_interactive,
+            model: None,
+            workdir: "/work",
+            yolo: false,
+            yolo_profile: None,
+            allow: Vec::new(),
+            max_depth: None,
+            regions,
+            no_seed_commands: false,
+            output_request: None,
+            parts: Vec::new(),
+        }
+    }
+
+    /// `--diff` with no `--task` on a blueprint whose task is optional spawns
+    /// with an empty task; the same blueprint given nothing at all is still
+    /// asked, and a task it is given still goes through.
+    #[test]
+    fn an_optional_task_is_not_demanded_when_a_region_was_handed_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_optional_task_manifest(&dir.path().join("diff-or-task"));
+        let diff = HashMap::from([("diff".to_string(), "- a\n+ b".to_string())]);
+
+        let args = resolve_spawn_args(launch(&manifest, None, diff.clone())).unwrap();
+        assert_eq!(args.task, "");
+        assert_eq!(
+            args.regions.get("diff").map(String::as_str),
+            Some("- a\n+ b")
+        );
+
+        let err = resolve_spawn_args(launch(&manifest, None, HashMap::new())).unwrap_err();
+        assert!(err.to_string().contains("No task provided"), "got: {err}");
+
+        let args = resolve_spawn_args(launch(&manifest, Some("look at b"), diff)).unwrap();
+        assert_eq!(args.task, "look at b");
+    }
+
+    /// A `required` task region is a demand, and a region on the side does not
+    /// waive it: the run would only be refused at spawn with the same ask.
+    #[test]
+    fn a_required_task_is_still_demanded_beside_a_region() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_optional_task_manifest(&dir.path().join("insists"));
+        let insisting = std::fs::read_to_string(&manifest)
+            .unwrap()
+            .replace("seed = \"task\" }", "seed = \"task\", required = true }");
+        std::fs::write(&manifest, insisting).unwrap();
+        let regions = HashMap::from([("diff".to_string(), "x".to_string())]);
+        let err = resolve_spawn_args(launch(&manifest, None, regions)).unwrap_err();
+        assert!(err.to_string().contains("No task provided"), "got: {err}");
+    }
+
     /// `lev run diffonly --diff ...` is a complete command line, so no task is
     /// demanded and no editor is opened - which is the whole reason the demand
     /// is conditional rather than unconditional.
@@ -856,11 +986,13 @@ conversation = { kind = "sliding_window", max_items = 20, max_tokens = 10000 }
             model: None,
             workdir: "/work",
             yolo: false,
+            yolo_profile: None,
             allow: Vec::new(),
             max_depth: None,
             regions,
             no_seed_commands: false,
             output_request: None,
+            parts: Vec::new(),
         })
         .expect("no task is required of an agent that takes none");
         assert_eq!(args.task, "");
@@ -884,11 +1016,13 @@ conversation = { kind = "sliding_window", max_items = 20, max_tokens = 10000 }
             model: None,
             workdir: "/work",
             yolo: false,
+            yolo_profile: None,
             allow: Vec::new(),
             max_depth: None,
             regions: HashMap::new(),
             no_seed_commands: false,
             output_request: None,
+            parts: Vec::new(),
         })
         .unwrap_err();
         let msg = err.to_string();
@@ -913,11 +1047,13 @@ conversation = { kind = "sliding_window", max_items = 20, max_tokens = 10000 }
             model: None,
             workdir: "/work",
             yolo: false,
+            yolo_profile: None,
             allow: Vec::new(),
             max_depth: None,
             regions: HashMap::new(),
             no_seed_commands: false,
             output_request: None,
+            parts: Vec::new(),
         })
         .expect("blank is the same as absent");
         assert_eq!(args.task, "");
@@ -938,11 +1074,13 @@ conversation = { kind = "sliding_window", max_items = 20, max_tokens = 10000 }
             model: None,
             workdir: "/work",
             yolo: false,
+            yolo_profile: None,
             allow: Vec::new(),
             max_depth: None,
             regions,
             no_seed_commands: false,
             output_request: None,
+            parts: Vec::new(),
         })
         .unwrap_err();
         assert!(err.to_string().contains("unknown region"), "got: {err}");
@@ -993,11 +1131,13 @@ conversation = { kind = "sliding_window", max_items = 20, max_tokens = 10000 }
             model: None,
             workdir: "/work",
             yolo: false,
+            yolo_profile: None,
             allow: Vec::new(),
             max_depth: None,
             regions,
             no_seed_commands: false,
             output_request: None,
+            parts: Vec::new(),
         })
         .unwrap();
         // `@path` was read and trimmed.
@@ -1041,11 +1181,13 @@ conversation = { kind = "sliding_window", max_items = 20, max_tokens = 10000 }
             model: None,
             workdir: "/work",
             yolo: false,
+            yolo_profile: None,
             allow: Vec::new(),
             max_depth: None,
             regions,
             no_seed_commands: false,
             output_request: None,
+            parts: Vec::new(),
         })
         .unwrap_err();
         assert!(err.to_string().contains("(none)"), "got: {err}");
@@ -1066,11 +1208,13 @@ conversation = { kind = "sliding_window", max_items = 20, max_tokens = 10000 }
             model: None,
             workdir: "/work",
             yolo: false,
+            yolo_profile: None,
             allow: Vec::new(),
             max_depth: None,
             regions,
             no_seed_commands: false,
             output_request: None,
+            parts: Vec::new(),
         })
         .unwrap_err();
         assert!(err.to_string().contains("read manifest"), "got: {err}");
@@ -1094,11 +1238,13 @@ conversation = { kind = "sliding_window", max_items = 20, max_tokens = 10000 }
             model: None,
             workdir: "/work",
             yolo: false,
+            yolo_profile: None,
             allow: Vec::new(),
             max_depth: None,
             regions,
             no_seed_commands: false,
             output_request: None,
+            parts: Vec::new(),
         })
         .unwrap_err();
         assert!(err.to_string().contains("parse manifest"), "got: {err}");
@@ -1118,11 +1264,13 @@ conversation = { kind = "sliding_window", max_items = 20, max_tokens = 10000 }
             model: None,
             workdir: "/work",
             yolo: false,
+            yolo_profile: None,
             allow: Vec::new(),
             max_depth: None,
             regions,
             no_seed_commands: false,
             output_request: None,
+            parts: Vec::new(),
         })
         .unwrap_err();
         assert!(
@@ -1143,11 +1291,13 @@ conversation = { kind = "sliding_window", max_items = 20, max_tokens = 10000 }
             model: None,
             workdir: "/work",
             yolo: false,
+            yolo_profile: None,
             allow: Vec::new(),
             max_depth: None,
             regions,
             no_seed_commands: false,
             output_request: None,
+            parts: Vec::new(),
         })
         .unwrap_err();
         assert!(
@@ -1779,5 +1929,346 @@ model = { models = [{ provider = "anthropic", model = "claude-sonnet-5" }] }
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not reachable"));
+    }
+
+    /// `--yolo=<name>` reaches the daemon as the bit plus the name.
+    #[test]
+    fn resolve_spawn_args_carries_a_yolo_profile() {
+        let root = tempfile::tempdir().unwrap();
+        let agent_dir = root.path().join("my-agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let manifest = write_manifest(&agent_dir);
+        let args = resolve_spawn_args(LaunchRequest {
+            parts: Vec::new(),
+            path: manifest.to_str().unwrap(),
+            task: Some("do it"),
+            stdin_is_terminal: &never_interactive,
+            model: None,
+            workdir: "/work",
+            yolo: true,
+            yolo_profile: Some("careful".to_string()),
+            allow: Vec::new(),
+            max_depth: None,
+            regions: HashMap::new(),
+            no_seed_commands: false,
+            output_request: None,
+        })
+        .unwrap();
+        assert!(args.yolo);
+        assert_eq!(args.yolo_profile.as_deref(), Some("careful"));
+    }
+
+    /// The profile pre-flight: nothing for an attended run or the bare flag,
+    /// what a named profile keeps for a person, and a refusal for a name the
+    /// file does not have - before the daemon is asked.
+    #[tokio::test]
+    async fn the_yolo_profile_preflight_names_holds_and_refuses_unknown_names() {
+        crate::config::with_isolated_config_path_async("spawn-yolo-profile", |cfg| async move {
+            std::fs::write(
+                cfg.join("yolo.toml"),
+                "[careful]\ndefault = \"ask\"\nquestions = \"ask\"\n\n[loose]\ndefault = \"allow\"\n",
+            )
+            .unwrap();
+            let with = |yolo: bool, profile: Option<&str>| SpawnArgs {
+                yolo,
+                yolo_profile: profile.map(str::to_string),
+                ..SpawnArgs::default()
+            };
+            assert!(yolo_profile_preflight(&with(false, None)).unwrap().is_empty());
+            assert!(yolo_profile_preflight(&with(true, None)).unwrap().is_empty());
+            assert!(yolo_profile_preflight(&with(false, Some("nope"))).unwrap().is_empty());
+
+            let lines = yolo_profile_preflight(&with(true, Some("careful"))).unwrap();
+            assert_eq!(lines[0], "--yolo=careful keeps these for you:");
+            assert!(lines[1].contains("questions"), "{lines:?}");
+            assert!(lines[2].contains("lists do not allow"), "{lines:?}");
+
+            let lines = yolo_profile_preflight(&with(true, Some("loose"))).unwrap();
+            assert_eq!(lines.len(), 1);
+            assert!(lines[0].contains("keeps nothing for you"), "{lines:?}");
+
+            let err = yolo_profile_preflight(&with(true, Some("nope"))).unwrap_err();
+            assert!(err.to_string().contains("careful, loose"), "{err}");
+
+            // Through `send_spawn`: refused before any socket is dialled, so
+            // the error is the profile's, not "daemon not reachable".
+            let id = control_id(&cfg.join("nowhere"));
+            let err = send_spawn(&ControlClient::new(id), with(true, Some("nope")), false)
+                .await
+                .expect_err("an unknown profile stops the spawn");
+            assert!(err.to_string().contains("no yolo profile"), "{err}");
+        })
+        .await;
+    }
+
+    /// A profiled spawn prints what the profile keeps before the daemon is
+    /// asked, on the single path and the batch path, and an unknown name
+    /// stops a batch before its first run.
+    #[tokio::test]
+    async fn a_profiled_spawn_prints_its_holds_before_the_daemon_is_asked() {
+        crate::config::with_isolated_config_path_async("spawn-yolo-holds", |cfg| async move {
+            std::fs::write(
+                cfg.join("yolo.toml"),
+                "[careful]\ndefault = \"ask\"\nquestions = \"ask\"\n",
+            )
+            .unwrap();
+            let args = SpawnArgs {
+                run_id: "wide-researcher-1785900000-0123456789ab".to_string(),
+                yolo: true,
+                yolo_profile: Some("careful".to_string()),
+                ..SpawnArgs::default()
+            };
+            let one = tempfile::tempdir().unwrap();
+            let (id, server) = fake_daemon_serving(
+                one.path(),
+                vec![r#"{"result":"spawned","run_id":"a-1-000000000001"}"#],
+            );
+            send_spawn(&ControlClient::new(id), args.clone(), false)
+                .await
+                .expect("one spawn");
+            server.await.unwrap();
+
+            let many = tempfile::tempdir().unwrap();
+            let (id, server) = fake_daemon_serving(
+                many.path(),
+                vec![
+                    r#"{"result":"spawned","run_id":"a-1-000000000002"}"#,
+                    r#"{"result":"spawned","run_id":"a-1-000000000003"}"#,
+                ],
+            );
+            send_spawn_batch(&ControlClient::new(id), args.clone(), 2, false)
+                .await
+                .expect("a batch");
+            server.await.unwrap();
+
+            let none = tempfile::tempdir().unwrap();
+            let id = control_id(&none.path().join("no-daemon"));
+            let err = send_spawn_batch(
+                &ControlClient::new(id),
+                SpawnArgs {
+                    yolo_profile: Some("nope".to_string()),
+                    ..args
+                },
+                2,
+                false,
+            )
+            .await
+            .expect_err("an unknown profile stops the batch");
+            assert!(err.to_string().contains("no yolo profile"), "{err}");
+        })
+        .await;
+    }
+}
+
+#[cfg(test)]
+mod part_tests {
+    use super::*;
+    use leviath_core::mime::{InboundPart, MimeType};
+
+    fn write_typed_manifest(dir: &std::path::Path, regions: &str) -> std::path::PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join("agent.leviath"),
+            format!(
+                "[agent]\nname = \"artist\"\n\n[stages.main]\nmode = \"autonomous\"\n\n\
+                 [stages.main.model]\nprovider = \"anthropic\"\nmodel = \"claude-sonnet-5\"\n\n\
+                 [context.regions]\n{regions}\n"
+            ),
+        )
+        .unwrap();
+        dir.join("agent.leviath")
+    }
+
+    const TASK_AND_ART: &str = "task = { kind = \"pinned\", max_tokens = 4000, seed = \"task_input\" }\n\
+        art = { kind = \"pinned\", max_tokens = 4000, seed = \"input\", accepts = [\"image/*\"] }\n\
+        conversation = { kind = \"sliding_window\", max_items = 20, max_tokens = 10000 }";
+
+    fn request<'a>(
+        manifest: &'a str,
+        task: Option<&'a str>,
+        regions: HashMap<String, String>,
+        parts: Vec<InboundPart>,
+    ) -> LaunchRequest<'a> {
+        LaunchRequest {
+            yolo_profile: None,
+            path: manifest,
+            task,
+            stdin_is_terminal: &never_interactive,
+            model: None,
+            workdir: "/work",
+            yolo: false,
+            allow: Vec::new(),
+            max_depth: None,
+            regions,
+            no_seed_commands: false,
+            output_request: None,
+            parts,
+        }
+    }
+
+    #[test]
+    fn attached_named_and_region_files_all_become_parts() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_typed_manifest(&dir.path().join("artist"), TASK_AND_ART);
+        let png = dir.path().join("hero.png");
+        std::fs::write(&png, b"\x89PNG\r\n\x1a\nbody").unwrap();
+        let task = format!(
+            "edit @{} so the arm is longer, not @nothing.png",
+            png.display()
+        );
+        let regions = HashMap::from([("art".to_string(), format!("@{}", png.display()))]);
+        let attached = InboundPart::from_bytes("extra.wav", vec![1, 2, 3]);
+        let args = resolve_spawn_args(request(
+            manifest.to_str().unwrap(),
+            Some(&task),
+            regions,
+            vec![attached],
+        ))
+        .unwrap();
+        assert_eq!(args.task, task);
+        assert!(
+            args.regions.is_empty(),
+            "a binary region file is a part, not text"
+        );
+        let names: Vec<&str> = args.parts.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["hero.png", "extra.wav", "hero.png"]);
+        assert_eq!(args.parts[0].region.as_deref(), Some("art"));
+        assert_eq!(args.parts[1].region, None);
+        assert_eq!(args.parts[2].region, None);
+    }
+
+    /// The dashboard resolves a task's `@path` into a part and still sends the
+    /// task naming it, so the resolver finds the same file again; the exact
+    /// repeat is dropped. A copy in another region, or a different file, stays.
+    #[test]
+    fn an_exact_repeat_part_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_typed_manifest(&dir.path().join("artist"), TASK_AND_ART);
+        let png = dir.path().join("hero.png");
+        let bytes = b"\x89PNG\r\n\x1a\nbody".to_vec();
+        std::fs::write(&png, &bytes).unwrap();
+        let task = format!("see @{}", png.display());
+        let attached = InboundPart::from_bytes("hero.png", bytes.clone());
+        let args = resolve_spawn_args(request(
+            manifest.to_str().unwrap(),
+            Some(&task),
+            HashMap::new(),
+            vec![attached],
+        ))
+        .unwrap();
+        let names: Vec<&str> = args.parts.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["hero.png"], "the exact repeat was dropped");
+
+        // The same bytes attached to a named region is a different part, and a
+        // different file is too: both are kept beside the task's copy.
+        let other = dir.path().join("other.png");
+        std::fs::write(&other, b"\x89PNG\r\n\x1a\nother").unwrap();
+        let task2 = format!("see @{} and @{}", png.display(), other.display());
+        let art = InboundPart::from_bytes("hero.png", bytes).in_region("art");
+        let args = resolve_spawn_args(request(
+            manifest.to_str().unwrap(),
+            Some(&task2),
+            HashMap::new(),
+            vec![art],
+        ))
+        .unwrap();
+        let mut got: Vec<(Option<&str>, &str)> = args
+            .parts
+            .iter()
+            .map(|p| (p.region.as_deref(), p.name.as_str()))
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            [
+                (None, "hero.png"),
+                (None, "other.png"),
+                (Some("art"), "hero.png"),
+            ]
+        );
+    }
+
+    #[test]
+    fn parts_are_checked_against_the_blueprint_before_dialling() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_typed_manifest(&dir.path().join("artist"), TASK_AND_ART);
+        let path = manifest.to_str().unwrap();
+        let wav = InboundPart::from_bytes("song.wav", vec![1])
+            .in_region("art")
+            .typed(MimeType::parse("audio/wav").unwrap());
+        let err = resolve_spawn_args(request(path, Some("t"), HashMap::new(), vec![wav]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not accept audio/wav"), "{err}");
+        assert!(err.contains("it accepts: image/*"), "{err}");
+
+        let ghost = InboundPart::from_bytes("x.bin", vec![1]).in_region("ghost");
+        let err = resolve_spawn_args(request(path, Some("t"), HashMap::new(), vec![ghost]))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("region 'ghost', which this agent does not declare"),
+            "{err}"
+        );
+        assert!(err.contains("task, art, conversation"), "{err}");
+
+        // An untyped part into a typed region is the daemon's to judge.
+        let untyped = InboundPart::from_bytes("maybe.png", vec![1]).in_region("art");
+        assert!(
+            resolve_spawn_args(request(path, Some("t"), HashMap::new(), vec![untyped])).is_ok()
+        );
+
+        // A `task` region that is not pinned does not count as the task
+        // region; the first pinned one does.
+        let manifest = write_typed_manifest(
+            &dir.path().join("rolling"),
+            "task = { kind = \"sliding_window\", max_items = 5, max_tokens = 1000 }\n\
+             art = { kind = \"pinned\", max_tokens = 4000, accepts = [\"image/*\"] }",
+        );
+        let wav = InboundPart::from_bytes("song.wav", vec![1])
+            .typed(MimeType::parse("audio/wav").unwrap());
+        let err = resolve_spawn_args(request(
+            manifest.to_str().unwrap(),
+            Some("t"),
+            HashMap::new(),
+            vec![wav],
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("region 'art' does not accept audio/wav"),
+            "{err}"
+        );
+
+        // A task naming an empty file is refused before anything is dialled.
+        let manifest = write_typed_manifest(&dir.path().join("artist2"), TASK_AND_ART);
+        let empty = dir.path().join("empty.png");
+        std::fs::write(&empty, b"").unwrap();
+        let task = format!("edit @{}", empty.display());
+        let err = resolve_spawn_args(request(
+            manifest.to_str().unwrap(),
+            Some(&task),
+            HashMap::new(),
+            Vec::new(),
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("nothing to attach"), "{err}");
+
+        // No pinned region at all: a part with no region has nowhere to go.
+        let manifest = write_typed_manifest(
+            &dir.path().join("chatty"),
+            "conversation = { kind = \"sliding_window\", max_items = 20, max_tokens = 10000 }",
+        );
+        let loose = InboundPart::from_bytes("x.bin", vec![1]);
+        let err = resolve_spawn_args(request(
+            manifest.to_str().unwrap(),
+            None,
+            HashMap::new(),
+            vec![loose],
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("names no region"), "{err}");
     }
 }

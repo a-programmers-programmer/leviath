@@ -118,11 +118,13 @@ impl EmbedSpawner {
             agent_id: args.run_id.clone(),
             blueprint,
             seeds,
+            parts: args.parts.clone(),
             stages,
             global_hints: self.hints,
             global_nudge: // The default nudge policy; blueprints override per stage/agent.
             leviath_core::NudgeConfig::default(),
             region_scripts: HashMap::new(),
+            mime_registry: None,
         },
         )?;
 
@@ -147,7 +149,13 @@ impl EmbedSpawner {
                 callback_secret: None,
                 title: None,
                 title_error: None,
+                // The embedded host keeps no run directory to snapshot a
+                // manifest into, and a staged blueprint never had a file, so
+                // there is no digest to record. `None` says "unknown", which
+                // is the truth here rather than a missing feature.
+                blueprint_digest: None,
                 unattended: args.yolo,
+                yolo_profile: args.yolo_profile.clone(),
                 // The embedded spawner has no user config to grant against, so
                 // there is nothing to report; `[read_paths]` enforcement is the
                 // host's, through the tool context it supplies.

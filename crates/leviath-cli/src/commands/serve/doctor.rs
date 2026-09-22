@@ -27,6 +27,11 @@ use crate::commands::run::session::build_provider_registry_from_config;
 /// re-read per request (not taken from [`AppState`]) so the button reflects an
 /// edit the user just made.
 pub(super) async fn run_doctor(State(_state): State<AppState>) -> Json<DoctorResp> {
+    Json(offline_report().await)
+}
+
+/// The checks, run offline. Both surfaces call this.
+pub(super) async fn offline_report() -> DoctorResp {
     let args = DoctorArgs {
         offline: true,
         ..DoctorArgs::default()
@@ -37,13 +42,22 @@ pub(super) async fn run_doctor(State(_state): State<AppState>) -> Json<DoctorRes
         DaemonTarget::Skip,
     )
     .await;
-    Json(report(checks))
+    report(checks)
 }
 
 /// One live doctor at a time. Two of them would race two throwaway runs and
 /// four billed calls against the same config, and a double-clicked button
 /// means one check.
 static LIVE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Hold the live-doctor lock, so a test can ask what a second run answers.
+///
+/// The refusal is the whole point of the lock, and it cannot be provoked by
+/// calling twice: the first call finishes before the second starts.
+#[cfg(test)]
+pub(super) async fn hold_live_run() -> tokio::sync::MutexGuard<'static, ()> {
+    LIVE.lock().await
+}
 
 /// `POST /api/doctor/live`: the whole chain, billed calls included. Admin only.
 ///
@@ -57,9 +71,21 @@ static LIVE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 pub(super) async fn run_doctor_live(
     State(state): State<AppState>,
 ) -> Result<Json<DoctorResp>, (StatusCode, Json<ErrorResponse>)> {
+    live_checks(&state)
+        .await
+        .map(|checks| Json(DoctorResp { checks }))
+        .map_err(|e| super::core::error::as_api_error(&e))
+}
+
+/// Run the checks that reach the network, for whichever surface asked.
+///
+/// One at a time: each check costs a request to a provider and a round trip to
+/// the daemon, and two runs at once would double that for no better answer.
+pub(super) async fn live_checks(
+    state: &AppState,
+) -> Result<Vec<super::types::DoctorCheck>, super::core::error::ServeError> {
     let Ok(_running) = LIVE.try_lock() else {
-        return Err(err(
-            StatusCode::CONFLICT,
+        return Err(super::core::error::ServeError::Conflict(
             "a live doctor run is already in progress".to_string(),
         ));
     };
@@ -69,7 +95,7 @@ pub(super) async fn run_doctor_live(
         DaemonTarget::Client(&state.control),
     )
     .await;
-    Ok(Json(report(checks)))
+    Ok(report(checks).checks)
 }
 
 /// The checks as the wire shape both halves answer with.
@@ -127,6 +153,8 @@ mod tests {
     fn test_state() -> AppState {
         let (tx, _) = broadcast::channel(64);
         AppState {
+            caches: Default::default(),
+            signer: Default::default(),
             update_check: Default::default(),
             update_jobs: Default::default(),
             config: crate::commands::serve::testutil::fixed_config(Config::default()),

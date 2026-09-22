@@ -17,13 +17,16 @@ resolution, one real inference, and the daemon handoff, in that order, and repor
 check that fails tells you which section below you need. In particular it separates "my keys are
 wrong" from "the daemon is stuck", which look identical from the outside.
 
+If you get stuck, `lev rage` packs the logs, the config with its keys removed, and the run into
+one zip you can attach to an issue. See [Reporting issues](/docs/reporting-issues).
+
 ## I edited config.toml and nothing changed
 
 The daemon picks up `~/.leviath/config.toml` on its own, so an edit that does nothing almost always
 means the file no longer parses. When that happens Leviath keeps serving **the last version of the
-file that loaded**: runs still start and still work, on the settings from before your edit. That is
-deliberate - a half-typed save should not break a spawn - and it is why the symptom is "nothing
-changed" rather than an error.
+file that loaded**: runs still start and still work, on the settings from before your edit. That
+is deliberate, because a half-typed save should not break a spawn. It is also why the symptom is
+"nothing changed" rather than an error.
 
 Any of these will tell you:
 
@@ -35,9 +38,9 @@ lev dash          # a warning across the top of the screen, for as long as it la
 ```
 
 The message names the file and where in it the problem is. A syntax error, or a value of the wrong
-type, comes with a line and a column. A value that parsed and was then refused - an
-`openai-compatible` gateway with no `base_url`, an `[[mcp_servers]]` entry with neither a `command`
-nor a `url` - comes with the key instead, such as `model_providers.local`.
+type, comes with a line and a column. A value that parsed and was then refused comes with the key
+instead, such as `model_providers.local`. That covers an `openai-compatible` gateway with no
+`base_url`, and an `[[mcp_servers]]` entry with neither a `command` nor a `url`.
 
 Fix the file and save it. Everything above clears on its own and the next run uses the new config;
 nothing needs restarting. If you would rather see it over HTTP, `GET /api/config` carries the same
@@ -72,11 +75,13 @@ An agent needs at least one [provider](/docs/providers). Run `lev setup`: an API
 Claude subscription you sign in to, or a local [Ollama](https://ollama.com) all count, and the last
 two need no key.
 
-`lev doctor` says which provider your defaults actually resolve to, and which ones it tried to get
-there. That matters because a stage naming no model of its own falls back to `anthropic`. So a
-machine with only an OpenRouter key can resolve to a provider it has no credential for, spawn, and
-sit at iteration 0. When your configured `default_provider` is the one being passed over, the
-`resolve` line says that too.
+`lev doctor` says which provider your defaults actually resolve to. With no provider configured
+its `resolve` line fails and names the one your config asked for, `default_provider` or the first
+entry of `provider_order`, and lists what is registered. A config that names a provider but no
+`override_model` or `fallback_model` is fine. The line passes on that provider, and the inference
+check picks a model from its catalogue to probe with. Each stage of a real run uses the model its
+blueprint names. When your configured `default_provider` is being passed over for one
+that is configured, the `resolve` line says that too.
 
 ## Every run dies immediately with a payment or auth error
 
@@ -111,7 +116,8 @@ That stage's `models` list never mentions the provider you configured. A bluepri
 starts on a provider it lists. The [bundled agents](/docs/agent-catalog) list all five providers,
 so with them any key qualifies; a blueprint you downloaded or wrote may list fewer.
 
-Set `default_provider` and `default_model` together, which puts your provider ahead of the
+Set `fallback_model` beside your `default_provider`: a stage none of whose models is configured
+here then runs on that. `override_model` is the heavier tool, putting one model ahead of the
 blueprint's list for every stage that has not opted out. `--model <provider>/<model>` does it for
 one run, and copying the blueprint does it per stage. See
 [which entry a stage starts on](/docs/providers#which-entry-a-stage-starts-on).
@@ -124,7 +130,7 @@ over from before Ollama became opt-in, since an address that used to configure i
 it is on, every bundled agent lists it last, so on a stage that names no model of its own it is the
 first entry that matches, and the run starts against `http://localhost:11434`.
 
-Two ways to stop it. Turn Ollama off if you did not mean to enable it. Or set `default_model`
+Two ways to stop it. Turn Ollama off if you did not mean to enable it. Or set `fallback_model`
 alongside your `default_provider`: without a model to send, `default_provider` is never consulted
 and Ollama wins by default. `lev doctor` says so in its `resolve` line when your configured provider
 is being passed over.
@@ -153,9 +159,31 @@ uses it: the daemon rebuilds its providers from the file, so there is nothing to
 that parked because its provider ran out of credits moves to whatever the file names now when you
 `lev resume` it.
 
-A run that gets past that and still can't dispatch (say you removed a provider key after it
-started) is failed after `[limits] stall_timeout_secs`, 60 seconds by default. Its `meta.json`
-records the reason. Set the limit to `0` to wait indefinitely instead.
+A run that gets past that and still can't dispatch is paused after `[limits] stall_timeout_secs`,
+60 seconds by default, so nothing it did is lost. That covers removing a provider key after the
+run started, and every provider it can use going out of service. Set the limit to `0` to wait
+indefinitely instead.
+
+## A run says `paused` and I did not pause it
+
+Leviath pauses a run when something outside it has to change first. `lev ps` shows which kind of
+problem it is in the STATUS column and, under the table, what happened and what to do, with the
+provider's own error. The stage log in `lev dash` has the same line, starting `[paused]`. Fix it,
+then `lev resume` the run.
+
+| STATUS | What happened | What to do |
+|---|---|---|
+| `paused: needs provider` | The stage names a provider this install does not have | Add it with `lev setup` |
+| `paused: needs credits` | The account is out of credits | Top it up |
+| `paused: needs key` | The provider rejected the API key | Replace it with `lev setup` |
+| `paused: needs access` | The key cannot use this model | Check the account's plan |
+| `paused: provider unreachable` | No connection: the name did not resolve, the port refused, or TLS failed | Check the network and the provider's `base_url` |
+| `paused: provider timed out` | The provider was reached and did not answer in time | Resume to try again; a very large request may need a longer `request_timeout_secs` |
+| `paused: provider failed` | The provider was reached and failed: a server error, or a reply that stopped part-way | Resume once the provider recovers |
+| `paused: needs providers` | Every provider the stage can use is out of service, for reasons that do not agree | Read the line under the table |
+
+`lev doctor`, `lev setup` and `lev models list` print a provider failure in the same words, so the
+error in a paused run's line is the one to look up.
 
 Waiting for a busy model is *not* this. An agent queued behind other in-flight requests to the same
 model is working as intended and is never failed, however long the queue takes. Raise
@@ -181,8 +209,8 @@ same records and does not expire them. Widen `[limits] finished_retention_secs` 
 polling less often than the default five minutes.
 
 If it is none of those, the spawn itself failed and no run was ever created. `lev run` reports
-that on the spot, and the daemon logs it at `error` level, so check there rather than in the
-listing.
+that on the spot, and the daemon logs it at `error` level in `~/.leviath/daemon.log`, so check
+there rather than in the listing.
 
 This matters most to anything that schedules work by spawning agents and watching for them.
 Poll the listing rather than timing how long a run "should" take: a wall-clock deadline that is
@@ -205,17 +233,58 @@ the same way: an API error on the first call, not a `lev validate` failure.
 
 If the name in the error carries a provider prefix, as in Ollama's
 `model 'ollama/qwen3.8:latest' not found`, the model was written as `provider/model` where a bare
-id was expected. `default_model` in `config.toml` and a `model` in a blueprint's `models` list
-pair with a provider that is named separately, so they take `qwen3.8:latest`; only `--model` and
-`[providers] fallback_order` take `ollama/qwen3.8:latest`. A `default_model` prefixed with its own
-`default_provider` is read bare and `lev doctor` says so; a blueprint entry is sent as written.
+id was expected. `override_model` and `fallback_model` in `config.toml` and a `model` in a
+blueprint's `models` list pair with a provider that is named separately, so they take
+`qwen3.8:latest`; only `--model` and `[providers] fallback_order` take `ollama/qwen3.8:latest`. An
+`override_model` or `fallback_model` prefixed with its own `default_provider` is read bare and
+`lev doctor` says so; a blueprint entry is sent as written.
 
-Check the spelling against `lev models list --provider <name> --remote`, which asks the provider
-rather than Leviath's built-in table. A provider *name* it cannot reach at all fails the command
-outright, so a typo there is answered rather than shown as an empty table. Note that a valid dated identifier such as
-`deepseek/deepseek-v4-flash-0731` may be absent from the offline table while still working, so
-absence there is not proof of a bad name. See
+Check the spelling against `lev models list --provider <name>`, which asks the provider rather
+than Leviath's built-in table. Asking is the default; `--offline` is what limits the answer to the
+table. A provider *name* it cannot reach at all fails the command outright, so a typo there is
+answered rather than shown as an empty table.
+
+A valid dated identifier such as `deepseek/deepseek-v4-flash-0731` may be absent from the offline
+table while still working, so absence there is not proof of a bad name. See
 [model identifiers](/docs/providers#model-identifiers).
+
+## Bedrock answers with an access error
+
+A 403 from Bedrock says one of two things, and the message names which. `UnrecognizedClientException`
+or `ExpiredTokenException` is the key itself: it was mistyped, deactivated in the Bedrock console,
+or has expired. `AccessDeniedException` is a key that works but is not allowed this call. That
+is nearly always a model the account has not enabled in the region the request went to. It can
+also be a region that is not the one the key was made for. `lev models list --provider bedrock`
+lists what the key can reach where it is pointed; the region comes from `bedrock_region`, then
+`AWS_REGION`, then `us-east-1`. A 404 `ResourceNotFoundException` saying model use case details
+have not been submitted is AWS's Anthropic use case form. The account fills it in once, in the
+Bedrock console under model access, and AWS says to allow fifteen minutes after. A shell or Rhai
+tool does not see `AWS_*` variables unless `[security] allow_env_vars` names them; that is
+deliberate and does not affect the provider.
+
+## Grok answers 401, 403 or 429
+
+A 401 that survives Leviath's automatic refresh means the sign-in was revoked or has lapsed:
+`lev auth login grok` signs in again. A 403 is an account the Grok route will not serve, usually a
+plan without SuperGrok or X Premium+; `lev auth status` shows the plan the sign-in carries. A 429
+with no wait time is the subscription's limit for the period: `lev providers quota` shows each
+window and when it resets, and the run waits for that reset rather than retrying blind.
+
+## Meta refuses a request with a 400
+
+Meta's Model API refuses several parameters other APIs take: a reasoning effort of `none`, `stop`,
+`logit_bias`, `n` and log probabilities. Leviath removes those from a stage's parameters, so a 400
+that still comes back names something else in the message. `muse-voice-transcribe-1.0` takes WAV
+audio only (mono, 16-bit, 16 or 24 kHz, at most 32 MB and ten minutes); any other audio is refused
+before it is sent, with the format it needs.
+
+## A large file reached the model as a line of text
+
+A part the model takes natively reaches it as a one-line stand-in when it is too large to send.
+The line says why: over the provider's inline limit and not uploaded (zero data retention is on,
+or `[providers] file_uploads = false`), or over `[mime] max_part_bytes` when it arrived. Upload is
+the usual fix for the first; raise `max_part_bytes` for the second. A generated video or a long
+speech file can be large too. See [Files and size limits](/docs/mime#files-and-size-limits).
 
 ## Windows quoting and environment variables
 
@@ -236,7 +305,7 @@ lev run coder --task "Fix the failing test"
 ```
 
 Quoting. PowerShell strips the outer quotes before `lev` sees the argument, so a task containing a
-literal quote needs escaping, and single quotes are safest when the text contains `$`:
+literal quote needs escaping. Single quotes are safest when the text contains `$`:
 
 ```powershell
 lev run coder --task 'Handle the $HOME case'
@@ -342,6 +411,29 @@ lev serve --token 6618… --cors https://leviath.dev --allow-admin
 > [!WARNING]
 > A page served over **https** can't call an **http** endpoint (mixed content). `http://127.0.0.1`
 > is exempt, so localhost works; for a remote box use TLS, an SSH tunnel, or the Docker image.
+
+## `mkcert` stops with `keytool -list`
+
+```
+ERROR: failed to execute "keytool -list": exit status 1
+keytool error: java.lang.Exception: Keystore file does not exist: /Users/you/.keystore
+```
+
+Both `mkcert -install` and the command that makes a certificate can stop like this. It is a bug in
+mkcert 1.4.4: when `JAVA_HOME` points at a directory with a `keytool` but no
+`lib/security/cacerts`, which is what `brew --prefix openjdk` gives you, mkcert runs keytool with
+an empty keystore path. The Lair never needs the Java trust store. Put `TRUST_STORES=system,nss` in
+front of both commands:
+
+```bash
+TRUST_STORES=system,nss mkcert -install
+TRUST_STORES=system,nss mkcert 127.0.0.1 localhost
+```
+
+If the install printed "now installed in the system trust store" before it stopped, the CA is in
+place. Only the certificate command needs running again. Setting `JAVA_HOME` to
+`$(brew --prefix openjdk)/libexec/openjdk.jdk/Contents/Home` fixes it for good. The full recipe is
+on [the API page](/docs/api#mkcert-if-the-browser-and-leviath-are-on-machines-you-control).
 
 ## I get `401 Unauthorized`
 

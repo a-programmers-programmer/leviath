@@ -143,6 +143,23 @@ pub(crate) fn dispatch_compaction(
         let Some(provider) = providers.0.get(&config.provider) else {
             continue; // compaction provider not registered - skip, non-fatal
         };
+        // A summary sends the run's context, so a compaction model zero
+        // retention refuses is never called; the spawn gate refuses such a
+        // blueprint, so this is a switch turned on under a running daemon.
+        if let Some(refusal) = providers
+            .0
+            .retention_refusal(&config.provider, &config.model)
+        {
+            tracing::warn!("compaction skipped: its model is {refusal}");
+            continue;
+        }
+        // A summary request carries the run's context, so the zero-retention
+        // fields ride it the way they ride a stage's own request.
+        for (_, request) in requests.iter_mut() {
+            providers
+                .0
+                .apply_retention_knobs(&config.provider, &mut request.extra);
+        }
         let Some(permit) = stage.pools.try_acquire(&config.provider, &config.model) else {
             continue; // pool full - skip compaction this round
         };
@@ -254,6 +271,30 @@ pub(crate) fn collect_compaction(
                     );
                     continue;
                 }
+                // The summary is text: whatever stored parts the region held
+                // are gone with the entries it replaces. Said once, by name,
+                // so a run that lost an image to compaction can tell why the
+                // model stopped seeing it; the stand-ins the summary was
+                // written from are what it keeps.
+                let dropped: Vec<String> = window
+                    .get_region(&region_name)
+                    .map(|r| {
+                        r.content
+                            .iter()
+                            .flat_map(|e| e.content.stored())
+                            .map(|p| p.name.clone().unwrap_or_else(|| "(unnamed)".to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if !dropped.is_empty() {
+                    let names = dropped.join(", ");
+                    tracing::warn!(
+                        region = %region_name,
+                        parts = %names,
+                        "[mime] compaction replaced entries carrying stored parts with a text summary; \
+                         the parts stay in the run's store but leave the window"
+                    );
+                }
                 let summary_tokens = leviath_core::estimate_tokens(&summary);
                 let history = window
                     .regions
@@ -264,11 +305,24 @@ pub(crate) fn collect_compaction(
                     })
                     .map(|r| r.name.clone());
                 if let Some(history_name) = history {
-                    let _ = window.add_to_region(&history_name, summary, summary_tokens);
+                    let _ = window.add_to_region_caused(
+                        leviath_core::ContextCause::Compaction,
+                        &history_name,
+                        summary,
+                        summary_tokens,
+                    );
                 }
+                let before = window.begin_change(&region_name);
                 if let Some(region) = window.get_region_mut(&region_name) {
                     region.clear();
                 }
+                // The source region emptying is half of what a compaction did,
+                // and the half a reader is most likely to be looking for.
+                window.commit_change(
+                    leviath_core::ContextCause::Compaction,
+                    before,
+                    crate::components::Pushed::Nothing,
+                );
             }
             window.current_tokens = window.calculate_tokens();
         }
@@ -326,10 +380,7 @@ pub fn is_stage_specific(kind: &leviath_core::RegionKind) -> bool {
         leviath_core::RegionKind::Pinned
             | leviath_core::RegionKind::CompactHistory { .. }
             | leviath_core::RegionKind::HashMap { .. }
-            | leviath_core::RegionKind::Custom {
-                persistent: true,
-                ..
-            }
+            | leviath_core::RegionKind::Custom { pinned: true, .. }
     )
 }
 
@@ -369,16 +420,27 @@ pub(crate) fn apply_edge_transform(
             clear,
             ..
         } => {
-            clear
+            // One transaction over every region the edge clears. The edge clears
+            // them as one act, and recording each on its own would leave a
+            // reader to guess from the timestamps which of them went together.
+            let cleared: Vec<&str> = clear
                 .iter()
                 .filter(|n| !carry.contains(n))
-                .for_each(|name| {
-                    window
-                        .get_region_mut(name)
-                        .into_iter()
-                        .for_each(|r| r.clear());
-                });
+                .map(String::as_str)
+                .collect();
+            let emptying = window.begin_changes(cleared.iter().copied());
+            for name in &cleared {
+                window
+                    .get_region_mut(name)
+                    .into_iter()
+                    .for_each(|r| r.clear());
+            }
             window.current_tokens = window.calculate_tokens();
+            window.commit_change(
+                leviath_core::ContextCause::Transform,
+                emptying,
+                crate::components::Pushed::Nothing,
+            );
             compact
                 .iter()
                 .filter(|n| !carry.contains(n))
@@ -445,7 +507,13 @@ pub(crate) fn dispatch_edge_compact(
         let started = settings
             .and_then(|s| {
                 let config = &s.0;
-                let requests = build_edge_compact_requests(window, &pending.0, config)?;
+                let mut requests = build_edge_compact_requests(window, &pending.0, config)?;
+                // As above: a summary carries the run's context.
+                for (_, request) in requests.iter_mut() {
+                    providers
+                        .0
+                        .apply_retention_knobs(&config.provider, &mut request.extra);
+                }
                 let Some(provider) = providers.0.get(&config.provider) else {
                     tracing::warn!(
                         provider = %config.provider,
@@ -455,6 +523,17 @@ pub(crate) fn dispatch_edge_compact(
                     );
                     return None;
                 };
+                if let Some(refusal) = providers
+                    .0
+                    .retention_refusal(&config.provider, &config.model)
+                {
+                    tracing::warn!(
+                        regions = ?pending.0,
+                        "edge transform asked to compact, but its model is {refusal} \
+                         Carrying the regions as written"
+                    );
+                    return None;
+                }
                 let Some(permit) = stage.pools.try_acquire(&config.provider, &config.model) else {
                     tracing::warn!(
                         model = %config.model,

@@ -16,6 +16,14 @@ pub struct AgentState {
     /// Current execution stage
     pub current_stage: String,
 
+    /// The id of this stay in that stage, minted when the run entered it.
+    ///
+    /// The correlation key for everything that happens during the stay: a tool
+    /// batch dispatched now records it, so a reader can ask what one visit did
+    /// without pairing timestamps. Empty in a world with no stage ledger, which
+    /// is where nothing opens a visit to be in.
+    pub current_visit: String,
+
     /// Number of iterations in current stage
     pub iteration: usize,
 
@@ -31,6 +39,30 @@ pub struct AgentState {
     /// Whether the current stage accepts mid-run user messages.
     /// When false, messages stay in the inbox until a stage that accepts them.
     pub accepts_messages: bool,
+}
+
+/// The execution ids minted for the tool batch in flight, by provider call id.
+///
+/// Dispatch mints one id per attempt and the journal records it; the completion
+/// system needs the same id to say which attempt finished, and the provider's own
+/// id cannot serve because it may be reused across a retry. Carried on the entity
+/// because dispatch and completion are two systems and two ticks apart.
+///
+/// Replaced wholesale at each dispatch: one batch is in flight per agent, so the
+/// previous batch's ids are answered for by then and keeping them would let a
+/// late completion attach itself to the wrong attempt.
+#[derive(Component, Debug, Clone, Default)]
+pub struct BatchExecutions {
+    /// Provider call id to the execution id minted for it.
+    pub ids: std::collections::HashMap<String, String>,
+}
+
+impl BatchExecutions {
+    /// The execution id for one provider call id, or empty when this world did
+    /// not mint one (a world with no journal to agree with).
+    pub fn id_for(&self, call_id: &str) -> String {
+        self.ids.get(call_id).cloned().unwrap_or_default()
+    }
 }
 
 /// Reference to a parent agent, making this agent a sub-agent.
@@ -307,6 +339,14 @@ impl StageHookScripts {
 /// and any tool calls that need to be executed.
 #[derive(Component, Debug, Clone)]
 pub(crate) struct InferenceResult {
+    /// The provider attempt that produced this answer, as minted before its
+    /// request went out. Empty in a world that minted none.
+    ///
+    /// Carried so a tool batch can say which trip to the provider asked for it.
+    /// Nothing at the dispatch end could work it out: a failover means the answer
+    /// came from a different provider than the attempt before it went to.
+    pub attempt_id: String,
+
     /// The model's response text
     pub response: String,
 
@@ -326,6 +366,11 @@ pub(crate) struct InferenceResult {
     /// provider issued one. Stored on the assistant turn so the next request
     /// hands it back; see `leviath_core::RegionEntry::reasoning`.
     pub reasoning: Option<String>,
+
+    /// Mime the model produced, already in the run's store, or a text part
+    /// saying what was dropped when it could not be stored. Written beside
+    /// the reply's text on the assistant turn.
+    pub parts: Vec<leviath_core::mime::Part>,
 }
 
 /// A tool call requested by the model.
@@ -354,6 +399,9 @@ pub struct AgentMessage {
     pub content: String,
     /// Which region to add the message to (default: "conversation")
     pub target_region: Option<String>,
+    /// Files attached to the message; stored when it is delivered and written
+    /// beside the text in one entry.
+    pub parts: Vec<leviath_core::mime::InboundPart>,
 }
 
 /// Inbox component for receiving messages sent to a running agent.
@@ -455,13 +503,23 @@ mod tests {
         window.add_region(region);
 
         // Replacing an existing region overwrites its content wholesale.
-        assert!(window.replace_region("plan", "new plan".to_string(), 3));
+        assert!(window.replace_region(
+            leviath_core::ContextCause::Seed,
+            "plan",
+            "new plan".to_string(),
+            3
+        ));
         let plan = window.get_region("plan").unwrap();
         assert_eq!(plan.content.len(), 1);
         assert_eq!(plan.content[0].content, "new plan");
 
         // A missing region is a no-op that reports false.
-        assert!(!window.replace_region("nope", "x".to_string(), 1));
+        assert!(!window.replace_region(
+            leviath_core::ContextCause::Seed,
+            "nope",
+            "x".to_string(),
+            1
+        ));
     }
 
     #[test]
@@ -620,6 +678,7 @@ mod tests {
             agent_id: "agent-1".to_string(),
             content: "hello".to_string(),
             target_region: None,
+            parts: Vec::new(),
         });
         assert_eq!(inbox.messages.len(), 1);
 
@@ -636,6 +695,7 @@ mod tests {
                 agent_id: "a".to_string(),
                 content: content.to_string(),
                 target_region: None,
+                parts: Vec::new(),
             });
         }
 
@@ -772,6 +832,7 @@ mod tests {
     fn test_agent_state_with_children_fields() {
         let state = AgentState {
             agent_id: "test-01".to_string(),
+            current_visit: String::new(),
             current_stage: "analyze".to_string(),
             iteration: 0,
             status: AgentStatus::Active,
@@ -874,6 +935,7 @@ mod tests {
             agent_id: "a".to_string(),
             content: "msg".to_string(),
             target_region: None,
+            parts: Vec::new(),
         });
         let _ = inbox.drain_all();
         assert!(inbox.messages.is_empty());
@@ -888,6 +950,7 @@ mod tests {
             agent_id: "agent-1".to_string(),
             content: "hello".to_string(),
             target_region: Some("conv".to_string()),
+            parts: Vec::new(),
         };
         let cloned = msg.clone();
         assert_eq!(cloned.agent_id, "agent-1");
@@ -939,6 +1002,7 @@ mod tests {
     #[test]
     fn test_inference_result_fields() {
         let ir = InferenceResult {
+            attempt_id: String::new(),
             response: "Hello".to_string(),
             tool_calls: vec![ToolCall {
                 tool_id: "t1".to_string(),
@@ -949,6 +1013,7 @@ mod tests {
             tokens_used: 100,
             cut_off_at: None,
             reasoning: None,
+            parts: Vec::new(),
         };
         assert_eq!(ir.response, "Hello");
         assert_eq!(ir.tool_calls.len(), 1);
@@ -1030,6 +1095,7 @@ mod tests {
 
         window
             .add_tainted_to_region(
+                leviath_core::ContextCause::ToolResult,
                 "tools",
                 "secret data".to_string(),
                 10,
@@ -1051,6 +1117,7 @@ mod tests {
     fn test_add_tainted_to_nonexistent_region() {
         let mut window = ContextWindow::new(10000);
         let result = window.add_tainted_to_region(
+            leviath_core::ContextCause::ToolResult,
             "nope",
             "data".to_string(),
             10,
@@ -1068,10 +1135,22 @@ mod tests {
         window.add_region(r2);
 
         window
-            .add_tainted_to_region("a", "x".to_string(), 5, leviath_core::TaintLevel::Internal)
+            .add_tainted_to_region(
+                leviath_core::ContextCause::ToolResult,
+                "a",
+                "x".to_string(),
+                5,
+                leviath_core::TaintLevel::Internal,
+            )
             .unwrap();
         window
-            .add_tainted_to_region("b", "y".to_string(), 5, leviath_core::TaintLevel::Public)
+            .add_tainted_to_region(
+                leviath_core::ContextCause::ToolResult,
+                "b",
+                "y".to_string(),
+                5,
+                leviath_core::TaintLevel::Public,
+            )
             .unwrap();
 
         assert_eq!(
@@ -1091,6 +1170,7 @@ mod tests {
 
         window
             .add_tainted_to_region(
+                leviath_core::ContextCause::ToolResult,
                 "conv",
                 "x".to_string(),
                 5,
@@ -1121,6 +1201,7 @@ mod tests {
 
         window
             .add_tainted_to_region(
+                leviath_core::ContextCause::ToolResult,
                 "temp",
                 "private".to_string(),
                 30,
@@ -1129,6 +1210,7 @@ mod tests {
             .unwrap();
         window
             .add_tainted_to_region(
+                leviath_core::ContextCause::ToolResult,
                 "temp",
                 "public".to_string(),
                 30,
@@ -1192,6 +1274,101 @@ mod tests {
             Some("user"),
             "the assembled conversation must end with a user message"
         );
+    }
+
+    #[test]
+    fn assemble_wraps_tool_arguments_that_are_not_an_object() {
+        // A call the output cap cut off is stored as the partial text that
+        // arrived. Every provider that takes tool input as an object refuses
+        // a string there, so it goes out as `{"_raw": ...}`; an object is
+        // sent as it was stored.
+        let mut window = ContextWindow::new(100_000);
+        window.add_region(Region::new(
+            "conversation".to_string(),
+            RegionKind::SlidingWindow {
+                max_items: 100,
+                eviction_strategy: EvictionStrategy::PerItem,
+            },
+            50_000,
+        ));
+        let call = |id: &str, arguments: serde_json::Value| leviath_core::SerializedToolCall {
+            id: id.to_string(),
+            name: "write_file".to_string(),
+            arguments,
+            thought_signature: None,
+        };
+        window
+            .add_typed_entry(
+                "conversation",
+                leviath_core::EntryKind::UserMessage,
+                "Write the report.".to_string(),
+                10,
+            )
+            .unwrap();
+        window
+            .add_typed_entry(
+                "conversation",
+                leviath_core::EntryKind::AssistantTurn {
+                    tool_calls: vec![
+                        call("cut", serde_json::json!("{\"path\": \"re")),
+                        call("list", serde_json::json!([1, 2])),
+                        call("whole", serde_json::json!({ "path": "a.md" })),
+                    ],
+                },
+                "Writing.".to_string(),
+                50,
+            )
+            .unwrap();
+        for id in ["cut", "list", "whole"] {
+            window
+                .add_typed_entry(
+                    "conversation",
+                    leviath_core::EntryKind::ToolResult {
+                        tool_call_id: id.to_string(),
+                        tool_name: "write_file".to_string(),
+                        is_error: true,
+                    },
+                    "[error] was not run".to_string(),
+                    10,
+                )
+                .unwrap();
+        }
+
+        let assembled = window.assemble();
+        let blocks: Vec<&leviath_providers::ContentBlock> = assembled
+            .messages
+            .iter()
+            .filter_map(|msg| match &msg.content {
+                leviath_providers::MessageContent::Blocks(blocks) => Some(blocks),
+                leviath_providers::MessageContent::Text(_) => None,
+            })
+            .flatten()
+            .collect();
+        let inputs: Vec<(String, serde_json::Value)> = blocks
+            .iter()
+            .filter_map(|block| match block {
+                leviath_providers::ContentBlock::ToolUse { id, input, .. } => {
+                    Some((id.clone(), input.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        let results = blocks
+            .iter()
+            .filter(|block| matches!(block, leviath_providers::ContentBlock::ToolResult { .. }))
+            .count();
+        assert_eq!(
+            inputs,
+            vec![
+                (
+                    "cut".to_string(),
+                    serde_json::json!({ "_raw": "{\"path\": \"re" })
+                ),
+                ("list".to_string(), serde_json::json!({ "_raw": [1, 2] })),
+                ("whole".to_string(), serde_json::json!({ "path": "a.md" })),
+            ]
+        );
+        assert_eq!(results, 3, "every result stays paired");
     }
 
     #[test]
@@ -1693,10 +1870,10 @@ mod tests {
         );
     }
 
-    fn custom_kind(script: &str, persistent: bool) -> RegionKind {
+    fn custom_kind(script: &str, pinned: bool) -> RegionKind {
         RegionKind::Custom {
             script: script.to_string(),
-            persistent,
+            pinned,
         }
     }
 
@@ -1760,13 +1937,13 @@ mod tests {
 
     /// A window with one custom region (`brain`, budget 100) backed by `src`,
     /// compiled and installed in the script table under "s.rhai".
-    fn custom_window(src: &str, persistent: bool) -> ContextWindow {
+    fn custom_window(src: &str, pinned: bool) -> ContextWindow {
         let mut window = ContextWindow::new(10_000);
         window.add_region(Region::new(
             "brain".to_string(),
             RegionKind::Custom {
                 script: "s.rhai".to_string(),
-                persistent,
+                pinned,
             },
             100,
         ));
@@ -1796,6 +1973,7 @@ mod tests {
             .unwrap();
         window
             .add_tainted_to_region(
+                leviath_core::ContextCause::ToolResult,
                 "brain",
                 "c".to_string(),
                 1,
@@ -1804,12 +1982,15 @@ mod tests {
             .unwrap();
         window
             .typed_write(
-                crate::components::WriteOrigin::System,
-                "brain",
-                leviath_core::EntryKind::UserMessage,
+                crate::components::TypedWrite {
+                    cause: None,
+                    origin: crate::components::WriteOrigin::System,
+                    region: "brain",
+                    kind: leviath_core::EntryKind::UserMessage,
+                    taint: Some(leviath_core::TaintLevel::Public),
+                },
                 "d".to_string(),
                 1,
-                Some(leviath_core::TaintLevel::Public),
             )
             .unwrap();
 
@@ -1828,7 +2009,12 @@ mod tests {
         // Token counts were re-estimated for the replacements.
         assert_eq!(window.current_tokens, window.calculate_tokens());
 
-        assert!(window.replace_region("brain", "e".to_string(), 1));
+        assert!(window.replace_region(
+            leviath_core::ContextCause::Seed,
+            "brain",
+            "e".to_string(),
+            1
+        ));
         let region = window.get_region("brain").unwrap();
         assert_eq!(region.content.len(), 1);
         assert_eq!(region.content[0].content, "text:e");
@@ -1856,6 +2042,7 @@ mod tests {
         // replacement happens, rather than the script vetoing (say) an
         // interaction answer.
         assert!(with_tracing(|| window.replace_region(
+            leviath_core::ContextCause::Seed,
             "brain",
             "revised".to_string(),
             1
@@ -1885,6 +2072,7 @@ mod tests {
                 .unwrap();
             window
                 .add_tainted_to_region(
+                    leviath_core::ContextCause::ToolResult,
                     "brain",
                     "b".to_string(),
                     1,
@@ -1893,12 +2081,15 @@ mod tests {
                 .unwrap();
             window
                 .typed_write(
-                    crate::components::WriteOrigin::System,
-                    "brain",
-                    leviath_core::EntryKind::UserMessage,
+                    crate::components::TypedWrite {
+                        cause: None,
+                        origin: crate::components::WriteOrigin::System,
+                        region: "brain",
+                        kind: leviath_core::EntryKind::UserMessage,
+                        taint: Some(leviath_core::TaintLevel::Public),
+                    },
                     "c".to_string(),
                     1,
-                    Some(leviath_core::TaintLevel::Public),
                 )
                 .unwrap();
         });
@@ -1923,6 +2114,7 @@ mod tests {
         let mut window = custom_window(src, false);
         let err = window
             .add_to_region_keyed(
+                None,
                 crate::components::WriteOrigin::Agent,
                 "brain",
                 Some("claim-1"),
@@ -1941,12 +2133,15 @@ mod tests {
             custom_window("fn render(ctx) { \"\" }\nfn on_write(ctx) { false }", false);
         let err = window
             .typed_write(
-                crate::components::WriteOrigin::Agent,
-                "brain",
-                leviath_core::EntryKind::Text,
+                crate::components::TypedWrite {
+                    cause: None,
+                    origin: crate::components::WriteOrigin::Agent,
+                    region: "brain",
+                    kind: leviath_core::EntryKind::Text,
+                    taint: None,
+                },
                 "x".to_string(),
                 1,
-                None,
             )
             .unwrap_err();
         assert!(err.to_string().contains("declined"), "{err}");
@@ -1964,10 +2159,22 @@ mod tests {
         "#;
         let mut window = custom_window(src, false);
         window
-            .agent_replace_region("brain", None, "good".to_string(), 1)
+            .agent_replace_region(
+                leviath_core::ContextCause::ContextTool,
+                "brain",
+                None,
+                "good".to_string(),
+                1,
+            )
             .unwrap();
         let err = window
-            .agent_replace_region("brain", None, "bad".to_string(), 1)
+            .agent_replace_region(
+                leviath_core::ContextCause::ContextTool,
+                "brain",
+                None,
+                "bad".to_string(),
+                1,
+            )
             .unwrap_err();
         assert!(err.to_string().contains("refused"), "{err}");
         assert_eq!(
@@ -1977,7 +2184,13 @@ mod tests {
 
         // And a region that does not exist is still its own error.
         let err = window
-            .agent_replace_region("ghost", None, "x".to_string(), 1)
+            .agent_replace_region(
+                leviath_core::ContextCause::ContextTool,
+                "ghost",
+                None,
+                "x".to_string(),
+                1,
+            )
             .unwrap_err();
         assert!(err.to_string().contains("ghost"), "{err}");
     }
@@ -2013,7 +2226,12 @@ mod tests {
             fn on_write(ctx) { #{ key: "current" } }
         "#;
         let mut window = custom_window(src, false);
-        assert!(window.replace_region("brain", "v1".to_string(), 1));
+        assert!(window.replace_region(
+            leviath_core::ContextCause::Seed,
+            "brain",
+            "v1".to_string(),
+            1
+        ));
         let entry = &window.get_region("brain").unwrap().content[0];
         assert_eq!(entry.key.as_deref(), Some("current"));
         assert_eq!(entry.content, "v1");
@@ -2028,7 +2246,7 @@ mod tests {
             "brain".to_string(),
             RegionKind::Custom {
                 script: "s.rhai".to_string(),
-                persistent: false,
+                pinned: false,
             },
             100,
         ));
@@ -2066,7 +2284,7 @@ mod tests {
             "brain".to_string(),
             RegionKind::Custom {
                 script: "s.rhai".to_string(),
-                persistent: false,
+                pinned: false,
             },
             100,
         ));
@@ -2185,7 +2403,7 @@ mod tests {
             "brain".to_string(),
             RegionKind::Custom {
                 script: "s.rhai".to_string(),
-                persistent: false,
+                pinned: false,
             },
             100,
         ));
@@ -2279,7 +2497,7 @@ mod tests {
             "conversation".to_string(),
             RegionKind::Custom {
                 script: "conv.rhai".to_string(),
-                persistent: false,
+                pinned: false,
             },
             5_000,
         ));
@@ -2844,7 +3062,7 @@ mod tests {
             "corpus".to_string(),
             RegionKind::Custom {
                 script: "s.rhai".to_string(),
-                persistent: false,
+                pinned: false,
             },
             10_000,
         );
@@ -2888,7 +3106,7 @@ mod tests {
             "corpus".to_string(),
             RegionKind::Custom {
                 script: "s.rhai".to_string(),
-                persistent: false,
+                pinned: false,
             },
             10_000,
         );
@@ -2977,12 +3195,15 @@ mod tests {
     fn test_add_typed_tainted_to_nonexistent_region() {
         let mut window = ContextWindow::new(10000);
         let result = window.typed_write(
-            crate::components::WriteOrigin::System,
-            "ghost",
-            leviath_core::EntryKind::UserMessage,
+            crate::components::TypedWrite {
+                cause: None,
+                origin: crate::components::WriteOrigin::System,
+                region: "ghost",
+                kind: leviath_core::EntryKind::UserMessage,
+                taint: Some(leviath_core::TaintLevel::Public),
+            },
             "data".to_string(),
             10,
-            Some(leviath_core::TaintLevel::Public),
         );
         assert!(result.is_err());
         let err_str = result.unwrap_err().to_string();
@@ -3250,16 +3471,19 @@ mod tests {
 
         window
             .typed_write(
-                crate::components::WriteOrigin::System,
-                "conv",
-                leviath_core::EntryKind::ToolResult {
-                    tool_call_id: "tc_1".to_string(),
-                    tool_name: "read_file".to_string(),
-                    is_error: false,
+                crate::components::TypedWrite {
+                    cause: None,
+                    origin: crate::components::WriteOrigin::System,
+                    region: "conv",
+                    kind: leviath_core::EntryKind::ToolResult {
+                        tool_call_id: "tc_1".to_string(),
+                        tool_name: "read_file".to_string(),
+                        is_error: false,
+                    },
+                    taint: Some(leviath_core::TaintLevel::Private),
                 },
                 "secret data".to_string(),
                 100,
-                Some(leviath_core::TaintLevel::Private),
             )
             .unwrap();
 
@@ -3274,12 +3498,15 @@ mod tests {
     fn typed_tainted_write_not_found() {
         let mut window = ContextWindow::new(10000);
         let result = window.typed_write(
-            crate::components::WriteOrigin::System,
-            "nonexistent",
-            leviath_core::EntryKind::Text,
+            crate::components::TypedWrite {
+                cause: None,
+                origin: crate::components::WriteOrigin::System,
+                region: "nonexistent",
+                kind: leviath_core::EntryKind::Text,
+                taint: Some(leviath_core::TaintLevel::Public),
+            },
             "data".to_string(),
             10,
-            Some(leviath_core::TaintLevel::Public),
         );
         assert!(result.is_err());
     }
@@ -3644,6 +3871,7 @@ mod tests {
         window.add_region(region);
 
         let result = window.add_tainted_to_region(
+            leviath_core::ContextCause::ToolResult,
             "conv",
             "far too many tokens".to_string(),
             100,
@@ -3661,12 +3889,15 @@ mod tests {
         window.add_region(region);
 
         let result = window.typed_write(
-            crate::components::WriteOrigin::System,
-            "conv",
-            leviath_core::EntryKind::Text,
+            crate::components::TypedWrite {
+                cause: None,
+                origin: crate::components::WriteOrigin::System,
+                region: "conv",
+                kind: leviath_core::EntryKind::Text,
+                taint: Some(leviath_core::TaintLevel::Public),
+            },
             "far too many tokens".to_string(),
             100,
-            Some(leviath_core::TaintLevel::Public),
         );
         assert!(result.is_err());
     }

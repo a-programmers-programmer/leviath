@@ -144,6 +144,65 @@
         }
       }
     },
+    "mime_types": {
+      "type": "object",
+      "description": "Rows this agent adds to the mime registry, keyed by type/subtype or type/*, layered over the operator's rows for this agent's runs. Name only what the row changes.",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "family": {
+            "type": "string",
+            "description": "What providers key their encoders on: text, image, audio, video, document, model, binary, or a name of your own."
+          },
+          "text": {
+            "type": "boolean",
+            "description": "The bytes are UTF-8 and may travel inline and reach any text model as text."
+          },
+          "tokens": {
+            "type": "object",
+            "description": "Exactly one of per_byte, per_pixel (with max), per_second or fixed.",
+            "additionalProperties": false,
+            "properties": {
+              "per_byte": {
+                "type": "number"
+              },
+              "per_pixel": {
+                "type": "integer"
+              },
+              "max": {
+                "type": "integer"
+              },
+              "per_second": {
+                "type": "integer"
+              },
+              "fixed": {
+                "type": "integer"
+              }
+            }
+          },
+          "extensions": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Extensions, without the dot, that imply this type."
+          },
+          "magic": {
+            "type": "string",
+            "description": "A hex prefix that identifies the bytes."
+          },
+          "stand_in": {
+            "type": "string",
+            "description": "What a consumer that cannot take the type sees; {type} {name} {size} {dims} {duration}."
+          },
+          "check": {
+            "type": "string",
+            "description": "A Rhai script, relative to the blueprint's directory, whose check(bytes, mime_type) refuses bytes that are not what they claim. An empty string lifts a check a broader row put on the type."
+          }
+        }
+      }
+    },
     "transforms": {
       "type": "array",
       "description": "How context maps when one blueprint hands off to another.",
@@ -187,6 +246,13 @@
           }
         }
       }
+    },
+    "dependencies": {
+      "type": "array",
+      "description": "Things that must be in place before the agent runs: an MCP server, an environment variable, a program on PATH, or a condition a Rhai script checks. Declared, never granted; an unmet required dependency fails the spawn before any billed inference.",
+      "items": {
+        "$ref": "#/$defs/dependency"
+      }
     }
   },
   "$defs": {
@@ -214,9 +280,20 @@
           "type": "integer",
           "minimum": 0
         },
+        "tool_rescan": {
+          "enum": [
+            "at_spawn",
+            "after_writes",
+            "before_dispatch"
+          ],
+          "default": "at_spawn",
+          "description": "When a run looks for tools again. `at_spawn` fixes the set when the run starts. `after_writes` adds the workdir's tools/ to the scan set and looks again before the next turn, when the agent itself writes or installs a script. `before_dispatch` also looks at those directories before each batch of tool calls, which is how a tool that arrived any other way is noticed."
+        },
         "dynamic_tools": {
           "type": "boolean",
-          "default": false
+          "default": false,
+          "deprecated": true,
+          "description": "Renamed to `tool_rescan`. `true` still reads as `after_writes`."
         },
         "batch_tool_hint": {
           "type": "boolean"
@@ -264,6 +341,41 @@
           ],
           "default": "reject",
           "description": "What happens to a submission when the validator itself cannot run: it threw, ran out of operations, or returned the wrong type. reject (the default) refuses the submission and sends the script's error back to the model as retry feedback; accept records the answer unchecked. The broken script is flagged on the run either way."
+        },
+        "overwrite_artifacts": {
+          "type": "boolean",
+          "description": "Whether an artifact named after a part the run produced (an image a model drew, a mesh a provider built) may replace a different file already at that path in the working directory. Unset defers to [mime] overwrite_artifacts in the user's config, which defaults to false: the existing file is left alone and the part is written beside it as <stem>-<sha8>.<ext>, which is the path the answer records."
+        },
+        "artifacts": {
+          "type": "array",
+          "description": "Files the stage hands back beside its answer, by name and type. A submission is checked against them: a required one must be present, and one that is present must be of the declared type. Accepted files are stored as parts of the run and served by the API.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "name",
+              "type"
+            ],
+            "properties": {
+              "name": {
+                "type": "string",
+                "description": "What the submission calls it: final, scene, track."
+              },
+              "type": {
+                "type": "string",
+                "description": "The mime type it must be, or a pattern it must match (video/*)."
+              },
+              "required": {
+                "type": "boolean",
+                "default": false,
+                "description": "Whether a submission without it is refused."
+              },
+              "description": {
+                "type": "string",
+                "description": "What it is for, shown to the model."
+              }
+            }
+          }
         }
       }
     },
@@ -297,7 +409,7 @@
         },
         "available_tools": {
           "type": "array",
-          "description": "The only tools the model is offered here. Anything absent is refused at dispatch.",
+          "description": "The only tools the model is offered here. Anything absent is refused at dispatch. An entry may be a tool name or a group token: `@builtin` (every compiled-in tool), `@subagent` (spawn, check, wait, send, kill), `@scripts` (every Rhai tool, the agent's own and the global ones), `@mcp` (every tool every connected server advertises) or `@all`. A group grants whatever exists at the time the stage runs, so a script or server installed later is offered without editing the manifest. Groups never grant submit_output or fan_out; name those, or use the mode that carries them.",
           "items": {
             "type": "string"
           }
@@ -308,7 +420,7 @@
           "items": {
             "type": "string"
           },
-          "$comment": "Kept separate from available_tools because that field is exact-match, and because an MCP tool's advertised name does not reliably carry its server - there is no prefix a wildcard could match."
+          "$comment": "The per-server form. `@mcp` in available_tools grants every connected server at once; this field is for granting one server and not another."
         },
         "require_output": {
           "type": "boolean",
@@ -318,6 +430,27 @@
         },
         "output": {
           "$ref": "#/$defs/outputSpec"
+        },
+        "input": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "What this stage takes as typed parts, beyond what the regions it sees already say.",
+          "properties": {
+            "accepts": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Mime type patterns the stage takes as parts (image/*, audio/wav). Left off, the union of the visible regions' accepts. Shown by lev validate and used to prefer a model that covers them."
+            },
+            "as_text": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Mime type patterns whose parts reach this stage's model as text whatever the model takes: the text bypass, forced. For a type the registry already calls text this changes nothing."
+            }
+          }
         },
         "required_tools": {
           "type": "array",
@@ -379,6 +512,17 @@
         "security": {
           "type": "object"
         },
+        "tool_accepts": {
+          "type": "object",
+          "description": "What each tool may be handed at this stage: a tool name to a list of mime type patterns. A stored part outside the list is out of that tool's reach here (spawn_agent's parts, a script's read_part and list_parts, context_export). Inline text is never hidden.",
+          "additionalProperties": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "string"
+            }
+          }
+        },
         "tool_permissions": {
           "$ref": "#/$defs/toolPermissions"
         },
@@ -390,8 +534,14 @@
             "default_region": {
               "type": "string"
             },
+            "keep_results": {
+              "type": "boolean",
+              "description": "Whether a tool's result stays in the region it was routed to. False sends it to `scratch` instead, where the stage can drop it."
+            },
             "persist": {
-              "type": "boolean"
+              "type": "boolean",
+              "deprecated": true,
+              "description": "Renamed to `keep_results`. Still read; `lev update` rewrites it."
             },
             "max_result_tokens": {
               "type": "integer",
@@ -432,6 +582,13 @@
             }
           }
         },
+        "output_routing": {
+          "type": "object",
+          "description": "Where the model's produced parts go, by mime type: a mime pattern (image/png, image/*, */*) to a region name. A reply that mixes text and media is split part by part; each part goes to the most specific matching pattern's region, and text and unmatched parts stay in conversation. The target need only be a region some layout declares, so a stage can hand a produced file to a later stage or to the user.",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
         "context": {
           "type": "object",
           "additionalProperties": false,
@@ -445,7 +602,16 @@
             "hide": {
               "type": "array",
               "description": "Regions this stage leaves out of its prompt. Hidden, not destroyed: the content is kept and every other stage sees it. Names must be declared by a layout in this blueprint, and the always-visible regions (conversation, tool_results, final_output, stage_instructions) cannot be hidden.",
-              "items": { "type": "string" }
+              "items": {
+                "type": "string"
+              }
+            },
+            "reset": {
+              "type": "array",
+              "description": "Regions emptied when this stage is entered, so it starts on a clean slate. Unlike hide, this clears the content (gone, not hidden); a re-entered stage clears it each visit. conversation can be reset. Names must be declared by a layout in this blueprint.",
+              "items": {
+                "type": "string"
+              }
             }
           }
         },
@@ -694,8 +860,21 @@
           "type": "string",
           "description": "For `kind = \"custom\"`: the Rhai script under context_hooks/."
         },
+        "pinned": {
+          "type": "boolean",
+          "description": "Make a custom region behave like a pinned one: never evicted, immune to a `clear` transform, counted as fixed budget."
+        },
         "persistent": {
-          "type": "boolean"
+          "type": "boolean",
+          "deprecated": true,
+          "description": "Renamed to `pinned`. Still read; `lev update` rewrites it."
+        },
+        "accepts": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Mime types this region takes, each type/subtype or type/*. Absent means anything. A write carrying a part outside the list is refused with the list."
         }
       }
     },
@@ -864,6 +1043,21 @@
               "type": "string",
               "description": "A checklist region that must have no open items before this edge is taken."
             },
+            "require_region_entries": {
+              "type": "object",
+              "description": "A region that must hold at least so many entries before this edge is taken. The gate holds the stage and re-runs it with the message until the count is met, so a stage whose model cannot call tools (an image model) draws until its set is complete.",
+              "additionalProperties": false,
+              "required": ["region", "at_least"],
+              "properties": {
+                "region": {
+                  "type": "string"
+                },
+                "at_least": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              }
+            },
             "message": {
               "type": "string"
             },
@@ -1022,8 +1216,14 @@
             "type": "string"
           }
         },
+        "keep_warm": {
+          "type": "boolean",
+          "description": "Keep one container warm across the run's stages rather than building one per call. It is still torn down when the run ends."
+        },
         "persist": {
-          "type": "boolean"
+          "type": "boolean",
+          "deprecated": true,
+          "description": "Renamed to `keep_warm`. Still read; `lev update` rewrites it."
         },
         "on_unavailable": {
           "enum": [
@@ -1076,6 +1276,135 @@
         },
         "on_error": {
           "type": "string"
+        }
+      }
+    },
+    "dependency": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "One [[dependencies]] entry. The kind field selects what must be present and which of the kind fields (server/env, var, command, check) apply.",
+      "required": [
+        "name",
+        "kind"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "A short identifier, unique within the blueprint."
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "mcp_server",
+            "env",
+            "binary",
+            "script"
+          ],
+          "description": "What must be present."
+        },
+        "required": {
+          "type": "boolean",
+          "default": true,
+          "description": "Whether an unmet dependency blocks the run."
+        },
+        "remedy": {
+          "type": "string",
+          "description": "A human sentence on how to satisfy the dependency, shown when it is missing."
+        },
+        "description": {
+          "type": "string",
+          "description": "Why the agent needs it."
+        },
+        "server": {
+          "type": "string",
+          "description": "kind=mcp_server: the MCP server name that must be configured."
+        },
+        "env": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "kind=mcp_server: environment variables or secrets the server needs."
+        },
+        "var": {
+          "type": "string",
+          "description": "kind=env: the variable that must be set and non-empty."
+        },
+        "command": {
+          "type": "string",
+          "description": "kind=binary: the program that must resolve on PATH."
+        },
+        "check": {
+          "type": "string",
+          "description": "kind=script: path to the Rhai check script (returns #{ ok, remedy })."
+        },
+        "install": {
+          "$ref": "#/$defs/dependencyInstall"
+        }
+      }
+    },
+    "dependencyInstall": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "How `lev deps install` can put a dependency in place. Never run automatically.",
+      "properties": {
+        "command": {
+          "type": "string",
+          "description": "A shell command that installs the dependency on any platform."
+        },
+        "commands": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Per-OS shell commands keyed by macos/linux/windows, preferred over command on a matching host."
+        },
+        "script": {
+          "type": "string",
+          "description": "A Rhai install script (relative to the blueprint), gated like a script tool."
+        },
+        "server": {
+          "$ref": "#/$defs/mcpServerTemplate"
+        }
+      }
+    },
+    "mcpServerTemplate": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "kind=mcp_server install: the non-secret server settings written into the user's config. Secrets are named in env and prompted for.",
+      "properties": {
+        "transport": {
+          "type": "string",
+          "enum": [
+            "stdio",
+            "http"
+          ]
+        },
+        "command": {
+          "type": "string"
+        },
+        "url": {
+          "type": "string"
+        },
+        "args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "headers": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Non-secret headers; a value may reference a secret with ${VAR} named in env."
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Environment for a stdio server's child; a value may reference a secret with ${VAR} named in env."
         }
       }
     }

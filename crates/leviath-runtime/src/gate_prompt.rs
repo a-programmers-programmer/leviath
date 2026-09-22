@@ -146,8 +146,11 @@ pub(crate) async fn run_gate_prompt(call: GatedCall, lane: PromptLane<GatePrompt
         outcomes,
         wake,
     } = lane;
+    // Minted before the id is moved into the backend, and carrying the run
+    // because the hub behind that backend is shared with every other run.
+    let id = leviath_core::interaction::request_id(&agent_id, "gate", &tool_id);
     let backend = hub.backend_for(agent_id);
-    let req = build_gate_request(format!("gate-{tool_id}"), &tool_name, taint, clearance);
+    let req = build_gate_request(id, &tool_name, taint, clearance);
     let resolution = resolution_from_answer(&backend.ask(req).await);
     let _ = outcomes.send(GatePromptOutcome {
         entity,
@@ -370,6 +373,7 @@ mod tests {
     fn state() -> AgentState {
         AgentState {
             agent_id: "run".to_string(),
+            current_visit: String::new(),
             current_stage: "s".to_string(),
             iteration: 0,
             status: crate::components::AgentStatus::Active,

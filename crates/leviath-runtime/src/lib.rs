@@ -62,6 +62,7 @@
 
 // Public because [`tool_bridge::ToolJob`] carries a `CancelToken`, so anything
 // handing work to the tool lane needs to name the type.
+pub mod blob_store;
 pub mod cancel;
 pub(crate) mod compaction_bridge;
 pub mod components;
@@ -82,11 +83,14 @@ pub(crate) mod inference_usage;
 pub mod interaction_hub;
 pub mod interaction_points;
 pub(crate) mod lane_supervisor;
+pub(crate) mod mime_tools;
 pub(crate) mod output_tool;
+pub mod persist_stats;
 pub mod persistence;
 pub(crate) mod persistence_bridge;
 pub mod pipeline;
 pub mod provider_creds;
+pub mod provider_files;
 pub(crate) mod providers;
 pub(crate) mod repetition;
 pub mod restore;

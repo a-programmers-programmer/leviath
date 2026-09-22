@@ -130,6 +130,44 @@ const MIN_OUTPUT_TOKENS: usize = 1;
 /// slack - and it is proportional because the error it covers is.
 const PROMPT_ESTIMATE_HEADROOM: usize = 16;
 
+/// The tokens a provider will bill for the stored parts a request sends as
+/// bytes, over what the window charged for them.
+///
+/// The window charges a stored part its one-line stand-in; a model that takes
+/// the bytes is billed the part's real cost, which the registry estimated at
+/// ingest. Only the parts this model takes count, and not one the stage sends
+/// as text (`as_text`), which is billed as the text it is. Hydration may still
+/// cap or drop a part, in which case the bill comes in under this figure and
+/// the calibration simply sees no shortfall - the safe direction to miss in.
+pub(super) fn native_media_tokens(
+    request: &leviath_providers::InferenceRequest,
+    mime: &leviath_providers::capabilities::ModelMime,
+    as_text: &[String],
+) -> usize {
+    request
+        .messages
+        .iter()
+        .filter_map(|m| match &m.content {
+            leviath_providers::MessageContent::Blocks(blocks) => Some(blocks),
+            leviath_providers::MessageContent::Text(_) => None,
+        })
+        .flatten()
+        .filter_map(|block| match block {
+            leviath_providers::ContentBlock::Mime { part, deliver, .. }
+                if mime.accepts(&part.mime_type)
+                    && *deliver != Some(leviath_core::mime::Delivery::Text)
+                    && !part.mime_type.matches_any(as_text) =>
+            {
+                Some(
+                    part.tokens
+                        .saturating_sub(leviath_core::estimate_tokens(&part.stand_in)),
+                )
+            }
+            _ => None,
+        })
+        .sum()
+}
+
 /// What earlier calls in this run taught us, carried into the next request.
 ///
 /// Three pieces of evidence with one thing in common: none of them can be
@@ -151,6 +189,96 @@ pub(crate) struct PriorCalls {
     /// A reply in this stage was cut off at the output cap, so the cap goes
     /// out at the model's maximum instead of the stage's setting.
     pub(crate) raise_output_cap: bool,
+}
+
+/// This run writes the exact request it sends the model into its journal, once
+/// per provider attempt.
+///
+/// A marker rather than a field on the stage's inference config, because it is a
+/// property of the run and not of a stage: it arrives from `[observability]
+/// capture_model_input` or from the spawn's own `capture_model_input`, and every
+/// stage of a captured run is captured.
+///
+/// Absent on all but the runs whose operator asked, which is the whole safety
+/// property: a captured request is the whole prompt, with whatever the context
+/// held in it.
+#[derive(Component, Debug, Clone, Copy, Default)]
+pub struct CaptureModelInput;
+
+/// The version of the prompt-assembly logic, recorded beside every captured
+/// request so a body stays interpretable once assembly changes.
+///
+/// Bumped by hand when what a request *means* changes: a system block that moves
+/// tier, a message shape that is built differently, guidance that is prepended
+/// where it was not. Adding a field a provider ignores does not move it.
+pub const MODEL_INPUT_ASSEMBLY_VERSION: &str = "1";
+
+/// An opaque identifier for the tool set one request offered the model.
+///
+/// Folded from each tool's name, description and parameter schema, so two
+/// requests that advertised the same tools share it and two that differ anywhere
+/// do not. Order participates: a model reads the list in the order it is given.
+pub(crate) fn tool_catalog_version(tools: &[Tool]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for tool in tools {
+        tool.name.hash(&mut hasher);
+        tool.description.hash(&mut hasher);
+        tool.parameters.to_string().hash(&mut hasher);
+    }
+    format!("{:016x}", hasher.finish())
+}
+
+/// The fingerprint of the window a request was assembled from.
+///
+/// Folded from the same per-entry digest the persistence lane computes to
+/// coalesce snapshots, so an attempt's fingerprint and a snapshot's idea of
+/// "unchanged" cannot disagree.
+pub(crate) fn source_context_digest(window: &ContextWindow, stage_name: &str) -> String {
+    let snapshot = crate::persistence::build_context_snapshot(window, stage_name);
+    leviath_core::run_archive::digest_context(&snapshot).fingerprint()
+}
+
+/// The parameters a built request really carries, after every override and
+/// clamp.
+///
+/// Read off the assembled request rather than off the stage's declaration,
+/// because the two differ routinely: the completion budget is whatever the
+/// window had room for, and a model that does not take a temperature gets zero
+/// whatever the blueprint asked.
+///
+/// `max_output_tokens` is spelled as a stage spells it, so a reader parses one
+/// vocabulary for a declared cap and an effective one.
+pub(crate) fn effective_parameters(
+    request: &InferenceRequest,
+) -> std::collections::BTreeMap<String, serde_json::Value> {
+    let mut table = std::collections::BTreeMap::new();
+    table.insert(
+        "temperature".to_string(),
+        serde_json::Value::from(request.temperature),
+    );
+    table.insert(
+        "max_output_tokens".to_string(),
+        serde_json::Value::from(request.max_tokens),
+    );
+    request.request_timeout_secs.into_iter().for_each(|secs| {
+        table.insert(
+            "request_timeout_secs".to_string(),
+            serde_json::Value::from(secs),
+        );
+    });
+    // Whatever the stage passed through for the provider (`top_p`, `stop`,
+    // `seed`, a retention knob), flattened in beside the two every provider
+    // takes. `Null` when the stage set none, which is the ordinary case.
+    request
+        .extra
+        .as_object()
+        .into_iter()
+        .flatten()
+        .for_each(|(key, value)| {
+            table.insert(key.clone(), value.clone());
+        });
+    table
 }
 
 /// Build the [`InferenceRequest`] for an agent from its context window + stage
@@ -244,12 +372,53 @@ pub(crate) fn build_request(
         _ => serde_json::Value::Null,
     };
 
+    // A model that cannot call tools is refused by its provider for any
+    // function call in the request, the history included. Everything a tool
+    // did earlier in the run reaches it as prose instead, and nothing is
+    // advertised to it.
+    let (messages, filtered_tools) = if caps.supports_tools {
+        (assembled.messages, filtered_tools)
+    } else {
+        // `submit_output` alone is what an output stage is always granted, and
+        // a stage on an image or video model is exactly that: nothing the
+        // blueprint asked for is being withheld, so there is nothing to warn of.
+        if filtered_tools
+            .iter()
+            .any(|t| t.name != leviath_tools::SUBMIT_OUTPUT_TOOL)
+        {
+            tracing::warn!(
+                model = %stage.model,
+                tools = filtered_tools.len(),
+                "the model cannot call tools; the stage's tools are not advertised to it"
+            );
+        }
+        (
+            leviath_providers::flatten_tool_turns(assembled.messages),
+            Vec::new(),
+        )
+    };
+
     let mut system = hint_blocks(config, &filtered_tools, std::env::consts::OS);
     system.extend(assembled.system_blocks);
 
+    // A model that does not read a system prompt has the stage's instruction
+    // folded into the user turn instead, or it is lost. It lands in the system
+    // blocks with a bare "Begin." user nudge (the convention that makes a text
+    // model act); a model that ignores the system prompt generates from the
+    // nudge - an image model's "Begin." becomes generic "start of a journey"
+    // scenery, never the asked subject. The capability says whether the model
+    // reads the system prompt; `ignores_system_prompt` is the one-off for a
+    // model no catalogue distinguishes (`gemini-2.5-flash-image`).
+    let mut messages = messages;
+    let reads_system = caps.supports_system_prompt
+        && !leviath_providers::capabilities::ignores_system_prompt(&stage.model);
+    if !reads_system {
+        fold_system_into_user(&mut system, &mut messages);
+    }
+
     let request = InferenceRequest {
         system,
-        messages: assembled.messages,
+        messages,
         model: stage.model.clone(),
         max_tokens,
         temperature,
@@ -258,6 +427,46 @@ pub(crate) fn build_request(
         request_timeout_secs: config.and_then(|c| c.request_timeout_secs),
     };
     (request, system_hash, block_hashes)
+}
+
+/// Fold the system blocks into the first user turn and clear them, for a model
+/// that does not read a system prompt. Done into the *first* user message, once,
+/// so a multi-turn conversation keeps its shape: the bare "Begin." nudge is
+/// replaced outright, a real text turn is prefixed, and a turn that carries
+/// blocks (an input image) gains the text ahead of them. With no user turn at
+/// all the folded system becomes one.
+pub(crate) fn fold_system_into_user(
+    system: &mut Vec<leviath_providers::SystemBlock>,
+    messages: &mut Vec<leviath_providers::Message>,
+) {
+    let text = system
+        .iter()
+        .map(|block| block.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if text.is_empty() {
+        return;
+    }
+    system.clear();
+    match messages.iter_mut().find(|m| m.role == "user") {
+        Some(first) => match &mut first.content {
+            leviath_providers::MessageContent::Text(existing) => {
+                *existing = match existing.trim() == leviath_providers::OPENING_TURN {
+                    true => text,
+                    false => format!("{text}\n\n{existing}"),
+                };
+            }
+            leviath_providers::MessageContent::Blocks(blocks) => {
+                blocks.insert(0, leviath_providers::ContentBlock::Text { text });
+            }
+        },
+        None => messages.push(leviath_providers::Message {
+            role: "user".to_string(),
+            content: leviath_providers::MessageContent::Text(text),
+            cache_breakpoint: false,
+            reasoning: None,
+        }),
+    }
 }
 
 /// Build the [`RetryPolicy`] for a job from the operator's `[limits]` retry
@@ -348,6 +557,7 @@ type InferenceQuery = (
     Option<&'static SystemPrefixHash>,
     Option<&'static SystemBlockHashes>,
     Option<&'static crate::pipeline::PromptCalibration>,
+    Option<&'static CaptureModelInput>,
 );
 
 /// The system prefix the last request sent, as a digest.
@@ -364,6 +574,26 @@ pub(crate) struct SystemPrefixHash(pub u64);
 #[derive(Component, Debug, Clone, Default)]
 pub(crate) struct SystemBlockHashes(pub Vec<u64>);
 
+/// The optional resources dispatch reads, as one parameter: the operator's
+/// circuit and retry settings, and the mime store, registry and limits. Every
+/// one is optional because a world assembled by hand in a test installs none
+/// of them, and each has a built-in answer for that case.
+#[derive(bevy_ecs::system::SystemParam)]
+pub(crate) struct DispatchTuning<'w, 's> {
+    /// Which providers' circuits are open.
+    pub circuits: Option<Res<'w, ProviderCircuits>>,
+    /// When a circuit opens and how long it stays open.
+    pub policy: Option<Res<'w, CircuitPolicy>>,
+    /// The retry schedule.
+    pub retry: Option<Res<'w, InferenceRetryTuning>>,
+    /// The journal lane, so each attempt the job makes is recorded where the
+    /// rest of the run is. Absent in an in-memory world, which then records
+    /// nothing rather than failing to dispatch.
+    pub persist: Option<Res<'w, PersistenceStage>>,
+    /// The mime store, registry and limits.
+    pub mime: crate::blob_store::MimeParams<'w, 's>,
+}
+
 /// Inference-dispatch system: for every `ReadyToInfer` agent, resolve its
 /// provider and, **if a per-model permit is free**, build the request, spawn the
 /// inference job, and move it to `AwaitingInference`. If its provider is missing
@@ -373,11 +603,16 @@ pub(crate) fn dispatch_inference(
     agents: Query<InferenceQuery, With<ReadyToInfer>>,
     stage: Res<InferenceStage>,
     providers: Res<Providers>,
-    circuits: Option<Res<ProviderCircuits>>,
-    policy: Option<Res<CircuitPolicy>>,
-    retry: Option<Res<InferenceRetryTuning>>,
+    tuning: DispatchTuning,
     par_commands: ParallelCommands,
 ) {
+    let DispatchTuning {
+        circuits,
+        policy,
+        retry,
+        persist,
+        mime,
+    } = tuning;
     // Fan out across ready agents: request assembly (`build_request`) is the
     // per-agent CPU cost and is independent, so it runs in parallel on the
     // compute pool. Permit acquisition (an atomic semaphore) and the tokio spawn
@@ -397,6 +632,7 @@ pub(crate) fn dispatch_inference(
     // embedded host, and most tests) gets the built-in schedule.
     let retry_tuning = retry.map(|r| *r).unwrap_or_default();
     let circuits = circuits.as_deref();
+    let persist = persist.as_deref();
     agents.par_iter().for_each(
         |(
             entity,
@@ -410,6 +646,7 @@ pub(crate) fn dispatch_inference(
             prefix,
             block_prefix,
             calibration,
+            capture,
         )| {
             crate::tick_scope::run_agent_parallel(entity, &par_commands, &mut || {
                 if state.status != AgentStatus::Active {
@@ -472,6 +709,13 @@ pub(crate) fn dispatch_inference(
                         raise_output_cap: progress.is_some_and(|p| p.raise_output_cap),
                     },
                 );
+                // Zero retention asked for: the providers that take it per
+                // request get their field here, keyed by the name the stage
+                // resolved to, which is the one the registry knows.
+                let mut request = request;
+                providers
+                    .0
+                    .apply_retention_knobs(&si.provider_name, &mut request.extra);
                 // Remembered for the next request, which is the only way the
                 // breakpoint decision can be made on evidence.
                 par_commands.command_scope(|mut commands| {
@@ -481,13 +725,21 @@ pub(crate) fn dispatch_inference(
                     commands
                         .entity(entity)
                         .insert(SystemBlockHashes(block_hashes.clone()));
-                    // What the window believes this call will cost. The response
-                    // says what it really cost, and the two together are the
-                    // only measurement of the estimator's drift the runtime
-                    // gets.
+                    // What the window believes this call will cost, and what
+                    // its stored parts will be billed over that. The response
+                    // says what it really cost, and the three together are
+                    // the only measurement of the estimator's drift the
+                    // runtime gets.
                     commands
                         .entity(entity)
-                        .insert(crate::pipeline::PromptEstimate(window.current_tokens));
+                        .insert(crate::pipeline::PromptEstimate(
+                            window.current_tokens,
+                            native_media_tokens(
+                                &request,
+                                &provider.mime(&si.model),
+                                config.map(|c| c.as_text.as_slice()).unwrap_or_default(),
+                            ),
+                        ));
                 });
                 // A provider that does not advertise streaming for this model
                 // is called non-streaming whatever the config says: `infer_stream`
@@ -495,13 +747,89 @@ pub(crate) fn dispatch_inference(
                 // asking anyway would pay for the fold and gain nothing.
                 let stream =
                     stage.stream_inference && provider.capabilities(&si.model).supports_streaming;
+                // The bytes of the request's stored parts are read in the
+                // job, off this thread, against what this model takes, typed
+                // by this run's registry. Every `PipelineWorld` installs the
+                // store; a world assembled by hand in a test may not, and
+                // then stored parts go out as their stand-ins.
+                let (mime_resources, max_media_bytes) = mime.hydration_inputs(entity);
+                let limits = provider.media_limits(&si.model);
+                let settings = providers.0.retention_settings();
+                let ttl_secs = mime.provider_file_ttl_secs();
+                let hydration = mime_resources.map(|(store, registry)| {
+                    let (files, why_inline) = crate::provider_files::route_for(
+                        &provider,
+                        &si.provider_name,
+                        &limits,
+                        settings,
+                        store.as_ref(),
+                        &state.agent_id,
+                        ttl_secs,
+                    );
+                    crate::inference_bridge::JobHydration {
+                        store,
+                        run_id: state.agent_id.clone(),
+                        registry,
+                        mime: provider.mime(&si.model),
+                        max_media_bytes: limits.inline_request_bytes.unwrap_or(max_media_bytes),
+                        as_text: config.map(|c| c.as_text.clone()).unwrap_or_default(),
+                        limits,
+                        files,
+                        why_inline,
+                    }
+                });
+                // What every attempt at this call has in common, worked out
+                // here because this is the last place the run, the stage, the
+                // configured provider name and the assembled request exist
+                // together: the job reports only an outcome, and by the time a
+                // retry happens the stage has moved on.
+                //
+                // The digest is the request's identity rather than its content.
+                // Two attempts that share one are the same request sent twice,
+                // which is the question a retry raises; the request itself is
+                // already in the window and has no business being copied into
+                // the journal once per attempt.
+                //
+                // The exact request rides along only for a run whose operator
+                // asked for it. The window fingerprint is computed here for the
+                // same reason the digest is, and only under capture: folding it
+                // walks every entry of the window, which is a cost no run that
+                // is not being captured should pay.
+                let journal = persist.map(|lane| crate::inference_bridge::AttemptJournal {
+                    run_id: state.agent_id.clone(),
+                    stage: state.current_stage.clone(),
+                    provider: si.provider_name.clone(),
+                    model: si.model.clone(),
+                    lane: lane.0.clone(),
+                    digest: leviath_core::run_archive::RequestDigest {
+                        system_hash,
+                        messages: request.messages.len(),
+                        tools: request.tools.len(),
+                        max_tokens: request.max_tokens,
+                        temperature: request.temperature,
+                    },
+                    model_input: crate::inference_bridge::ModelInputPlan {
+                        capture: capture.is_some(),
+                        source_context_digest: capture
+                            .map(|_| source_context_digest(window, &state.current_stage))
+                            .unwrap_or_default(),
+                        parameters: effective_parameters(&request),
+                        tool_catalog_version: tool_catalog_version(&request.tools),
+                    },
+                });
                 let job = InferenceJob {
                     entity,
+                    // Checked here, against the registry's live settings,
+                    // as well as at spawn: zero retention switched on under
+                    // a running daemon holds from the next call.
+                    refused: providers.0.retention_refusal(&si.provider_name, &si.model),
                     provider,
                     request,
                     permit,
                     calibration: calibration.copied(),
                     stream,
+                    hydration,
+                    journal,
                 };
                 let cancel = crate::cancel::CancelToken::new();
                 // Supervised: this agent is about to become `AwaitingInference`,
@@ -524,6 +852,7 @@ pub(crate) fn dispatch_inference(
                         let _ = lost_outcomes.send(InferenceOutcome {
                             entity,
                             result: Err(leviath_providers::ProviderError::Other(message)),
+                            attempt_id: String::new(),
                             // The job never got to measure itself.
                             latency: std::time::Duration::ZERO,
                             // ...and never reached a provider, so it billed

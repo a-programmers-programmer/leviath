@@ -7,9 +7,7 @@ mod catalog;
 
 use crate::capabilities::{Match, Row};
 use crate::learned::LearnedModels;
-use crate::openai_compat::{
-    openai_sse_stream, parse_openai_response, send_chat_request, temperature_refused,
-};
+use crate::openai_compat::{openai_sse_stream, parse_openai_response};
 use crate::provider::{
     InferenceRequest, InferenceResponse, LimitsSource, ModelCapabilities, ModelCapabilityOverride,
     ModelInfo, Provider, ProviderError, Result, StreamChunk,
@@ -64,6 +62,17 @@ pub struct OpenRouterProvider {
     /// Empty until primed, and empty forever if the endpoint could not be
     /// reached - both mean "fall back to the built-in table".
     learned: LearnedModels,
+
+    /// The models OpenRouter has at least one zero-retention endpoint for,
+    /// from `GET /endpoints/zdr`, filled by [`Provider::prime_capabilities`].
+    /// `None` until read, or when the endpoint could not be reached; then
+    /// the compiled-in table answers and a request for zero retention is
+    /// left to OpenRouter to refuse.
+    zdr_models: std::sync::RwLock<Option<std::collections::HashSet<String>>>,
+
+    /// The operator's extra headers, sent after the provider's own on every
+    /// request to `base_url`: a gateway's token, a tenant tag.
+    extra_headers: Vec<(String, String)>,
 }
 
 impl OpenRouterProvider {
@@ -94,6 +103,8 @@ impl OpenRouterProvider {
             warned_unknown: Default::default(),
             temperature_unsupported: Default::default(),
             learned: Default::default(),
+            zdr_models: std::sync::RwLock::new(None),
+            extra_headers: Vec::new(),
         }
     }
 
@@ -113,7 +124,16 @@ impl OpenRouterProvider {
             warned_unknown: Default::default(),
             temperature_unsupported: Default::default(),
             learned: Default::default(),
+            zdr_models: std::sync::RwLock::new(None),
+            extra_headers: Vec::new(),
         }
+    }
+
+    /// Extra headers on every request to the host, after the provider's own:
+    /// what a gateway named in `with_base_url` wants of its own.
+    pub fn with_headers(mut self, headers: Vec<(String, String)>) -> Self {
+        self.extra_headers = headers;
+        self
     }
 
     /// Point this provider at a different host.
@@ -468,13 +488,24 @@ impl OpenRouterProvider {
     /// OpenRouter attributes a request to an app by the referer and title
     /// pair, and sending only the referer left every Leviath call unnamed on
     /// the account's activity page.
-    fn chat_headers(&self) -> [(&'static str, String); 4] {
-        [
-            ("Authorization", format!("Bearer {}", self.api_key)),
-            ("HTTP-Referer", "https://leviath.dev".to_string()),
-            ("X-Title", "Leviath".to_string()),
-            ("Content-Type", "application/json".to_string()),
-        ]
+    fn chat_headers(&self) -> Vec<(&str, String)> {
+        crate::provider::with_extra_header_pairs(
+            vec![
+                ("Authorization", format!("Bearer {}", self.api_key)),
+                ("HTTP-Referer", "https://leviath.dev".to_string()),
+                ("X-Title", "Leviath".to_string()),
+                ("Content-Type", "application/json".to_string()),
+            ],
+            &self.extra_headers,
+        )
+    }
+
+    /// The headers a listing read carries: the key, and the operator's extras.
+    fn listing_headers(&self) -> Vec<(&str, String)> {
+        crate::provider::with_extra_header_pairs(
+            vec![("Authorization", format!("Bearer {}", self.api_key))],
+            &self.extra_headers,
+        )
     }
 
     /// Whether this model has already refused a temperature.
@@ -482,40 +513,88 @@ impl OpenRouterProvider {
         self.temperature_unsupported.contains(model)
     }
 
-    /// Record that it did, for the rest of this process.
-    fn remember_temperature_unsupported(&self, model: &str) {
-        self.temperature_unsupported.insert(model);
+    /// Send a chat request, retrying without temperature if the model refuses
+    /// it, for both the buffered and the streaming paths so they cannot drift.
+    ///
+    /// A fresh refusal - the gateway passes the backend's through verbatim, and
+    /// OpenRouter's `supported_parameters` advertises temperature for a model
+    /// whose backend rejects it - is remembered, temperature is dropped, and
+    /// the request is sent once more. The refusal is the initial HTTP response
+    /// in both paths (before any stream bytes), so the streaming caller catches
+    /// it the same way. A model already remembered never gets here with a
+    /// temperature to begin with: [`Self::capabilities`] reads the memo and
+    /// [`Self::build_request_body`] leaves temperature out up front.
+    async fn send_with_temperature_retry(
+        &self,
+        url: &str,
+        headers: &[(&str, String)],
+        body: &mut serde_json::Value,
+        request: &InferenceRequest,
+    ) -> Result<reqwest::Response> {
+        crate::provider::ChatTarget {
+            client: &self.client,
+            provider: "openrouter",
+            url,
+            headers,
+            limiter: self.rate_limiter.as_ref(),
+            timeout_secs: request.request_timeout_secs,
+        }
+        .send_dropping_refused_temperature(body, &request.model, &self.temperature_unsupported)
+        .await
     }
 
     /// GET `/models`, shared by [`Provider::list_models`] and
     /// [`Provider::prime_capabilities`] so the two cannot disagree about what
     /// the endpoint is or how its failures read.
     async fn fetch_models_json(&self) -> Result<serde_json::Value> {
-        let response = crate::provider::apply_request_timeout(
-            self.client
-                .get(format!("{}/models", self.base_url))
-                .header("Authorization", format!("Bearer {}", self.api_key)),
+        crate::provider::fetch_listing(
+            &self.client,
+            &format!("{}/models", self.base_url),
+            &self.listing_headers(),
             Some(crate::provider::SIDE_CALL_TIMEOUT_SECS),
         )
-        .send()
         .await
-        .map_err(|e| ProviderError::transport("listing models", &e))?;
+    }
 
-        let status = response.status();
-        if !status.is_success() {
-            let error_body = leviath_net::read_caps::read_text_capped(
-                response,
-                leviath_net::read_caps::JSON_BODY_CAP,
-            )
-            .await
-            .unwrap_or_else(|_| "unknown error".to_string());
-            return Err(ProviderError::ApiError(format!(
-                "HTTP {}: {}",
-                status, error_body
-            )));
-        }
+    /// GET `/endpoints/zdr`: every endpoint with a zero-retention policy,
+    /// remembered as the set of model ids that have at least one. Answers
+    /// how many models that is.
+    pub async fn read_zdr_endpoints(&self) -> Result<usize> {
+        let body = crate::provider::fetch_listing(
+            &self.client,
+            &format!("{}/endpoints/zdr", self.base_url),
+            &self.listing_headers(),
+            Some(crate::provider::SIDE_CALL_TIMEOUT_SECS),
+        )
+        .await?;
+        let rows = body
+            .get("data")
+            .and_then(|d| d.as_array())
+            .ok_or_else(|| ProviderError::InvalidResponse("Missing 'data' array".to_string()))?;
+        let models: std::collections::HashSet<String> = rows
+            .iter()
+            .filter_map(|row| row.get("model_id")?.as_str().map(str::to_string))
+            .collect();
+        let count = models.len();
+        *self
+            .zdr_models
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(models);
+        Ok(count)
+    }
 
-        crate::provider::decode_json(response).await
+    /// Whether `model` has a zero-retention endpoint, once the list has
+    /// been read: `None` before then. A variant suffix (`:free`, `:nitro`)
+    /// names a routing preference on the same model, so it is dropped for
+    /// the lookup when the full id is not listed.
+    pub fn has_zdr_endpoint(&self, model: &str) -> Option<bool> {
+        let listed = self
+            .zdr_models
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let models = listed.as_ref()?;
+        let plain = model.split_once(':').map_or(model, |(id, _)| id);
+        Some(models.contains(model) || models.contains(plain))
     }
 
     /// Say so when a model falls through to [`FALLBACK_CAPABILITIES`].
@@ -563,54 +642,15 @@ impl Provider for OpenRouterProvider {
         if let Some(limiter) = &self.rate_limiter {
             limiter.acquire().await?;
         }
+        // The retry/omit itself lives on the inherent impl below, shared by the
+        // streaming path so the two cannot drift.
 
         let mut body = self.build_request_body(request);
         let url = format!("{}/chat/completions", self.base_url);
-        // A model this gateway has already refused a temperature for: send it
-        // without one rather than spend a round trip learning the same thing.
-        if self.temperature_is_unsupported(&request.model)
-            && let Some(fields) = body.as_object_mut()
-        {
-            fields.remove("temperature");
-        }
         let headers = self.chat_headers();
-
-        let mut sent = send_chat_request(
-            &self.client,
-            "openrouter",
-            &url,
-            &headers,
-            &body,
-            self.rate_limiter.as_ref(),
-            request.request_timeout_secs,
-        )
-        .await;
-        // The gateway passes the upstream refusal through verbatim, so the
-        // same answer works here as on the direct provider: drop the
-        // temperature and ask again.
-        if let Err(crate::ProviderError::ApiError(detail)) = &sent
-            && temperature_refused(detail)
-        {
-            tracing::debug!(
-                model = %request.model,
-                "the API refused the temperature we sent; retrying without it"
-            );
-            self.remember_temperature_unsupported(&request.model);
-            if let Some(fields) = body.as_object_mut() {
-                fields.remove("temperature");
-            }
-            sent = send_chat_request(
-                &self.client,
-                "openrouter",
-                &url,
-                &headers,
-                &body,
-                self.rate_limiter.as_ref(),
-                request.request_timeout_secs,
-            )
-            .await;
-        }
-        let response = sent?;
+        let response = self
+            .send_with_temperature_retry(&url, &headers, &mut body, request)
+            .await?;
 
         let response_body: serde_json::Value = crate::provider::decode_json(response).await?;
 
@@ -636,17 +676,15 @@ impl Provider for OpenRouterProvider {
         let mut body = self.build_request_body(request);
         crate::openai_compat::make_streaming(&mut body);
         let url = format!("{}/chat/completions", self.base_url);
-
-        let response = send_chat_request(
-            &self.client,
-            "openrouter",
-            &url,
-            &self.chat_headers(),
-            &body,
-            self.rate_limiter.as_ref(),
-            request.request_timeout_secs,
-        )
-        .await?;
+        let headers = self.chat_headers();
+        // The same temperature-refusal handling as the buffered path: the
+        // refusal is the initial HTTP response, before any stream bytes, so it
+        // is caught and retried here too. Streaming used to skip this, and an
+        // image model reached by streaming failed the run over a temperature it
+        // never needed.
+        let response = self
+            .send_with_temperature_retry(&url, &headers, &mut body, request)
+            .await?;
 
         // Reuse OpenAI SSE parser since the format is identical
         let peer = leviath_net::read_caps::peer_of(&response);
@@ -676,6 +714,48 @@ impl Provider for OpenRouterProvider {
         "openrouter"
     }
 
+    fn learned_models(&self) -> Option<&crate::learned::LearnedModels> {
+        Some(&self.learned)
+    }
+
+    /// The zero-retention list, if it was never read.
+    async fn refresh_retention(&self) {
+        let unread = self
+            .zdr_models
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none();
+        if unread && let Err(e) = self.read_zdr_endpoints().await {
+            tracing::debug!(error = %e, "OpenRouter's zero-retention endpoints could not be read");
+        }
+    }
+
+    /// Once the zero-retention list has been read, a model on it takes the
+    /// documented answer (zero when asked for, per request); a model off it
+    /// cannot be asked, and says so, rather than letting the request field
+    /// go out and be refused by OpenRouter after the run has started.
+    fn live_retention(&self, model: &str) -> Option<crate::retention::RetentionPolicy> {
+        use crate::retention::{Control, Retention, RetentionPolicy, Source};
+        let listed = self.has_zdr_endpoint(model)?;
+        let base = crate::retention::builtin("openrouter", model);
+        Some(match listed {
+            true => RetentionPolicy {
+                source: Source::Live,
+                ..base
+            },
+            false => RetentionPolicy {
+                retention: Retention::Unknown,
+                control: Control::Fixed,
+                source: Source::Live,
+                note: "no OpenRouter endpoint for this model has a zero-retention policy \
+                       (GET /endpoints/zdr lists those that do), so a request for zero \
+                       retention would be refused by OpenRouter; the endpoint's own \
+                       policy applies"
+                    .to_string(),
+            },
+        })
+    }
+
     fn capabilities(&self, model: &str) -> ModelCapabilities {
         // Three answers, narrowest first: what the user wrote, what OpenRouter
         // says, what this build was compiled with.
@@ -696,6 +776,19 @@ impl Provider for OpenRouterProvider {
             caps.supports_temperature = false;
         }
         caps
+    }
+
+    fn mime(&self, model: &str) -> crate::capabilities::ModelMime {
+        // The listing's `architecture` block says outright what a model
+        // takes; before priming, the vendor prefix is the best guess.
+        let base = self
+            .learned
+            .mime_corrected(model, crate::mime_tables::by_prefix(model));
+        let mime = match self.capability_overrides.get(model) {
+            Some(o) => o.apply_mime(base),
+            None => base,
+        };
+        crate::mime::WireShape::OpenAi.carried(mime)
     }
 
     fn serves_model(&self, model_key: &str) -> Option<String> {
@@ -757,6 +850,15 @@ impl Provider for OpenRouterProvider {
             priced,
             "learned OpenRouter model capabilities and rates"
         );
+        // Best effort, like the rates: without the list the compiled-in
+        // table answers, and a request for zero retention is OpenRouter's
+        // to refuse rather than Leviath's.
+        match self.read_zdr_endpoints().await {
+            Ok(n) => tracing::debug!(models = n, "read OpenRouter's zero-retention endpoints"),
+            Err(e) => {
+                tracing::debug!(error = %e, "OpenRouter's zero-retention endpoints could not be read")
+            }
+        }
         Ok(())
     }
 
@@ -776,7 +878,44 @@ impl Provider for OpenRouterProvider {
 }
 
 #[cfg(test)]
+mod mime_tests;
+
+#[cfg(test)]
 mod tests {
+
+    /// Retention is a matter of documentation for a provider that reads no
+    /// setting (OpenAI's is an agreement), so it answers nothing live, and a
+    /// refresh has nothing to read: the trait's defaults.
+    #[tokio::test]
+    async fn a_provider_that_reads_no_retention_setting_answers_none() {
+        use crate::provider::Provider;
+        let provider = crate::openai::OpenAIProvider::new(reqwest::Client::new(), "k".to_string());
+        assert!(provider.live_retention("gpt-5.5").is_none());
+        provider.refresh_retention().await;
+        assert!(provider.live_retention("gpt-5.5").is_none());
+    }
+
+    /// A refresh reads the zero-retention list when it was never read and
+    /// leaves a list already read alone; a list that cannot be read is
+    /// logged and stays unknown.
+    #[tokio::test]
+    async fn a_refresh_reads_the_zero_retention_list_once() {
+        use crate::provider::Provider;
+        let _guard = always_on_tracing_guard();
+        let body = br#"{"data":[{"model_id":"openai/gpt-5"}]}"#;
+        let url = spawn_mock_server(200, "OK", body).await;
+        let provider = provider_with_url(url);
+        provider.refresh_retention().await;
+        assert_eq!(provider.has_zdr_endpoint("openai/gpt-5"), Some(true));
+        // The mock answered its one request; a second read would fail, and
+        // none is made.
+        provider.refresh_retention().await;
+        assert_eq!(provider.has_zdr_endpoint("openai/gpt-5"), Some(true));
+
+        let dead = provider_with_url("http://127.0.0.1:1".to_string());
+        dead.refresh_retention().await;
+        assert_eq!(dead.has_zdr_endpoint("openai/gpt-5"), None);
+    }
 
     /// `/models` quotes USD per token as strings; `ModelPricing` is per million.
     /// Getting that scale wrong is a factor of a million, which is the kind of
@@ -843,6 +982,7 @@ mod tests {
             crate::provider::build_http_client(None).expect("a test client builds"),
             "k".to_string(),
         );
+        assert!(p.learned_models().is_some());
         assert_eq!(p.pricing("x-ai/grok-4.6"), None);
     }
     use super::*;
@@ -1756,6 +1896,79 @@ mod tests {
         assert!(provider.temperature_is_unsupported("openai/gpt-5.5"));
     }
 
+    /// The streaming path retries the same way: an image or reasoning model is
+    /// reached by `infer_stream`, and the refusal used to sail past it and fail
+    /// the run. The refusal is the initial HTTP response, before any SSE bytes,
+    /// so it is caught and the stream resent without temperature.
+    #[tokio::test]
+    async fn a_streamed_request_retries_a_refused_temperature_too() {
+        let refusal = br#"{"error":{"message":"Unsupported parameter: 'temperature' is not supported with this model.","type":"invalid_request_error","param":"temperature","code":null}}"#;
+        let sse = b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+        let (url, bodies) = leviath_testkit::spawn_mock_sequence(vec![
+            (400, "Bad Request", refusal.to_vec()),
+            (200, "OK", sse.to_vec()),
+        ])
+        .await;
+
+        let provider = OpenRouterProvider::new(
+            crate::provider::build_http_client(None).expect("a test client builds"),
+            "key".to_string(),
+        )
+        .with_base_url(Some(url));
+
+        let request = InferenceRequest {
+            system: vec![],
+            messages: vec![crate::provider::Message {
+                role: "user".to_string(),
+                content: "hi".into(),
+                cache_breakpoint: false,
+                reasoning: None,
+            }],
+            model: "openai/gpt-5-image-mini".to_string(),
+            max_tokens: 16,
+            temperature: 0.7,
+            tools: vec![],
+            extra: serde_json::Value::Null,
+            request_timeout_secs: None,
+        };
+
+        let mut stream = provider
+            .infer_stream(&request)
+            .await
+            .expect("the retry rescues the stream");
+        use tokio_stream::StreamExt;
+        let chunk = stream.next().await.expect("a chunk").expect("no error");
+        assert_eq!(chunk.delta, "hi");
+
+        let sent = leviath_core::sync::lock(&bodies).clone();
+        let carried: Vec<bool> = sent.iter().map(|b| b.contains("temperature")).collect();
+        assert_eq!(
+            carried,
+            vec![true, false],
+            "the first stream request carries temperature and the retry drops it: {sent:?}"
+        );
+        assert!(provider.temperature_is_unsupported("openai/gpt-5-image-mini"));
+    }
+
+    /// The operator's extra headers reach the wire on an inference, after
+    /// the provider's own.
+    #[tokio::test]
+    async fn extra_headers_ride_every_request() {
+        let body = br#"{"choices":[{"message":{"content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#;
+        let (url, seen) = leviath_testkit::spawn_mock_recorder(200, "OK", body.to_vec()).await;
+        let provider = provider_with_url(url)
+            .with_headers(vec![("X-Gateway-Token".to_string(), "t-1".to_string())]);
+        provider.infer(&simple_request()).await.unwrap();
+        let request = leviath_core::sync::lock(&seen)[0].to_ascii_lowercase();
+        assert!(request.contains("x-gateway-token: t-1"), "{request}");
+        let own = request.find("authorization").expect("the key is sent");
+        let extra = request.find("x-gateway-token").expect("the extra is sent");
+        assert!(
+            own < extra,
+            "the provider's own header comes first: {request}"
+        );
+    }
+
     #[tokio::test]
     async fn infer_success_parses_response() {
         // Registers a real Subscriber so the tracing::debug! call's field
@@ -1868,6 +2081,96 @@ mod tests {
         let after = provider.capabilities("moonshotai/kimi-k3");
         assert_eq!(after.max_context_tokens, 1_048_576);
         assert_eq!(after.max_output_tokens, 32_768);
+    }
+
+    /// The zero-retention list is read into a set of model ids. A model on
+    /// it keeps the documented answer (per request, zero when asked for); a
+    /// model off it cannot be asked and says so, and a request for zero
+    /// retention does not turn it zero. A variant suffix names the same
+    /// model. Before the list is read, nothing is known.
+    #[tokio::test]
+    async fn the_zero_retention_list_decides_per_model() {
+        use crate::provider::Provider as _;
+        use crate::retention::{Control, Retention, RetentionSettings, Source, resolve};
+        let body = br#"{"data":[{"name":"A | anthropic/claude-sonnet-5","model_id":"anthropic/claude-sonnet-5"},{"model_id":"openai/gpt-5"},{"nonsense":1}]}"#;
+        let url = spawn_mock_server(200, "OK", body).await;
+        let provider = provider_with_url(url);
+        assert_eq!(provider.has_zdr_endpoint("openai/gpt-5"), None);
+        assert!(provider.live_retention("openai/gpt-5").is_none());
+
+        assert_eq!(provider.read_zdr_endpoints().await.unwrap(), 2);
+        assert_eq!(provider.has_zdr_endpoint("openai/gpt-5"), Some(true));
+        assert_eq!(
+            provider.has_zdr_endpoint("anthropic/claude-sonnet-5:nitro"),
+            Some(true),
+            "a variant suffix names the same model"
+        );
+        assert_eq!(provider.has_zdr_endpoint("x-ai/grok-5"), Some(false));
+
+        let asked = RetentionSettings {
+            zero_requested: true,
+            ..Default::default()
+        };
+        let listed = provider.live_retention("openai/gpt-5").unwrap();
+        assert_eq!(listed.source, Source::Live);
+        assert_eq!(listed.control, Control::PerRequest);
+        assert!(resolve(listed, "openrouter", "openai/gpt-5", &asked).is_zero());
+
+        let unlisted = provider.live_retention("x-ai/grok-5").unwrap();
+        assert_eq!(unlisted.retention, Retention::Unknown);
+        assert_eq!(unlisted.control, Control::Fixed);
+        assert!(
+            unlisted.note.contains("no OpenRouter endpoint"),
+            "{}",
+            unlisted.note
+        );
+        assert!(!resolve(unlisted, "openrouter", "x-ai/grok-5", &asked).is_zero());
+
+        // A page without the array is an invalid response, not a panic.
+        let url = spawn_mock_server(200, "OK", br#"{"endpoints":[]}"#).await;
+        let err = provider_with_url(url)
+            .read_zdr_endpoints()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("data"), "{err}");
+    }
+
+    /// Priming reads the models page and then the zero-retention list, and a
+    /// list that cannot be read leaves the models learned all the same.
+    #[tokio::test]
+    async fn priming_reads_the_zero_retention_list_after_the_models() {
+        let _guard = always_on_tracing_guard();
+        let models = br#"{"data":[{"id":"openai/o3","context_length":200000}]}"#.to_vec();
+        let zdr = br#"{"data":[{"model_id":"openai/o3"}]}"#.to_vec();
+        let (url, _) = leviath_testkit::spawn_mock_sequence(vec![
+            (200, "OK", models.clone()),
+            (200, "OK", zdr),
+        ])
+        .await;
+        let provider = provider_with_url(url);
+        provider.prime_capabilities().await.expect("primes");
+        assert_eq!(provider.has_zdr_endpoint("openai/o3"), Some(true));
+        assert_eq!(
+            provider.capabilities("openai/o3").max_context_tokens,
+            200_000
+        );
+
+        let (url, _) = leviath_testkit::spawn_mock_sequence(vec![
+            (200, "OK", models),
+            (500, "Internal Server Error", b"{}".to_vec()),
+        ])
+        .await;
+        let provider = provider_with_url(url);
+        provider
+            .prime_capabilities()
+            .await
+            .expect("the list is best effort");
+        assert_eq!(provider.has_zdr_endpoint("openai/o3"), None);
+        assert_eq!(
+            provider.capabilities("openai/o3").max_context_tokens,
+            200_000
+        );
     }
 
     /// An entry with no `supported_parameters` says nothing about shape, so
@@ -2332,7 +2635,7 @@ mod learned_tests {
             None,
         );
         assert!(provider.capabilities("x/model").supports_temperature);
-        provider.remember_temperature_unsupported("x/model");
+        provider.temperature_unsupported.insert("x/model");
         assert!(!provider.capabilities("x/model").supports_temperature);
     }
 }

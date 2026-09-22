@@ -152,7 +152,7 @@ version = "2.0.0"
 description = "A fully configured agent"
 max_child_depth = 3
 entry_stage = "start"
-dynamic_tools = true
+tool_rescan = "before_dispatch"
 
 [stages.start]
 mode = "autonomous"
@@ -181,7 +181,7 @@ conversation = { kind = "sliding_window", max_items = 20, max_tokens = 10000 }
     assert_eq!(bp.description, "A fully configured agent");
     assert_eq!(bp.max_child_depth, Some(3));
     assert_eq!(bp.entry_stage, Some("start".to_string()));
-    assert!(bp.dynamic_tools);
+    assert_eq!(bp.tool_rescan, crate::blueprint::ToolRescan::BeforeDispatch);
     assert_eq!(bp.stages.len(), 2);
 
     let start = bp.find_stage("start").unwrap();
@@ -461,7 +461,7 @@ fn parse_manifest_custom_region_kind() {
 name = "custom-region-test"
 
 [context.regions]
-brain = { kind = "custom", script = "context_hooks/brain.rhai", persistent = true, max_tokens = 5000 }
+brain = { kind = "custom", script = "context_hooks/brain.rhai", pinned = true, max_tokens = 5000 }
 scratch = { kind = "custom", script = "context_hooks/scratch.rhai", max_tokens = 2000 }
 "#;
     let bp = parse_manifest(toml).unwrap();
@@ -475,10 +475,10 @@ scratch = { kind = "custom", script = "context_hooks/scratch.rhai", max_tokens =
         brain.kind,
         RegionKind::Custom {
             script: "context_hooks/brain.rhai".to_string(),
-            persistent: true,
+            pinned: true,
         }
     );
-    // persistent defaults to false when omitted.
+    // pinned defaults to false when omitted.
     let scratch = bp
         .context_layout
         .regions
@@ -489,7 +489,7 @@ scratch = { kind = "custom", script = "context_hooks/scratch.rhai", max_tokens =
         scratch.kind,
         RegionKind::Custom {
             script: "context_hooks/scratch.rhai".to_string(),
-            persistent: false,
+            pinned: false,
         }
     );
 }
@@ -583,7 +583,7 @@ condition = "always"
     let layout = plan.context_layout.as_ref().unwrap();
     assert!(layout.regions.iter().any(|r| matches!(
         &r.kind,
-        RegionKind::Custom { script, persistent: false } if script == "hooks/plan.rhai"
+        RegionKind::Custom { script, pinned: false } if script == "hooks/plan.rhai"
     )));
     // Sibling stage inherits the global layout (no per-stage override).
     let implement = bp.stages.iter().find(|s| s.name == "implement").unwrap();
@@ -2632,6 +2632,109 @@ mode = "autonomous"
 }
 
 #[test]
+fn parse_manifest_region_accepts() {
+    let toml = r#"
+[agent]
+name = "typed-regions"
+
+[context.regions]
+art = { kind = "pinned", accepts = ["Image/*", "text/plain"] }
+any = { kind = "pinned" }
+"#;
+    let bp = parse_manifest(toml).unwrap();
+    let art = bp
+        .context_layout
+        .regions
+        .iter()
+        .find(|r| r.name == "art")
+        .unwrap();
+    assert_eq!(art.accepts, vec!["image/*", "text/plain"]);
+    let any = bp
+        .context_layout
+        .regions
+        .iter()
+        .find(|r| r.name == "any")
+        .unwrap();
+    assert!(any.accepts.is_empty());
+
+    for (bad, needle) in [
+        ("accepts = \"image/png\"", "expected a list"),
+        ("accepts = [1]", "expected a mime type string"),
+        ("accepts = [\"png\"]", "expected type/subtype or type/*"),
+        ("accepts = [\"a b/*\"]", "expected type/subtype or type/*"),
+    ] {
+        let toml = format!(
+            "[agent]\nname = \"typed-regions\"\n\n[context.regions]\nart = {{ kind = \"pinned\", {bad} }}\n"
+        );
+        let err = parse_manifest(&toml).unwrap_err().to_string();
+        assert!(err.contains(needle), "{bad}: {err}");
+    }
+}
+
+/// A blueprint's `[mime_types]` rows are carried as written, checked at
+/// parse so a bad row fails here rather than being skipped at the first file.
+#[test]
+fn parse_manifest_reads_and_checks_mime_type_rows() {
+    let toml = r#"
+[agent]
+name = "scenes"
+
+[mime_types."application/x-acme-scene"]
+family = "model"
+extensions = ["scene"]
+magic = "41434D45"
+check = "checks/scene.rhai"
+
+[mime_types."model/obj"]
+text = true
+"#;
+    let bp = parse_manifest(toml).expect("parses");
+    assert_eq!(bp.mime_types.len(), 2);
+    let reg = crate::mime::MimeRegistry::builtin()
+        .layered(&bp.mime_types, "blueprint")
+        .unwrap();
+    let scene = reg.info(&crate::mime::MimeType::parse("application/x-acme-scene").unwrap());
+    assert_eq!(scene.family, "model");
+    assert_eq!(scene.check.as_deref(), Some("checks/scene.rhai"));
+    assert_eq!(scene.source, "blueprint");
+    // Round-trips through the blueprint's own serialisation, and an empty
+    // table is left out of it.
+    let json = serde_json::to_string(&bp).unwrap();
+    assert!(json.contains("\"mime_types\""));
+    let back: crate::Blueprint = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.mime_types, bp.mime_types);
+    let plain = parse_manifest("[agent]\nname = \"plain\"\n").unwrap();
+    assert!(plain.mime_types.is_empty());
+    assert!(
+        !serde_json::to_string(&plain)
+            .unwrap()
+            .contains("mime_types")
+    );
+
+    for (bad, needle) in [
+        ("mime_types = 3", "[mime_types] must be a table"),
+        (
+            "[mime_types.png]\nfamily = \"image\"",
+            "[mime_types]: mime_types key png",
+        ),
+        (
+            "[mime_types.\"image/png\"]\nfamilies = 1",
+            "unknown field `families`",
+        ),
+        (
+            "[mime_types.\"image/png\"]\nmagic = \"zz\"",
+            "magic must be hex",
+        ),
+    ] {
+        // The bad rows come first, so a bare key lands at the top level
+        // rather than inside `[agent]`.
+        let toml = format!("{bad}\n\n[agent]\nname = \"scenes\"\n");
+        let err = parse_manifest(&toml).unwrap_err().to_string();
+        assert!(err.contains(needle), "{bad}: {err}");
+    }
+}
+
+#[test]
 fn parse_manifest_stage_accepts_messages_false() {
     let toml = r#"
 [agent]
@@ -3162,6 +3265,46 @@ on_validator_error = 3
     let err = parse_manifest(toml).expect_err("refused").to_string();
     assert!(err.contains("stage 'summary': output"), "{err}");
     assert!(err.contains("got: 3"), "{err}");
+}
+
+/// The artifact overwrite policy is read at both levels, and anything but a
+/// boolean is refused rather than loading as "unset".
+#[test]
+fn overwrite_artifacts_parses_at_agent_and_stage_level() {
+    let toml = r#"
+[agent]
+name = "overwrite-test"
+
+[agent.output]
+overwrite_artifacts = true
+
+[stages.summary]
+mode = "output"
+
+[stages.summary.output]
+overwrite_artifacts = false
+"#;
+    let bp = parse_manifest(toml).expect("parses");
+    assert_eq!(
+        bp.output.as_ref().and_then(|s| s.overwrite_artifacts),
+        Some(true)
+    );
+    let stage = bp.find_stage("summary").expect("the stage exists");
+    assert_eq!(
+        stage.output.as_ref().and_then(|s| s.overwrite_artifacts),
+        Some(false)
+    );
+
+    let toml = r#"
+[agent]
+name = "overwrite-test"
+
+[agent.output]
+overwrite_artifacts = "yes"
+"#;
+    let err = parse_manifest(toml).expect_err("refused").to_string();
+    assert!(err.contains("[agent.output]"), "{err}");
+    assert!(err.contains("true or false"), "{err}");
 }
 
 #[test]
@@ -3857,7 +4000,7 @@ mode = "autonomous"
 
 [stages.main.tool_routing]
 default_region = "my_results"
-persist = true
+keep_results = true
 max_result_tokens = 4096
 
 [stages.main.tool_routing.overrides]
@@ -3871,7 +4014,7 @@ read_file = "file_contents"
         .as_ref()
         .expect("tool_result_routing should be Some");
     assert_eq!(routing.default_region, "my_results");
-    assert!(routing.persist);
+    assert!(routing.keep_results);
     assert_eq!(routing.max_result_tokens, Some(4096));
     assert_eq!(routing.tool_overrides.len(), 2);
     assert_eq!(routing.tool_overrides.get("bash").unwrap(), "bash_output");
@@ -3901,7 +4044,7 @@ default_region = "custom_region"
         .expect("tool_result_routing should be Some");
     assert_eq!(routing.default_region, "custom_region");
     // defaults from ToolResultRouting::default()
-    assert!(routing.persist);
+    assert!(routing.keep_results);
     assert!(routing.max_result_tokens.is_none());
     assert!(routing.tool_overrides.is_empty());
 }
@@ -3918,6 +4061,238 @@ mode = "autonomous"
     let bp = parse_manifest(toml).unwrap();
     let main = bp.find_stage("main").unwrap();
     assert!(main.tool_result_routing.is_none());
+}
+
+#[test]
+fn parse_stage_output_routing_maps_mime_patterns_to_regions() {
+    let toml = r#"
+[agent]
+name = "draw"
+
+[context.regions]
+artwork = { kind = "pinned" }
+notes = { kind = "pinned" }
+
+[stages.draw]
+mode = "autonomous"
+
+[stages.draw.output_routing]
+"image/*" = "artwork"
+"application/pdf" = "notes"
+"#;
+    let bp = parse_manifest(toml).unwrap();
+    let draw = bp.find_stage("draw").unwrap();
+    assert_eq!(draw.output_routing.get("image/*").unwrap(), "artwork");
+    assert_eq!(draw.output_routing.get("application/pdf").unwrap(), "notes");
+}
+
+#[test]
+fn parse_stage_output_routing_rejects_a_key_that_is_not_a_mime_pattern() {
+    let toml = r#"
+[agent]
+name = "draw"
+
+[context.regions]
+artwork = { kind = "pinned" }
+
+[stages.draw]
+mode = "autonomous"
+
+[stages.draw.output_routing]
+"not a mime" = "artwork"
+"#;
+    let err = parse_manifest(toml).expect_err("the key is not a mime type");
+    assert!(err.to_string().contains("output_routing"), "{err}");
+}
+
+#[test]
+fn parse_stage_output_routing_rejects_a_non_string_region() {
+    let toml = r#"
+[agent]
+name = "draw"
+
+[stages.draw]
+mode = "autonomous"
+
+[stages.draw.output_routing]
+"image/*" = 7
+"#;
+    let err = parse_manifest(toml).expect_err("the region must be a string");
+    assert!(err.to_string().contains("must be a region name"), "{err}");
+}
+
+#[test]
+fn output_routing_to_a_region_no_layout_declares_is_refused() {
+    let toml = r#"
+[agent]
+name = "draw"
+
+[context.regions]
+conversation = { kind = "sliding_window" }
+
+[stages.draw]
+mode = "autonomous"
+
+[stages.draw.output_routing]
+"image/*" = "artwork"
+"#;
+    let err = parse_manifest(toml)
+        .expect("shape is fine")
+        .validate()
+        .expect_err("artwork is not declared anywhere");
+    let msg = err.to_string();
+    assert!(msg.contains("artwork"), "{msg}");
+    assert!(msg.contains("output_routing"), "{msg}");
+}
+
+#[test]
+fn output_routing_to_a_declared_region_validates() {
+    let toml = r#"
+[agent]
+name = "draw"
+
+[context.regions]
+artwork = { kind = "pinned" }
+
+[stages.draw]
+mode = "autonomous"
+
+[stages.draw.output_routing]
+"image/*" = "artwork"
+"#;
+    parse_manifest(toml)
+        .expect("shape is fine")
+        .validate()
+        .expect("artwork is declared, so the route is valid");
+}
+
+#[test]
+fn context_reset_must_be_a_list() {
+    let toml = r#"
+[agent]
+name = "draw"
+
+[stages.describe]
+mode = "autonomous"
+
+[stages.describe.context]
+reset = "conversation"
+"#;
+    let err = parse_manifest(toml).expect_err("reset must be a list, not a string");
+    assert!(
+        err.to_string().contains("context.reset must be a list"),
+        "{err}"
+    );
+}
+
+#[test]
+fn route_for_mime_picks_the_most_specific_pattern() {
+    use crate::mime::MimeType;
+    let toml = r#"
+[agent]
+name = "draw"
+
+[context.regions]
+pngs = { kind = "pinned" }
+images = { kind = "pinned" }
+anything = { kind = "pinned" }
+
+[stages.draw]
+mode = "autonomous"
+
+[stages.draw.output_routing]
+"image/png" = "pngs"
+"image/*" = "images"
+"*/*" = "anything"
+"#;
+    let bp = parse_manifest(toml).unwrap();
+    let draw = bp.find_stage("draw").unwrap();
+    let png = MimeType::parse("image/png").unwrap();
+    let jpeg = MimeType::parse("image/jpeg").unwrap();
+    let pdf = MimeType::parse("application/pdf").unwrap();
+    assert_eq!(draw.route_for_mime(&png), Some("pngs"));
+    assert_eq!(draw.route_for_mime(&jpeg), Some("images"));
+    assert_eq!(draw.route_for_mime(&pdf), Some("anything"));
+}
+
+#[test]
+fn route_for_mime_is_none_when_nothing_matches() {
+    use crate::mime::MimeType;
+    let toml = r#"
+[agent]
+name = "draw"
+
+[context.regions]
+artwork = { kind = "pinned" }
+
+[stages.draw]
+mode = "autonomous"
+
+[stages.draw.output_routing]
+"image/*" = "artwork"
+"#;
+    let bp = parse_manifest(toml).unwrap();
+    let draw = bp.find_stage("draw").unwrap();
+    let text = MimeType::parse("text/plain").unwrap();
+    assert_eq!(draw.route_for_mime(&text), None);
+}
+
+#[test]
+fn parse_stage_context_reset_lists_the_regions_to_empty() {
+    let toml = r#"
+[agent]
+name = "draw"
+
+[context.regions]
+artwork = { kind = "pinned" }
+
+[stages.describe]
+mode = "autonomous"
+
+[stages.describe.context]
+reset = ["conversation", "artwork"]
+"#;
+    let bp = parse_manifest(toml).unwrap();
+    let describe = bp.find_stage("describe").unwrap();
+    assert_eq!(describe.context_reset, vec!["conversation", "artwork"]);
+}
+
+#[test]
+fn context_reset_may_name_the_conversation() {
+    // Unlike hide, reset is allowed on the always-visible regions.
+    let toml = r#"
+[agent]
+name = "draw"
+
+[stages.describe]
+mode = "autonomous"
+
+[stages.describe.context]
+reset = ["conversation"]
+"#;
+    parse_manifest(toml)
+        .expect("shape is fine")
+        .validate()
+        .expect("resetting the conversation is allowed");
+}
+
+#[test]
+fn context_reset_of_an_unknown_region_is_refused() {
+    let toml = r#"
+[agent]
+name = "draw"
+
+[stages.describe]
+mode = "autonomous"
+
+[stages.describe.context]
+reset = ["ghost"]
+"#;
+    let err = parse_manifest(toml)
+        .expect("shape is fine")
+        .validate()
+        .expect_err("ghost is not declared");
+    assert!(err.to_string().contains("context.reset"), "{err}");
 }
 
 #[test]
@@ -3960,16 +4335,16 @@ compile = "build_output"
 }
 
 #[test]
-fn parse_stage_tool_routing_persist_false() {
+fn parse_stage_tool_routing_keep_results_false() {
     let toml = r#"
 [agent]
-name = "persist-false"
+name = "keep-results-false"
 
 [stages.main]
 mode = "autonomous"
 
 [stages.main.tool_routing]
-persist = false
+keep_results = false
 "#;
     let bp = parse_manifest(toml).unwrap();
     let main = bp.find_stage("main").unwrap();
@@ -3977,7 +4352,7 @@ persist = false
         .tool_result_routing
         .as_ref()
         .expect("tool_result_routing should be Some");
-    assert!(!routing.persist);
+    assert!(!routing.keep_results);
     // other fields keep defaults
     assert_eq!(routing.default_region, "tool_results");
     assert!(routing.max_result_tokens.is_none());
@@ -4005,7 +4380,7 @@ max_result_tokens = 8192
     assert_eq!(routing.max_result_tokens, Some(8192));
     // other fields keep defaults
     assert_eq!(routing.default_region, "tool_results");
-    assert!(routing.persist);
+    assert!(routing.keep_results);
     assert!(routing.tool_overrides.is_empty());
 }
 
@@ -4135,7 +4510,7 @@ image = "node:22-slim"
 engine = "podman"
 network = false
 mount = ["/data", "/cache"]
-persist = true
+keep_warm = true
 on_unavailable = "warn"
 "#;
     let bp = parse_manifest(toml).unwrap();
@@ -4151,7 +4526,7 @@ on_unavailable = "warn"
     assert_eq!(sb.engine.as_deref(), Some("podman"));
     assert!(!sb.network);
     assert_eq!(sb.mounts, vec!["/data".to_string(), "/cache".to_string()]);
-    assert!(sb.persist);
+    assert!(sb.keep_warm);
     assert_eq!(sb.on_unavailable, crate::OnUnavailable::Warn);
 }
 
@@ -4599,6 +4974,68 @@ notes = { kind = "pinned", max_tokens = 1000 }
     let bp = parse_manifest(toml).expect("parses");
     bp.validate()
         .expect("a cross-stage region reference is fine for a gate");
+}
+
+/// The count gate parses as an inline table, both halves required and the
+/// count positive; the validator holds its region to the same rule as every
+/// other gate's.
+#[test]
+fn a_count_gate_parses_and_refuses_the_typos() {
+    let good = r#"
+[agent]
+name = "t"
+entry_stage = "draw"
+
+[stages.draw]
+mode = "autonomous"
+system_prompt = "go"
+
+[stages.draw.transitions.build]
+condition = "always"
+gate = { require_region_entries = { region = "views", at_least = 4 } }
+
+[stages.build]
+mode = "autonomous"
+system_prompt = "go"
+
+[context.regions]
+views = { kind = "pinned", max_tokens = 1000 }
+"#;
+    let bp = parse_manifest(good).expect("parses");
+    let edge = &bp.stages[0].transitions.as_ref().unwrap()["build"];
+    let count = edge
+        .gate
+        .as_ref()
+        .unwrap()
+        .require_region_entries
+        .as_ref()
+        .unwrap();
+    assert_eq!(count.region, "views");
+    assert_eq!(count.at_least, 4);
+    bp.validate().expect("a declared region is fine");
+
+    let no_region = good.replace(r#"region = "views", "#, "");
+    let err = parse_manifest(&no_region).unwrap_err().to_string();
+    assert!(err.contains("needs a `region`"), "{err}");
+
+    let zero = good.replace("at_least = 4", "at_least = 0");
+    let err = parse_manifest(&zero).unwrap_err().to_string();
+    assert!(err.contains("1 or more"), "{err}");
+
+    let negative = good.replace("at_least = 4", "at_least = -2");
+    let err = parse_manifest(&negative).unwrap_err().to_string();
+    assert!(err.contains("must not be negative"), "{err}");
+
+    let ghost = good.replace(r#"region = "views""#, r#"region = "ghost""#);
+    let err = parse_manifest(&ghost)
+        .expect("parses")
+        .validate()
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("gate.require_region_entries names region 'ghost'"),
+        "{err}"
+    );
 }
 
 #[test]
@@ -5720,6 +6157,11 @@ fn the_published_schema_and_the_parser_agree_on_every_key() {
             super::stage::HOOK_KEYS,
         ),
         ("agent", &["$defs", "agent"][..], super::AGENT_KEYS),
+        (
+            "dependency",
+            &["$defs", "dependency"][..],
+            super::sections::DEPENDENCIES_KEYS,
+        ),
     ] {
         assert_eq!(
             keys_at(schema_path),
@@ -5890,4 +6332,653 @@ fn a_stage_sandbox_refuses_an_unknown_key_naming_it() {
         err.contains("stage 's': sandbox has unknown key 'netwrok'"),
         "{err}"
     );
+}
+
+#[test]
+fn a_stage_declares_what_it_takes_and_hands_back() {
+    let bp = parse_manifest(
+        r#"
+[agent]
+name = "artist"
+
+[context.regions]
+brief = { kind = "pinned", accepts = ["text/*"] }
+storyboard = { kind = "pinned", accepts = ["image/*", "image/png"] }
+scratch = { kind = "temporary" }
+
+[stages.look]
+mode = "autonomous"
+[stages.look.model]
+provider = "anthropic"
+model = "claude-sonnet-5"
+[stages.look.context]
+hide = ["scratch"]
+
+[stages.cut]
+mode = "autonomous"
+[stages.cut.model]
+provider = "anthropic"
+model = "claude-sonnet-5"
+[stages.cut.input]
+accepts = ["audio/wav"]
+as_text = ["model/*"]
+[stages.cut.tool_accepts]
+spawn_agent = ["Image/*", "audio/wav"]
+context_export = ["image/png"]
+[stages.cut.output]
+format = "markdown"
+[[stages.cut.output.artifacts]]
+name = "final"
+type = "Video/MP4"
+required = true
+description = "the cut"
+[[stages.cut.output.artifacts]]
+name = "notes"
+type = "text/*"
+"#,
+    )
+    .unwrap();
+    let look = &bp.stages[0];
+    assert_eq!(bp.stage_inputs(look), ["image/*", "image/png"]);
+    let cut = &bp.stages[1];
+    assert_eq!(bp.stage_inputs(cut), ["audio/wav"]);
+    assert_eq!(cut.input_as_text, ["model/*"]);
+    assert_eq!(
+        cut.tool_limit("spawn_agent"),
+        Some(["image/*".to_string(), "audio/wav".to_string()].as_slice())
+    );
+    assert_eq!(
+        cut.tool_limit("context_export"),
+        Some(["image/png".to_string()].as_slice())
+    );
+    assert!(cut.tool_limit("read_file").is_none());
+    assert!(look.tool_accepts.is_empty());
+    let spec = cut.output.as_ref().unwrap();
+    assert_eq!(spec.artifacts.len(), 2);
+    assert_eq!(spec.artifacts[0].name, "final");
+    assert_eq!(spec.artifacts[0].mime_type, "video/mp4");
+    assert!(spec.artifacts[0].required);
+    assert_eq!(spec.artifacts[0].description.as_deref(), Some("the cut"));
+    assert!(!spec.artifacts[1].required);
+    // A region that takes anything reports `*/*`.
+    let open = parse_manifest(
+        "[agent]\nname = \"o\"\n\n[context.regions]\ntask = { kind = \"pinned\" }\n\n[stages.s]\nmode = \"autonomous\"\n[stages.s.model]\nprovider = \"anthropic\"\nmodel = \"m\"\n",
+    )
+    .unwrap();
+    assert_eq!(open.stage_inputs(&open.stages[0]), ["*/*"]);
+}
+
+#[test]
+fn artifact_declarations_are_checked_at_load() {
+    let base = "[agent]\nname = \"a\"\n\n[context.regions]\ntask = { kind = \"pinned\" }\n\n[stages.s]\nmode = \"autonomous\"\n[stages.s.model]\nprovider = \"anthropic\"\nmodel = \"m\"\n";
+    for (tail, expect) in [
+        (
+            "[stages.s.output]\nartifacts = 5\n",
+            "must be a list of tables",
+        ),
+        (
+            "[stages.s.output]\nartifacts = [\"x\"]\n",
+            "must be a table",
+        ),
+        (
+            "[[stages.s.output.artifacts]]\ntype = \"video/mp4\"\n",
+            "needs a name",
+        ),
+        (
+            "[[stages.s.output.artifacts]]\nname = \"final\"\n",
+            "needs a type",
+        ),
+        (
+            "[[stages.s.output.artifacts]]\nname = \"final\"\ntype = \"video\"\n",
+            "not type/subtype",
+        ),
+        ("[stages.s.input]\nbogus = 1\n", "bogus"),
+        ("[stages.s.input]\naccepts = [\"nope\"]\n", "accepts"),
+        ("[stages.s.input]\nas_text = 5\n", "input"),
+        (
+            "[stages.s.tool_accepts]\nspawn_agent = []\n",
+            "must list at least one mime type",
+        ),
+        (
+            "[stages.s.tool_accepts]\nspawn_agent = \"image/*\"\n",
+            "tool_accepts has spawn_agent",
+        ),
+    ] {
+        let err = parse_manifest(&format!("{base}{tail}"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(expect), "{tail}: {err}");
+    }
+    // A limit table that is not a table.
+    let err = parse_manifest("[agent]\nname = \"a\"\n[stages.s]\ntool_accepts = 3\n")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("tool_accepts must be a table"), "{err}");
+}
+
+// ─── [[dependencies]] ─────────────────────────────────────────────────────
+
+use crate::blueprint::{Dependency, DependencyInstall, DependencyKind, McpServerTemplate};
+
+fn deps_manifest(body: &str) -> Result<crate::Blueprint> {
+    parse_manifest(&format!("[agent]\nname = \"deps\"\n{body}\n"))
+}
+
+#[test]
+fn parses_every_dependency_kind() {
+    let bp = deps_manifest(
+        r#"
+[[dependencies]]
+name = "meshy"
+kind = "mcp_server"
+server = "meshy"
+env = ["MESHY_API_KEY"]
+remedy = "set up meshy"
+description = "image to 3d"
+
+[[dependencies]]
+name = "key"
+kind = "env"
+var = "SOME_KEY"
+
+[[dependencies]]
+name = "blender"
+kind = "binary"
+command = "blender"
+required = false
+
+[[dependencies]]
+name = "probe"
+kind = "script"
+check = "deps/check.rhai"
+"#,
+    )
+    .unwrap();
+    assert_eq!(bp.dependencies.len(), 4);
+    let meshy = &bp.dependencies[0];
+    assert!(meshy.required);
+    assert_eq!(meshy.remedy.as_deref(), Some("set up meshy"));
+    assert_eq!(meshy.description.as_deref(), Some("image to 3d"));
+    assert!(
+        matches!(&meshy.kind, DependencyKind::McpServer { server, env }
+        if server == "meshy" && env == &["MESHY_API_KEY".to_string()])
+    );
+    assert!(matches!(&bp.dependencies[1].kind, DependencyKind::Env { var } if var == "SOME_KEY"));
+    assert!(!bp.dependencies[2].required);
+    assert!(
+        matches!(&bp.dependencies[2].kind, DependencyKind::Binary { command } if command == "blender")
+    );
+    assert!(
+        matches!(&bp.dependencies[3].kind, DependencyKind::Script { check } if check == "deps/check.rhai")
+    );
+    bp.validate().unwrap();
+}
+
+#[test]
+fn dependency_kind_tag_names_each_variant() {
+    assert_eq!(
+        DependencyKind::McpServer {
+            server: "s".into(),
+            env: vec![]
+        }
+        .tag(),
+        "mcp_server"
+    );
+    assert_eq!(DependencyKind::Env { var: "v".into() }.tag(), "env");
+    assert_eq!(
+        DependencyKind::Binary {
+            command: "c".into()
+        }
+        .tag(),
+        "binary"
+    );
+    assert_eq!(DependencyKind::Script { check: "x".into() }.tag(), "script");
+}
+
+#[test]
+fn parses_mcp_install_with_server_template() {
+    let bp = deps_manifest(
+        r#"
+[[dependencies]]
+name = "meshy"
+kind = "mcp_server"
+server = "meshy"
+env = ["MESHY_API_KEY"]
+
+[dependencies.install]
+command = "echo generic"
+
+[dependencies.install.commands]
+macos = "brew install meshy"
+linux = "apt install meshy"
+
+[dependencies.install.server]
+transport = "http"
+url = "https://api.meshy.ai/mcp"
+args = ["--flag"]
+
+[dependencies.install.server.headers]
+Authorization = "Bearer ${MESHY_API_KEY}"
+
+[dependencies.install.server.env]
+MESHY_API_KEY = "${MESHY_API_KEY}"
+"#,
+    )
+    .unwrap();
+    let install = bp.dependencies[0].install.as_ref().unwrap();
+    assert_eq!(install.command.as_deref(), Some("echo generic"));
+    assert_eq!(
+        install.commands.get("macos").map(String::as_str),
+        Some("brew install meshy")
+    );
+    assert_eq!(
+        install.commands.get("linux").map(String::as_str),
+        Some("apt install meshy")
+    );
+    let server = install.server.as_ref().unwrap();
+    assert_eq!(server.transport.as_deref(), Some("http"));
+    assert_eq!(server.url.as_deref(), Some("https://api.meshy.ai/mcp"));
+    assert_eq!(server.args, vec!["--flag".to_string()]);
+    assert_eq!(
+        server.headers.get("Authorization").map(String::as_str),
+        Some("Bearer ${MESHY_API_KEY}")
+    );
+    assert_eq!(
+        server.env.get("MESHY_API_KEY").map(String::as_str),
+        Some("${MESHY_API_KEY}")
+    );
+    bp.validate().unwrap();
+}
+
+#[test]
+fn parses_script_install_and_stdio_server_command() {
+    let bp = deps_manifest(
+        r#"
+[[dependencies]]
+name = "thing"
+kind = "script"
+check = "deps/check.rhai"
+[dependencies.install]
+script = "deps/install.rhai"
+"#,
+    )
+    .unwrap();
+    let install = bp.dependencies[0].install.as_ref().unwrap();
+    assert_eq!(install.script.as_deref(), Some("deps/install.rhai"));
+    bp.validate().unwrap();
+
+    // A stdio server template (command, no transport) parses too.
+    let bp = deps_manifest(
+        r#"
+[[dependencies]]
+name = "srv"
+kind = "mcp_server"
+server = "srv"
+[dependencies.install.server]
+command = "srv-mcp"
+"#,
+    )
+    .unwrap();
+    let server = bp.dependencies[0]
+        .install
+        .as_ref()
+        .unwrap()
+        .server
+        .as_ref()
+        .unwrap();
+    assert_eq!(server.command.as_deref(), Some("srv-mcp"));
+    bp.validate().unwrap();
+}
+
+#[test]
+fn dependency_entry_must_be_a_table() {
+    let err = parse_manifest("dependencies = [\"x\"]\n[agent]\nname = \"d\"\n")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("must be a table"), "{err}");
+}
+
+#[test]
+fn dependency_parse_errors() {
+    for (body, expect) in [
+        (
+            "[[dependencies]]\nkind = \"env\"\nvar = \"X\"",
+            "a dependency needs a name",
+        ),
+        ("[[dependencies]]\nname = \"d\"", "needs a kind"),
+        (
+            "[[dependencies]]\nname = \"d\"\nkind = \"nope\"",
+            "unknown kind 'nope'",
+        ),
+        (
+            "[[dependencies]]\nname = \"d\"\nkind = \"mcp_server\"",
+            "needs 'server'",
+        ),
+        (
+            "[[dependencies]]\nname = \"d\"\nkind = \"env\"",
+            "needs 'var'",
+        ),
+        (
+            "[[dependencies]]\nname = \"d\"\nkind = \"binary\"",
+            "needs 'command'",
+        ),
+        (
+            "[[dependencies]]\nname = \"d\"\nkind = \"script\"",
+            "needs 'check'",
+        ),
+        (
+            "[[dependencies]]\nname=\"d\"\nkind=\"mcp_server\"\nserver=\"s\"\nenv=[1]",
+            "env entries must be strings",
+        ),
+        (
+            "[[dependencies]]\nname=\"d\"\nkind=\"binary\"\ncommand=\"c\"\ninstall = 3",
+            "install must be a table",
+        ),
+        (
+            "[[dependencies]]\nname=\"d\"\nkind=\"mcp_server\"\nserver=\"s\"\n[dependencies.install]\nserver = 3",
+            "install.server must be a table",
+        ),
+        (
+            "[[dependencies]]\nname=\"d\"\nkind=\"mcp_server\"\nserver=\"s\"\n[dependencies.install.server]\nargs=[1]",
+            "install.server.args entries must be strings",
+        ),
+        (
+            "[[dependencies]]\nname=\"d\"\nkind=\"mcp_server\"\nserver=\"s\"\n[dependencies.install.server]\ncommand=\"x\"\n[dependencies.install.server.headers]\nA = 1",
+            "install.server.headers values must be strings",
+        ),
+        (
+            "[[dependencies]]\nname=\"d\"\nkind=\"mcp_server\"\nserver=\"s\"\n[dependencies.install.server]\ncommand=\"x\"\n[dependencies.install.server.env]\nK = 1",
+            "install.server.env values must be strings",
+        ),
+        (
+            "[[dependencies]]\nname=\"d\"\nkind=\"binary\"\ncommand=\"c\"\n[dependencies.install.commands]\nmacos = 1",
+            "install.commands values must be strings",
+        ),
+    ] {
+        let err = deps_manifest(body).unwrap_err().to_string();
+        assert!(err.contains(expect), "body {body:?} -> {err}");
+    }
+}
+
+#[test]
+fn dependency_validate_errors() {
+    for (body, expect) in [
+        (
+            "[[dependencies]]\nname=\"d\"\nkind=\"env\"\nvar=\"A\"\n[[dependencies]]\nname=\"d\"\nkind=\"env\"\nvar=\"B\"",
+            "two dependencies share this name",
+        ),
+        (
+            "[[dependencies]]\nname=\"d\"\nkind=\"binary\"\ncommand=\"c\"\n[dependencies.install.server]\ncommand=\"x\"",
+            "install.server is only valid",
+        ),
+        (
+            "[[dependencies]]\nname=\"d\"\nkind=\"mcp_server\"\nserver=\"s\"\n[dependencies.install.server]\ntransport=\"ftp\"",
+            "must be \"stdio\" or \"http\"",
+        ),
+        (
+            "[[dependencies]]\nname=\"d\"\nkind=\"binary\"\ncommand=\"c\"\n[dependencies.install.commands]\nfreebsd=\"x\"",
+            "must be \"macos\", \"linux\" or \"windows\"",
+        ),
+    ] {
+        let bp = deps_manifest(body).unwrap();
+        let err = bp.validate().unwrap_err().to_string();
+        assert!(err.contains(expect), "body {body:?} -> {err}");
+    }
+}
+
+#[test]
+fn empty_dependency_name_fails_validate() {
+    let mut bp = parse_manifest("[agent]\nname = \"a\"\n").unwrap();
+    bp.dependencies.push(Dependency {
+        name: "  ".into(),
+        kind: DependencyKind::Env { var: "X".into() },
+        required: true,
+        remedy: None,
+        description: None,
+        install: None,
+    });
+    let err = bp.validate().unwrap_err().to_string();
+    assert!(err.contains("non-empty name"), "{err}");
+}
+
+#[test]
+fn dependencies_round_trip_through_json() {
+    let bp = deps_manifest(
+        r#"
+[[dependencies]]
+name = "meshy"
+kind = "mcp_server"
+server = "meshy"
+env = ["MESHY_API_KEY"]
+[dependencies.install]
+command = "pip install meshy"
+[dependencies.install.server]
+url = "https://api.meshy.ai/mcp"
+
+[[dependencies]]
+name = "blender"
+kind = "binary"
+command = "blender"
+required = false
+"#,
+    )
+    .unwrap();
+    let json = serde_json::to_string(&bp.dependencies).unwrap();
+    let back: Vec<Dependency> = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, bp.dependencies);
+}
+
+#[test]
+fn dependency_required_defaults_true_on_deserialize() {
+    let dep: Dependency = serde_json::from_str(r#"{"name":"d","kind":"env","var":"X"}"#).unwrap();
+    assert!(dep.required);
+    assert!(matches!(dep.kind, DependencyKind::Env { .. }));
+}
+
+#[test]
+fn install_and_template_defaults_are_empty() {
+    assert!(DependencyInstall::default().command.is_none());
+    assert!(DependencyInstall::default().commands.is_empty());
+    assert!(McpServerTemplate::default().transport.is_none());
+    assert!(McpServerTemplate::default().args.is_empty());
+}
+
+#[test]
+fn empty_kind_fields_fail_validate() {
+    // The parser rejects an empty kind field up front, so these are only
+    // reachable on a blueprint built in code or restored from JSON. Validate
+    // catches them there too.
+    let cases = [
+        (
+            DependencyKind::McpServer {
+                server: " ".into(),
+                env: vec![],
+            },
+            "non-empty 'server'",
+        ),
+        (
+            DependencyKind::Env { var: String::new() },
+            "non-empty 'var'",
+        ),
+        (
+            DependencyKind::Binary {
+                command: "  ".into(),
+            },
+            "non-empty 'command'",
+        ),
+        (
+            DependencyKind::Script {
+                check: String::new(),
+            },
+            "non-empty 'check'",
+        ),
+    ];
+    for (kind, expect) in cases {
+        let mut bp = parse_manifest("[agent]\nname = \"a\"\n").unwrap();
+        bp.dependencies.push(Dependency {
+            name: "d".into(),
+            kind,
+            required: true,
+            remedy: None,
+            description: None,
+            install: None,
+        });
+        let err = bp.validate().unwrap_err().to_string();
+        assert!(err.contains(expect), "{err}");
+    }
+}
+
+/// Every key that was renamed is still read under the name it used to have.
+///
+/// This is the promise the rename was made on: a blueprint written before it
+/// runs exactly as it did, and nobody has to touch a file to upgrade. The
+/// three settings are checked together because they are one promise, and
+/// because a rename added later with no parser change would leave this test
+/// passing on the two that still work.
+#[test]
+fn a_blueprint_written_before_the_renames_still_parses_the_same() {
+    let manifest = |routing: &str, sandbox: &str, region: &str| {
+        format!(
+            r#"
+[agent]
+name = "old-spelling"
+
+[sandbox]
+kind = "container"
+image = "debian:stable-slim"
+{sandbox} = true
+
+[context.regions]
+brain = {{ kind = "custom", script = "b.rhai", {region} = true }}
+
+[stages.main]
+mode = "autonomous"
+
+[stages.main.tool_routing]
+{routing} = false
+"#
+        )
+    };
+    let old = parse_manifest(&manifest("persist", "persist", "persistent")).expect("the old names");
+    let new = parse_manifest(&manifest("keep_results", "keep_warm", "pinned")).expect("the new");
+    assert_eq!(format!("{old:#?}"), format!("{new:#?}"));
+
+    // And the setting really is the one that was read, not a default that
+    // happens to match: `keep_results` defaults to true, so `false` is only
+    // there because the old key was read.
+    let routing = old
+        .find_stage("main")
+        .unwrap()
+        .tool_result_routing
+        .as_ref()
+        .expect("the stage routes tool results");
+    assert!(!routing.keep_results);
+    assert!(old.sandbox.as_ref().expect("a sandbox").keep_warm);
+}
+
+/// Written both ways, the current name wins.
+///
+/// A file part-way through a rewrite reads as the author's newer intent, and
+/// `lev validate` reports the dead line rather than the parser silently
+/// picking whichever came first.
+#[test]
+fn the_current_name_wins_over_the_old_one() {
+    let bp = parse_manifest(
+        r#"
+[agent]
+name = "both"
+
+[stages.main]
+mode = "autonomous"
+
+[stages.main.tool_routing]
+persist = false
+keep_results = true
+"#,
+    )
+    .expect("both spellings at once still parse");
+    assert!(
+        bp.find_stage("main")
+            .unwrap()
+            .tool_result_routing
+            .as_ref()
+            .expect("the stage routes tool results")
+            .keep_results
+    );
+}
+
+/// Every value of `tool_rescan`, the flag it grew out of, and a word nothing
+/// names.
+///
+/// `dynamic_tools = true` did exactly what `after_writes` does, so a blueprint
+/// carrying it runs unchanged. A misspelled value is refused rather than
+/// defaulted: quietly running at `at_spawn` because somebody typed
+/// `before_dispath` is the failure the strict key checks exist to prevent.
+#[test]
+fn tool_rescan_reads_every_value_and_the_flag_it_replaced() {
+    use crate::blueprint::ToolRescan;
+    let with = |line: &str| {
+        format!("[agent]\nname = \"a\"\n{line}\n\n[stages.main]\nmode = \"autonomous\"\n")
+    };
+    for value in ToolRescan::ALL {
+        let bp = parse_manifest(&with(&format!("tool_rescan = \"{}\"", value.wire())))
+            .expect("every value parses");
+        assert_eq!(bp.tool_rescan, value, "{}", value.wire());
+    }
+
+    assert_eq!(
+        parse_manifest(&with("dynamic_tools = true"))
+            .expect("the flag still parses")
+            .tool_rescan,
+        ToolRescan::AfterWrites
+    );
+    assert_eq!(
+        parse_manifest(&with("dynamic_tools = false"))
+            .expect("and so does the other half")
+            .tool_rescan,
+        ToolRescan::AtSpawn
+    );
+    // Nothing said at all.
+    assert_eq!(
+        parse_manifest(&with("description = \"d\""))
+            .expect("a blueprint need not mention it")
+            .tool_rescan,
+        ToolRescan::AtSpawn
+    );
+
+    // The new key wins where both are written.
+    assert_eq!(
+        parse_manifest(&with("dynamic_tools = true\ntool_rescan = \"at_spawn\""))
+            .expect("both is not an error")
+            .tool_rescan,
+        ToolRescan::AtSpawn
+    );
+
+    let err = parse_manifest(&with("tool_rescan = \"before_dispath\""))
+        .expect_err("a misspelling is refused")
+        .to_string();
+    assert!(err.contains("before_dispath"), "{err}");
+    assert!(
+        err.contains("before_dispatch"),
+        "it lists the real ones: {err}"
+    );
+}
+
+/// What each value turns on, said once so the daemon and the API agree.
+#[test]
+fn each_rescan_value_says_what_it_turns_on() {
+    use crate::blueprint::ToolRescan;
+    assert!(!ToolRescan::AtSpawn.rescans());
+    assert!(!ToolRescan::AtSpawn.before_dispatch());
+    assert!(ToolRescan::AfterWrites.rescans());
+    assert!(!ToolRescan::AfterWrites.before_dispatch());
+    // Strictly more eager, so it does everything the one before it does.
+    assert!(ToolRescan::BeforeDispatch.rescans());
+    assert!(ToolRescan::BeforeDispatch.before_dispatch());
+
+    // The word round-trips, which is what the manifest and the schema share.
+    for value in ToolRescan::ALL {
+        assert_eq!(ToolRescan::parse(value.wire()), Some(value));
+    }
+    assert_eq!(ToolRescan::parse("dynamic"), None);
 }

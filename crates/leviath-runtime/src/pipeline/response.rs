@@ -13,12 +13,17 @@ pub(crate) struct ProcessResponse;
 pub(crate) struct InferenceResults(pub UnboundedReceiver<InferenceOutcome>);
 
 /// Convert a provider response into the stored `InferenceResult` component.
-/// (Ported from `AgentEngine::apply_inference_response`.)
+/// (Ported from `AgentEngine::apply_inference_response`.) `parts` are the
+/// response's mime once stored, from [`store_model_parts`].
 pub(crate) fn to_inference_result(
     response: &leviath_providers::InferenceResponse,
+    parts: Vec<leviath_core::mime::Part>,
+    attempt_id: &str,
 ) -> crate::components::InferenceResult {
     crate::components::InferenceResult {
+        attempt_id: attempt_id.to_string(),
         response: response.content.clone(),
+        parts,
         tool_calls: response
             .tool_calls
             .iter()
@@ -36,62 +41,98 @@ pub(crate) fn to_inference_result(
     }
 }
 
-/// What a person has to do about a provider that could not be reached.
-///
-/// A separate constant rather than a line-continued literal inside the
-/// `format!`: rustfmt reflows those, and it silently baked the source's own
-/// indentation into the middle of the sentence a user reads.
-const UNREACHABLE_REMEDY: &str = "check the network connection, then `lev resume` this run";
-
-/// Whether a failed provider call is the machine's problem rather than the
-/// run's, and if so what to tell the person who has to fix it.
-///
-/// `None` means the run itself is what went wrong and the caller should fail it.
-///
-/// Two lanes ask - the stage call in [`collect_inference`] and the routing call
-/// at a stage boundary in `collect_transition_choice` - and they have to answer
-/// the same way. Split the decision between them and one blip parks a run or
-/// kills it depending on which call happened to be in flight when the network
-/// went. The decision and the wording live here so the two cannot drift; what
-/// each lane must do to keep its own continuation alive is still its own
-/// business, because those genuinely differ.
-pub(super) fn setup_park(
-    err: &leviath_providers::ProviderError,
-    provider: &str,
-) -> Option<(leviath_core::run_meta::SetupBlocker, String)> {
-    use leviath_core::run_meta::SetupBlocker;
-    use leviath_providers::UnavailableReason;
-
-    match err.unavailable_reason()? {
-        // Running out of credits is an account state, not a defect in the run:
-        // the operator tops up and resumes. Failing here would make the run
-        // permanently unresumable and throw away every iteration it has already
-        // paid for, to punish somebody for a billing lapse. Unattended included
-        // - a harness that cannot rescue a run cancels it instead.
-        UnavailableReason::CreditsExhausted => Some((
-            SetupBlocker::CreditsExhausted,
-            format!("out of credits ({err}): top up the account, then `lev resume` this run"),
-        )),
-        // The provider could not be reached and there is no candidate left to
-        // try. That is the network being down, not the run being wrong: the
-        // request never got an answer, so nothing about this run is known to be
-        // bad, and the condition is usually over in seconds and always somebody
-        // else's to fix.
-        //
-        // Reachable only once the retry policy is spent - a transport failure is
-        // transient, so the dispatch job has already tried and backed off
-        // `inference_retry_attempts` times before the outcome gets here.
-        UnavailableReason::Unreachable => Some((
-            SetupBlocker::ProvidersUnavailable,
-            format!("could not reach '{provider}' ({err}): {UNREACHABLE_REMEDY}"),
-        )),
-        // A rejected key or a model the account may not have is a real setup
-        // problem, but one the failover list may still route around, and the
-        // stall watchdog already parks a run whose every candidate is out of
-        // service (see `fail_stalled_dispatch`). Left to the caller's error
-        // path so this change adds no new parking reason.
-        UnavailableReason::AuthFailed | UnavailableReason::Forbidden => None,
+/// Put the mime a model produced into the run's store, each as a stored
+/// part named as the provider named it. A blob the run cannot keep (no
+/// store, over the ceiling) becomes a text part saying so, so the model's
+/// own reply still records that it made something.
+pub(crate) fn store_model_parts(
+    blobs: Vec<leviath_core::mime::Blob>,
+    entity: Entity,
+    run_id: &str,
+    mime: &crate::blob_store::MimeParams,
+) -> Vec<leviath_core::mime::Part> {
+    if blobs.is_empty() {
+        return Vec::new();
     }
+    // Drop byte-identical duplicates a model returned in one reply. Some
+    // gateways echo the same file more than once - a streamed image resent on a
+    // later delta, an `images` array with a repeat - and the store is
+    // content-addressed, so two identical blobs are one file on disk anyway;
+    // keeping both parts would only send the model its own output back twice.
+    // Exact bytes only: a model that returns two genuinely different files,
+    // even near-identical ones, keeps both.
+    let blobs = dedupe_identical_blobs(blobs);
+    let (sources, _) = mime.hydration_inputs(entity);
+    let Some((store, registry)) = sources else {
+        return blobs
+            .into_iter()
+            .map(|blob| {
+                dropped_part(
+                    run_id,
+                    &format!(
+                        "{} of {}, this run has no blob store",
+                        blob.mime_type,
+                        leviath_core::mime::human_size(blob.bytes.len() as u64)
+                    ),
+                )
+            })
+            .collect();
+    };
+    let sink = crate::context_setup::PartSink {
+        store: store.as_ref(),
+        registry: &registry,
+        run_id,
+        max_part_bytes: mime.max_part_bytes(),
+        inline_text_bytes: mime.inline_text_bytes(),
+    };
+    blobs
+        .into_iter()
+        .enumerate()
+        .map(|(i, blob)| {
+            let name = blob
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("model-{}", i + 1));
+            let mut inbound = leviath_core::mime::InboundPart::from_bytes(name, blob.bytes);
+            inbound.mime_type = Some(blob.mime_type);
+            sink.store_part(&inbound)
+                .unwrap_or_else(|e| dropped_part(run_id, &e))
+        })
+        .collect()
+}
+
+/// The text every part the run could not keep begins with, so a stage log or
+/// a test can pick the notes out of a reply's parts.
+pub(crate) const DROPPED_PART_PREFIX: &str = "[model output dropped: ";
+
+/// The text part that stands where a produced part should be, and the
+/// warning that goes with it. Both, because a stage that then has "nothing
+/// to hand back" must read as a ceiling in the run's log, not as a model
+/// that made nothing.
+fn dropped_part(run_id: &str, why: &str) -> leviath_core::mime::Part {
+    tracing::warn!(run = %run_id, "[mime] produced part dropped: {why}");
+    leviath_core::mime::Part::text(format!("{DROPPED_PART_PREFIX}{why}]"))
+}
+
+/// The notes [`dropped_part`] left among a reply's parts, for the stage log.
+pub(crate) fn dropped_part_notes(parts: &[leviath_core::mime::Part]) -> Vec<String> {
+    parts
+        .iter()
+        .filter_map(|p| p.inline_text())
+        .filter(|t| t.starts_with(DROPPED_PART_PREFIX))
+        .map(|t| format!("[mime] {}", t.trim_matches(['[', ']'])))
+        .collect()
+}
+
+/// Keep the first of each byte-identical blob, in the order they arrived.
+/// Identity is the sha256 of the bytes, the same key the blob store uses, so
+/// this drops exactly what the store would have collapsed to one file.
+fn dedupe_identical_blobs(blobs: Vec<leviath_core::mime::Blob>) -> Vec<leviath_core::mime::Blob> {
+    let mut seen = std::collections::HashSet::new();
+    blobs
+        .into_iter()
+        .filter(|b| seen.insert(leviath_core::mime::sha256_hex(&b.bytes)))
+        .collect()
 }
 
 /// What `collect_inference` selects.
@@ -123,6 +164,7 @@ pub(crate) fn collect_inference(
     mut circuits: Option<ResMut<ProviderCircuits>>,
     policy: Option<Res<CircuitPolicy>>,
     persist: Option<Res<crate::pipeline::persist::PersistenceStage>>,
+    mime: crate::blob_store::MimeParams,
     mut commands: Commands,
 ) {
     crate::tick_scope::clear();
@@ -204,14 +246,20 @@ pub(crate) fn collect_inference(
         // counts against it and may take it out of service for everyone.
         if let Some(circuits) = circuits.as_deref_mut() {
             let failed = outcome.result.as_ref().err();
-            match failed.and_then(|e| e.unavailable_reason()) {
-                Some(reason) => {
+            match failed.and_then(|e| e.unavailable_reason().map(|r| (e, r))) {
+                Some((err, reason)) => {
                     // The kind travels with the reason: a provider that
                     // accepted the connection and then answered slowly is not
                     // the same as one that refused it, and the breaker gives the
                     // first far more rope before taking it away from every run.
-                    let kind = failed.and_then(|e| e.failure_kind());
-                    if circuits.record_failure(&called_provider, reason, kind, now, &policy) {
+                    let kind = err.failure_kind();
+                    let opened =
+                        circuits.record_failure(&called_provider, reason, kind, now, &policy);
+                    // The words, kept for the watchdog: a run that later finds
+                    // every provider out of service says what the last one
+                    // actually answered, not only that it stopped.
+                    circuits.note_error(&called_provider, err.describe());
+                    if opened {
                         // Loud and once, on the transition only: without it,
                         // ten dead runs in a row look like ten unrelated
                         // failures.
@@ -299,7 +347,15 @@ pub(crate) fn collect_inference(
                     estimate,
                     response.tokens_used.prompt_tokens,
                 );
-                // Buffer the readable output + a token line for the stage's logs.
+                let parts = store_model_parts(
+                    response.parts.clone(),
+                    outcome.entity,
+                    &state.agent_id,
+                    &mime,
+                );
+                // Buffer the readable output + a token line for the stage's
+                // logs, and a line for each produced part the run could not
+                // keep, so the log says why a stage has nothing to hand back.
                 if let Some(mut buffer) = buffer {
                     if !response.content.trim().is_empty() {
                         buffer.output.push((idx, response.content.clone()));
@@ -312,8 +368,11 @@ pub(crate) fn collect_inference(
                             response.tokens_used.completion_tokens
                         ),
                     ));
+                    for note in dropped_part_notes(&parts) {
+                        buffer.logs.push((idx, note));
+                    }
                 }
-                let result = to_inference_result(&response);
+                let result = to_inference_result(&response, parts, &outcome.attempt_id);
                 commands
                     .entity(outcome.entity)
                     .insert(result)
@@ -386,6 +445,40 @@ pub(crate) fn collect_inference(
                             ),
                         ));
                     }
+                    // Journaled from here rather than from the lane, because
+                    // here is where the decision is made: the job reported a
+                    // failure and knew nothing about a second candidate. Without
+                    // this record the run's attempts change provider between one
+                    // and the next with nothing saying who moved them, which
+                    // reads as a run that was always configured this way.
+                    //
+                    // Keyed on the agent id, which is the run id, so it lands in
+                    // the same journal as the attempts it sits between. A world
+                    // with no lane writes nothing, exactly as the attempts do.
+                    if let Some(persist) = persist.as_deref() {
+                        let record = leviath_core::run_archive::FailoverRecord {
+                            stage: state.current_stage.clone(),
+                            iteration: state.iteration,
+                            from_provider: called_provider.clone(),
+                            from_model: called_model.clone(),
+                            to_provider: next.provider.clone(),
+                            to_model: next.model.clone(),
+                            reason: err
+                                .unavailable_reason()
+                                .map(leviath_providers::UnavailableReason::label)
+                                .expect("a failover only happens for an unusable provider")
+                                .to_string(),
+                            kind: crate::inference_bridge::failure_label(&err),
+                            at: now,
+                        };
+                        let _ = persist.0.send(PersistMsg::Append {
+                            run_id: state.agent_id.clone(),
+                            record: Box::new(
+                                leviath_core::run_archive::RunRecord::InferenceFailover(record),
+                            ),
+                            ack: None,
+                        });
+                    }
                     let si = inference
                         .as_deref_mut()
                         .expect("the failover branch only runs with a StageInference");
@@ -402,7 +495,7 @@ pub(crate) fn collect_inference(
                         .insert(ReadyToInfer);
                     continue;
                 }
-                if let Some((blocker, message)) = setup_park(&err, &called_provider) {
+                if let Some((blocker, message)) = super::park::setup_park(&err, &called_provider) {
                     tracing::warn!(
                         provider = %called_provider,
                         blocker = %blocker,
@@ -526,6 +619,10 @@ pub(crate) fn calibrate(
     let Some(estimate) = estimate else {
         return;
     };
+    // The bytes this request sent are billed at their real cost and charged
+    // to the window as stand-ins; that difference is this request's alone,
+    // not the estimator's, so it comes off before the comparison.
+    let reported = reported.saturating_sub(estimate.1);
     let (moved, shortfall) = match calibration {
         Some(calibration) => (
             calibration.observe(estimate.0, reported),
@@ -561,9 +658,10 @@ pub(crate) struct StageProgress {
     /// Consecutive text-only responses that were nudged toward tool use.
     pub text_only_nudges: usize,
     /// Replies the output cap cut off that were sent back with an explanation
-    /// instead of being taken as the answer. Bounded by
-    /// `MAX_CUT_OFF_NUDGES` so a model that cannot fit its reply in the
-    /// model's own maximum still ends the stage.
+    /// instead of being taken as the answer: a text reply with a nudge, a tool
+    /// call with its refusal. One count for both, bounded by
+    /// `MAX_CUT_OFF_NUDGES`, so a model that cannot fit its reply in the
+    /// model's own maximum still ends the stage whichever shape the reply takes.
     pub cut_off_nudges: usize,
     /// Set once a reply in this stage was cut off: the next requests go out
     /// with the output cap raised to the model's maximum, since the stage's
@@ -609,6 +707,15 @@ pub(crate) struct StageProgress {
     /// without it a stuck interrupt whose edge became unavailable would ping-pong
     /// between [`detect_stuck_stage`] and [`resolve_transition`]'s resume arm.
     pub stuck_fired: bool,
+    /// Image parts this stage has produced. A stage that declares image output
+    /// but has produced none is one whose image generation is failing; the
+    /// counter tells that apart from a stage that has already drawn something
+    /// and is now wrapping up in text.
+    pub images_produced: usize,
+    /// Text-only replies nudged back because the stage expected an image and
+    /// had produced none. Bounded by `MAX_NO_IMAGE_NUDGES` so a model that
+    /// keeps refusing does not loop forever.
+    pub no_image_nudges: usize,
 }
 
 /// How a stage ended, when that governs the transition. Absent ⇒ the stage
@@ -656,6 +763,11 @@ type ProcessResponseQuery = (
     &'static crate::components::InferenceResult,
     &'static mut StageProgress,
     Option<&'static mut crate::persistence::TokenTotals>,
+    // For a stage that ends on cut-off tool calls: the error status, and the
+    // `[error]` line in the stage log that says why.
+    Option<&'static mut crate::components::AgentState>,
+    Option<&'static mut StageIoBuffer>,
+    Option<&'static StageCursor>,
 );
 
 /// Process-response system: route each `ProcessResponse` agent by whether its
@@ -667,7 +779,7 @@ pub(crate) fn process_response(
     mut commands: Commands,
 ) {
     crate::tick_scope::clear();
-    for (entity, result, mut progress, totals) in agents.iter_mut() {
+    for (entity, result, mut progress, totals, state, buffer, cursor) in agents.iter_mut() {
         crate::tick_scope::enter(entity);
         progress.iterations += 1; // per-stage inference count (for max_iterations)
         // Whatever the reply held, the cap it did not fit under is not worth
@@ -679,6 +791,45 @@ pub(crate) fn process_response(
         }
         let mut e = commands.entity(entity);
         e.remove::<ProcessResponse>();
+        // A call the cap cut off mid-argument arrives as text. Its refusal is
+        // this path's nudge, so it spends the same budget a cut-off text
+        // reply does. Both conditions are needed: text arguments alone can
+        // also be a torn journal record, and a reply the cap stopped after
+        // its calls were complete ran them as usual.
+        let cut_off_call = result.cut_off_at.is_some()
+            && result.tool_calls.iter().any(|c| c.arguments.is_string());
+        let cut_off_text = result.cut_off_at.is_some() && result.tool_calls.is_empty();
+        if cut_off_call {
+            if progress.cut_off_nudges >= MAX_CUT_OFF_NUDGES {
+                // Nothing in this reply can run, and the model has been told
+                // how to split the call as many times as the budget allows. A
+                // stage error, not a stage end: an `error` edge takes the run
+                // to recovery with the reason, and without one the run fails
+                // rather than reporting complete with the work undone.
+                let tools: Vec<&str> = result.tool_calls.iter().map(|c| c.name.as_str()).collect();
+                let message = cut_off_stage_error(progress.cut_off_nudges + 1, &tools);
+                tracing::warn!(stage_error = %message, "ending the stage");
+                if let Some(mut buffer) = buffer {
+                    let idx = cursor.map_or(0, |c| c.index);
+                    buffer.logs.push((idx, format!("[error] {message}")));
+                }
+                if let Some(mut state) = state {
+                    state.status = AgentStatus::Error {
+                        message: message.clone(),
+                    };
+                }
+                e.insert(StageOutcome::Errored(message))
+                    .insert(ResolveTransition);
+                continue;
+            }
+            progress.cut_off_nudges += 1;
+        } else if !cut_off_text {
+            // Counted in a row: a reply that was not cut off (any number of
+            // ordinary tool calls, or an answer) shows the model got past it,
+            // so a later cut-off starts a fresh budget. A cut-off text reply
+            // is counted by `handle_empty_response`.
+            progress.cut_off_nudges = 0;
+        }
         if result.tool_calls.is_empty() {
             e.insert(ReadyForTransition);
         } else {
@@ -738,6 +889,7 @@ pub(crate) fn stage_output_is_reviewed(bp: &AgentBlueprint, cursor: &StageCursor
 /// lifetimes: the borrow is bound when the query is fetched.
 type EmptyResponseQuery = (
     Entity,
+    Option<&'static crate::components::AgentState>,
     &'static mut ContextWindow,
     &'static crate::components::InferenceResult,
     &'static mut StageProgress,
@@ -762,12 +914,19 @@ type EmptyResponseQuery = (
 /// for itself. The text supports `{stage}` and `{regions}` placeholders.
 pub(crate) fn handle_empty_response(
     mut agents: Query<EmptyResponseQuery, With<ReadyForTransition>>,
+    mime: crate::blob_store::MimeParams,
     mut commands: Commands,
 ) {
     crate::tick_scope::clear();
-    for (entity, mut window, infer, mut progress, bp, cursor, global) in agents.iter_mut() {
+    for (entity, state, mut window, infer, mut progress, bp, cursor, global) in agents.iter_mut() {
         crate::tick_scope::enter(entity);
         let stage = bp.0.stages.get(cursor.index);
+        // Where a long reply is stored, when the world has a store and this
+        // run is known by id.
+        let (sources, _) = mime.hydration_inputs(entity);
+        let sink = state.and_then(|state| {
+            crate::context_setup::PartSink::over(&sources, &state.agent_id, &mime)
+        });
         let nudge = leviath_core::resolve_nudge(
             global.map(|g| &g.0),
             bp.0.nudge.as_ref(),
@@ -785,7 +944,13 @@ pub(crate) fn handle_empty_response(
             && progress.cut_off_nudges < MAX_CUT_OFF_NUDGES
         {
             progress.cut_off_nudges += 1;
-            store_text_reply(&mut window, &infer.response, infer.reasoning.clone());
+            store_reply(
+                &mut window,
+                infer,
+                infer.reasoning.clone(),
+                stage,
+                sink.as_ref(),
+            );
             inject_system_nudge(&mut window, &cut_off_nudge(cut_off_at));
             commands
                 .entity(entity)
@@ -793,7 +958,48 @@ pub(crate) fn handle_empty_response(
                 .insert(ReadyToInfer);
             continue;
         }
-        if progress.total_tool_calls > 0 || !nudge.enabled || progress.text_only_nudges >= nudge.max
+        // A stage that produces an image but just returned text, and has drawn
+        // nothing so far, is one whose image generation is failing: a refusal, a
+        // content filter, or an error string in place of a data URI. Count what
+        // this turn drew first (an image reply has no tool calls, so it lands
+        // here too); if the stage still has no image, send the model's own words
+        // back so the retry is informed. Bounded, so a model that keeps refusing
+        // lets the stage end rather than looping.
+        if let Some(family) = stage_expected_media(stage) {
+            progress.images_produced += media_part_count(&infer.parts, family);
+            if progress.images_produced == 0 && progress.no_image_nudges < MAX_NO_IMAGE_NUDGES {
+                progress.no_image_nudges += 1;
+                tracing::warn!(
+                    stage = stage.map(|s| s.name.as_str()).unwrap_or(""),
+                    family,
+                    "a media stage returned text and nothing it makes; likely a generation failure"
+                );
+                store_reply(
+                    &mut window,
+                    infer,
+                    infer.reasoning.clone(),
+                    stage,
+                    sink.as_ref(),
+                );
+                inject_system_nudge(&mut window, &no_media_nudge(&infer.response, family));
+                commands
+                    .entity(entity)
+                    .remove::<ReadyForTransition>()
+                    .insert(ReadyToInfer);
+                continue;
+            }
+        }
+        // A reply that produced a part (a mesh from a 3D generator, an image
+        // from a drawing model) has done the stage's work even with no text and
+        // no tool call: its output is the part, not a call it forgot to make.
+        // Accept it rather than nudging "use your tools" at a stage whose whole
+        // answer is what it just produced. (The image-failure case above has
+        // already had its say: it only nudges when nothing was drawn.)
+        let produced_a_part = !infer.parts.is_empty();
+        if progress.total_tool_calls > 0
+            || produced_a_part
+            || !nudge.enabled
+            || progress.text_only_nudges >= nudge.max
         {
             // The reply is accepted as the stage's last word, so it goes into
             // the conversation like every other turn. Drop it here and a
@@ -802,14 +1008,26 @@ pub(crate) fn handle_empty_response(
             // told "you have not written the file yet" with its own unwritten
             // draft in front of it can split it; one with nothing in front of
             // it drafts the whole thing again.
-            store_text_reply(&mut window, &infer.response, infer.reasoning.clone());
+            store_reply(
+                &mut window,
+                infer,
+                infer.reasoning.clone(),
+                stage,
+                sink.as_ref(),
+            );
             commands
                 .entity(entity)
                 .remove::<ReadyForTransition>()
                 .insert(ResolveTransition);
         } else {
             progress.text_only_nudges += 1;
-            store_text_reply(&mut window, &infer.response, infer.reasoning.clone());
+            store_reply(
+                &mut window,
+                infer,
+                infer.reasoning.clone(),
+                stage,
+                sink.as_ref(),
+            );
             let stage_name = stage.map(|s| s.name.as_str()).unwrap_or("");
             let regions = stage
                 .and_then(|s| s.context_layout.as_ref())
@@ -833,44 +1051,112 @@ pub(crate) fn handle_empty_response(
     }
 }
 
-/// How many times a stage sends a cut-off reply back before accepting what
-/// it has. The first retry goes out with the cap raised to the model's
-/// maximum, so a second cut-off means the reply does not fit the model at all
-/// and the nudge asks for it in pieces; a third means the model is not
-/// listening, and the stage ends rather than paying for a fourth.
-pub(crate) const MAX_CUT_OFF_NUDGES: usize = 3;
+/// How many text-only replies an image stage is nudged back before it is let
+/// go. Small on purpose: an image model that returns text three times running
+/// is refusing or erroring, not warming up, and the stage's own
+/// `require_output`/`max_iterations` then ends it rather than looping.
+pub(crate) const MAX_NO_IMAGE_NUDGES: usize = 3;
 
-/// The `[System]` line sent back with a cut-off reply.
-///
-/// It names the cause and the two ways out, because the reply that got cut
-/// off was almost always a single oversized write, and a model told only "you
-/// have not written the file yet" sends the same write again.
-pub(crate) fn cut_off_nudge(cut_off_at: usize) -> String {
+/// The media family a stage declares it makes (`image`, `video` or `audio`),
+/// from a `format` or an `output_routing` target: `None` for a stage that
+/// makes text. A plain prefix check, because both are opaque labels the
+/// manifest already validated as mime patterns. Image first, then video, then
+/// audio, when a stage names more than one.
+pub(crate) fn stage_expected_media(
+    stage: Option<&leviath_core::blueprint::Stage>,
+) -> Option<&'static str> {
+    let stage = stage?;
+    let format = stage.output.as_ref().and_then(|o| o.format.as_deref());
+    ["image", "video", "audio"].into_iter().find(|family| {
+        let prefix = format!("{family}/");
+        format.is_some_and(|f| f.starts_with(&prefix))
+            || stage.output_routing.keys().any(|k| k.starts_with(&prefix))
+    })
+}
+
+/// Parts of `family` among a reply's produced parts.
+fn media_part_count(parts: &[leviath_core::mime::Part], family: &str) -> usize {
+    let pattern = format!("{family}/*");
+    parts
+        .iter()
+        .filter(|p| p.mime_type.matches(&pattern))
+        .count()
+}
+
+/// The `[System]` line sent back when a media stage returned text and nothing
+/// of the `family` it makes. It quotes the model's own words, because a
+/// refusal or a filtered request states its reason there, so the retry is
+/// informed rather than blind.
+pub(crate) fn no_media_nudge(reply_text: &str, family: &str) -> String {
+    let what = match family {
+        "image" => "an image",
+        "video" => "a video",
+        _ => "audio",
+    };
+    let trimmed = reply_text.trim();
+    if trimmed.is_empty() {
+        return format!(
+            "This stage produces {what}, but your last reply contained none. The \
+             generation may have failed. Generate {what} and try again."
+        );
+    }
+    let mut quoted = leviath_core::text::truncate_chars(trimmed, 500);
+    if trimmed.chars().count() > 500 {
+        quoted.push_str("...");
+    }
     format!(
-        "Your previous reply was cut off by the output limit after {cut_off_at} output tokens, \
-         so it was not used. Do not send it again as it was. Either make it shorter, or split \
-         the work into smaller pieces: for a file, write the first part, then add each further \
-         part with a separate call. The output limit has been raised to the model's maximum \
-         for your next reply."
+        "This stage produces {what}, but your last reply contained none, only text: \
+         \"{quoted}\". That usually means the generation failed or was refused. If that \
+         text names a problem, address it; then generate {what} and try again."
     )
 }
 
-/// Record a text-only reply in the conversation as the model's turn. A reply
-/// with nothing in it (a cut-off tool call, an empty answer) leaves no entry:
-/// an empty assistant message is noise to the next request and some
-/// providers refuse it outright.
-fn store_text_reply(window: &mut ContextWindow, text: &str, reasoning: Option<String>) {
-    if text.trim().is_empty() {
-        return;
+/// Record a reply with no tool calls in the conversation as the model's
+/// turn: its text and whatever mime it produced. A reply with nothing in it
+/// (a cut-off tool call, an empty answer) leaves no entry: an empty
+/// assistant message is noise to the next request and some providers refuse
+/// it outright.
+fn store_reply(
+    window: &mut ContextWindow,
+    infer: &crate::components::InferenceResult,
+    reasoning: Option<String>,
+    stage: Option<&leviath_core::blueprint::Stage>,
+    sink: Option<&crate::context_setup::PartSink<'_>>,
+) {
+    // The stage may send some produced parts to regions of their own
+    // (`output_routing`). The reply's text and any unrouted part stay in the
+    // conversation as the assistant turn; the routed parts land in their
+    // regions as separate entries.
+    let routed = super::part_routing::split(stage, &infer.parts);
+    if let Some(content) = reply_content(&infer.response, &routed.kept, sink) {
+        let tokens = content.tokens(sink.map(|s| s.registry));
+        let _ = window.add_turn(
+            Some(leviath_core::ContextCause::ModelReply),
+            "conversation",
+            leviath_core::EntryKind::AssistantTurn { tool_calls: vec![] },
+            content,
+            tokens,
+            reasoning,
+        );
     }
-    let tokens = leviath_core::estimate_tokens(text);
-    let _ = window.add_assistant_turn(
-        "conversation",
-        leviath_core::EntryKind::AssistantTurn { tool_calls: vec![] },
-        text.to_string(),
-        tokens,
-        reasoning,
-    );
+    super::part_routing::store_routed(window, &routed);
+}
+
+/// A reply's text and produced parts as one entry's content, or `None` when
+/// there is nothing to record. Text over `[mime] inline_text_bytes` is stored
+/// through `sink` and the entry carries its stand-in; with no sink it stays
+/// inline.
+pub(crate) fn reply_content(
+    text: &str,
+    parts: &[leviath_core::mime::Part],
+    sink: Option<&crate::context_setup::PartSink<'_>>,
+) -> Option<leviath_core::region::EntryContent> {
+    let mut all = Vec::with_capacity(parts.len() + 1);
+    if !text.trim().is_empty() {
+        all.push(crate::context_setup::text_part(sink, "reply.txt", text));
+    }
+    all.extend(parts.iter().cloned());
+    (!all.is_empty()).then(|| leviath_core::region::EntryContent::from_parts(all))
 }
 
 /// Append a `[System]` nudge to the conversation region: the one injection path
@@ -881,5 +1167,10 @@ fn store_text_reply(window: &mut ContextWindow, text: &str, reasoning: Option<St
 pub(crate) fn inject_system_nudge(window: &mut ContextWindow, text: &str) {
     let content = format!("[System] {text}");
     let tokens = leviath_core::estimate_tokens(&content);
-    let _ = window.add_to_region("conversation", content, tokens);
+    let _ = window.add_to_region_caused(
+        leviath_core::ContextCause::Framework,
+        "conversation",
+        content,
+        tokens,
+    );
 }

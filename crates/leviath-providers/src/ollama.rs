@@ -34,35 +34,12 @@ pub struct OllamaProvider {
     warned_guessed: crate::provider::ModelMemo,
 }
 
-/// A tool-call id unique for the life of a conversation.
+/// A tool-call id for a reply that carries none.
 ///
-/// Ollama sends no ids of its own, so these are minted here, and they have to
-/// be unique across the conversation rather than within one response: a
-/// per-response index restarts at 0 every turn, so a window ten turns deep
-/// holds ten distinct calls all named `ollama_0`.
-///
-/// That is not cosmetic. `drop_unpaired_tool_turns` pairs a call with its
-/// response *by id*, to keep a window that has evicted half a pair from putting
-/// a malformed conversation on the wire. With every id equal, every call looks
-/// answered and every response looks called, the guard removes nothing, and a
-/// response stranded by eviction survives at the head of the conversation,
-/// where it suppresses the inserted user turn.
-///
-/// The sequence is process-wide rather than per-response, and carries a prefix
-/// minted once per process, because a run outlives the daemon: a pause and
-/// resume restores a window full of ids from the previous process, and a bare
-/// counter would start again at zero and collide with them. The sequence is
-/// still monotonic within a process, so a transcript reads in call order.
+/// Ollama sends no ids of its own. What the minted one has to guarantee, and
+/// why, is in [`crate::call_ids`].
 fn next_tool_call_id() -> String {
-    static PREFIX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-    let prefix = PREFIX.get_or_init(|| {
-        use rand::RngExt as _;
-        format!("{:08x}", rand::rng().random::<u32>())
-    });
-    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    format!("ollama_{prefix}_{sequence}")
+    crate::call_ids::mint("ollama")
 }
 
 /// The effective serving window named in an `/api/show` response, if it names one.
@@ -123,13 +100,7 @@ fn estimated_request_tokens(request: &InferenceRequest) -> usize {
 
 /// One content block's share of [`estimated_request_tokens`].
 fn estimated_block_tokens(block: &crate::ContentBlock) -> usize {
-    match block {
-        crate::ContentBlock::Text { text } => leviath_core::estimate_tokens(text),
-        crate::ContentBlock::ToolUse { name, input, .. } => {
-            leviath_core::estimate_tokens(name) + leviath_core::estimate_tokens(&input.to_string())
-        }
-        crate::ContentBlock::ToolResult { content, .. } => leviath_core::estimate_tokens(content),
-    }
+    crate::mime::block_tokens(block)
 }
 
 /// How long a model warmed for a run stays resident with nothing calling it.
@@ -497,6 +468,7 @@ impl OllamaProvider {
                 LearnedModel {
                     max_context_tokens: window,
                     supports_tools: calls_tools(&show),
+                    input_types: sees_images(&show),
                     ..Default::default()
                 },
             );
@@ -518,6 +490,18 @@ impl OllamaProvider {
 fn calls_tools(show: &serde_json::Value) -> Option<bool> {
     let capabilities = show.get("capabilities")?.as_array()?;
     Some(capabilities.iter().any(|c| c.as_str() == Some("tools")))
+}
+
+/// What `/api/show` says the model takes: text and images when it lists
+/// `vision`, text alone when it lists capabilities without it, and `None`
+/// when the answer has no such array, so the name table keeps its guess.
+fn sees_images(show: &serde_json::Value) -> Option<Vec<String>> {
+    let capabilities = show.get("capabilities")?.as_array()?;
+    let vision = capabilities.iter().any(|c| c.as_str() == Some("vision"));
+    Some(match vision {
+        true => vec!["text/*".to_string(), "image/*".to_string()],
+        false => vec!["text/*".to_string()],
+    })
 }
 
 impl OllamaProvider {
@@ -645,6 +629,7 @@ impl OllamaProvider {
             },
             finish_reason,
             reasoning: None,
+            parts: Vec::new(),
         })
     }
 }
@@ -729,6 +714,10 @@ impl Provider for OllamaProvider {
         Some(crate::ModelPricing::flat(0.0, 0.0))
     }
 
+    fn learned_models(&self) -> Option<&crate::learned::LearnedModels> {
+        Some(&self.learned)
+    }
+
     fn capabilities(&self, model: &str) -> ModelCapabilities {
         // Three answers, narrowest first: what the user wrote, what the server
         // says, what this build was compiled with.
@@ -744,6 +733,19 @@ impl Provider for OllamaProvider {
                 base
             }
         }
+    }
+
+    fn mime(&self, model: &str) -> crate::capabilities::ModelMime {
+        // The vision builds are known by name; `/api/show` corrects that
+        // when it lists `vision` among a model's capabilities.
+        let base = self
+            .learned
+            .mime_corrected(model, crate::mime_tables::ollama(model));
+        let mime = match self.capability_overrides.get(model) {
+            Some(o) => o.apply_mime(base),
+            None => base,
+        };
+        crate::mime::WireShape::OpenAi.carried(mime)
     }
 
     /// Learn every installed model's real window, so percentage region budgets
@@ -891,6 +893,7 @@ fn ollama_chunk(json: &serde_json::Value) -> StreamChunk {
         .to_string();
     if !done {
         return StreamChunk {
+            parts: Vec::new(),
             delta: content,
             tool_calls: Vec::new(),
             tokens: None,
@@ -940,6 +943,7 @@ fn ollama_chunk(json: &serde_json::Value) -> StreamChunk {
     };
 
     StreamChunk {
+        parts: Vec::new(),
         delta: content,
         tool_calls,
         tokens: Some(TokenUsage {
@@ -980,8 +984,12 @@ fn ollama_flush(buffer: &mut String) -> Option<StreamChunk> {
         tokens: None,
         finish_reason: Some(FinishReason::Complete),
         reasoning: None,
+        parts: Vec::new(),
     })
 }
+
+#[cfg(test)]
+mod mime_tests;
 
 #[cfg(test)]
 mod tests {
@@ -995,6 +1003,7 @@ mod tests {
         let provider = OllamaProvider::new(
             crate::provider::build_http_client(None).expect("a test client builds"),
         );
+        assert!(provider.learned_models().is_some());
         let p = provider.pricing("qwen3.5:9b").expect("a known zero");
         assert_eq!(p.input_per_mtok, 0.0);
         assert_eq!(p.output_per_mtok, 0.0);
@@ -3433,6 +3442,19 @@ mod tests {
             Some(false)
         );
         assert_eq!(calls_tools(&serde_json::json!({ "parameters": "" })), None);
+        assert_eq!(
+            sees_images(&serde_json::json!({ "capabilities": ["completion", "vision"] })),
+            Some(vec!["text/*".to_string(), "image/*".to_string()])
+        );
+        assert_eq!(
+            sees_images(&serde_json::json!({ "capabilities": ["completion"] })),
+            Some(vec!["text/*".to_string()])
+        );
+        assert_eq!(sees_images(&serde_json::json!({ "parameters": "" })), None);
+        assert_eq!(
+            sees_images(&serde_json::json!({ "capabilities": "vision" })),
+            None
+        );
         assert_eq!(
             calls_tools(&serde_json::json!({ "capabilities": "tools" })),
             None

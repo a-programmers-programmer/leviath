@@ -37,16 +37,7 @@ use crate::commands::update::{UpdateArgs, UpdateEnv, plan, plan_json};
 /// discovery degrades to worse detection rather than to an error - a copy this
 /// build cannot place is `unknown` with advice, an answer rather than a 500.
 pub(super) async fn get_update(State(state): State<AppState>) -> Json<serde_json::Value> {
-    // `--check` is implied: this route only ever plans. The other fields are
-    // defaults, which is what a caller who is not choosing a channel means.
-    let args = UpdateArgs {
-        check: true,
-        ..UpdateArgs::default()
-    };
-    // `for_planning_offline` rather than `for_planning`: planning never fetches,
-    // and handing this path a fetcher it is trusted not to call is how a later
-    // edit turns a fast route into a slow one with nothing to catch it.
-    let plan = plan(&args, &UpdateEnv::for_planning_offline());
+    let plan = planned();
     // Reports what is known now and, if that has gone stale, starts a lookup for
     // whoever asks next. Never waits on one.
     //
@@ -59,6 +50,24 @@ pub(super) async fn get_update(State(state): State<AppState>) -> Json<serde_json
             .read_and_maybe_refresh(plan.method.channel(), API_VERSION);
     }
     Json(plan_json(&plan, API_VERSION, &state.update_check.peek()))
+}
+
+/// What an update would do, planned without reaching the network.
+///
+/// Both surfaces plan through here, so neither can plan differently from the
+/// other. `--check` is implied: this only ever plans, and the other arguments
+/// stay at their defaults, which is what a caller who is not choosing a channel
+/// means. `for_planning_offline` rather than `for_planning` because planning
+/// never fetches, and handing this path a fetcher it is trusted not to call is
+/// how a later edit turns a fast read into a slow one with nothing to catch it.
+pub(super) fn planned() -> crate::commands::update::UpdatePlan {
+    plan(
+        &UpdateArgs {
+            check: true,
+            ..UpdateArgs::default()
+        },
+        &UpdateEnv::for_planning_offline(),
+    )
 }
 
 /// `POST /api/update`: carry the plan out.
@@ -88,7 +97,7 @@ pub(super) async fn post_update(
         Err(message) => return err(StatusCode::BAD_REQUEST, message).into_response(),
     };
     match state.update_jobs.spawn(req, &state.event_tx) {
-        Ok(job_id) => (StatusCode::ACCEPTED, Json(started(&job_id, req))).into_response(),
+        Ok(job) => (StatusCode::ACCEPTED, Json(started(&job.id, req))).into_response(),
         Err(running) => err(
             StatusCode::CONFLICT,
             format!("update {running} is already running"),
@@ -159,6 +168,8 @@ mod tests {
     fn test_state() -> super::super::types::AppState {
         let (tx, _) = tokio::sync::broadcast::channel(64);
         super::super::types::AppState {
+            caches: Default::default(),
+            signer: Default::default(),
             update_check: super::super::update_cache::UpdateCheckCache::with_fetcher(
                 std::sync::Arc::new(declines),
             ),
@@ -208,6 +219,8 @@ mod tests {
 
         let (tx, _) = tokio::sync::broadcast::channel(64);
         let state = super::super::types::AppState {
+            caches: Default::default(),
+            signer: Default::default(),
             update_check: super::super::update_cache::UpdateCheckCache::with_fetcher(counting),
             update_jobs: Default::default(),
             config: crate::commands::serve::testutil::fixed_config(crate::config::Config {
@@ -338,33 +351,41 @@ mod tests {
     /// answer `lev update --json` gives on the same machine. A route that
     /// drifted from the CLI would send people a command their own terminal
     /// disagrees with.
+    /// Both plans are built inside one scoped home, because both read the
+    /// machine and another test in this binary can change what "the machine" is
+    /// between them. The scope takes the same lock those tests take, so the two
+    /// readings are of one state and the assertion is about agreement rather
+    /// than about timing.
     #[tokio::test]
     async fn get_update_agrees_with_what_the_cli_would_print() {
-        let env = UpdateEnv::for_planning();
-        let args = UpdateArgs {
-            check: true,
-            ..UpdateArgs::default()
-        };
-        let from_cli = plan_json(&plan(&args, &env), API_VERSION, &LatestCheck::default());
+        super::super::testutil::with_home(|_home| async move {
+            let env = UpdateEnv::for_planning();
+            let args = UpdateArgs {
+                check: true,
+                ..UpdateArgs::default()
+            };
+            let from_cli = plan_json(&plan(&args, &env), API_VERSION, &LatestCheck::default());
 
-        let app = Router::new()
-            .route("/api/update", get(get_update))
-            .with_state(test_state());
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/update")
-                    .body(Body::empty())
-                    .expect("a GET with no body always builds"),
-            )
-            .await
-            .expect("the router is infallible");
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .expect("the body is a small JSON document");
-        let from_route: serde_json::Value =
-            serde_json::from_slice(&bytes).expect("the handler serializes a plan");
-        assert_eq!(from_route, from_cli);
+            let app = Router::new()
+                .route("/api/update", get(get_update))
+                .with_state(test_state());
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/update")
+                        .body(Body::empty())
+                        .expect("a GET with no body always builds"),
+                )
+                .await
+                .expect("the router is infallible");
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .expect("the body is a small JSON document");
+            let from_route: serde_json::Value =
+                serde_json::from_slice(&bytes).expect("the handler serializes a plan");
+            assert_eq!(from_route, from_cli);
+        })
+        .await;
     }
 
     // ─── POST /api/update, and reading a job back ────────────────────────────
@@ -386,6 +407,8 @@ mod tests {
             }
         }));
         let state = super::super::types::AppState {
+            caches: Default::default(),
+            signer: Default::default(),
             update_jobs: jobs,
             ..test_state()
         };
@@ -478,7 +501,8 @@ mod tests {
         let running = state
             .update_jobs
             .start()
-            .expect("nothing is running to begin with");
+            .expect("nothing is running to begin with")
+            .id;
         let (status, body) = call(update_app(state), post_with("")).await;
         assert_eq!(status, StatusCode::CONFLICT);
         assert!(
@@ -493,7 +517,7 @@ mod tests {
     #[tokio::test]
     async fn a_job_can_be_read_back_by_id() {
         let (_dir, state) = applying_state();
-        let id = state.update_jobs.start().expect("nothing is running");
+        let id = state.update_jobs.start().expect("nothing is running").id;
         let request = Request::builder()
             .uri(format!("/api/update/jobs/{id}"))
             .body(Body::empty())
@@ -511,7 +535,7 @@ mod tests {
             .iter()
             .map(|step| step["step"].as_str().expect("a step names itself"))
             .collect();
-        assert_eq!(steps, vec!["binary", "agents", "migrations"]);
+        assert_eq!(steps, vec!["binary", "agents", "keys", "migrations"]);
     }
 
     /// An id nobody minted is a 404 that names it, not an empty 200 a client

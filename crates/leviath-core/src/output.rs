@@ -1,14 +1,11 @@
 //! An agent's final output: the one value a run hands back to whoever asked.
 //!
-//! Before this existed, the only way an agent could return something was to
-//! write a file. Every surface that should have reported a result reported
-//! something else - `GET /api/agents/{id}/result` tailed a log file, the
-//! completion webhook's `result` field carried the *error* string, and
-//! `wait_for_agent`, whose schema promises "return its final result", returned
-//! `"Sub-agent 'x' finished with status: Complete"`. A fan-out worker's
-//! contribution to its merge stage was whatever text happened to sit in its last
-//! assistant message, so a worker whose final turn was a tool call contributed
-//! an empty string.
+//! Every surface that reports a result reads this and nothing else:
+//! `GET /api/agents/{id}/result`, the completion webhook's `result` field,
+//! `wait_for_agent`'s answer to a parent, and a fan-out worker's contribution
+//! to its merge stage. None of them has to guess at a log tail or at whatever
+//! text sat in a last assistant message, which for a worker whose final turn
+//! was a tool call is nothing at all.
 //!
 //! # The format rule
 //!
@@ -122,6 +119,20 @@ pub struct OutputSpec {
     /// setting along with it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_validator_error: Option<OnValidatorError>,
+
+    /// Whether an artifact named after a part the run produced may replace a
+    /// different file already at that path in the working directory. `None`
+    /// defers to the user's `[mime] overwrite_artifacts`, which defaults to
+    /// false: the existing file is left alone and the part is written beside
+    /// it under a name carrying its hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overwrite_artifacts: Option<bool>,
+
+    /// The files the stage hands back beside its answer, by name and type.
+    /// A submission is checked against them: a `required` one must be
+    /// present, and one that is present must be of the declared type.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<ArtifactSpec>,
 }
 
 impl OutputSpec {
@@ -134,7 +145,118 @@ impl OutputSpec {
             && self.schema.is_none()
             && self.validator.is_none()
             && self.on_validator_error.is_none()
+            && self.overwrite_artifacts.is_none()
+            && self.artifacts.is_empty()
     }
+}
+
+/// A file a stage declares it hands back beside its answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactSpec {
+    /// What the submission calls it: `final`, `scene`, `track`.
+    pub name: String,
+    /// The mime type it must be, or a pattern it must match (`video/*`).
+    #[serde(rename = "type")]
+    pub mime_type: String,
+    /// Whether a submission without it is refused.
+    #[serde(default)]
+    pub required: bool,
+    /// What it is for, shown to the model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// A file a run produced, as recorded on its answer.
+///
+/// Every field but `path` is what the run could tell from the bytes: the
+/// registry's type (or the declared one), the size, and the hash the run's
+/// blob store holds the file under. An answer recorded before artifacts were
+/// typed carried a bare path, and reads back as one with the rest unknown.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Artifact {
+    /// The name the stage declared, or the file name when it declared none.
+    pub name: String,
+    /// The file, relative to the working directory. An answer emitted from
+    /// routed parts alone never wrote a file, and carries the part's name here
+    /// instead; its bytes are reachable only through `sha256`.
+    pub path: String,
+    /// The file's type.
+    pub mime_type: crate::mime::MimeType,
+    /// Size in bytes.
+    #[serde(default)]
+    pub size: u64,
+    /// The sha256 the run's blob store holds the bytes under; empty when the
+    /// file was too large to store, or the answer predates typed artifacts.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sha256: String,
+}
+
+impl Artifact {
+    /// `name (type, size)`: how a produced file reads in a sentence.
+    pub fn short_label(&self) -> String {
+        format!(
+            "{} ({}, {})",
+            self.name,
+            self.mime_type,
+            crate::mime::human_size(self.size)
+        )
+    }
+
+    /// The columns after the name in a listing: path, type, size, and the
+    /// hash prefix when the bytes are stored.
+    pub fn detail_columns(&self) -> String {
+        let sha = match self.sha256.is_empty() {
+            true => String::new(),
+            false => format!(
+                "  sha256:{}",
+                self.sha256.chars().take(12).collect::<String>()
+            ),
+        };
+        format!(
+            "{}  {}  {}{sha}",
+            self.path,
+            self.mime_type,
+            crate::mime::human_size(self.size)
+        )
+    }
+
+    /// An artifact known only by its path: the shape every answer recorded
+    /// before artifacts were typed carried.
+    pub fn from_path(path: &str) -> Self {
+        let name = path
+            .rsplit(['/', '\\'])
+            .find(|s| !s.is_empty())
+            .unwrap_or(path)
+            .to_string();
+        Self {
+            name,
+            path: path.to_string(),
+            mime_type: crate::mime::octet_stream(),
+            size: 0,
+            sha256: String::new(),
+        }
+    }
+}
+
+/// One artifact on the wire: the typed record, or the bare path older
+/// answers wrote.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ArtifactWire {
+    Full(Artifact),
+    Path(String),
+}
+
+/// Read an artifacts list that may hold bare paths.
+fn artifacts_from_wire<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Artifact>, D::Error> {
+    let listed: Vec<ArtifactWire> = Vec::deserialize(d)?;
+    Ok(listed
+        .into_iter()
+        .map(|a| match a {
+            ArtifactWire::Full(a) => a,
+            ArtifactWire::Path(p) => Artifact::from_path(&p),
+        })
+        .collect())
 }
 
 /// What an agent actually produced, content included.
@@ -168,15 +290,19 @@ pub struct FinalOutput {
     #[serde(default)]
     pub truncated: bool,
 
-    /// Files the run produced, as workdir-relative paths.
+    /// Files the run produced, typed and hashed.
     ///
     /// An answer is one model response; anything larger is a file. A run that
     /// gathers two million rows writes them incrementally and names the file
     /// here, so a consumer can fetch it rather than parse the path out of prose.
     /// Validated to resolve inside the run's working directory, the same rule
     /// the files endpoint enforces when serving one.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub artifacts: Vec<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "artifacts_from_wire"
+    )]
+    pub artifacts: Vec<Artifact>,
 }
 
 impl FinalOutput {
@@ -200,7 +326,7 @@ impl FinalOutput {
     }
 
     /// The same submission with `artifacts` attached.
-    pub fn with_artifacts(mut self, artifacts: Vec<String>) -> Self {
+    pub fn with_artifacts(mut self, artifacts: Vec<Artifact>) -> Self {
         self.artifacts = artifacts;
         self
     }
@@ -241,9 +367,13 @@ pub struct FinalOutputDescriptor {
     /// Whether [`MAX_FINAL_OUTPUT_BYTES`] cut the answer short.
     #[serde(default)]
     pub truncated: bool,
-    /// Files the run produced, as workdir-relative paths.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub artifacts: Vec<String>,
+    /// Files the run produced, typed and hashed.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "artifacts_from_wire"
+    )]
+    pub artifacts: Vec<Artifact>,
 }
 
 /// The file, inside a run's directory, holding the answer's bytes.
@@ -311,6 +441,18 @@ pub fn resolve_output_spec(
         false => field(agent, stage, request, |s| s.on_validator_error),
     };
 
+    // Declared artifacts describe the declared shape, so they go with the
+    // schema and the validator when a caller reshapes. Otherwise the nearest
+    // non-empty list wins whole: a stage that names its own files replaces
+    // the agent's list rather than adding to it.
+    let artifacts = match reshaped {
+        true => request.map(|r| r.artifacts.clone()).unwrap_or_default(),
+        false => field(agent, stage, request, |s| {
+            (!s.artifacts.is_empty()).then(|| s.artifacts.clone())
+        })
+        .unwrap_or_default(),
+    };
+
     Some(OutputSpec {
         format: field(agent, stage, request, |s| s.format.clone()),
         instructions: field(agent, stage, request, |s| s.instructions.clone()),
@@ -318,6 +460,8 @@ pub fn resolve_output_spec(
         schema: shape_field(|s| s.schema.clone()),
         validator,
         on_validator_error,
+        overwrite_artifacts: field(agent, stage, request, |s| s.overwrite_artifacts),
+        artifacts,
     })
 }
 
@@ -326,10 +470,9 @@ pub fn resolve_output_spec(
 ///
 /// Retiring the declared Rhai validator and JSON schema when the request names
 /// a different format is deliberate and stays: a check written for one shape
-/// cannot judge another. What this adds is the saying-so. Before it, the
-/// retirement was completely silent, so a caller who typed
-/// `--output-format json` over a blueprint with a validator kept believing the
-/// run was still being checked.
+/// cannot judge another. These warnings say so out loud, so a caller who types
+/// `--output-format json` over a blueprint with a validator does not go on
+/// believing the run is still being checked.
 ///
 /// One line per group of stages losing the same checks, so an agent-level
 /// validator shared by four stages reads as one sentence naming four stages.
@@ -499,6 +642,29 @@ pub fn describe_spec(spec: &OutputSpec) -> String {
             "Here is an example of the expected shape:\n{example}"
         ));
     }
+    if !spec.artifacts.is_empty() {
+        let listed: Vec<String> = spec
+            .artifacts
+            .iter()
+            .map(|a| {
+                let mut line = format!("- {} ({}", a.name, a.mime_type);
+                if a.required {
+                    line.push_str(", required");
+                }
+                line.push(')');
+                if let Some(d) = &a.description {
+                    line.push_str(": ");
+                    line.push_str(d);
+                }
+                line
+            })
+            .collect();
+        parts.push(format!(
+            "Hand back these files in `artifacts`, each as {{ name, path }} with the name \
+             given here and the path of the file you wrote:\n{}",
+            listed.join("\n")
+        ));
+    }
     if !parts.is_empty() {
         parts.push(
             "This governs how the answer is presented. Where anything else you were told says \
@@ -536,12 +702,34 @@ mod tests {
             42,
         )
         .with_artifacts(vec![
-            "data/dataset.csv".to_string(),
-            "report.pdf".to_string(),
+            Artifact::from_path("data/dataset.csv"),
+            Artifact::from_path("report.pdf"),
         ]);
 
-        assert_eq!(output.artifacts, ["data/dataset.csv", "report.pdf"]);
+        assert_eq!(output.artifacts[0].path, "data/dataset.csv");
+        assert_eq!(output.artifacts[0].name, "dataset.csv");
+        assert_eq!(output.artifacts[1].name, "report.pdf");
         assert_eq!(output.descriptor().artifacts, output.artifacts);
+        // An answer recorded before artifacts were typed carried bare paths.
+        let old: FinalOutputDescriptor = serde_json::from_str(
+            "{\"stage\":\"s\",\"submitted_at\":1,\"artifacts\":[\"a/b.csv\",{\"name\":\"final\",\"path\":\"out.mp4\",\"mime_type\":\"video/mp4\",\"size\":9}]}",
+        )
+        .unwrap();
+        assert_eq!(old.artifacts[0].name, "b.csv");
+        assert_eq!(
+            old.artifacts[0].mime_type.as_str(),
+            "application/octet-stream"
+        );
+        assert_eq!(old.artifacts[1].name, "final");
+        assert_eq!(old.artifacts[1].size, 9);
+        assert_eq!(Artifact::from_path("").name, "");
+        assert!(
+            serde_json::from_str::<FinalOutputDescriptor>(
+                "{\"stage\":\"s\",\"submitted_at\":1,\"artifacts\":5}"
+            )
+            .is_err()
+        );
+        assert_eq!(Artifact::from_path("dir\\x.png").name, "x.png");
         // The bytes stay out of the descriptor: it goes in `meta.json`, which is
         // read for every run in a listing.
         assert_eq!(output.descriptor().bytes, "the summary".len());
@@ -554,6 +742,46 @@ mod tests {
                 .artifacts
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn declared_artifacts_cascade_whole_and_retire_on_a_reshape() {
+        let art = |name: &str| ArtifactSpec {
+            name: name.to_string(),
+            mime_type: "video/*".to_string(),
+            required: true,
+            description: None,
+        };
+        let agent = OutputSpec {
+            format: Some("markdown".to_string()),
+            artifacts: vec![art("agent-file")],
+            ..OutputSpec::default()
+        };
+        let stage = OutputSpec {
+            artifacts: vec![art("stage-file")],
+            ..OutputSpec::default()
+        };
+        // The nearest non-empty list, whole.
+        let resolved = resolve_output_spec(Some(&agent), Some(&stage), None).unwrap();
+        assert_eq!(resolved.artifacts[0].name, "stage-file");
+        let resolved = resolve_output_spec(Some(&agent), None, None).unwrap();
+        assert_eq!(resolved.artifacts[0].name, "agent-file");
+        // A reshaping request retires them with the schema and validator.
+        let request = OutputSpec {
+            format: Some("json".to_string()),
+            ..OutputSpec::default()
+        };
+        let resolved = resolve_output_spec(Some(&agent), Some(&stage), Some(&request)).unwrap();
+        assert!(resolved.artifacts.is_empty());
+        // Unless it brings its own.
+        let request = OutputSpec {
+            format: Some("json".to_string()),
+            artifacts: vec![art("request-file")],
+            ..OutputSpec::default()
+        };
+        let resolved = resolve_output_spec(Some(&agent), Some(&stage), Some(&request)).unwrap();
+        assert_eq!(resolved.artifacts[0].name, "request-file");
+        assert!(!agent.is_empty());
     }
 
     #[test]
@@ -598,6 +826,8 @@ mod tests {
             schema: None,
             validator: None,
             on_validator_error: None,
+            overwrite_artifacts: None,
+            artifacts: Vec::new(),
         };
         let stage = OutputSpec {
             instructions: Some("stage guidance".to_string()),
@@ -611,6 +841,26 @@ mod tests {
         assert_eq!(resolved.example.as_deref(), Some("agent example"));
     }
 
+    /// The listing columns every surface prints: the hash prefix rides along
+    /// only when the bytes were stored.
+    #[test]
+    fn an_artifact_lists_its_columns_with_the_hash_only_when_stored() {
+        let mut artifact = Artifact::from_path("out/hero.png");
+        assert!(
+            artifact
+                .short_label()
+                .starts_with("hero.png (application/octet-stream, ")
+        );
+        let bare = artifact.detail_columns();
+        assert!(
+            bare.starts_with("out/hero.png  application/octet-stream  "),
+            "{bare}"
+        );
+        assert!(!bare.contains("sha256"));
+        artifact.sha256 = "abcdef0123456789".repeat(4);
+        assert!(artifact.detail_columns().ends_with("  sha256:abcdef012345"));
+    }
+
     #[test]
     fn a_stage_alone_can_ask_for_an_output() {
         let stage = spec(Some("a2ui"), None);
@@ -619,9 +869,9 @@ mod tests {
         assert_eq!(resolved.format.as_deref(), Some("a2ui"));
     }
 
-    /// The bug this replaced: naming the format the blueprint already declared
-    /// dropped the schema, so a caller who asked for exactly what was on offer
-    /// lost the check that came with it.
+    /// Naming the format the blueprint already declared keeps its schema: a
+    /// caller who asks for exactly what is on offer must not lose the check
+    /// that comes with it.
     #[test]
     fn re_stating_the_declared_format_keeps_its_shape_checks() {
         let agent = OutputSpec {
@@ -677,6 +927,42 @@ mod tests {
             resolved.validator.as_deref(),
             Some("a2ui.rhai"),
             "the validator itself still falls through from the agent"
+        );
+    }
+
+    /// The artifact overwrite policy cascades on its own, reshape or not: a
+    /// stage beats the agent, a request beats both, and unset stays unset so
+    /// the user's config can decide.
+    #[test]
+    fn the_overwrite_policy_cascades_field_by_field() {
+        let agent = OutputSpec {
+            format: Some("markdown".to_string()),
+            overwrite_artifacts: Some(true),
+            ..OutputSpec::default()
+        };
+        let stage = OutputSpec {
+            overwrite_artifacts: Some(false),
+            ..OutputSpec::default()
+        };
+        let resolved = resolve_output_spec(Some(&agent), None, None).unwrap();
+        assert_eq!(resolved.overwrite_artifacts, Some(true));
+        let resolved = resolve_output_spec(Some(&agent), Some(&stage), None).unwrap();
+        assert_eq!(resolved.overwrite_artifacts, Some(false));
+        let request = OutputSpec {
+            format: Some("json".to_string()),
+            overwrite_artifacts: Some(true),
+            ..OutputSpec::default()
+        };
+        let resolved = resolve_output_spec(Some(&agent), Some(&stage), Some(&request)).unwrap();
+        assert_eq!(resolved.overwrite_artifacts, Some(true));
+        let resolved = resolve_output_spec(None, Some(&OutputSpec::default()), None).unwrap();
+        assert_eq!(resolved.overwrite_artifacts, None);
+        assert!(
+            !OutputSpec {
+                overwrite_artifacts: Some(false),
+                ..OutputSpec::default()
+            }
+            .is_empty()
         );
     }
 
@@ -1004,11 +1290,34 @@ mod tests {
             schema: Some(json!({"type": "object"})),
             validator: None,
             on_validator_error: None,
+            overwrite_artifacts: None,
+            artifacts: Vec::new(),
         });
         assert!(described.contains("Return it in this format: a2ui."));
         assert!(described.contains("One card per finding."));
         assert!(described.contains("valid against this schema"));
         assert!(described.contains("{\"root\": {}}"));
+        let with_files = describe_spec(&OutputSpec {
+            artifacts: vec![
+                ArtifactSpec {
+                    name: "final".to_string(),
+                    mime_type: "video/mp4".to_string(),
+                    required: true,
+                    description: Some("the cut".to_string()),
+                },
+                ArtifactSpec {
+                    name: "notes".to_string(),
+                    mime_type: "text/*".to_string(),
+                    required: false,
+                    description: None,
+                },
+            ],
+            ..OutputSpec::default()
+        });
+        assert!(
+            with_files.contains("- final (video/mp4, required): the cut\n- notes (text/*)"),
+            "{with_files}"
+        );
     }
 
     /// Without this the spec and the stage's own system prompt are two peer

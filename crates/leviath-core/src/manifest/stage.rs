@@ -3,6 +3,9 @@
 
 use super::*;
 
+/// The keys of a `[stages.<name>.input]` table.
+const INPUT_KEYS: &[&str] = &["accepts", "as_text"];
+
 /// Every key `parse_stage` reads off a `[stages.<name>]` table.
 ///
 /// Kept beside the parser because it is only true of the parser: a key added
@@ -20,6 +23,7 @@ pub(super) const STAGE_KEYS: &[&str] = &[
     "context",
     "description",
     "hooks",
+    "input",
     "interaction_points",
     "items_region",
     "max_attempts",
@@ -33,6 +37,7 @@ pub(super) const STAGE_KEYS: &[&str] = &[
     "nudge",
     "on_worker_failure",
     "output",
+    "output_routing",
     "require_output",
     "required_tools",
     "requires_children",
@@ -42,6 +47,7 @@ pub(super) const STAGE_KEYS: &[&str] = &[
     "shell_hint",
     "split_prompt",
     "system_prompt",
+    "tool_accepts",
     "tool_permissions",
     "tool_routing",
     "transition_prompt",
@@ -58,7 +64,7 @@ pub(super) const STAGE_KEYS: &[&str] = &[
 /// regions from an otherwise inherited one. Either way what is left out is
 /// hidden rather than destroyed. An author who guesses any other key hears
 /// about it instead of quietly carrying the region they meant to drop.
-pub(super) const CONTEXT_KEYS: &[&str] = &["regions", "hide"];
+pub(super) const CONTEXT_KEYS: &[&str] = &["regions", "hide", "reset"];
 
 /// The hooks this build implements, in the order the refusal names them.
 /// `parse_stage_hooks` matches on each, and the schema guard in `tests.rs`
@@ -79,6 +85,9 @@ pub(super) const TOOL_ROUTING_KEYS: &[&str] = &[
     "max_result_tokens",
     "max_result_tokens_per_tool",
     "overrides",
+    "keep_results",
+    // The name `keep_results` used to carry, still read so an older blueprint
+    // keeps working and is not told it has a typo.
     "persist",
 ];
 
@@ -89,6 +98,7 @@ pub(super) const GATE_KEYS: &[&str] = &[
     "region",
     "require_modifications",
     "require_no_open_items",
+    "require_region_entries",
     "require_region_updated",
     "require_regions",
     "tools",
@@ -148,7 +158,7 @@ pub(super) fn reject_unknown_keys(
         if !allowed.contains(&key.as_str()) {
             return Err(Error::Other(format!(
                 "{where_} has unknown key '{key}' (valid: {})",
-                allowed.join(", ")
+                super::renamed::current_names(allowed).join(", ")
             )));
         }
     }
@@ -358,8 +368,8 @@ pub(super) fn parse_stage(stage_name: &str, stage_value: &toml::Value) -> Result
         if let Some(dr) = str_of(routing_table, "default_region") {
             routing.default_region = dr.to_string();
         }
-        if let Some(p) = bool_of(routing_table, "persist") {
-            routing.persist = p;
+        if let Some(keep) = renamed_bool_of(routing_table, &renamed::KEEP_RESULTS) {
+            routing.keep_results = keep;
         }
         if let Some(mt) = count_of(
             routing_table,
@@ -398,6 +408,30 @@ pub(super) fn parse_stage(stage_name: &str, stage_value: &toml::Value) -> Result
         }
 
         stage.tool_result_routing = Some(routing);
+    }
+
+    // `[stages.<name>.output_routing]`: where the model's produced parts go by
+    // mime type. Each key is a mime pattern and each value a region name. The
+    // pattern is validated here (shape only); that the region exists is checked
+    // in `Blueprint::validate`, once every layout is known.
+    if let Some(routing_table) = table_of(stage_value, "output_routing") {
+        for (pattern, region_val) in routing_table {
+            crate::mime::MimeType::parse(pattern).map_err(|_| {
+                Error::Other(format!(
+                    "stage '{stage_name}': output_routing key '{pattern}' is not a mime type \
+                     or pattern, e.g. \"image/*\" or \"application/pdf\""
+                ))
+            })?;
+            let region = region_val.as_str().ok_or_else(|| {
+                Error::Other(format!(
+                    "stage '{stage_name}': output_routing.\"{pattern}\" must be a region name, \
+                     e.g. \"{pattern}\" = \"artwork\""
+                ))
+            })?;
+            stage
+                .output_routing
+                .insert(pattern.clone(), region.to_string());
+        }
     }
 
     // Parse requires_children flag
@@ -530,6 +564,45 @@ pub(super) fn parse_stage(stage_name: &str, stage_value: &toml::Value) -> Result
         )?);
     }
 
+    // `[stages.<name>.input]`: what the stage takes as parts, when the
+    // regions it sees do not already say, and which types reach its model
+    // as text whatever the model takes.
+    if let Some(input_table) = table_of(stage_value, "input") {
+        reject_unknown_keys(
+            &format!("stage '{stage_name}': input"),
+            input_table,
+            INPUT_KEYS,
+        )?;
+        let where_ = format!("stage '{stage_name}': input");
+        stage.input_accepts =
+            super::regions::parse_pattern_list(&where_, "accepts", input_table.get("accepts"))?;
+        stage.input_as_text =
+            super::regions::parse_pattern_list(&where_, "as_text", input_table.get("as_text"))?;
+    }
+
+    // `[stages.<name>.tool_accepts]`: what each tool may be handed here. A
+    // limit that lists nothing would hide every part, which is never what
+    // was meant; dropping the key is how a limit is lifted.
+    if let Some(value) = stage_value.field("tool_accepts") {
+        let Some(limits) = value.as_table() else {
+            return Err(Error::Other(format!(
+                "stage '{stage_name}': tool_accepts must be a table of tool = [mime types], \
+                 e.g. spawn_agent = [\"image/*\"]"
+            )));
+        };
+        for (tool, list) in limits {
+            let where_ = format!("stage '{stage_name}': tool_accepts");
+            let patterns = super::regions::parse_pattern_list(&where_, tool, Some(list))?;
+            if patterns.is_empty() {
+                return Err(Error::Other(format!(
+                    "stage '{stage_name}': tool_accepts.{tool} must list at least one mime \
+                     type; drop the key to lift the limit"
+                )));
+            }
+            stage.tool_accepts.insert(tool.clone(), patterns);
+        }
+    }
+
     // Parse accepts_messages flag: whether mid-run user messages are
     // injected into context between inference calls. Defaults to true
     // (via the Stage constructor); set false for stages that shouldn't
@@ -591,6 +664,26 @@ pub(super) fn parse_stage(stage_name: &str, stage_value: &toml::Value) -> Result
                     ))
                 })?;
             stage.context_hide = names;
+        }
+        // `reset = ["conversation"]`: the regions this stage empties on entry.
+        // Names are checked against the blueprint in `Blueprint::validate`;
+        // here only the shape is.
+        if let Some(reset) = context_table.get("reset") {
+            let names = reset
+                .as_array()
+                .and_then(|items| {
+                    items
+                        .iter()
+                        .map(|v| v.as_str().map(str::to_string))
+                        .collect::<Option<Vec<_>>>()
+                })
+                .ok_or_else(|| {
+                    Error::Other(format!(
+                        "stage '{stage_name}': context.reset must be a list of region names, \
+                         e.g. reset = [\"conversation\"]"
+                    ))
+                })?;
+            stage.context_reset = names;
         }
     }
 
@@ -1053,6 +1146,26 @@ pub(super) fn parse_transition_gate(
     }
     if let Some(region) = str_of(table, "require_no_open_items") {
         gate.require_no_open_items = Some(region.to_string());
+    }
+    // An inline table, `{ region = "views", at_least = 4 }`. Both halves are
+    // required and the count must be positive: a count of zero is a gate that
+    // passes every time, which is a typo, not a wish.
+    if let Some(count) = table_of(table, "require_region_entries") {
+        let Some(region) = str_of(count, "region") else {
+            return Err(Error::Other(format!(
+                "{where_}: require_region_entries needs a `region`"
+            )));
+        };
+        let at_least = count_of(count, where_, "at_least")?.unwrap_or(0);
+        if at_least == 0 {
+            return Err(Error::Other(format!(
+                "{where_}: require_region_entries needs `at_least` of 1 or more"
+            )));
+        }
+        gate.require_region_entries = Some(crate::blueprint::RegionCount {
+            region: region.to_string(),
+            at_least,
+        });
     }
     if let Some(tools) = array_of(table, "tools") {
         gate.tools = tools

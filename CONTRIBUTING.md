@@ -1,31 +1,10 @@
 # Contributing to Leviath
 
 Contributions are welcome: bug reports, docs fixes, and code. This page covers
-this fork's contribution process and the inherited hooks, lints, and coverage
-tooling.
+both the *process* (how a change lands) and the *tooling* (hooks, lints, and the
+coverage gate).
 
-## Validation in this fork
-
-For owner-directed work in `a-programmers-programmer/leviath`, validation is
-discretionary and based on the risk of the change. A full workspace build, test
-suite, lint run, coverage run, or live daemon exercise is not a mandatory step
-before committing or merging. Choose focused checks when they help establish
-that the changed behavior works; expand them when there is a concrete unresolved
-risk. Documentation-only changes can be reviewed directly.
-
-Record the checks actually run and their results in the change description.
-When checks were not run, say so; do not imply that unperformed checks passed.
-Owner authorization to implement and merge an agreed design does not require
-another issue or permission request solely to satisfy the upstream process.
-
-This policy does not disable installed Git hooks, GitHub Actions workflows, or
-repository protection rules. The sections below describe the inherited tooling
-and upstream process so contributors can use them when useful or when preparing
-a contribution to `GEMISIS/leviath`. Any checks enforced by the active repository
-configuration still operate as configured; this document does not establish
-that a particular fork has upstream's protection rules enabled.
-
-## How a change lands upstream
+## How a change lands
 
 ```mermaid
 flowchart LR
@@ -36,13 +15,13 @@ flowchart LR
   E --> F["Merge queue<br/>(rebase)"]
 ```
 
-The upstream contribution process uses GitHub's merge queue for `main`: once a PR is approved and green, queueing it
+Merges to `main` go through GitHub's merge queue: once a PR is approved and green, queueing it
 re-runs the required checks on the exact tree that will land, then rebase-merges automatically.
 
 - **Start with an issue** for anything non-trivial. Agreeing on the approach
   first saves you from writing code that can't be merged. Small fixes (typos,
   doc corrections, obvious bugs) can go straight to a PR.
-- **Direct pushes to upstream `main` are disabled** for everyone, maintainers included.
+- **Direct pushes to `main` are disabled** for everyone, maintainers included.
   Every change arrives as a pull request, must pass all required CI checks, and
   needs maintainer approval before it can merge.
 - **History is rebase-only**, with no merge commits. Keep your branch rebased on
@@ -59,11 +38,8 @@ re-runs the required checks on the exact tree that will land, then rebase-merges
 
 ## Getting the code building
 
-Use the fork URL for owner-directed work. The test and lint commands are
-available checks, not a required sequence for every change in this fork.
-
 ```bash
-git clone https://github.com/a-programmers-programmer/leviath.git
+git clone https://github.com/GEMISIS/leviath.git
 cd leviath
 cargo build
 cargo test --workspace
@@ -74,19 +50,15 @@ cargo clippy --workspace
 
 The hook installs itself the first time you build or test, with no setup step. `cargo test` / `cargo build` pulls in `xtask`'s dev-dependencies, which include [`cargo-husky`](https://github.com/rhysd/cargo-husky). On the first build it installs `.cargo-husky/hooks/pre-commit` into `.git/hooks/pre-commit` automatically.
 
-When installed and invoked, the hook checks:
+The hook enforces, before every commit:
 
 - **formatting** (`cargo fmt --check`)
 - **clippy** with warnings-as-errors
 - **doc lints** (`cargo doc` with `-D warnings`, so no broken or private intra-doc links and no stray HTML)
+- the **full test suite**
 - the **coverage-suppression-marker lint** (`ast-grep scan`, if `ast-grep` is installed; CI always enforces it)
-- **structural limits** (`cargo xtask structure`)
-- **documentation content** (`cargo xtask docs`)
 
-The checked-in hook does **not** run `cargo test` or the full `cargo xtask
-coverage` check. The inherited CI workflow contains separate test and coverage
-jobs, including a 100% coverage threshold. Whether those jobs run and block a
-merge depends on the repository's Actions and protection configuration.
+It does **not** run the full `cargo xtask coverage` check, which is several minutes, too slow for a local commit gate. CI runs it on every push instead, enforcing 100% for real.
 
 If the hook script itself changes (e.g. a commit edits `.cargo-husky/hooks/pre-commit`), `cargo-husky` only reinstalls it on a *fresh* compile of its crate, not on incremental builds. Force it with:
 
@@ -106,22 +78,12 @@ npm install -g @ast-grep/cli     # via npm
 
 ## Testing policy
 
-This fork uses the discretionary validation policy above. The inherited coverage
-command and CI configuration retain a **100%** threshold on lines, regions, and
-functions; choosing not to run coverage locally does not change that threshold.
-Coverage-suppression markers (`#[cfg(not(test))]`, `coverage(off)`,
-tarpaulin/lcov/grcov annotations) are rejected by the ast-grep lint above. Prefer
-testable code rather than hiding it from measurement. The thin `lev` binary
-entrypoint (`crates/leviath-cli/src/main.rs`) is excluded from coverage measurement:
-it wires real terminal, stdin, network, and subprocess I/O into the library's
-tested cores. The inherited CI configuration also guards entrypoint changes
-with a maintainer-sign-off check.
+The workspace is gated at a hard **100%** on lines, regions, and functions, with no way to opt out. Coverage-suppression markers (`#[cfg(not(test))]`, `coverage(off)`, tarpaulin/lcov/grcov annotations) are banned by the ast-grep lint above, so code can't be hidden from measurement; it has to be refactored until it's testable. The *only* un-unit-tested code is the thin `lev` binary entrypoint (`crates/leviath-cli/src/main.rs`): the composition root that wires real terminal, stdin, network, and subprocess I/O into the library's tested cores. It's excluded from coverage measurement and guarded by a CI check that requires maintainer sign-off to change.
 
 ### Suppressing a lint
 
-The inherited lint rules reject the suppressions listed here. The pre-commit
-hook (when `ast-grep` is installed) and CI's `check-exclusions` job run `ast-grep
-scan`, whose rules fail the check on `#[allow(...)]` or
+You cannot. The pre-commit hook and CI's `check-exclusions` job run `ast-grep
+scan`, whose rules fail the build on `#[allow(...)]` or
 `#[expect(...)]` for `too_many_arguments`, `type_complexity`, `dead_code`,
 `deprecated`, `async_fn_in_trait`, `match_same_arms`, `new_without_default`,
 `permissions_set_readonly_false` and `enum_variant_names`.
@@ -195,32 +157,35 @@ brew install codeql                                                    # the CLI
 codeql database create target/codeql-db --language=rust --overwrite    # builds the workspace through cargo
 codeql database analyze target/codeql-db codeql/rust-queries:codeql-suites/rust-code-scanning.qls \
   --format=sarif-latest --output=target/codeql.sarif --download
-python3 perf-tools/codeql_summary.py target/codeql.sarif                # rule, sink, and every flow's source
+python3 scripts/codeql_summary.py target/codeql.sarif                  # rule, sink, and every flow's source
 ```
 
 The summary's exit status is the number of findings, so a shell can gate on it. Two things worth knowing before reading a result: the Rust model treats every parameter of an axum handler as request data, `State` included (see `SECURITY.md`, "What the scanners say"), and the sensitive-data queries go by variable *name*, so a loop variable called `secret` that holds env-var names reads as a leak.
 
 ## Live-testing against a real daemon
 
-A green test suite and a 100% coverage number do not establish every runtime
-behavior: this repository has shipped fixes that a unit test certified and a
-running daemon ignored. A live daemon exercise can help when a change affects
-tool calls, spawning, or HTTP requests. Use it when that additional evidence is
-useful under this fork's risk-based validation policy; it is not mandatory for
-every such change.
+A green test suite and a 100% coverage number are not the same thing as
+"tested": this repository has shipped fixes that a unit test certified and a
+running daemon ignored. Anything that changes what the daemon does on a tool
+call, a spawn or an HTTP request gets driven through a real daemon as well.
 
-`perf-tools/` holds the harness. `perf-tools/harness.sh CMD...` runs `CMD`
-in an isolated environment (`LEVIATH_HOME=/tmp/lv`, the repo `.env` skipped,
-the native OpenAI provider pointed at `perf-tools/mock.py`) and installs a
-one-stage `probe` blueprint. `mock.py` is a stateless OpenAI-compatible server
-that asks for a tool call of your choosing on the first turn; `daemon_drive.py`
-starts everything, spawns runs over `lev serve`, and waits for them to finish:
+The harness lives in
+[leviath-benchmarks](https://github.com/GEMISIS/leviath-benchmarks), under
+`perf/`. `perf/harness.sh CMD...` runs `CMD` in an isolated environment
+(`LEVIATH_HOME=/tmp/lv`, any `.env` skipped, the native OpenAI provider
+pointed at `perf/mock.py`) and installs a one-stage `probe` blueprint.
+`mock.py` is a stateless OpenAI-compatible server that asks for a tool call of
+your choosing on the first turn; `daemon_drive.py` starts everything, spawns
+runs over `lev serve`, and waits for them to finish. `LV_BIN` names the build
+under test:
 
 ```sh
 cargo build --release -p leviath-cli
-perf-tools/harness.sh python3 perf-tools/daemon_drive.py \
+git clone https://github.com/GEMISIS/leviath-benchmarks ../leviath-benchmarks   # once
+export LV_BIN="$PWD/target/release/lev"
+../leviath-benchmarks/perf/harness.sh python3 ../leviath-benchmarks/perf/daemon_drive.py \
     --runs 2 --tool shell --args '{"command":"echo hi > note.txt"}' --yolo --keep
-perf-tools/harness.sh target/release/lev timeline <run-id>
+../leviath-benchmarks/perf/harness.sh "$LV_BIN" timeline <run-id>
 ```
 
 Every "the bad thing did not happen" probe needs a control in the same script
@@ -228,9 +193,10 @@ that makes the good thing happen. A probe whose control is also silent proves
 that the harness is broken, not that the fix works. `mock.py`'s `GET /count`
 exists so "no provider call was made" can be asserted rather than assumed.
 
-The same directory holds tools for measuring performance changes
-(`dash_pty.py`, `serve_latency.py`, `binsize.sh`) and the baseline numbers
-under `perf-tools/baselines/`; see `perf-tools/README.md`.
+The same directory holds the measuring sticks a performance change is gated
+on (`dash_pty.py`, `serve_latency.py`, `binsize.sh`) and the baseline numbers
+under `perf/baselines/`; see its `perf/README.md`. A performance PR here adds
+its before-and-after numbers there.
 
 ## Dependencies
 
@@ -319,31 +285,10 @@ reviewers and approvers), and once accepted the alpha build would submit
 `lev.exe` through `signpath/github-action-submit-signing-request` and receive
 it back signed with the Foundation's certificate - which Windows trusts, and
 which accrues reputation across releases. That is the only way the Defender
-flags stop for good; everything below is the paid alternative.
-
-The alpha build also carries an opt-in step for Azure Artifact Signing (which
-costs money and is not configured). It signs when six repository secrets
-exist and prints a `::notice` and ships unsigned when they do not, so nothing
-about a fork or a PR build depends on Azure. Should that ever be wanted:
-
-1. **Azure portal → Artifact Signing** (Basic tier): create an account, complete
-   the identity validation for Sun Forge AI (this is the slow step - days - and
-   nothing signs until it is approved), then add a certificate profile of type
-   *Public Trust*. Note the account's endpoint (for example
-   `https://eus.codesigning.azure.net`).
-2. **Microsoft Entra → App registrations**: create an app. Under *Certificates &
-   secrets → Federated credentials*, add one for GitHub Actions: organization
-   `GEMISIS`, repository `leviath`, entity **Branch**, branch `main`. No client
-   secret - the workflow authenticates with OpenID Connect, and the alpha build
-   only ever runs from `main`.
-3. **The signing account → Access control (IAM)**: assign the app the role
-   *Artifact Signing Certificate Profile Signer*.
-4. **Repository secrets**: `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`,
-   `AZURE_SUBSCRIPTION_ID`, `ARTIFACT_SIGNING_ENDPOINT`,
-   `ARTIFACT_SIGNING_ACCOUNT`, `ARTIFACT_SIGNING_PROFILE`.
-
-The next alpha run signs. Verify on the published asset with
-`Get-AuthenticodeSignature lev.exe`.
+flags stop for good. The release pipeline carries no signing step today, so
+adopting it means adding that step to the alpha build (beta and stable promote
+the alpha artifacts, so a signature travels with them). Verify a signed asset
+with `Get-AuthenticodeSignature lev.exe`.
 
 ## Design notes
 

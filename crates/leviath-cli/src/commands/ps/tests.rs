@@ -31,6 +31,7 @@ fn entry(run_id: &str, status: AgentStatus) -> RunListEntry {
         tool_calls: 0,
         last_progress_at: None,
         unattended: false,
+        yolo_profile: None,
         empty_output: false,
         read_paths: None,
         has_final_output: false,
@@ -367,6 +368,28 @@ fn an_empty_listing_still_says_why_nothing_is_running() {
     assert!(out.starts_with("no agent runs active"), "{out}");
     assert!(out.contains("1 provider is out of service:"), "{out}");
     assert!(out.contains("openrouter (credits-exhausted"), "{out}");
+}
+
+/// A run parked until something is fixed is not "waiting for an answer": it
+/// gets a line under the table saying what happened and what to do, which the
+/// status cell has no room for.
+#[test]
+fn format_runs_spells_out_why_a_parked_run_is_paused() {
+    use leviath_core::run_meta::SetupBlocker;
+    let mut parked = entry("run-parked", AgentStatus::Paused);
+    parked.wait_reason = Some(WaitReason::NeedsSetup {
+        blocker: SetupBlocker::ProviderTimedOut,
+        remedy: "'openai' did not answer in time ([timeout] waiting)".to_string(),
+    });
+    let out = format_runs(&[parked], &[], &healthy_daemon(), 0);
+    assert!(out.contains("paused: provider timed out"), "{out}");
+    assert!(!out.contains("needs an answer"), "{out}");
+    assert!(
+        out.contains(
+            "paused until something is fixed:\n  run-parked: 'openai' did not answer in time"
+        ),
+        "{out}"
+    );
 }
 
 /// The whole point of the change: two runs both `Waiting`, telling the operator
@@ -1054,4 +1077,62 @@ fn a_config_that_does_not_load_gets_a_line_under_the_table() {
     listing(&path);
     std::fs::write(&path, "default_provider = \"anthropic\"\n").unwrap();
     listing(&path);
+}
+
+/// A daemon that cannot write one run's journal.
+fn journal_failing() -> DaemonHealth {
+    DaemonHealth {
+        journal: leviath_runtime::persist_stats::JournalHealth {
+            appends_attempted: 40,
+            appends_failed: 1,
+            last_error: Some(leviath_runtime::persist_stats::JournalError {
+                run_id: "run-a".to_string(),
+                path: "/runs/run-a/run.lvr".to_string(),
+                message: "Permission denied".to_string(),
+                at: 100,
+            }),
+            ..Default::default()
+        },
+        ..healthy_daemon()
+    }
+}
+
+/// A journal that is refusing writes is said out loud under the table: every row
+/// above it can look perfectly healthy while nothing about them is being
+/// recorded.
+#[test]
+fn a_journal_that_cannot_be_written_is_reported_under_the_table() {
+    let out = format_runs(
+        &[entry("run-a", AgentStatus::Active)],
+        &[],
+        &journal_failing(),
+        0,
+    );
+    assert!(out.contains("journal: 1 journal append(s)"), "{out}");
+    assert!(out.contains("/runs/run-a/run.lvr"), "{out}");
+    assert!(out.contains("Permission denied"), "{out}");
+    assert!(out.contains("lev doctor"), "{out}");
+}
+
+/// And on an empty listing, which is where a daemon that cannot record anything
+/// is easiest to mistake for an idle one.
+#[test]
+fn an_empty_listing_still_says_the_journal_is_failing() {
+    let out = format_runs(&[], &[], &journal_failing(), 0);
+    assert!(out.starts_with("no agent runs active"), "{out}");
+    assert!(out.contains("journal:"), "{out}");
+}
+
+/// A daemon writing everything it is asked to says nothing about it.
+#[test]
+fn a_working_journal_adds_no_footer() {
+    let out = format_runs(&[], &[], &healthy_daemon(), 0);
+    assert_eq!(out, "no agent runs active");
+    let out = format_runs(
+        &[entry("run-a", AgentStatus::Active)],
+        &[],
+        &healthy_daemon(),
+        0,
+    );
+    assert!(!out.contains("journal:"), "{out}");
 }

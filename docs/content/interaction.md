@@ -3,7 +3,7 @@ title: Human-in-the-loop
 description: What to do when a run shows waiting: answer agent questions, tool approvals, and checkpoints with lev respond, the dashboard, or the API.
 group: Concepts
 group_order: 2
-order: 10
+order: 11
 ---
 
 # Human-in-the-loop
@@ -78,8 +78,8 @@ call until the answer comes back, then continues with it:
 
 Every prompt on this page waits on a person, and by default it waits until one answers. A run
 parked on an approval is still parked when you get back, whether that is ten minutes or a weekend
-later; it is not failed, reaped, or marked stuck by any timer while it waits, and it survives a
-daemon restart still waiting. The only things that end the wait are an answer and `lev cancel`.
+later. No timer fails it, reaps it, or marks it stuck while it waits. It survives a daemon restart
+still waiting. The only things that end the wait are an answer and `lev cancel`.
 
 That is the right default for a person at a keyboard and the wrong one for a run nobody is
 watching, where a prompt would hold a slot until the daemon restarts. For those, `[limits]
@@ -93,7 +93,7 @@ way). When a deadline passes, the prompt resolves exactly as cancelling it would
 | `ask_user_*` | The model is told no answer came, and carries on. |
 | Interaction point | Proceeds with no user text, unless it declared `unattended = "ask"`. See below. |
 
-An interaction point that declared `unattended = "ask"` behaves differently on a timeout: the run
+An interaction point that declared `unattended = "ask"` behaves differently on a timeout. The run
 **stops with an error**, rather than approving a checkpoint nobody made.
 
 The deadline is read from `config.toml` every time it reloads, so setting one or clearing it needs
@@ -145,7 +145,7 @@ opt in, because otherwise any agent package could pre-approve its own shell with
 ### The prompt
 
 An `ask` gate raises a `tool_approval` prompt naming the tool and its telling argument (the shell
-command for `bash`/`shell`, the path for the file tools), with five options:
+command for `bash`/`shell`, the path for the file tools). The prompt offers five options:
 
 - **Allow once**: permit this one call and nothing more.
 - **Allow ... for this stage**: permit every later call this covers, until the run leaves the
@@ -175,7 +175,7 @@ what a call runs.
 
 That prompt's unanswered cases go the safe way. Left open past
 `[limits] interaction_timeout_secs`, it resolves as a deny and the model gets `[blocked]`, the same
-as if you had pressed it: the hub hands the waiting call the neutral response a cancelled prompt
+as if you had pressed it. The hub hands the waiting call the neutral response a cancelled prompt
 produces, and a neutral response carries no choice. With no `interaction_timeout_secs` configured,
 which is the default, it waits for as long as the daemon is up and the run stays in
 `waiting_input`. The one case that does not park and does not deny is `--yolo`, which waives the
@@ -259,7 +259,14 @@ conversation region between inference calls, as if the user had spoken mid-turn:
 
 ```bash
 lev msg <agent-id> "Focus on the auth module first, skip the migrations for now."
+lev msg <agent-id> "the arm is still wrong, see @marked_up.png" --attach notes.md:brief
 ```
+
+A message can carry files. A `@path` in the text and every `--attach` become typed
+[parts](/docs/mime) on the same entry as the words, in the region the message lands in. An
+attachment naming another region (`--attach notes.md:brief`) lands there on its own. A part the
+run cannot take (over the size ceiling, or a region that refuses its type) is logged and dropped,
+and the text is still delivered.
 
 Whether a message lands right away is per-stage. `accepts_messages` defaults to `true`; set it to
 `false` on a stage that shouldn't be interrupted (e.g. a final report), and messages stay queued in
@@ -289,7 +296,41 @@ lev respond <request-id> --approve --stage     # and every later call this cover
 lev respond <request-id> --approve --session   # and every later call this covers, this run
 lev respond <request-id> --deny          # reject
 lev respond <request-id> --deny --feedback "use git log, not git show"   # reject and redirect
+lev respond <request-id> "the arm is still wrong, see @marked_up.png"    # a text answer with a file
+lev respond <request-id> "here" --attach sketch.png:sprites                # or attached by flag
 ```
+
+A request id is opaque, and it names the run that asked: two runs stopped on the same tool call are
+two questions with two ids, and answering one says nothing about the other.
+
+The id can be cut short. `lev respond` takes the start of one, as long as that start fits exactly
+one open interaction:
+
+```bash
+lev respond probe-1789971553 --approve   # the whole id is probe-1789971553-793b8652da33-approve-call_1
+```
+
+Since the run comes first in an id, the run's own id is usually short enough on its own. A start
+that fits two open interactions answers neither. It is refused, both are listed, and you type a few
+more characters:
+
+```
+'probe-' is the start of 2 open interactions, so nothing was answered; give enough of an id to name just one:
+  probe-1789971553-793b8652da33-approve-call_1  [tool-approval]  agent=probe-1789971553-793b8652da33  stage=work
+  probe-1789971554-8a2b1c3d4e5f-approve-call_1  [tool-approval]  agent=probe-1789971554-8a2b1c3d4e5f  stage=work
+```
+
+Matching runs from the start of the id, so the tail of one (`approve-call_1`) names nothing. That
+tail is the part two runs are most likely to share. An id given in full answers that interaction
+whatever longer ids begin with it, and a start that fits nothing is `no such open interaction`, the
+same as an id that was never open.
+
+A text answer carries files the way a message does. Every `--attach` and every `@path` in the
+words become typed [parts](/docs/mime) stored by the run, and written beside the answer in the
+tool result. The model reads the file where the words mention it. A choice or an approval has
+no text for a file to sit beside, and `--attach` on one is refused. The dashboard and the API take
+the same: a `@path` in a typed reply, and `parts` or a multipart upload on
+`POST /api/agents/{id}/interaction`.
 
 You don't have to use the CLI. The same open questions can be answered interactively from the
 [dashboard](/docs/dashboard) (press `i`), from [The Lair](https://leviath.dev/lair), or over the

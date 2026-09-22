@@ -58,6 +58,7 @@ fn rate(input: f64, read: Option<f64>, write: Option<f64>, output: f64) -> Rate 
         cache_read: read,
         cache_write: write,
         output,
+        long_context: None,
     }
 }
 
@@ -74,6 +75,7 @@ fn row(provider: &str, prefix: &str, rates: [f64; 4], source: &str) -> Row {
         cache_write: rates[2],
         output: rates[3],
         source: source.to_owned(),
+        long_context: None,
     }
 }
 
@@ -84,6 +86,7 @@ fn table(read_on: &str, rows: Vec<Row>) -> Table {
             .into_iter()
             .map(|r| ((r.provider.clone(), r.prefix.clone()), r))
             .collect(),
+        unit_rows: Vec::new(),
     }
 }
 
@@ -95,7 +98,9 @@ fn baseline() -> (Prices, Prices) {
     for (p, id) in [
         ("anthropic", "claude-base"),
         ("google", "gemini-base"),
+        ("meta", "muse-spark-base"),
         ("openai", "gpt-base"),
+        ("xai", "grok-base"),
     ] {
         or.insert(key(p, id), rate(1.0, Some(0.1), None, 4.0));
         ll.insert(key(p, id), rate(1.0, Some(0.1), None, 4.0));
@@ -123,7 +128,7 @@ fn mode_parses_write_check_and_rejects_the_rest() {
 // ── OpenRouter parser ────────────────────────────────────────────────────────
 
 #[test]
-fn openrouter_keeps_the_three_vendors_per_million_and_normalises_anthropic() {
+fn openrouter_keeps_the_vendors_per_million_and_normalises_anthropic() {
     let body = openrouter_body(&[
         or_model("anthropic/claude-opus-4.8", "0.000005", "0.000025", Some("0.0000005"), Some("0.00000625")),
         or_model("openai/gpt-5.5", "0.000005", "0.00003", Some("0.0000005"), None),
@@ -144,6 +149,7 @@ fn openrouter_keeps_the_three_vendors_per_million_and_normalises_anthropic() {
             &key("anthropic", "claude-opus-4-8"),
             &key("google", "gemini-3.5-flash"),
             &key("openai", "gpt-5.5"),
+            &key("xai", "grok-4.6"),
         ]
     );
     let opus = &prices[&key("anthropic", "claude-opus-4-8")];
@@ -335,7 +341,7 @@ fn agreement_within_five_percent_writes_both_at_openrouters_figure() {
     assert_eq!(row.source, "both");
     assert_eq!(merged.table.read_on, "2026-08-29");
     assert!(merged.disagreements.is_empty());
-    assert_eq!(merged.changes.len(), 4, "three baseline rows plus this one");
+    assert_eq!(merged.changes.len(), 6, "five baseline rows plus this one");
 }
 
 #[test]
@@ -675,6 +681,14 @@ fn fixture_openrouter() -> String {
             Some("0.00000015"),
             Some("0.00000004"),
         ),
+        or_model(
+            "meta/muse-spark-1.3",
+            "0.00000125",
+            "0.00000425",
+            Some("0.00000015"),
+            None,
+        ),
+        or_model("x-ai/grok-4.3", "0.000002", "0.00001", None, None),
     ])
 }
 
@@ -705,6 +719,24 @@ fn fixture_litellm() -> String {
             Some(1.5e-6),
             Some(9e-6),
             Some(1.5e-7),
+            None,
+        ),
+        ll_entry(
+            "meta/muse-spark-1.3",
+            "meta",
+            "chat",
+            Some(1.25e-6),
+            Some(4.25e-6),
+            Some(1.5e-7),
+            None,
+        ),
+        ll_entry(
+            "xai/grok-4.3",
+            "xai",
+            "chat",
+            Some(2e-6),
+            Some(1e-5),
+            None,
             None,
         ),
     ])
@@ -739,10 +771,10 @@ const EMPTY_FILE: &str = "read_on = \"2026-01-01\"\n";
 fn write_mode_rewrites_the_file_and_stamps_today() {
     let (_dir, path) = scratch_file(EMPTY_FILE);
     let outcome = run_with(PricesMode::Write, fixture_fetch, &path, "2026-08-29").unwrap();
-    assert_eq!(outcome, Outcome::Changed(3));
+    assert_eq!(outcome, Outcome::Changed(5));
     let written = parse_table(&std::fs::read_to_string(&path).unwrap()).unwrap();
     assert_eq!(written.read_on, "2026-08-29");
-    assert_eq!(written.rows.len(), 3);
+    assert_eq!(written.rows.len(), 5);
     let gemini = &written.rows[&key("google", "gemini-3.5-flash")];
     assert_eq!(gemini.cache_write, 1.5, "storage figure rejected");
     assert_eq!(gemini.source, "both");
@@ -762,7 +794,7 @@ fn write_mode_rewrites_the_file_and_stamps_today() {
 fn check_mode_fails_when_the_file_would_change_and_touches_nothing() {
     let (_dir, path) = scratch_file(EMPTY_FILE);
     let err = run_with(PricesMode::Check, fixture_fetch, &path, "2026-08-29").unwrap_err();
-    assert!(err.to_string().contains("would change (3 rows)"), "{err}");
+    assert!(err.to_string().contains("would change (5 rows)"), "{err}");
     assert!(!is_network_error(&err));
     assert_eq!(std::fs::read_to_string(&path).unwrap(), EMPTY_FILE);
 }
@@ -827,4 +859,319 @@ fn the_network_error_reads_as_one() {
     let err = NetworkError("x".to_owned());
     assert_eq!(err.to_string(), "network: x");
     assert!(std::error::Error::source(&err).is_none());
+}
+
+// ── New vendors, tiers and unit rows ────────────────────────────────────────
+
+#[test]
+fn openrouter_ids_map_x_ai_to_xai_and_keep_only_metas_served_models() {
+    assert_eq!(
+        openrouter_model("x-ai/grok-4.3", &PROVIDERS),
+        Some(key("xai", "grok-4.3"))
+    );
+    assert_eq!(
+        openrouter_model("meta/muse-spark-1.3", &PROVIDERS),
+        Some(key("meta", "muse-spark-1.3"))
+    );
+    assert_eq!(openrouter_model("meta/muse-glimmer-30b", &PROVIDERS), None);
+    assert_eq!(openrouter_model("meta-llama/llama-4", &PROVIDERS), None);
+    assert_eq!(openrouter_model("x-ai/grok-4.3:batch", &PROVIDERS), None);
+    assert_eq!(openrouter_model("no-slash", &PROVIDERS), None);
+}
+
+#[test]
+fn litellm_reads_the_new_vendors_and_the_smallest_long_context_tier() {
+    let tiered = "\"xai/grok-4.3\": {\"litellm_provider\": \"xai\", \"mode\": \"chat\", \
+        \"input_cost_per_token\": 2e-6, \"output_cost_per_token\": 1e-5, \
+        \"input_cost_per_token_above_200k_tokens\": 4e-6, \"output_cost_per_token_above_200k_tokens\": 2e-5, \
+        \"cache_read_input_token_cost_above_200k_tokens\": 1e-6, \
+        \"input_cost_per_token_above_500k_tokens\": 8e-6, \"output_cost_per_token_above_500k_tokens\": 4e-5, \
+        \"input_cost_per_token_above_xk_tokens\": 1e-6}"
+        .to_owned();
+    let half = "\"meta/muse-spark-1.3\": {\"litellm_provider\": \"meta\", \"mode\": \"chat\", \
+        \"input_cost_per_token\": 1.25e-6, \"output_cost_per_token\": 4.25e-6, \
+        \"input_cost_per_token_above_128k_tokens\": 2e-6}"
+        .to_owned();
+    let glimmer = ll_entry(
+        "meta/muse-glimmer-30b",
+        "meta",
+        "chat",
+        Some(1e-7),
+        Some(2e-7),
+        None,
+        None,
+    );
+    let prices = parse_litellm(&litellm_body(&[tiered, half, glimmer])).unwrap();
+    assert_eq!(prices.len(), 2, "Glimmer is not served by Meta's API");
+    let grok = &prices[&key("xai", "grok-4.3")];
+    let tier = grok.long_context.expect("a tier");
+    assert_eq!(tier.threshold, 200_000);
+    assert_eq!(tier.input, 4.0);
+    assert_eq!(tier.cache_read, Some(1.0));
+    assert_eq!(tier.cache_write, None);
+    assert_eq!(tier.output, 20.0);
+    assert_eq!(
+        prices[&key("meta", "muse-spark-1.3")].long_context,
+        None,
+        "a tier with no output price is no tier"
+    );
+}
+
+#[test]
+fn a_tier_rides_on_the_row_whichever_source_vouched_and_renders_back() {
+    let (mut or, mut ll) = baseline();
+    let tier = TierRate {
+        threshold: 200_000,
+        input: 4.0,
+        cache_read: None,
+        cache_write: Some(1.0),
+        output: 20.0,
+    };
+    or.insert(key("xai", "grok-4.3"), rate(2.0, None, None, 10.0));
+    ll.insert(
+        key("xai", "grok-4.3"),
+        Rate {
+            long_context: Some(tier),
+            ..rate(2.0, None, None, 10.0)
+        },
+    );
+    let merged = merge(&empty_table(), &or, &ll, "2026-09-16").unwrap();
+    let row = &merged.table.rows[&key("xai", "grok-4.3")];
+    assert_eq!(row.source, "both");
+    assert_eq!(
+        row.long_context,
+        Some(Tier {
+            threshold: 200_000,
+            input: 4.0,
+            cache_read: 4.0,
+            cache_write: 4.0,
+            output: 20.0,
+        }),
+        "the cache sides default the way a row's do"
+    );
+    let change = merged
+        .changes
+        .iter()
+        .find(|c| matches!(c, Change::Added(r) if r.prefix == "grok-4.3"))
+        .unwrap();
+    assert!(
+        change.to_string().contains("+4.0/4.0/4.0/20.0 from 200000"),
+        "{change}"
+    );
+
+    let mut with_units = merged.table.clone();
+    with_units.unit_rows.push(UnitRow {
+        provider: "meta".into(),
+        prefix: "muse-image-1.0".into(),
+        unit: "image".into(),
+        usd: 0.01,
+        source: "manual".into(),
+        checked_on: "2026-09-16".into(),
+    });
+    let text = render_table(&with_units);
+    assert!(
+        text.contains("[rate.long_context]\nthreshold = 200000\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("[[unit_rate]]\nprovider = \"meta\""),
+        "{text}"
+    );
+    assert_eq!(parse_table(&text).unwrap(), with_units);
+}
+
+#[test]
+fn unit_rows_survive_a_refresh_and_an_old_one_is_reported() {
+    let mut existing = empty_table();
+    existing.unit_rows = vec![
+        UnitRow {
+            provider: "xai".into(),
+            prefix: "grok-tts".into(),
+            unit: "million_chars".into(),
+            usd: 15.0,
+            source: "manual".into(),
+            checked_on: "2026-01-01".into(),
+        },
+        UnitRow {
+            provider: "meta".into(),
+            prefix: "muse-image-1.0".into(),
+            unit: "image".into(),
+            usd: 0.01,
+            source: "manual".into(),
+            checked_on: "2026-09-01".into(),
+        },
+        UnitRow {
+            provider: "meta".into(),
+            prefix: "muse-voice".into(),
+            unit: "audio_hour".into(),
+            usd: 0.18,
+            source: "manual".into(),
+            checked_on: "someday".into(),
+        },
+    ];
+    let (or, ll) = baseline();
+    let merged = merge(&existing, &or, &ll, "2026-09-16").unwrap();
+    assert_eq!(merged.table.unit_rows, existing.unit_rows);
+    let stale = stale_unit_rows(&existing, "2026-09-16");
+    assert_eq!(stale.len(), 2, "{stale:?}");
+    assert!(stale[0].contains("xai/grok-tts"));
+    assert!(stale[1].contains("'someday'"));
+    assert!(stale_unit_rows(&existing, "not a day").is_empty());
+}
+
+/// Image, speech and transcription models priced by the token are read like
+/// chat models; an image model with no plain output rate is priced by its
+/// image tokens.
+#[test]
+fn litellm_reads_the_media_models_priced_by_the_token() {
+    let image =
+        "\"gpt-image-1\": {\"litellm_provider\": \"openai\", \"mode\": \"image_generation\", \
+                 \"input_cost_per_token\": 5e-06, \"output_cost_per_image_token\": 4e-05}"
+            .to_owned();
+    let body = litellm_body(&[
+        image,
+        ll_entry(
+            "gpt-4o-mini-tts",
+            "openai",
+            "audio_speech",
+            Some(6e-7),
+            Some(1e-5),
+            None,
+            None,
+        ),
+        ll_entry(
+            "sora-2",
+            "openai",
+            "video_generation",
+            Some(1e-6),
+            Some(1e-6),
+            None,
+            None,
+        ),
+    ]);
+    let prices = parse_litellm(&body).unwrap();
+    assert_eq!(prices[&key("openai", "gpt-image-1")].output, 40.0);
+    assert_eq!(prices[&key("openai", "gpt-4o-mini-tts")].input, 0.6);
+    assert!(
+        !prices.contains_key(&key("openai", "sora-2")),
+        "a video model is priced by the second, not the token"
+    );
+}
+
+#[test]
+fn litellm_unit_prices_are_read_per_second_character_hour_image_and_clip() {
+    let body = r#"{
+        "sora-2": {"litellm_provider": "openai", "mode": "video_generation", "output_cost_per_video_per_second": 0.1},
+        "openai/sora-2": {"litellm_provider": "openai", "mode": "video_generation", "output_cost_per_video_per_second": 0.1},
+        "gemini/veo-3.1-lite-generate-preview": {"litellm_provider": "gemini", "mode": "video_generation", "output_cost_per_second": 0.05},
+        "tts-1": {"litellm_provider": "openai", "mode": "audio_speech", "input_cost_per_character": 1.5e-05},
+        "gpt-4o-mini-tts": {"litellm_provider": "openai", "mode": "audio_speech", "input_cost_per_token": 6e-07, "output_cost_per_second": 0.00025},
+        "xai/grok-imagine-image": {"litellm_provider": "xai", "mode": "image_generation", "input_cost_per_image": 0.02},
+        "whisper-1": {"litellm_provider": "openai", "mode": "audio_transcription", "input_cost_per_second": 0.0001},
+        "stability.sd3-5-large-v1:0": {"litellm_provider": "bedrock", "mode": "image_generation", "output_cost_per_image": 0.08},
+        "gemini/lyria-3-clip-preview": {"litellm_provider": "gemini", "mode": "chat", "output_cost_per_image": 0.04},
+        "gemini/gemini-3.1-flash-image": {"litellm_provider": "gemini", "mode": "image_generation", "input_cost_per_token": 5e-07, "output_cost_per_image": 0.045},
+        "gemini/veo-disagrees": {"litellm_provider": "gemini", "mode": "video_generation", "output_cost_per_second": 0.05},
+        "veo-disagrees": {"litellm_provider": "gemini", "mode": "video_generation", "output_cost_per_second": 0.5},
+        "ft:tts-1:x": {"litellm_provider": "openai", "mode": "audio_speech", "input_cost_per_character": 1e-05},
+        "1024-x-1024/max-steps/stability.x": {"litellm_provider": "bedrock", "mode": "image_generation", "output_cost_per_image": 0.1},
+        "mistral-image": {"litellm_provider": "mistral", "mode": "image_generation", "output_cost_per_image": 0.1},
+        "free-video": {"litellm_provider": "openai", "mode": "video_generation", "output_cost_per_second": 0},
+        "gpt-5.5": {"litellm_provider": "openai", "mode": "chat", "output_cost_per_image": 0.2},
+        "a-note": "not an object"
+    }"#;
+    let rows = parse_litellm_units(body, "2026-09-17").unwrap();
+    let found: Vec<(&str, &str, &str, f64)> = rows
+        .iter()
+        .map(|r| {
+            (
+                r.provider.as_str(),
+                r.prefix.as_str(),
+                r.unit.as_str(),
+                r.usd,
+            )
+        })
+        .collect();
+    assert_eq!(
+        found,
+        vec![
+            ("bedrock", "stability.sd3-5-large-v1:0", "image", 0.08),
+            ("google", "lyria-3-clip-preview", "clip", 0.04),
+            (
+                "google",
+                "veo-3.1-lite-generate-preview",
+                "video_second",
+                0.05
+            ),
+            ("openai", "gpt-4o-mini-tts", "audio_hour", 0.9),
+            ("openai", "sora-2", "video_second", 0.1),
+            ("openai", "tts-1", "million_chars", 15.0),
+            ("openai", "whisper-1", "audio_hour", 0.36),
+            ("xai", "grok-imagine-image", "image", 0.02),
+        ]
+    );
+    assert!(
+        rows.iter()
+            .all(|r| r.source == LITELLM_UNIT_SOURCE && r.checked_on == "2026-09-17")
+    );
+    assert!(parse_litellm_units("[]", "2026-09-17").is_err());
+    assert!(parse_litellm_units("nope", "2026-09-17").is_err());
+}
+
+#[test]
+fn unit_rows_keep_a_persons_rows_and_refresh_litellms() {
+    let unit = |provider: &str, prefix: &str, usd: f64, source: &str, checked_on: &str| UnitRow {
+        provider: provider.into(),
+        prefix: prefix.into(),
+        unit: "image".into(),
+        usd,
+        source: source.into(),
+        checked_on: checked_on.into(),
+    };
+    let existing = vec![
+        unit("xai", "grok-imagine-image", 0.02, "manual", "2026-09-16"),
+        unit("openai", "same", 0.1, "litellm", "2026-01-01"),
+        unit("openai", "moved", 0.1, "litellm", "2026-01-01"),
+        unit("openai", "gone", 0.1, "litellm", "2026-01-01"),
+    ];
+    let fresh = vec![
+        unit("xai", "grok-imagine-image", 0.5, "litellm", "2026-09-17"),
+        unit("openai", "same", 0.1, "litellm", "2026-09-17"),
+        unit("openai", "moved", 0.2, "litellm", "2026-09-17"),
+        unit("openai", "new", 0.3, "litellm", "2026-09-17"),
+    ];
+    let (rows, changes) = merge_units(&existing, fresh);
+    assert_eq!(
+        rows[0], existing[0],
+        "a person's row wins and is kept as written"
+    );
+    let same = rows.iter().find(|r| r.prefix == "same").unwrap();
+    assert_eq!(
+        same.checked_on, "2026-01-01",
+        "an unmoved row keeps its day"
+    );
+    assert!(rows.iter().all(|r| r.prefix != "gone"));
+    assert_eq!(
+        changes,
+        vec![
+            "~ unit openai/moved: 0.1 per image -> 0.2 per image",
+            "+ unit openai/new: 0.3 per image",
+            "- unit openai/gone: LiteLLM no longer prices it",
+        ]
+    );
+    let (_, none) = merge_units(&rows, rows.clone());
+    assert!(
+        none.is_empty(),
+        "a refresh with nothing new changes nothing"
+    );
+
+    let table = Table {
+        read_on: "2026-09-17".into(),
+        rows: Rows::new(),
+        unit_rows: vec![unit("openai", "old-litellm", 0.1, "litellm", "2020-01-01")],
+    };
+    assert!(
+        stale_unit_rows(&table, "2026-09-17").is_empty(),
+        "LiteLLM's rows are read again"
+    );
 }

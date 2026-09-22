@@ -3,7 +3,7 @@ title: Embedding
 description: Run the Leviath runtime inside your own Rust process with the leviath crate, with no CLI, daemon, or config file.
 group: Reference
 group_order: 3
-order: 15
+order: 16
 ---
 
 # Embedding Leviath in a Rust application
@@ -77,14 +77,22 @@ returning.
 | --- | --- |
 | `provider(creds)` | Register a provider from credentials. Repeatable. `ProviderCreds::simple(name)` covers key-free providers like `ollama`. |
 | `register_provider(name, arc)` | Register your own `Provider` implementation, including mocks for tests. Wins over a credentials entry with the same name. |
-| `default_model(provider, model)` | The fallback when none of a stage's listed models has a registered provider. |
-| `fallback_model(provider, model)` | Where a run moves when its provider fails mid-run, so a single-model blueprint survives an outage. |
+| `default_provider(provider)` | The provider bare model names route to. Each stage keeps the model its blueprint names. |
+| `override_model(provider, model)` | The embedded `override_model`. One model every stage that allows a user default starts on. |
+| `fallback_model(model)` | The embedded `fallback_model`. A last model to try when a stage's own list is spent. |
+| `fallback_route(provider, model)` | Where a run moves when its provider fails mid-run. |
 | `prompt_hints(hints)` | Turn on the batch-tool and shell hints, which are off by default on the embed path. |
 | `tool_service(arc)` | Replace the built-in tool service with your own (see below). |
 | `state_dir(dir)` | Persist runs on disk in the daemon's layout (`dir/runs/<run_id>/`). Without it the world stays in memory. |
 | `inference_pool(config)` | Per-model inference concurrency limits. |
 | `tool_concurrency(n)` | How many tool batches may execute at once (default 4). |
 | `runtime(handle)` | Run on a specific Tokio runtime instead of the ambient one. |
+
+`override_model` sets the default provider as well. Its model goes ahead of what a stage's
+blueprint names, on every stage that allows a user default. `fallback_model` names a model on the
+default provider, tried after every model a stage names and never ahead of them. `fallback_route`
+is how a single-model blueprint survives an outage, and it carried the name `fallback_model`
+before 0.6.
 
 Blueprints come from three places: `BlueprintSource::Path` for a `.leviath` file,
 `BlueprintSource::Toml` for blueprint text you already have in memory, and
@@ -126,7 +134,24 @@ erroring, and the stream ends after `shutdown()`.
 that produced it. Reading it from the event avoids a second call and avoids racing the write to
 disk.
 
-`AgentWorld::result(&run_id)` asks for the same thing at any point while the run is loaded.
+`AgentWorld::result(&run_id)` asks for the same thing at any point while the run is loaded. Its
+`artifacts` are the files the run produced, each with a path relative to the workdir, a mime
+type, a size and the hash the run's blob store holds it under. `artifact_bytes(&run_id, &artifact)`
+reads one of them back from that store, so an embedder never needs to know where the world keeps
+its files. It answers `None` for a file the store does not hold, such as one too large to store or
+an artifact recorded by path alone.
+
+Files go in the same way. `SpawnSpec::attach` puts an `InboundPart` on the spawn. The run's
+registry types it unless the part declares a type, and it lands in the task region unless it names
+another. `send_message_with` sends a message with files, and an `InteractionResponse::text` answer
+takes files through `with_parts`. A `@path` inside the text is not resolved here, since an
+embedder has no working directory to resolve it against. Attach the file and keep the name in the
+text, and the model reads the same name.
+
+```rust
+let spec = SpawnSpec::new(source, "edit @hero.png so the arm is longer", cwd)
+    .attach(InboundPart::from_bytes("hero.png", std::fs::read("hero.png")?));
+```
 
 Ask for a shape when you spawn. The label reaches the model untouched, so your own house format
 works with no support from this crate.

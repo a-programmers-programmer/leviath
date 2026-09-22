@@ -324,6 +324,9 @@ fn print_success(blueprint: &leviath_core::Blueprint) {
     for line in input_lines(blueprint) {
         println!("{line}");
     }
+    for line in mime_lines(blueprint) {
+        println!("{line}");
+    }
 
     let is_graph = blueprint.stages.iter().any(|s| s.transitions.is_some());
     if is_graph {
@@ -389,6 +392,84 @@ fn global_tools_suffix(stage: &leviath_core::Stage) -> &'static str {
     } else {
         ""
     }
+}
+
+/// One line per stage that takes mime or hands back declared artifacts:
+/// what `lev run --attach` may aim at it, and what `lev result` will list.
+fn mime_lines(blueprint: &leviath_core::Blueprint) -> Vec<String> {
+    let mut lines = Vec::new();
+    if !blueprint.mime_types.is_empty() {
+        let rows: Vec<String> = blueprint
+            .mime_types
+            .iter()
+            .map(
+                |(key, row)| match row.get("check").and_then(|v| v.as_str()) {
+                    Some(check) if !check.is_empty() => format!("{key} (check {check})"),
+                    _ => key.clone(),
+                },
+            )
+            .collect();
+        lines.push(format!(
+            "  Mime types: adds {} row{} for its runs: {}",
+            rows.len(),
+            match rows.len() {
+                1 => "",
+                _ => "s",
+            },
+            rows.join(", ")
+        ));
+    }
+    for stage in &blueprint.stages {
+        let takes: Vec<String> = blueprint
+            .stage_inputs(stage)
+            .into_iter()
+            .filter(|p| p != "*/*")
+            .collect();
+        let hands_back: Vec<String> = stage
+            .output
+            .as_ref()
+            .map(|o| {
+                o.artifacts
+                    .iter()
+                    .map(|a| {
+                        format!(
+                            "{} ({}{})",
+                            a.name,
+                            a.mime_type,
+                            if a.required { ", required" } else { "" }
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let limits: Vec<String> = stage
+            .tool_accepts
+            .iter()
+            .map(|(tool, list)| format!("{tool} to [{}]", list.join(", ")))
+            .collect();
+        if takes.is_empty() && hands_back.is_empty() && limits.is_empty() {
+            continue;
+        }
+        let mut parts = Vec::new();
+        if !takes.is_empty() {
+            parts.push(format!("takes {}", takes.join(", ")));
+        }
+        if !stage.input_as_text.is_empty() {
+            parts.push(format!("as text: {}", stage.input_as_text.join(", ")));
+        }
+        if !hands_back.is_empty() {
+            parts.push(format!("hands back {}", hands_back.join(", ")));
+        }
+        if !limits.is_empty() {
+            parts.push(format!("limits {}", limits.join(", ")));
+        }
+        lines.push(format!(
+            "  Mime, stage '{}': {}",
+            stage.name,
+            parts.join("; ")
+        ));
+    }
+    lines
 }
 
 /// Outcome of the real, testable logic in [`execute`]. Kept distinct from
@@ -484,6 +565,7 @@ fn execute_reporting_outcome(
         let workdir = crate::commands::resolve_cwd().unwrap_or_default();
         if !args.json {
             print_model_resolution(&checked.blueprint, config, registry);
+            print_dependencies(&checked.blueprint, config, &checked.agent_dir);
         }
         env = env
             .with_providers(&checked.blueprint, config)
@@ -493,7 +575,9 @@ fn execute_reporting_outcome(
         // an empty catalogue would call every model wrong - so this is the one
         // builder that takes the registry the caller already warmed.
         if let Some(registry) = registry {
-            env = env.with_provider_catalogs(&checked.blueprint, config, registry);
+            env = env
+                .with_provider_catalogs(&checked.blueprint, config, registry)
+                .with_retention(&checked.blueprint, config, registry);
         }
     }
     let findings = lint_manifest(&checked.content, &checked.blueprint, &env);
@@ -512,11 +596,36 @@ fn execute_reporting_outcome(
     Ok(ValidateOutcome::Success)
 }
 
+/// Print each declared dependency and whether this machine satisfies it, the
+/// same check the spawn gate makes. Non-fatal: an unmet dependency is a
+/// machine-setup fact, not a blueprint error, so it is shown rather than
+/// counted as a finding. A blueprint that declares none prints nothing.
+fn print_dependencies(
+    blueprint: &leviath_core::Blueprint,
+    config: &crate::config::Config,
+    agent_dir: &std::path::Path,
+) {
+    if blueprint.dependencies.is_empty() {
+        return;
+    }
+    let report = crate::dependencies::evaluate(
+        &blueprint.dependencies,
+        &config.mcp_servers,
+        agent_dir,
+        &crate::dependencies::SystemProbe,
+    );
+    println!();
+    println!("Dependencies:");
+    for status in &report.statuses {
+        println!("  {}", status.line());
+    }
+}
+
 /// What each stage would actually dispatch to on this machine, and why.
 ///
 /// A blueprint lists an ordered set of models per stage, and the resolver
 /// reorders it: registered candidates on `default_provider` move to the front,
-/// `default_model` first among them. Nothing surfaced the result, so a config
+/// `override_model` first among them. Nothing surfaced the result, so a config
 /// line could silently move every stage onto a fallback model and the only
 /// evidence was in a finished run's metadata. The line under each stage is the
 /// blueprint's own order, so the promotion is visible as a difference rather
@@ -539,10 +648,12 @@ fn print_model_resolution(
 
 /// Whether anything registered here can run this entry.
 ///
-/// A pinned entry needs its provider registered. An open one needs some provider
-/// to claim the model, which is the same question the resolver asks.
+/// A pinned entry needs its provider registered. An open one needs a provider
+/// in the preference to claim the model, which is the same question the
+/// resolver asks: a provider outside the preference never serves a bare name.
 fn model_is_reachable(
     entry: &leviath_core::blueprint::ModelEntry,
+    defaults: &leviath_runtime::pipeline::ModelDefaults,
     registry: &leviath_runtime::ProviderRegistry,
 ) -> bool {
     if !entry.provider.is_empty() {
@@ -552,7 +663,7 @@ fn model_is_reachable(
     registry
         .native_providers()
         .iter()
-        .any(|(_, p)| p.serves_model(key).is_some())
+        .any(|(name, p)| defaults.is_preferred(name) && p.serves_model(key).is_some())
 }
 
 /// A model id without its vendor prefix, for comparing what was asked for
@@ -598,10 +709,10 @@ fn model_resolution_lines(
             .model
             .models
             .iter()
-            .filter(|e| model_is_reachable(e, registry))
+            .filter(|e| model_is_reachable(e, &defaults, registry))
             .count();
         if let Some(first) = stage.model.models.first()
-            && !model_is_reachable(first, registry)
+            && !model_is_reachable(first, &defaults, registry)
         {
             lines.push(format!(
                 "  {:<16}   prefers {}, which no configured provider serves - running {model}",
@@ -649,9 +760,10 @@ fn model_resolution_lines(
         }
     }
     if !config.default_provider.is_empty() {
-        let model = config.default_model.as_deref().unwrap_or("(unset)");
+        let over = config.override_model.as_deref().unwrap_or("(unset)");
+        let fall = config.fallback_model.as_deref().unwrap_or("(unset)");
         lines.push(format!(
-            "  default_provider = {}, default_model = {model}",
+            "  default_provider = {}, override_model = {over}, fallback_model = {fall}",
             config.default_provider
         ));
     }
@@ -1049,7 +1161,7 @@ system_prompt = "hi"
 
         let config = crate::config::Config {
             default_provider: "anthropic".to_string(),
-            default_model: None,
+            override_model: None,
             providers: crate::config::ProviderConfig {
                 anthropic_api_key: Some("test-key".to_string()),
                 ..Default::default()
@@ -1159,7 +1271,7 @@ system_prompt = "hi"
         // is not part of what the test is about.
         let with_keys = |default_provider: &str| crate::config::Config {
             default_provider: default_provider.to_string(),
-            default_model: None,
+            override_model: None,
             openrouter_api_key: Some("test-key".to_string()),
             providers: crate::config::ProviderConfig {
                 anthropic_api_key: Some("test-key".to_string()),
@@ -1213,7 +1325,7 @@ system_prompt = "hi"
             lines
                 .iter()
                 .any(|l| l.contains("default_provider = openrouter")
-                    && l.contains("default_model = (unset)")),
+                    && l.contains("override_model = (unset), fallback_model = (unset)")),
             "and the setting responsible has to be named: {lines:#?}"
         );
 
@@ -1354,6 +1466,21 @@ model = { provider = "anthropic", model = "claude-sonnet-4-6" }
         leviath_core::manifest::parse_manifest(toml).unwrap()
     }
 
+    #[test]
+    fn print_dependencies_skips_when_none_and_lists_when_present() {
+        let cfg = crate::config::Config::default();
+        let dir = std::path::Path::new(".");
+        // A blueprint with no dependencies prints nothing and must not panic.
+        let none = parse("[agent]\nname = \"n\"\n");
+        print_dependencies(&none, &cfg, dir);
+        // One with a dependency reaches the listing loop.
+        let some = parse(
+            "[agent]\nname = \"a\"\n\n\
+             [[dependencies]]\nname = \"e\"\nkind = \"env\"\nvar = \"LEVIATH_VALIDATE_UNSET_XYZ\"\n",
+        );
+        print_dependencies(&some, &cfg, dir);
+    }
+
     /// Helper to create a minimal valid blueprint TOML with given stages.
     fn make_blueprint_toml(stages_toml: &str) -> String {
         format!(
@@ -1370,6 +1497,84 @@ system = {{ kind = "pinned", max_tokens = 1000 }}
 conversation = {{ kind = "sliding_window", max_items = 50, max_tokens = 10000 }}
 "#
         )
+    }
+
+    #[test]
+    fn mime_lines_say_what_each_stage_takes_and_hands_back() {
+        let toml = make_blueprint_toml(
+            r#"
+[stages.plan]
+mode = "autonomous"
+model = { provider = "anthropic", model = "claude-sonnet-4-6" }
+description = "Plan"
+max_iterations = 5
+
+[stages.cut]
+mode = "autonomous"
+model = { provider = "anthropic", model = "claude-sonnet-4-6" }
+description = "Cut"
+max_iterations = 5
+[stages.cut.input]
+accepts = ["audio/*", "image/*"]
+as_text = ["model/obj"]
+[stages.cut.tool_accepts]
+spawn_agent = ["image/*"]
+[[stages.cut.output.artifacts]]
+name = "final"
+type = "video/mp4"
+required = true
+[[stages.cut.output.artifacts]]
+name = "notes"
+type = "text/*"
+
+[stages.ship]
+mode = "autonomous"
+model = { provider = "anthropic", model = "claude-sonnet-4-6" }
+description = "Ship"
+max_iterations = 5
+[[stages.ship.output.artifacts]]
+name = "bundle"
+type = "application/zip"
+
+[stages.hear]
+mode = "autonomous"
+model = { provider = "anthropic", model = "claude-sonnet-4-6" }
+description = "Hear"
+max_iterations = 5
+[stages.hear.input]
+accepts = ["audio/*"]
+
+[mime_types."application/x-acme-scene"]
+family = "model"
+check = "checks/scene.rhai"
+[mime_types."model/obj"]
+text = true
+"#,
+        );
+        let lines = mime_lines(&parse(&toml));
+        assert_eq!(
+            lines,
+            vec![
+                "  Mime types: adds 2 rows for its runs: application/x-acme-scene (check \
+                 checks/scene.rhai), model/obj"
+                    .to_string(),
+                "  Mime, stage 'cut': takes audio/*, image/*; as text: model/obj; hands back \
+                 final (video/mp4, required), notes (text/*); limits spawn_agent to [image/*]"
+                    .to_string(),
+                "  Mime, stage 'ship': hands back bundle (application/zip)".to_string(),
+                "  Mime, stage 'hear': takes audio/*".to_string(),
+            ]
+        );
+        print_success(&parse(&toml));
+        // One row, and a check lifted with an empty name, read as a bare key.
+        let one = make_blueprint_toml(
+            "[stages.plan]\nmode = \"autonomous\"\nmodel = { provider = \"anthropic\", model = \"m\" }\n\
+             description = \"Plan\"\nmax_iterations = 5\n\n[mime_types.\"image/gif\"]\ncheck = \"\"\n",
+        );
+        assert_eq!(
+            mime_lines(&parse(&one)),
+            vec!["  Mime types: adds 1 row for its runs: image/gif".to_string()]
+        );
     }
 
     #[test]

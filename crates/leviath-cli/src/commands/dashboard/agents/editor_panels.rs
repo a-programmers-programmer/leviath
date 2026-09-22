@@ -7,23 +7,63 @@ use std::collections::BTreeSet;
 
 use super::super::state::Dashboard;
 use super::super::types::ConfirmAction;
-use super::editor::PickerFor;
+use super::choices::ToolChoice;
+use super::editor::{ModalBase, PickerFor, TYPE_ANOTHER};
 use super::inspector::{FieldId, Panel, REGION_KINDS};
-use crate::blueprint_edit::{RegionField, RegionScope, RegionValue, Rule, TransformKind};
+use crate::blueprint_edit::{
+    ArtifactField, InputList, RegionField, RegionScope, RegionValue, Rule, TransformKind,
+    WorkerKind, split_list,
+};
+
+/// The output type that asks for no shape.
+const OUTPUT_ANY: &str = "(any)";
+
+/// The plain shapes the output type chooser offers ahead of the mime
+/// types, each with what it means.
+const OUTPUT_SHAPES: [(&str, &str); 4] = [
+    (OUTPUT_ANY, "no shape asked for"),
+    ("markdown", "prose the model formats; checked to parse"),
+    (
+        "json",
+        "a JSON document; checked to parse, and against a schema when the stage has one",
+    ),
+    ("text", "plain text"),
+];
 use crate::tui::widgets::confirm::Confirm;
 use crate::tui::widgets::line_edit::LineEdit;
 use crate::tui::widgets::picker::{Picker, PickerOption};
 use ratatui::text::Line;
 
-/// `200k`, `1M`, `1.5M`: a context window as the picker shows it.
-pub(super) fn window_label(tokens: usize) -> String {
-    if tokens >= 1_000_000 {
-        let m = tokens as f64 / 1_000_000.0;
-        let text = format!("{m:.1}");
-        format!("{}M", text.trim_end_matches(".0"))
-    } else {
-        format!("{}k", tokens / 1000)
+/// A word for a chooser row: what a family or a wildcard stands for.
+fn type_detail(value: &str) -> String {
+    match value.split_once('/') {
+        Some(("*", "*")) => "anything".to_string(),
+        Some((kind, "*")) => format!("every {kind} type"),
+        _ => String::new(),
     }
+}
+
+/// A short label for what a model makes, when it is not a plain text model:
+/// "makes 3D models", "makes images", and so on. `None` for a text model, so
+/// the picker only tags the ones worth calling out (a Meshy operation, an image
+/// model). Read from the compiled mime table, which needs no live provider.
+fn model_modality_tag(provider: &str, model: &str) -> Option<&'static str> {
+    let mime = leviath_providers::mime_tables::builtin_mime(provider, model);
+    for (family, tag) in [
+        ("model/", "makes 3D models"),
+        ("image/", "makes images"),
+        ("audio/", "makes audio"),
+        ("video/", "makes video"),
+    ] {
+        if mime
+            .output
+            .iter()
+            .any(|pattern| pattern.starts_with(family))
+        {
+            return Some(tag);
+        }
+    }
+    None
 }
 
 /// The regions a stage's tool routing may name: its effective layout plus
@@ -39,19 +79,41 @@ impl Dashboard {
     /// The scope of the region panel, when the inspector is on one.
     fn panel_region(&mut self) -> Option<(RegionScope, String)> {
         match &self.editor().panel {
-            Panel::Region { scope, name, .. } => Some((scope.clone(), name.clone())),
+            Panel::Region { scope, name } => Some((scope.clone(), name.clone())),
             _ => None,
         }
     }
 
-    /// A toggle the core does not know: the region's `required`.
+    /// The declared file a window is open on, when one is.
+    fn panel_artifact(&mut self) -> Option<(String, usize)> {
+        match &self.editor().panel {
+            Panel::Artifact { stage, index } => Some((stage.clone(), *index)),
+            _ => None,
+        }
+    }
+
+    /// A toggle the core does not know: the region's `required`, an
+    /// artifact's.
     pub(super) fn editor_set_toggle_more(&mut self, id: &FieldId, on: bool) {
-        if *id == FieldId::RegionRequired
-            && let Some((scope, name)) = self.panel_region()
-        {
-            self.editor_mutate(|d| {
-                d.set_region_field(&scope, &name, RegionField::Required, RegionValue::Flag(on))
-            });
+        match id {
+            FieldId::RegionRequired => {
+                if let Some((scope, name)) = self.panel_region() {
+                    self.editor_mutate(|d| {
+                        d.set_region_field(
+                            &scope,
+                            &name,
+                            RegionField::Required,
+                            RegionValue::Flag(on),
+                        )
+                    });
+                }
+            }
+            FieldId::ArtifactRequired => {
+                if let Some((stage, i)) = self.panel_artifact() {
+                    self.editor_mutate(|d| d.set_artifact(&stage, i, ArtifactField::Required(on)));
+                }
+            }
+            _ => {}
         }
     }
 
@@ -141,6 +203,12 @@ impl Dashboard {
     pub(super) fn editor_pick_more(&mut self, id: &FieldId, value: &str) {
         let value = value.to_string();
         match id {
+            // The "another…" row asks for the name; anything else is it.
+            FieldId::WorkerRef if value == TYPE_ANOTHER => {
+                self.editor().line =
+                    Some((FieldId::WorkerRef, LineEdit::new(String::new(), false)));
+            }
+            FieldId::WorkerRef => self.editor_set_worker(&value),
             FieldId::RoutingDefault => {
                 let stage = self.editor().panel_stage().expect("a stage field");
                 let region = if value == "(default)" {
@@ -230,6 +298,16 @@ impl Dashboard {
                 );
                 self.editor().picker = Some((PickerFor::RoutingTool, picker));
             }
+            FieldId::AddArtifact => {
+                self.editor().add_artifact = Some(LineEdit::new(String::new(), false));
+            }
+            FieldId::DeleteArtifact => {
+                if let Some((stage, i)) = self.panel_artifact()
+                    && self.editor_mutate(|d| d.delete_artifact(&stage, i))
+                {
+                    self.editor_close_modal();
+                }
+            }
             FieldId::DeleteRegion => {
                 let Some((scope, name)) = self.panel_region() else {
                     return;
@@ -256,18 +334,10 @@ impl Dashboard {
         name: &str,
     ) {
         let (scope, name) = (scope.clone(), name.to_string());
-        // Where the panel came from, taken before the refresh forgets it.
-        let back = match &self.editor().panel {
-            Panel::Region { back, .. } => Some((**back).clone()),
-            _ => None,
-        };
-        if self.editor_mutate(|d| d.delete_region(&scope, &name))
-            && let Some(back) = back
-        {
-            let editor = self.editor();
-            editor.panel = back;
-            editor.panel_anchor = None;
-            editor.cursor = 0;
+        // The window closes with the region; the refresh would have closed
+        // it anyway, and this way the cursor lands where it was.
+        if self.editor_mutate(|d| d.delete_region(&scope, &name)) {
+            self.editor_close_modal();
         }
     }
 
@@ -296,6 +366,37 @@ impl Dashboard {
                 if !self.editor_mutate(|d| d.rename_region(&scope, &name, &text)) {
                     self.set_region_panel_name(&name);
                 }
+            }
+            // A typed list of types: the chooser's "another…" row lands
+            // here with what was picked already in the box.
+            FieldId::StageAccepts
+            | FieldId::StageAsText
+            | FieldId::RegionAccepts
+            | FieldId::ToolLimitRow(_)
+            | FieldId::ArtifactType => self.editor_write_types(id, split_list(&text)),
+            FieldId::OutputFormat => {
+                let stage = self.editor().panel_stage().expect("a stage field");
+                self.editor_mutate(|d| d.set_output_format(&stage, &text));
+            }
+            FieldId::OutputRouting => {
+                let stage = self.editor().panel_stage().expect("a stage field");
+                let entries = super::inspector::parse_routing(&text);
+                self.editor_mutate(|d| d.set_output_routing(&stage, &entries));
+            }
+            FieldId::ContextReset => {
+                let stage = self.editor().panel_stage().expect("a stage field");
+                let regions = super::inspector::parse_region_list(&text);
+                self.editor_mutate(|d| d.set_context_reset(&stage, &regions));
+            }
+            FieldId::ArtifactName | FieldId::ArtifactDescription => {
+                let Some((stage, i)) = self.panel_artifact() else {
+                    return;
+                };
+                let field = match id {
+                    FieldId::ArtifactName => ArtifactField::Name(text),
+                    _ => ArtifactField::Description(text),
+                };
+                self.editor_mutate(|d| d.set_artifact(&stage, i, field));
             }
             FieldId::RegionStrategy
             | FieldId::RegionMessage
@@ -331,7 +432,7 @@ impl Dashboard {
             FieldId::RegionRow(name) => {
                 self.editor_open_region(RegionScope::Shared, name);
             }
-            FieldId::StageRegionRow(name) => {
+            FieldId::StageRegionRow(name) | FieldId::IoRegionRow(name) => {
                 let stage = self.editor().panel_stage().expect("a stage field");
                 let scope = if self.editor().doc.effective_regions(Some(&stage)).inherited {
                     RegionScope::Shared
@@ -340,6 +441,17 @@ impl Dashboard {
                 };
                 self.editor_open_region(scope, name);
             }
+            FieldId::ArtifactRow(i) => {
+                let stage = self.editor().panel_stage().expect("a stage field");
+                self.editor_open_artifact(&stage, *i);
+            }
+            FieldId::StageAccepts
+            | FieldId::StageAsText
+            | FieldId::RegionAccepts
+            | FieldId::ToolLimitRow(_)
+            | FieldId::ArtifactType
+            | FieldId::OutputFormat => self.editor_open_type_chooser(id),
+            FieldId::WorkerRef => self.editor_open_worker_picker(),
             FieldId::ModelEntry(i) => self.editor_open_model_picker(PickerFor::ReplaceModel(*i)),
             // The empty chain reads as a model row; Enter still adds.
             FieldId::AddModel => self.editor_open_model_picker(PickerFor::AddModel),
@@ -353,12 +465,25 @@ impl Dashboard {
         }
     }
 
-    /// `x` on a row: drop a model from the chain, stop routing a tool.
+    /// `x` on a row: drop a model from the chain, stop routing a tool, drop
+    /// an artifact declaration.
     pub(super) fn editor_remove_row(&mut self) {
         let Some(field) = self.editor().current_field() else {
             return;
         };
         match field.id {
+            FieldId::ArtifactRow(i) => {
+                let stage = self.editor().panel_stage().expect("a stage field");
+                self.editor_mutate(|d| d.delete_artifact(&stage, i));
+            }
+            // A list of types cleared: the stage's, a tool's, a region's; the
+            // output type back to none.
+            FieldId::StageAccepts
+            | FieldId::StageAsText
+            | FieldId::RegionAccepts
+            | FieldId::ToolLimitRow(_)
+            | FieldId::OutputFormat => self.editor_write_types(&field.id, Vec::new()),
+            FieldId::WorkerRef => self.editor_set_worker(""),
             FieldId::ModelEntry(i) => {
                 let stage = self.editor().panel_stage().expect("a stage field");
                 let chain: Vec<String> = self
@@ -447,17 +572,36 @@ impl Dashboard {
         self.editor_mutate(|d| d.set_transform_rule(&from, &to, &region, rule));
     }
 
-    /// Open the region panel, remembering where to go back to.
-    pub(super) fn editor_open_region(&mut self, scope: RegionScope, name: &str) {
+    /// Open `panel` in a window over the panel the inspector shows, which
+    /// stays where it is until the window closes. A window never opens over
+    /// another: every row that opens one sits on a panel the inspector
+    /// shows, so the panel here is always the one to come back to.
+    fn editor_open_modal(&mut self, panel: Panel) {
         let editor = self.editor();
-        let back = Box::new(editor.panel.clone());
-        editor.panel_anchor = Some(editor.view.selection());
-        editor.panel = Panel::Region {
+        editor.modal = Some(ModalBase {
+            panel: editor.panel.clone(),
+            cursor: editor.cursor,
+            anchor: editor.view.selection(),
+        });
+        editor.panel = panel;
+        editor.cursor = 0;
+        editor.focus = super::editor::Focus::Inspector;
+    }
+
+    /// Open a region's window.
+    pub(super) fn editor_open_region(&mut self, scope: RegionScope, name: &str) {
+        self.editor_open_modal(Panel::Region {
             scope,
             name: name.to_string(),
-            back,
-        };
-        editor.cursor = 0;
+        });
+    }
+
+    /// Open a declared file's window.
+    pub(super) fn editor_open_artifact(&mut self, stage: &str, index: usize) {
+        self.editor_open_modal(Panel::Artifact {
+            stage: stage.to_string(),
+            index,
+        });
     }
 
     /// Open the path panel on a stage's loop back to itself. A loop is not
@@ -467,34 +611,213 @@ impl Dashboard {
     pub(super) fn editor_open_self_loop(&mut self, stage: &str) {
         let editor = self.editor();
         editor.view.select_stage(stage);
-        editor.panel_anchor = Some(editor.view.selection());
-        editor.panel = Panel::Edge {
-            from: stage.to_string(),
-            to: stage.to_string(),
+        // The window opens over the stage's behaviour tab, whichever panel
+        // led here: the canvas menu, or a fresh loop just connected.
+        editor.modal = None;
+        editor.panel = Panel::Stage {
+            name: stage.to_string(),
+            tab: super::inspector::StageTab::Behaviour,
         };
         editor.cursor = 0;
-        editor.focus = super::editor::Focus::Inspector;
+        self.editor_open_modal(Panel::Edge {
+            from: stage.to_string(),
+            to: stage.to_string(),
+        });
     }
 
-    /// Esc on a pushed panel: back to what opened it.
-    pub(super) fn editor_leave_region(&mut self) {
+    /// Esc on a window: back to the panel it was opened over. Nothing
+    /// happens when no window is up.
+    pub(super) fn editor_close_modal(&mut self) {
         let editor = self.editor();
-        if let Panel::Edge { from, .. } = &editor.panel {
-            let name = from.clone();
-            editor.panel = Panel::Stage {
-                name,
-                tab: super::inspector::StageTab::Behaviour,
-            };
-            editor.panel_anchor = None;
-            editor.cursor = 0;
+        let Some(base) = editor.modal.take() else {
+            return;
+        };
+        editor.panel = base.panel;
+        editor.cursor = base.cursor;
+        let count = editor.fields().len();
+        editor.cursor = editor.cursor.min(count.saturating_sub(1));
+    }
+
+    /// What a type field holds now, whether it takes one type or many, and
+    /// what the chooser is called.
+    fn type_field_state(&mut self, id: &FieldId) -> (Vec<String>, bool, String, String) {
+        let stage = self.editor().panel_stage();
+        let view = stage.as_deref().and_then(|s| self.editor().doc.stage(s));
+        match id {
+            FieldId::StageAccepts => (
+                view.map(|s| s.input_accepts).unwrap_or_default(),
+                false,
+                "What the stage takes, beyond its regions".to_string(),
+                "Mime type patterns the stage takes as parts. Left empty, its regions decide."
+                    .to_string(),
+            ),
+            FieldId::StageAsText => (
+                view.map(|s| s.input_as_text).unwrap_or_default(),
+                false,
+                "What the stage reads as text".to_string(),
+                "Types whose parts reach the model as text whatever it takes natively.".to_string(),
+            ),
+            FieldId::ToolLimitRow(tool) => (
+                view.and_then(|s| {
+                    s.tool_accepts
+                        .into_iter()
+                        .find(|(t, _)| t == tool)
+                        .map(|(_, list)| list)
+                })
+                .unwrap_or_default(),
+                false,
+                format!("What {tool} may be handed here"),
+                "A part of any other type is out of the tool's reach at this stage; nothing \
+                 picked means whatever the tool takes."
+                    .to_string(),
+            ),
+            FieldId::ArtifactType => (
+                self.panel_artifact()
+                    .and_then(|(s, i)| self.editor().doc.artifacts(&s).into_iter().nth(i))
+                    .map(|a| vec![a.mime_type])
+                    .unwrap_or_default(),
+                true,
+                "The file's type".to_string(),
+                "The mime type the file must be, or a pattern it must match.".to_string(),
+            ),
+            FieldId::OutputFormat => (
+                vec![
+                    view.map(|s| s.output_format)
+                        .filter(|f| !f.is_empty())
+                        .unwrap_or_else(|| OUTPUT_ANY.to_string()),
+                ],
+                true,
+                "The answer's type".to_string(),
+                "A label the model is told and the result records: markdown, json, text, or a \
+                 mime type. Nothing converts between shapes."
+                    .to_string(),
+            ),
+            _ => (
+                self.panel_region()
+                    .and_then(|(scope, name)| self.editor().doc.region(scope.stage(), &name))
+                    .map(|r| r.accepts)
+                    .unwrap_or_default(),
+                false,
+                "What the region takes".to_string(),
+                "Mime type patterns the region takes; a write outside them is refused with \
+                 the list. Nothing picked takes anything."
+                    .to_string(),
+            ),
+        }
+    }
+
+    /// The mime type chooser for a field: every family, every type the
+    /// registry knows, whatever the field already holds, and a row to type
+    /// one in.
+    fn editor_open_type_chooser(&mut self, id: &FieldId) {
+        let (current, single, title, explain) = self.type_field_state(id);
+        // The output type is a label before it is a mime type: the plain
+        // shapes come first, then every type the registry knows.
+        let mut values: Vec<String> = match id {
+            FieldId::OutputFormat => OUTPUT_SHAPES.iter().map(|(v, _)| v.to_string()).collect(),
+            _ => Vec::new(),
+        };
+        values.extend(self.editor().mime_types.iter().cloned());
+        for held in &current {
+            if !values.contains(held) {
+                values.push(held.clone());
+            }
+        }
+        let mut rows: Vec<PickerOption> = values
+            .iter()
+            .map(|value| PickerOption {
+                value: value.clone(),
+                detail: OUTPUT_SHAPES
+                    .iter()
+                    .find(|(v, _)| v == value)
+                    .map(|(_, d)| d.to_string())
+                    .unwrap_or_else(|| type_detail(value)),
+            })
+            .collect();
+        rows.push(PickerOption {
+            value: TYPE_ANOTHER.to_string(),
+            detail: "a type/subtype or type/* the list does not have".to_string(),
+        });
+        let cursor = current
+            .first()
+            .and_then(|c| values.iter().position(|v| v == c))
+            .unwrap_or(0);
+        let mut picker = Picker::new(title, vec![explain], rows, cursor);
+        if !single {
+            picker.multi = Some(
+                values
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, v)| current.contains(v))
+                    .map(|(i, _)| i)
+                    .collect(),
+            );
+        }
+        self.editor().picker = Some((PickerFor::MimeTypes(id.clone()), picker));
+    }
+
+    /// What the type chooser settled on. The "another…" row opens the line
+    /// editor with the rest already in it, so one more can be typed.
+    pub(super) fn editor_settle_types(&mut self, id: &FieldId, chosen: Vec<String>) {
+        let (kept, another): (Vec<String>, Vec<String>) =
+            chosen.into_iter().partition(|v| v != TYPE_ANOTHER);
+        if !another.is_empty() {
+            let mut text = kept.join(", ");
+            if !text.is_empty() {
+                text.push_str(", ");
+            }
+            self.editor().line = Some((id.clone(), LineEdit::new(text, false)));
             return;
         }
-        if let Panel::Region { back, .. } = &editor.panel {
-            editor.panel = (**back).clone();
-            editor.panel_anchor = None;
-            editor.cursor = 0;
-            let count = editor.fields().len();
-            editor.cursor = editor.cursor.min(count.saturating_sub(1));
+        self.editor_write_types(id, kept);
+    }
+
+    /// Write a list of types to the field it belongs to.
+    fn editor_write_types(&mut self, id: &FieldId, types: Vec<String>) {
+        match id {
+            FieldId::StageAccepts | FieldId::StageAsText => {
+                let stage = self.editor().panel_stage().expect("a stage field");
+                let which = if *id == FieldId::StageAccepts {
+                    InputList::Accepts
+                } else {
+                    InputList::AsText
+                };
+                self.editor_mutate(|d| d.set_stage_input(&stage, which, &types));
+            }
+            FieldId::ToolLimitRow(tool) => {
+                let stage = self.editor().panel_stage().expect("a stage field");
+                self.editor_mutate(|d| d.set_tool_accepts(&stage, tool, &types));
+            }
+            FieldId::ArtifactType => {
+                let Some((stage, i)) = self.panel_artifact() else {
+                    return;
+                };
+                let Some(first) = types.into_iter().next() else {
+                    return;
+                };
+                self.editor_mutate(|d| d.set_artifact(&stage, i, ArtifactField::Type(first)));
+            }
+            FieldId::OutputFormat => {
+                let stage = self.editor().panel_stage().expect("a stage field");
+                let format = types
+                    .into_iter()
+                    .next()
+                    .filter(|f| f != OUTPUT_ANY)
+                    .unwrap_or_default();
+                self.editor_mutate(|d| d.set_output_format(&stage, &format));
+            }
+            _ => {
+                if let Some((scope, name)) = self.panel_region() {
+                    self.editor_mutate(|d| {
+                        d.set_region_field(
+                            &scope,
+                            &name,
+                            RegionField::Accepts,
+                            RegionValue::Text(types.join(", ")),
+                        )
+                    });
+                }
+            }
         }
     }
 
@@ -517,7 +840,16 @@ impl Dashboard {
                     detail.push("already in this agent".to_string());
                 }
                 if let Some(window) = windows.get(&(provider.to_string(), id.to_string())) {
-                    detail.push(format!("{} context", window_label(*window)));
+                    detail.push(format!(
+                        "{} context",
+                        crate::commands::dashboard::helpers::format_tokens(*window)
+                    ));
+                }
+                // What the model makes, so a stage that must emit a mesh or an
+                // image can be pointed at a model that produces one rather than
+                // a text model that cannot.
+                if let Some(tag) = model_modality_tag(provider, id) {
+                    detail.push(tag.to_string());
                 }
                 PickerOption {
                     value: m.clone(),
@@ -541,29 +873,37 @@ impl Dashboard {
     /// The tools multi-chooser, preselected with the stage's tools.
     fn editor_open_tools_picker(&mut self) {
         let stage = self.editor().panel_stage().expect("a stage field");
-        let have = self
+        let (have, connectors) = self
             .editor()
             .doc
             .stage(&stage)
-            .map(|s| s.tools)
+            .map(|s| (s.tools, s.connectors))
             .unwrap_or_default();
         let all = self.editor().tools.clone();
         let rows: Vec<PickerOption> = all
             .iter()
             .map(|t| PickerOption {
-                value: t.clone(),
-                detail: String::new(),
+                value: t.name.clone(),
+                detail: t.detail.clone(),
             })
             .collect();
         let chosen: Vec<usize> = all
             .iter()
             .enumerate()
-            .filter(|(_, t)| have.contains(t))
+            .filter(|(_, t)| match t.connector {
+                true => connectors.contains(&t.name),
+                false => have.contains(&t.name),
+            })
             .map(|(i, _)| i)
             .collect();
         let mut picker = Picker::new(
             format!("Tools {stage} may use"),
-            vec!["Every tool this install has: built in, and scripts under the agent.".to_string()],
+            vec![
+                "A group such as @builtin grants every tool of that kind, installed now or \
+                 later; an MCP server grants every tool it advertises, now or later; the \
+                 rest are tools one by one, an MCP server's as server__tool."
+                    .to_string(),
+            ],
             rows,
             0,
         );
@@ -615,16 +955,113 @@ impl Dashboard {
                 let region = value.to_string();
                 self.editor_mutate(|d| d.set_tool_routing_override(&stage, &tool, &region));
             }
-            PickerFor::Tools | PickerFor::Field(_) | PickerFor::ConnectFrom(_) => {}
+            PickerFor::Tools
+            | PickerFor::Field(_)
+            | PickerFor::ConnectFrom(_)
+            | PickerFor::MimeTypes(_) => {}
         }
+    }
+
+    /// The worker chooser: the agent's other stages when the workers are a
+    /// stage of it, every agent in the catalog when they are another agent
+    /// (with an "another…" row for one that is not installed here). A query
+    /// is a text row, so Enter on it types rather than coming here.
+    fn editor_open_worker_picker(&mut self) {
+        let stage = self.editor().panel_stage().expect("a stage field");
+        let worker = self
+            .editor()
+            .doc
+            .stage(&stage)
+            .and_then(|s| s.fan_out.worker);
+        let current = worker.as_ref().map(|(_, v)| v.clone()).unwrap_or_default();
+        let kind = worker.map(|(k, _)| k);
+        let (title, explain, mut rows): (String, String, Vec<PickerOption>) = match kind {
+            Some(WorkerKind::Agent) => {
+                let own = self.editor().name.clone();
+                let rows = self
+                    .agents()
+                    .catalog
+                    .entries
+                    .iter()
+                    .filter(|e| e.name != own)
+                    .map(|e| PickerOption {
+                        value: e.name.clone(),
+                        detail: e.description.clone(),
+                    })
+                    .collect();
+                (
+                    format!("Which agent runs {stage}'s workers?"),
+                    "Every agent installed here; one that is not yet can be named.".to_string(),
+                    rows,
+                )
+            }
+            _ => (
+                format!("Which stage runs {stage}'s workers?"),
+                "A stage of this agent, run once per piece of the work.".to_string(),
+                self.editor()
+                    .doc
+                    .stage_names()
+                    .into_iter()
+                    .filter(|n| *n != stage)
+                    .map(|n| PickerOption {
+                        value: n,
+                        detail: String::new(),
+                    })
+                    .collect(),
+            ),
+        };
+        if kind == Some(WorkerKind::Agent) {
+            rows.push(PickerOption {
+                value: TYPE_ANOTHER.to_string(),
+                detail: "an agent by name, installed elsewhere".to_string(),
+            });
+        }
+        let cursor = rows.iter().position(|r| r.value == current).unwrap_or(0);
+        let picker = Picker::new(title, vec![explain], rows, cursor);
+        self.editor().picker = Some((PickerFor::Field(FieldId::WorkerRef), picker));
+    }
+
+    /// Write the worker the fan-out runs as, keeping its kind; empty clears
+    /// it.
+    pub(super) fn editor_set_worker(&mut self, value: &str) {
+        let stage = self.editor().panel_stage().expect("a stage field");
+        let kind = self
+            .editor()
+            .doc
+            .stage(&stage)
+            .and_then(|s| s.fan_out.worker.map(|(k, _)| k))
+            .unwrap_or(WorkerKind::Stage);
+        let worker = (!value.is_empty()).then(|| (kind, value.to_string()));
+        self.editor_mutate(|d| {
+            d.set_fan_out(&stage, crate::blueprint_edit::FanOutField::Worker(worker))
+        });
     }
 
     /// The tools chosen in the multi-chooser.
     pub(super) fn editor_settle_tools(&mut self, chosen: &[usize]) {
         let stage = self.editor().panel_stage().expect("a stage field");
         let all = self.editor().tools.clone();
-        let tools: Vec<String> = chosen.iter().filter_map(|i| all.get(*i).cloned()).collect();
-        self.editor_mutate(|d| d.set_tools(&stage, &tools));
+        let (connectors, tools): (Vec<&ToolChoice>, Vec<&ToolChoice>) = chosen
+            .iter()
+            .filter_map(|i| all.get(*i))
+            .partition(|t| t.connector);
+        let tools: Vec<String> = tools.into_iter().map(|t| t.name.clone()).collect();
+        let connectors: Vec<String> = connectors.into_iter().map(|t| t.name.clone()).collect();
+        self.editor_mutate(|d| {
+            d.set_tools(&stage, &tools)
+                .and_then(|()| d.set_connectors(&stage, &connectors))
+        });
+    }
+
+    /// Enter on the add-artifact prompt: a new declaration on the stage the
+    /// panel shows, opened in its window so its type can be picked at once.
+    pub(super) fn editor_add_artifact(&mut self, name: &str) {
+        let stage = self.editor().panel_stage().expect("a stage field");
+        let name = name.to_string();
+        if self.editor_mutate(|d| d.add_artifact(&stage, &name)) {
+            let last = self.editor().doc.artifacts(&stage).len().saturating_sub(1);
+            self.editor_open_artifact(&stage, last);
+        }
     }
 
     /// Enter on the add-region prompt: a new region in the stage's own
@@ -638,5 +1075,25 @@ impl Dashboard {
         if self.editor_mutate(|d| d.add_region(&scope, &name)) {
             self.editor_open_region(scope, &name);
         }
+    }
+}
+
+#[cfg(test)]
+mod modality_tag_tests {
+    use super::model_modality_tag;
+
+    #[test]
+    fn labels_non_text_makers_and_leaves_text_models_untagged() {
+        assert_eq!(
+            model_modality_tag("meshy", "image-to-3d"),
+            Some("makes 3D models")
+        );
+        assert_eq!(
+            model_modality_tag("openai", "gpt-image-1"),
+            Some("makes images")
+        );
+        assert_eq!(model_modality_tag("openai", "tts-1"), Some("makes audio"));
+        assert_eq!(model_modality_tag("google", "veo-3"), Some("makes video"));
+        assert_eq!(model_modality_tag("anthropic", "claude-opus-5"), None);
     }
 }

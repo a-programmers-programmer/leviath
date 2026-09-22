@@ -4,8 +4,10 @@
 //! tool lane runs off the world, so it blocks on the host applying each op via a
 //! oneshot - the same shape as an interaction.
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use leviath_core::region::EntryContent;
 use leviath_providers::ToolCall;
 use leviath_runtime::components::AgentStatus;
 use leviath_runtime::host::{SubAgentOp, SubAgentReport};
@@ -38,6 +40,9 @@ pub(crate) struct SubAgentHandle {
     /// with it whenever the parent is waiting on it. The operator asked for an
     /// unattended run; the tree is the run.
     pub unattended: bool,
+    /// The parent run's yolo profile, inherited with `unattended`: a child of
+    /// a `careful` run is a `careful` run, not a bare `--yolo` one.
+    pub yolo_profile: Option<String>,
     /// The parent run's `--model` override, inherited by children.
     ///
     /// The docs call the override absolute - it "overrides everything" - and a
@@ -46,6 +51,79 @@ pub(crate) struct SubAgentHandle {
     /// blueprint's model list instead. `None` when the run named no model,
     /// which leaves every child resolving from its blueprint.
     pub model_override: Option<String>,
+    /// The parent's stored parts, as the runtime last offered them to the
+    /// tool lane: what `spawn_agent`'s `parts` names.
+    pub offered_parts: Arc<std::sync::Mutex<Vec<leviath_core::mime::Part>>>,
+    /// The parent's blob store, to read a named part's bytes from. `None`
+    /// in a world with no store, where `parts` is refused.
+    pub mime: Option<Arc<leviath_tools::ToolMime>>,
+}
+
+/// The parts `spawn_agent`'s `parts` argument names, read from the parent's
+/// store as inbound parts for the child, which stores them again under its
+/// own run. A name that matches nothing, or bytes the store no longer holds,
+/// refuses the spawn: a child started without the file its parent meant to
+/// hand it would work from a stand-in and never know.
+fn parts_for_child(
+    h: &SubAgentHandle,
+    args: &serde_json::Value,
+    limit: Option<&[String]>,
+) -> Result<Vec<leviath_core::mime::InboundPart>, String> {
+    let wanted: Vec<&str> = args
+        .get("parts")
+        .and_then(|v| v.as_array())
+        .map(|items| items.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    if wanted.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some(mime) = h.mime.as_deref() else {
+        return Err(
+            "this run has no blob store, so it has no parts to hand a sub-agent".to_string(),
+        );
+    };
+    let offered = h
+        .offered_parts
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    wanted
+        .into_iter()
+        .map(|name| {
+            let (part, blob) = offered
+                .iter()
+                .filter_map(|p| p.blob().map(|b| (p, b)))
+                .find(|(p, _)| leviath_scripting::parts::part_matches(p, name))
+                .ok_or_else(|| {
+                    format!(
+                        "'{name}' names no stored part of this run (a part's name or sha256 prefix)"
+                    )
+                })?;
+            // The stage's limit for this tool, when it has one.
+            if let Some(limit) = limit
+                && !blob.mime_type.matches_any(limit)
+            {
+                return Err(format!(
+                    "'{name}' is {}; at this stage spawn_agent may be handed only {}",
+                    blob.mime_type,
+                    limit.join(", ")
+                ));
+            }
+            let bytes = mime
+                .store
+                .read(&mime.run_id, &blob.sha256)
+                .map_err(|e| format!("'{name}' could not be read from the store: {e}"))?;
+            let mut inbound = leviath_core::mime::InboundPart::from_bytes(
+                part.name
+                    .clone()
+                    .unwrap_or_else(|| blob.short_sha().to_string()),
+                bytes.to_vec(),
+            )
+            .typed(blob.mime_type.clone());
+            inbound.deliver = part.deliver;
+            Ok(inbound)
+        })
+        .collect()
 }
 
 // The sub-agent tool-name list lives in `leviath-tools` (next to the tool
@@ -59,14 +137,43 @@ pub(crate) use leviath_tools::is_subagent_tool;
 const WAIT_POLL: Duration = Duration::from_millis(500);
 
 /// Dispatch one sub-agent tool call, returning the textual result for the model.
+#[cfg(test)]
 pub(crate) async fn handle(h: &SubAgentHandle, tc: &ToolCall) -> String {
+    handle_within(h, tc, None).await
+}
+
+/// [`handle`], with what the stage lets `spawn_agent` be handed
+/// (`tool_accepts`), when it limits it: the text view of
+/// [`handle_content`].
+#[cfg(test)]
+pub(crate) async fn handle_within(
+    h: &SubAgentHandle,
+    tc: &ToolCall,
+    limit: Option<&[String]>,
+) -> String {
+    handle_content(h, tc, limit).await.into_string()
+}
+
+/// Dispatch one sub-agent tool call, keeping the files a finished child
+/// handed back as parts on the result rather than flattening them into its
+/// text.
+///
+/// The tool lane's result is an entry, so a child that drew or built
+/// something reaches its parent's model as the file itself when the model
+/// takes the type, and as the stand-in line otherwise. `limit` is what the
+/// stage lets `spawn_agent` be handed (`tool_accepts`), when it limits it.
+pub(crate) async fn handle_content(
+    h: &SubAgentHandle,
+    tc: &ToolCall,
+    limit: Option<&[String]>,
+) -> EntryContent {
     match tc.name.as_str() {
-        "spawn_agent" => spawn(h, &tc.arguments).await,
+        "spawn_agent" => spawn(h, &tc.arguments, limit).await,
         "check_agent" => check(h, str_arg(&tc.arguments, "agent_id")).await,
         "wait_for_agent" => wait(h, str_arg(&tc.arguments, "agent_id")).await,
-        "send_to_agent" => send(h, &tc.arguments).await,
-        "kill_agent" => kill(h, str_arg(&tc.arguments, "agent_id")).await,
-        other => format!("[error] '{other}' is not a sub-agent tool"),
+        "send_to_agent" => EntryContent::text(send(h, &tc.arguments).await),
+        "kill_agent" => EntryContent::text(kill(h, str_arg(&tc.arguments, "agent_id")).await),
+        other => EntryContent::text(format!("[error] '{other}' is not a sub-agent tool")),
     }
 }
 
@@ -91,11 +198,15 @@ fn str_arg<'a>(args: &'a serde_json::Value, key: &str) -> &'a str {
     args.get(key).and_then(|v| v.as_str()).unwrap_or("")
 }
 
-async fn spawn(h: &SubAgentHandle, args: &serde_json::Value) -> String {
+async fn spawn(
+    h: &SubAgentHandle,
+    args: &serde_json::Value,
+    limit: Option<&[String]>,
+) -> EntryContent {
     let blueprint = str_arg(args, "blueprint");
     let task = str_arg(args, "task");
     if blueprint.is_empty() || task.is_empty() {
-        return "[error] spawn_agent requires 'blueprint' and 'task'".to_string();
+        return EntryContent::text("[error] spawn_agent requires 'blueprint' and 'task'");
     }
     // Never a blueprint the agent could have written itself.
     //
@@ -113,11 +224,11 @@ async fn spawn(h: &SubAgentHandle, args: &serde_json::Value) -> String {
     // outside the workdir has arbitrary execution by other means, so nothing
     // here is the weak link.
     if resolves_within_workdir(blueprint, &h.workdir) {
-        return format!(
+        return EntryContent::text(format!(
             "[error] '{blueprint}' is inside this agent's own working directory. \
              Spawn an installed agent by name, or a blueprint from outside the \
              workspace - an agent may not author the blueprint it runs."
-        );
+        ));
     }
 
     // Optional seed context is prepended to the task (it lands in the child's
@@ -130,6 +241,10 @@ async fn spawn(h: &SubAgentHandle, args: &serde_json::Value) -> String {
         .get("max_child_depth")
         .and_then(|v| v.as_u64())
         .map(|n| n as usize);
+    let parts = match parts_for_child(h, args, limit) {
+        Ok(parts) => parts,
+        Err(e) => return EntryContent::text(format!("[error] cannot spawn '{blueprint}': {e}")),
+    };
     let wait_flag = args.get("wait").and_then(|v| v.as_bool()).unwrap_or(false);
     // A parent may ask its child for a particular shape. Passed through as a
     // label, never interpreted: the child's own `submit_output` description is
@@ -153,6 +268,8 @@ async fn spawn(h: &SubAgentHandle, args: &serde_json::Value) -> String {
                 schema: None,
                 validator: None,
                 on_validator_error: None,
+                overwrite_artifacts: None,
+                artifacts: Vec::new(),
             }),
         }
     };
@@ -164,15 +281,17 @@ async fn spawn(h: &SubAgentHandle, args: &serde_json::Value) -> String {
         model: h.model_override.clone(),
         workdir: &h.workdir,
         yolo: h.unattended,
+        yolo_profile: h.yolo_profile.clone(),
         allow: Vec::new(),
         max_depth: child_max_depth,
         regions: // Sub-agents receive their whole task via `full_task`; no region flags.
         std::collections::HashMap::new(),
         no_seed_commands: h.no_seed_commands,
         output_request: child_output,
+        parts,
     }) {
         Ok(a) => a,
-        Err(e) => return format!("[error] cannot spawn '{blueprint}': {e}"),
+        Err(e) => return EntryContent::text(format!("[error] cannot spawn '{blueprint}': {e}")),
     };
 
     let (tx, rx) = oneshot::channel();
@@ -185,34 +304,38 @@ async fn spawn(h: &SubAgentHandle, args: &serde_json::Value) -> String {
         })
         .is_err()
     {
-        return "[error] the daemon is shutting down".to_string();
+        return EntryContent::text("[error] the daemon is shutting down");
     }
     match rx.await {
         Ok(Ok(child_id)) if wait_flag => wait(h, &child_id).await,
-        Ok(Ok(child_id)) => format!("Spawned sub-agent '{child_id}'."),
-        Ok(Err(e)) => format!("[error] {e}"),
-        Err(_) => "[error] the daemon dropped the spawn request".to_string(),
+        Ok(Ok(child_id)) => EntryContent::text(format!("Spawned sub-agent '{child_id}'.")),
+        Ok(Err(e)) => EntryContent::text(format!("[error] {e}")),
+        Err(_) => EntryContent::text("[error] the daemon dropped the spawn request"),
     }
 }
 
-async fn check(h: &SubAgentHandle, agent_id: &str) -> String {
+async fn check(h: &SubAgentHandle, agent_id: &str) -> EntryContent {
     match report_of(h, agent_id).await {
         // The tool's schema promises "its current status and result if
         // complete", so a finished child's answer comes back with the status
         // rather than the parent being told only that it finished.
-        Some(report) if is_terminal(&report.status) => format!(
-            "Sub-agent '{agent_id}' status: {}{}",
-            label(&report.status),
-            describe_result(&report)
+        Some(report) if is_terminal(&report.status) => finished(
+            h,
+            agent_id,
+            format!("Sub-agent '{agent_id}' status: {}", label(&report.status)),
+            &report,
         ),
-        Some(report) => format!("Sub-agent '{agent_id}' status: {}", label(&report.status)),
-        None => format!("[error] no such sub-agent '{agent_id}'"),
+        Some(report) => EntryContent::text(format!(
+            "Sub-agent '{agent_id}' status: {}",
+            label(&report.status)
+        )),
+        None => EntryContent::text(format!("[error] no such sub-agent '{agent_id}'")),
     }
 }
 
-async fn wait(h: &SubAgentHandle, agent_id: &str) -> String {
+async fn wait(h: &SubAgentHandle, agent_id: &str) -> EntryContent {
     if agent_id.is_empty() {
-        return "[error] wait_for_agent requires 'agent_id'".to_string();
+        return EntryContent::text("[error] wait_for_agent requires 'agent_id'");
     }
     // The whole wait happens off the tool lane. The child's own tool batches
     // queue on that lane, so a parent that kept lane capacity while waiting
@@ -222,19 +345,23 @@ async fn wait(h: &SubAgentHandle, agent_id: &str) -> String {
 }
 
 /// Poll `agent_id` until it reaches a terminal state, or until the caller does.
-async fn poll_until_finished(h: &SubAgentHandle, agent_id: &str) -> String {
+async fn poll_until_finished(h: &SubAgentHandle, agent_id: &str) -> EntryContent {
     loop {
         match report_of(h, agent_id).await {
-            None => return format!("[error] no such sub-agent '{agent_id}'"),
+            None => return EntryContent::text(format!("[error] no such sub-agent '{agent_id}'")),
             Some(report) if is_terminal(&report.status) => {
                 // This is what the tool has always advertised - "block until a
                 // sub-agent completes, then return its final result" - and what
                 // it never did. A parent that waited got a status label and had
                 // to agree on a file path out of band to receive any work.
-                return format!(
-                    "Sub-agent '{agent_id}' finished with status: {}{}",
-                    label(&report.status),
-                    describe_result(&report)
+                return finished(
+                    h,
+                    agent_id,
+                    format!(
+                        "Sub-agent '{agent_id}' finished with status: {}",
+                        label(&report.status)
+                    ),
+                    &report,
                 );
             }
             // The caller itself was cancelled (or failed) while waiting. Give up
@@ -242,11 +369,80 @@ async fn poll_until_finished(h: &SubAgentHandle, agent_id: &str) -> String {
             // it - this loop has no other exit, so it would otherwise run for as
             // long as the daemon lived.
             Some(_) if caller_is_terminal(h).await => {
-                return format!("[error] cancelled while waiting for '{agent_id}'");
+                return EntryContent::text(format!(
+                    "[error] cancelled while waiting for '{agent_id}'"
+                ));
             }
             Some(_) => tokio::time::sleep(WAIT_POLL).await,
         }
     }
+}
+
+/// A finished child's report: the status line, its answer, and the files it
+/// handed back as parts of the result.
+fn finished(
+    h: &SubAgentHandle,
+    agent_id: &str,
+    status_line: String,
+    report: &SubAgentReport,
+) -> EntryContent {
+    EntryContent::text(format!("{status_line}{}", describe_result(report)))
+        .with_parts(handed_back(h, agent_id, report))
+}
+
+/// The child's artifacts, stored again under the parent's run as parts
+/// named `<child>/<artifact>`.
+///
+/// The store is content-addressed and shared across runs, so the child's
+/// bytes are read by hash and stored under the parent, typed as the child
+/// declared them, so a sub-agent that drew or built something hands its
+/// parent the file and not a path it cannot read. A file the store no longer
+/// holds, or one over the part
+/// ceiling, is left out with a warning; a world with no store hands up
+/// nothing, and the text still names every file.
+fn handed_back(
+    h: &SubAgentHandle,
+    agent_id: &str,
+    report: &SubAgentReport,
+) -> Vec<leviath_core::mime::Part> {
+    let (Some(mime), Some(output)) = (h.mime.as_deref(), report.final_output.as_ref()) else {
+        return Vec::new();
+    };
+    output
+        .artifacts
+        .iter()
+        .filter(|a| {
+            let stored = !a.sha256.is_empty();
+            if !stored {
+                tracing::warn!(
+                    child = %agent_id,
+                    part = %a.name,
+                    "[mime] sub-agent artifact not handed up: the child never stored it"
+                );
+            }
+            stored
+        })
+        .filter_map(|artifact| {
+            let name = format!("{agent_id}/{}", artifact.name);
+            let stored = mime
+                .store
+                .read(agent_id, &artifact.sha256)
+                .map_err(|e| e.to_string())
+                .and_then(|bytes| {
+                    let mut blob =
+                        leviath_core::mime::Blob::new(artifact.mime_type.clone(), bytes.to_vec());
+                    blob.name = Some(name.clone());
+                    mime.store(blob)
+                });
+            match stored {
+                Ok(part) => Some(part),
+                Err(why) => {
+                    tracing::warn!(child = %agent_id, part = %name, "[mime] sub-agent artifact not handed up: {why}");
+                    None
+                }
+            }
+        })
+        .collect()
 }
 
 /// Whether the agent that called `wait_for_agent` has itself reached a terminal
@@ -351,8 +547,19 @@ fn describe_result(report: &SubAgentReport) -> String {
                 true => "\n[the agent's output was truncated at the size limit]",
                 false => "",
             };
+            // The files, named so the parent can tell them apart from its own
+            // and read them by the same name the parts carry.
+            let files: String = output
+                .artifacts
+                .iter()
+                .map(|a| format!("\n- {}", a.short_label()))
+                .collect();
+            let files = match files.is_empty() {
+                true => String::new(),
+                false => format!("\n\n--- files handed back ---{files}"),
+            };
             format!(
-                "\n\n--- final output{shape} ---\n{}{truncated}",
+                "\n\n--- final output{shape} ---\n{}{truncated}{files}",
                 output.content
             )
         }
@@ -398,7 +605,10 @@ mod tests {
             max_depth: 3,
             no_seed_commands: false,
             unattended: false,
+            yolo_profile: None,
             model_override: None,
+            offered_parts: Arc::new(std::sync::Mutex::new(Vec::new())),
+            mime: None,
         };
 
         for bad in [
@@ -406,7 +616,12 @@ mod tests {
             "x".to_string(),
             "x/agent.leviath".to_string(),
         ] {
-            let out = spawn(&h, &serde_json::json!({"blueprint": bad, "task": "go"})).await;
+            let out = spawn(
+                &h,
+                &serde_json::json!({"blueprint": bad, "task": "go"}),
+                None,
+            )
+            .await;
             assert!(
                 out.contains("own working directory"),
                 "{bad} must be refused: {out}"
@@ -438,7 +653,10 @@ mod tests {
             max_depth: 3,
             no_seed_commands: false,
             unattended: false,
+            yolo_profile: None,
             model_override: None,
+            offered_parts: Arc::new(std::sync::Mutex::new(Vec::new())),
+            mime: None,
         };
         let out = spawn(
             &h,
@@ -446,6 +664,7 @@ mod tests {
                 "blueprint": elsewhere.path().to_string_lossy(),
                 "task": "go"
             }),
+            None,
         )
         .await;
         assert!(
@@ -458,6 +677,8 @@ mod tests {
 
     fn handle_with(sender: UnboundedSender<SubAgentOp>) -> SubAgentHandle {
         SubAgentHandle {
+            offered_parts: Arc::new(std::sync::Mutex::new(Vec::new())),
+            mime: None,
             sender,
             parent_run_id: "parent".to_string(),
             // This crate's own directory, deliberately *not* the system temp
@@ -470,6 +691,7 @@ mod tests {
             max_depth: 3,
             no_seed_commands: false,
             unattended: false,
+            yolo_profile: None,
             model_override: None,
         }
     }
@@ -720,6 +942,139 @@ task = { kind = "pinned", max_tokens = 1000 }
         }
     }
 
+    /// `parts` hands the child files the parent holds: read from the parent's
+    /// store by name or hash prefix, typed and delivered as the parent's part
+    /// was, and refused by name when the parent has no such part or no store.
+    #[tokio::test]
+    async fn spawn_hands_named_parts_to_the_child() {
+        use leviath_core::mime::{Blob, BlobStore, Delivery, MimeRegistry, MimeType, Part};
+        let bp = temp_blueprint();
+        let (mut h, seen, _t) = fake_host(Ok("child-1".to_string()), vec![], false);
+        let store = std::sync::Arc::new(leviath_core::mime::MemoryBlobStore::new());
+        let registry = MimeRegistry::builtin();
+        let png = Blob::new(
+            MimeType::parse("image/png").unwrap(),
+            b"\x89PNG\r\n\x1a\nhero".to_vec(),
+        );
+        let stored = store.put("parent", &png, &registry).unwrap();
+        let other = Blob::new(MimeType::parse("image/png").unwrap(), b"other".to_vec());
+        let unnamed = store.put("parent", &other, &registry).unwrap();
+        let sha = unnamed.sha256.clone();
+        let lost = leviath_core::mime::BlobRef {
+            sha256: "e".repeat(64),
+            ..stored.clone()
+        };
+        *h.offered_parts.lock().unwrap() = vec![
+            Part::text("words"),
+            Part::stored(stored)
+                .named("hero.png")
+                .delivered(Delivery::Text),
+            Part::stored(unnamed),
+            Part::stored(lost).named("lost.png"),
+        ];
+        h.mime = Some(std::sync::Arc::new(leviath_tools::ToolMime {
+            store,
+            registry: std::sync::Arc::new(leviath_core::mime::RegistryCell::new(
+                std::sync::Arc::new(registry),
+            )),
+            run_id: "parent".to_string(),
+            max_part_bytes: 1024,
+        }));
+        let prefix: String = sha.chars().take(8).collect();
+        let out = handle(
+            &h,
+            &tc(
+                "spawn_agent",
+                json!({
+                    "blueprint": bp.path().to_str().unwrap(),
+                    "task": "edit @hero.png",
+                    "parts": ["hero.png", prefix]
+                }),
+            ),
+        )
+        .await;
+        assert!(out.contains("Spawned sub-agent"), "{out}");
+        {
+            let seen = seen.lock().unwrap();
+            let parts = &seen[0].parts;
+            assert_eq!(parts.len(), 2);
+            assert_eq!(parts[0].name, "hero.png");
+            assert_eq!(parts[0].mime_type.as_ref().unwrap().as_str(), "image/png");
+            assert_eq!(parts[0].deliver, Some(Delivery::Text));
+            assert_eq!(parts[0].data, b"\x89PNG\r\n\x1a\nhero");
+            // The unnamed part is named by its hash.
+            assert_eq!(parts[1].name, sha.chars().take(12).collect::<String>());
+            assert_eq!(parts[1].data, b"other");
+            assert!(parts[1].deliver.is_none());
+        }
+
+        // The stage's limit for spawn_agent: a part outside it refuses the
+        // spawn by name, one inside it goes through.
+        let audio_only = ["audio/*".to_string()];
+        let out = handle_within(
+            &h,
+            &tc(
+                "spawn_agent",
+                json!({"blueprint": bp.path().to_str().unwrap(), "task": "go", "parts": ["hero.png"]}),
+            ),
+            Some(&audio_only),
+        )
+        .await;
+        assert!(out.starts_with("[error] cannot spawn"), "{out}");
+        assert!(
+            out.contains(
+                "'hero.png' is image/png; at this stage spawn_agent may be handed only audio/*"
+            ),
+            "{out}"
+        );
+        let images = ["image/*".to_string()];
+        let out = handle_within(
+            &h,
+            &tc(
+                "spawn_agent",
+                json!({"blueprint": bp.path().to_str().unwrap(), "task": "go", "parts": ["hero.png"]}),
+            ),
+            Some(&images),
+        )
+        .await;
+        assert!(out.contains("Spawned sub-agent"), "{out}");
+        // A name the parent holds no part under, and a part whose bytes the
+        // store has lost, each refuse the spawn by name.
+        for (wanted, says) in [
+            ("nope.png", "names no stored part"),
+            ("lost.png", "could not be read from the store"),
+        ] {
+            let out = handle(
+                &h,
+                &tc(
+                    "spawn_agent",
+                    json!({"blueprint": bp.path().to_str().unwrap(), "task": "go", "parts": [wanted]}),
+                ),
+            )
+            .await;
+            assert!(out.starts_with("[error] cannot spawn"), "{out}");
+            assert!(out.contains(says), "{out}");
+        }
+        // No store at all: the argument is refused outright. Nothing named:
+        // nothing handed on.
+        h.mime = None;
+        let out = handle(
+            &h,
+            &tc(
+                "spawn_agent",
+                json!({"blueprint": bp.path().to_str().unwrap(), "task": "go", "parts": ["hero.png"]}),
+            ),
+        )
+        .await;
+        assert!(out.contains("no blob store"), "{out}");
+        assert!(
+            parts_for_child(&h, &json!({"parts": []}), None)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(parts_for_child(&h, &json!({}), None).unwrap().is_empty());
+    }
+
     /// A run's `--model` covers the children it spawns as well. The child is
     /// named by the model at run time, so it is part of this run rather than a
     /// separate one, and dropping the override there is silent.
@@ -850,7 +1205,7 @@ task = { kind = "pinned", max_tokens = 1000 }
                 Box::pin(async move {
                     let out =
                         handle(&h, &tc("wait_for_agent", json!({"agent_id": "child-1"}))).await;
-                    vec![("wait".to_string(), out)]
+                    vec![("wait".to_string(), out.into())]
                 })
             }),
         );
@@ -860,16 +1215,13 @@ task = { kind = "pinned", max_tokens = 1000 }
         // Which is what lets anything else run - a child's tool batch, here.
         submit(
             2,
-            Box::new(|| Box::pin(async { vec![("child".to_string(), "ran".to_string())] })),
+            Box::new(|| Box::pin(async { vec![("child".to_string(), "ran".into())] })),
         );
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(30), results.recv())
             .await
             .expect("the batch behind the waiter ran")
             .expect("an outcome arrived");
-        assert_eq!(
-            outcome.results,
-            vec![("child".to_string(), "ran".to_string())]
-        );
+        assert_eq!(outcome.results, vec![("child".to_string(), "ran".into())]);
 
         // And the waiter takes a permit again and reports, once its child is done.
         let waited = tokio::time::timeout(std::time::Duration::from_secs(30), results.recv())
@@ -1214,6 +1566,76 @@ task = { kind = "pinned", max_tokens = 1000 }
         assert!(out.contains("markdown"), "names the shape: {out}");
     }
 
+    /// A child's files reach its parent: listed under the answer, and handed
+    /// up as parts stored under the parent's run and named after the child.
+    /// A file the store lost, one never stored (no hash) and one over the
+    /// ceiling are left out of the parts but still named in the text.
+    #[tokio::test]
+    async fn a_finished_childs_files_are_handed_up_as_parts() {
+        use leviath_core::mime::{Blob, BlobStore, MimeRegistry, MimeType};
+        let store = std::sync::Arc::new(leviath_core::mime::MemoryBlobStore::new());
+        let registry = MimeRegistry::builtin();
+        let png = Blob::new(
+            MimeType::parse("image/png").unwrap(),
+            b"\x89PNG\r\n\x1a\nhero".to_vec(),
+        );
+        let stored = store.put("child-1", &png, &registry).unwrap();
+        let big = Blob::new(MimeType::parse("image/png").unwrap(), vec![0; 2048]);
+        let too_big = store.put("child-1", &big, &registry).unwrap();
+        let artifact = |name: &str, sha: String| leviath_core::output::Artifact {
+            name: name.to_string(),
+            path: format!("out/{name}.png"),
+            mime_type: MimeType::parse("image/png").unwrap(),
+            size: 12,
+            sha256: sha,
+        };
+        let output = answer("drew the hero").with_artifacts(vec![
+            artifact("hero", stored.sha256.clone()),
+            artifact("lost", "e".repeat(64)),
+            artifact("huge", too_big.sha256.clone()),
+            leviath_core::output::Artifact::from_path("untracked.txt"),
+        ]);
+        let (mut h, _seen, _t) =
+            fake_host_with_output(vec![Some(AgentStatus::Complete)], Some(output.clone()));
+        h.mime = Some(std::sync::Arc::new(leviath_tools::ToolMime {
+            store: store.clone(),
+            registry: std::sync::Arc::new(leviath_core::mime::RegistryCell::new(
+                std::sync::Arc::new(registry),
+            )),
+            run_id: "parent".to_string(),
+            max_part_bytes: 1024,
+        }));
+        let content = handle_content(
+            &h,
+            &tc("wait_for_agent", json!({"agent_id": "child-1"})),
+            None,
+        )
+        .await;
+        let text = content.as_str();
+        assert!(text.contains("drew the hero"), "{text}");
+        assert!(text.contains("--- files handed back ---"), "{text}");
+        assert!(text.contains("- hero (image/png, 12 B)"), "{text}");
+        assert!(text.contains("- untracked.txt"), "{text}");
+        let stored_parts: Vec<_> = content.stored().collect();
+        assert_eq!(stored_parts.len(), 1, "{text}");
+        assert_eq!(stored_parts[0].name.as_deref(), Some("child-1/hero"));
+        assert_eq!(stored_parts[0].blob().unwrap().sha256, stored.sha256);
+        assert!(
+            store.read("parent", &stored.sha256).is_ok(),
+            "the bytes now sit under the parent's run"
+        );
+
+        // `check_agent` hands the same files up; a world with no store hands
+        // up the text alone.
+        let (mut h, _seen, _t) =
+            fake_host_with_output(vec![Some(AgentStatus::Complete)], Some(output));
+        h.mime = None;
+        let content =
+            handle_content(&h, &tc("check_agent", json!({"agent_id": "child-1"})), None).await;
+        assert!(content.as_str().contains("- hero (image/png, 12 B)"));
+        assert!(content.is_text_only());
+    }
+
     #[tokio::test]
     async fn check_returns_the_childs_final_output_once_it_is_done() {
         let (h, _seen, _t) = fake_host_with_output(
@@ -1305,5 +1727,27 @@ task = { kind = "pinned", max_tokens = 1000 }
         )
         .await;
         assert!(seen.lock().unwrap()[0].output.is_none());
+    }
+
+    /// The profile travels with the bit: a child of a `careful` run is a
+    /// `careful` run, not a bare `--yolo` one.
+    #[tokio::test]
+    async fn spawn_hands_the_parents_yolo_profile_to_the_child() {
+        let bp = temp_blueprint();
+        let (mut h, seen, _t) = fake_host(Ok("child-1".to_string()), vec![], false);
+        h.unattended = true;
+        h.yolo_profile = Some("careful".to_string());
+        let out = handle(
+            &h,
+            &tc(
+                "spawn_agent",
+                json!({"blueprint": bp.path().to_str().unwrap(), "task": "go"}),
+            ),
+        )
+        .await;
+        assert!(out.contains("Spawned sub-agent"), "{out}");
+        let seen = seen.lock().unwrap();
+        assert!(seen[0].yolo);
+        assert_eq!(seen[0].yolo_profile.as_deref(), Some("careful"));
     }
 }

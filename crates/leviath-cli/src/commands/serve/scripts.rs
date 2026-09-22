@@ -1,9 +1,9 @@
 //! Read and write the Rhai scripts a machine runs.
 //!
-//! Five extension points share one API because they share one editor: a script
-//! tool, a region hook, a stage hook, an output validator and a model provider
-//! are all a `.rhai` file somewhere under the home directory, and only the
-//! `kind` says which compiler has to accept it.
+//! Six extension points share one API because they share one editor: a script
+//! tool, a region hook, a stage hook, an output validator, a mime check and a
+//! model provider are all a `.rhai` file somewhere under the home directory,
+//! and only the `kind` says which compiler has to accept it.
 //!
 //! # Where each kind actually lives
 //!
@@ -32,6 +32,13 @@
 //! so this route takes no `?agent=` and refuses one rather than inventing a
 //! per-agent layout that nothing would load.
 //!
+//! A **mime check** is named by a registry row's `check`, and a row lives in
+//! two places: the operator's `mime_types.toml` (or `[mime_types]` in the
+//! config), whose scripts resolve against the config's directory, and a
+//! blueprint's own `[mime_types]`, whose scripts resolve against the agent's
+//! directory like its hooks. So this kind takes an `?agent=` or not, and the
+//! listing derives it from the rows either way.
+//!
 //! # Why the write half is gated
 //!
 //! A blueprint is declarative. A `.rhai` file is executable code every agent
@@ -48,8 +55,10 @@ use axum::http::StatusCode;
 use axum::response::Json;
 use serde::{Deserialize, Serialize};
 
+use super::core::error::ServeError;
+use super::scripts_mime::{collect_mime_checks, config_dir, row_checks};
 use super::tools::agent_dir;
-use super::types::{ApiError, AppState, err};
+use super::types::{ApiError, AppState};
 
 /// Which extension point a script plugs into, and so which compiler decides
 /// whether it is valid.
@@ -63,18 +72,21 @@ pub(super) enum ScriptKind {
     StageHook,
     /// A validator that decides whether an agent's output may be handed back.
     OutputValidator,
+    /// A check on the bytes behind a mime type, named by a registry row.
+    MimeCheck,
     /// A drop-in model provider, global to the machine.
     Provider,
 }
 
 impl ScriptKind {
     /// The wire spelling, which is also the `{kind}` path segment.
-    fn as_str(self) -> &'static str {
+    pub(super) fn as_str(self) -> &'static str {
         match self {
             Self::Tool => "tool",
             Self::RegionHook => "region_hook",
             Self::StageHook => "stage_hook",
             Self::OutputValidator => "output_validator",
+            Self::MimeCheck => "mime_check",
             Self::Provider => "provider",
         }
     }
@@ -87,6 +99,7 @@ impl ScriptKind {
             "region_hook" => Some(Self::RegionHook),
             "stage_hook" => Some(Self::StageHook),
             "output_validator" => Some(Self::OutputValidator),
+            "mime_check" => Some(Self::MimeCheck),
             "provider" => Some(Self::Provider),
             _ => None,
         }
@@ -94,7 +107,7 @@ impl ScriptKind {
 }
 
 /// The kinds, spelled the way the 400s list them.
-const KIND_LIST: &str = "tool, region_hook, stage_hook, output_validator or provider";
+const KIND_LIST: &str = "tool, region_hook, stage_hook, output_validator, mime_check or provider";
 
 /// The global drop-in directory, `~/.leviath/tools`.
 ///
@@ -142,12 +155,12 @@ struct Target {
 /// three answers - what to call it, where it sits, and what to write into a
 /// manifest - and having them computed twice is how the two disagreed.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Addressed {
+pub(super) struct Addressed {
     /// The `{name}` the routes address it by: `/`-separated, `.rhai` stripped.
-    name: String,
+    pub(super) name: String,
     /// The same file relative to the base directory, extension included, always
     /// with `/` separators because that is what goes into a manifest.
-    relative: String,
+    pub(super) relative: String,
     /// The directory components between the base and the file, in order.
     dirs: Vec<String>,
     /// The file name, `.rhai` included.
@@ -163,7 +176,7 @@ impl Addressed {
     }
 
     /// The file itself under `base`.
-    fn path_in(&self, base: &Path) -> PathBuf {
+    pub(super) fn path_in(&self, base: &Path) -> PathBuf {
         self.dir_in(base).join(&self.file)
     }
 }
@@ -229,29 +242,24 @@ fn resolve(
     kind: &str,
     name: &str,
     agent: Option<&str>,
-) -> Result<Target, ApiError> {
+) -> Result<Target, ServeError> {
     let Some(kind) = ScriptKind::parse(kind) else {
-        return Err(err(
-            StatusCode::BAD_REQUEST,
-            format!("Unknown script kind '{kind}': expected {KIND_LIST}"),
-        ));
+        return Err(ServeError::BadRequest(format!(
+            "Unknown script kind '{kind}': expected {KIND_LIST}"
+        )));
     };
     let Some(addressed) = addressed_path(name) else {
-        return Err(err(
-            StatusCode::BAD_REQUEST,
-            format!(
-                "Invalid script name '{name}': each '/'-separated part may contain only \
+        return Err(ServeError::BadRequest(format!(
+            "Invalid script name '{name}': each '/'-separated part may contain only \
                  letters, digits, '.', '_' and '-'"
-            ),
-        ));
+        )));
     };
 
     let (dir, scope, owner) = match (agent, kind) {
         // A provider is machine-wide. Scoping one to an agent would write a file
         // nothing loads, so the agent is refused rather than ignored.
         (Some(_), ScriptKind::Provider) => {
-            return Err(err(
-                StatusCode::BAD_REQUEST,
+            return Err(ServeError::BadRequest(
                 "A provider is global to the machine and lives in ~/.leviath/providers, \
                  so this route takes no ?agent="
                     .to_string(),
@@ -269,15 +277,14 @@ fn resolve(
         }
         (None, ScriptKind::Tool) => (global_tools_dir(), "global", None),
         (None, ScriptKind::Provider) => (global_providers_dir(), "global", None),
+        // The operator's rows name a check relative to the config's directory.
+        (None, ScriptKind::MimeCheck) => (config_dir(), "global", None),
         (None, _) => {
-            return Err(err(
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "A {} is only ever loaded from beside the agent that declares it, \
+            return Err(ServeError::BadRequest(format!(
+                "A {} is only ever loaded from beside the agent that declares it, \
                      so this route needs ?agent=<name>",
-                    kind.as_str()
-                ),
-            ));
+                kind.as_str()
+            )));
         }
     };
 
@@ -320,35 +327,29 @@ enum Presence {
 /// question about a missing file would answer "forbidden" on the platforms
 /// where the temporary directory is itself a symlink and "not found" everywhere
 /// else.
-fn guard(target: &Target, presence: Presence) -> Result<(), ApiError> {
+fn guard(target: &Target, presence: Presence) -> Result<(), ServeError> {
     match (std::fs::symlink_metadata(&target.path), presence) {
         (Ok(meta), _) if !meta.is_file() => {
-            return Err(err(
-                StatusCode::FORBIDDEN,
-                format!(
-                    "'{}' is not a plain file, so it will not be read or written through",
-                    target.path.display()
-                ),
-            ));
+            return Err(ServeError::Forbidden(format!(
+                "'{}' is not a plain file, so it will not be read or written through",
+                target.path.display()
+            )));
         }
         (Err(_), Presence::Required) => {
-            return Err(err(
-                StatusCode::NOT_FOUND,
-                format!("No such script: {}", target.path.display()),
-            ));
+            return Err(ServeError::NotFound(format!(
+                "No such script: {}",
+                target.path.display()
+            )));
         }
         _ => {}
     }
     match leviath_core::resolves_within(&target.path, &target.dir) {
         true => Ok(()),
-        false => Err(err(
-            StatusCode::FORBIDDEN,
-            format!(
-                "'{}' does not resolve inside {}",
-                target.path.display(),
-                target.dir.display()
-            ),
-        )),
+        false => Err(ServeError::Forbidden(format!(
+            "'{}' does not resolve inside {}",
+            target.path.display(),
+            target.dir.display()
+        ))),
     }
 }
 
@@ -362,7 +363,7 @@ fn guard(target: &Target, presence: Presence) -> Result<(), ApiError> {
 /// Every arm stops at the AST. That is what lets `POST /api/scripts/validate`
 /// stay ungated: a provider's `initialize` is script code, and `check_source`
 /// reads it off the compiled AST rather than running it.
-fn compile_status(
+pub(super) fn compile_status(
     kind: ScriptKind,
     label: &str,
     content: &str,
@@ -381,6 +382,9 @@ fn compile_status(
         ScriptKind::OutputValidator => leviath_scripting::output_validator::compile(label, content)
             .map(drop)
             .map_err(|e| e.to_string()),
+        ScriptKind::MimeCheck => leviath_scripting::mime_check::compile(label, content)
+            .map(drop)
+            .map_err(|e| e.to_string()),
         ScriptKind::Provider => leviath_providers::rhai_provider::check_source(label, content)
             .map(drop)
             .map_err(|e| e.to_string()),
@@ -388,7 +392,7 @@ fn compile_status(
 }
 
 /// Flatten a compile outcome into the pair the wire types carry.
-fn status_pair(status: Result<(), String>) -> (bool, Option<String>) {
+pub(super) fn status_pair(status: Result<(), String>) -> (bool, Option<String>) {
     match status {
         Ok(()) => (true, None),
         Err(reason) => (false, Some(reason)),
@@ -477,8 +481,8 @@ fn provider_meta(kind: ScriptKind, content: &str) -> Option<ProviderScriptMeta> 
 /// One script in the listing.
 #[derive(Debug, Serialize, Deserialize)]
 pub(super) struct ScriptItem {
-    /// `tool`, `region_hook`, `stage_hook`, `output_validator` or `provider`,
-    /// or [`CANDIDATE_KIND`] for a file nothing has claimed yet.
+    /// `tool`, `region_hook`, `stage_hook`, `output_validator`, `mime_check`
+    /// or `provider`, or [`CANDIDATE_KIND`] for a file nothing has claimed yet.
     pub(super) kind: String,
     /// The `{name}` the read and write routes address it by, once a caller has
     /// picked a `kind` for it. `/`-separated for a file in a subdirectory.
@@ -490,9 +494,11 @@ pub(super) struct ScriptItem {
     pub(super) agent: Option<String>,
     /// The file on disk.
     pub(super) path: String,
-    /// The same file relative to the agent's own directory, which is the
-    /// spelling a manifest wants (`validators/a2ui.rhai`). Absent for a
-    /// machine-wide script, which no blueprint contains.
+    /// The same file relative to the directory whose rows or manifest name
+    /// it, which is the spelling that goes there (`validators/a2ui.rhai`;
+    /// `checks/scene.rhai` for a mime check, relative to the config's
+    /// directory when the row is the operator's). Absent for a global tool
+    /// or a provider, which nothing names by path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) relative_path: Option<String>,
     /// Whether something loads this file as this `kind`: a `tools/` directory
@@ -599,7 +605,7 @@ pub(super) struct ValidateScriptResp {
 /// declaration that is not a `.rhai` file at all: `addressed_path` appends the
 /// extension, so a declared `notes.txt` would be reported as `notes.txt.rhai`,
 /// a different file. Requiring the suffix here keeps the listing off it.
-fn declared_address(declared: &str) -> Option<Addressed> {
+pub(super) fn declared_address(declared: &str) -> Option<Addressed> {
     let stem = declared.strip_suffix(".rhai")?;
     addressed_path(stem)
 }
@@ -648,6 +654,10 @@ fn declared_scripts(bp: &leviath_core::Blueprint) -> BTreeMap<(ScriptKind, Strin
                 .entry((ScriptKind::OutputValidator, validator.to_string()))
                 .or_default();
         }
+    }
+
+    for (_, script) in row_checks(&bp.mime_types) {
+        declared.entry((ScriptKind::MimeCheck, script)).or_default();
     }
 
     declared
@@ -925,7 +935,7 @@ const INCLUDE_CANDIDATES: &str = "candidates";
 /// silent no-op: the whole point of the parameter is that its absence and its
 /// presence give different answers, so a client that misspells it would read a
 /// short listing as "this agent has no files".
-fn wants_candidates(include: Option<&str>) -> Result<bool, ApiError> {
+fn wants_candidates(include: Option<&str>) -> Result<bool, ServeError> {
     let Some(raw) = include else {
         return Ok(false);
     };
@@ -937,10 +947,9 @@ fn wants_candidates(include: Option<&str>) -> Result<bool, ApiError> {
             "" => {}
             INCLUDE_CANDIDATES => wanted = true,
             other => {
-                return Err(err(
-                    StatusCode::BAD_REQUEST,
-                    format!("Unknown include '{other}': expected {INCLUDE_CANDIDATES}"),
-                ));
+                return Err(ServeError::BadRequest(format!(
+                    "Unknown include '{other}': expected {INCLUDE_CANDIDATES}"
+                )));
             }
         }
     }
@@ -968,9 +977,30 @@ pub(super) async fn list_scripts(
     State(state): State<AppState>,
     Query(q): Query<ListScriptsQuery>,
 ) -> Result<Json<ScriptsResp>, ApiError> {
-    let candidates = wants_candidates(q.include.as_deref())?;
+    let candidates =
+        wants_candidates(q.include.as_deref()).map_err(|e| super::core::error::as_api_error(&e))?;
+    let scripts = registered_with(&state, q.agent.as_deref(), candidates)
+        .map_err(|e| super::core::error::as_api_error(&e))?;
+    Ok(Json(ScriptsResp { scripts }))
+}
+
+/// The registered scripts, optionally scoped to one blueprint's own directory.
+pub(super) fn registered(
+    state: &AppState,
+    agent: Option<&str>,
+) -> Result<Vec<ScriptItem>, super::core::error::ServeError> {
+    registered_with(state, agent, false)
+}
+
+/// [`registered`], with the "what could be a script but is not registered"
+/// pass the REST route can ask for.
+fn registered_with(
+    state: &AppState,
+    agent: Option<&str>,
+    candidates: bool,
+) -> Result<Vec<ScriptItem>, super::core::error::ServeError> {
     let mut scripts = Vec::new();
-    if let Some(name) = q.agent.as_deref() {
+    if let Some(name) = agent {
         let dir = agent_dir(&state.current_config(), name)?;
         collect_tools(&dir.join("tools"), "agent", Some(name), &mut scripts);
         collect_declared(&dir, name, &mut scripts);
@@ -979,8 +1009,9 @@ pub(super) async fn list_scripts(
         }
     }
     collect_tools(&global_tools_dir(), "global", None, &mut scripts);
+    collect_mime_checks(&state.current_config(), &mut scripts);
     collect_providers(&global_providers_dir(), &mut scripts);
-    Ok(Json(ScriptsResp { scripts }))
+    Ok(scripts)
 }
 
 /// `GET /api/scripts/{kind}/{name}[?agent=<name>]`: the source text.
@@ -989,22 +1020,28 @@ pub(super) async fn get_script(
     AxumPath((kind, name)): AxumPath<(String, String)>,
     Query(q): Query<ScriptQuery>,
 ) -> Result<Json<ScriptSource>, ApiError> {
-    let target = resolve(&state.current_config(), &kind, &name, q.agent.as_deref())?;
+    read_one(&state.current_config(), &kind, &name, q.agent.as_deref())
+        .map(Json)
+        .map_err(|e| super::core::error::as_api_error(&e))
+}
+
+/// One script's source, for whichever surface asked.
+pub(super) fn read_one(
+    config: &crate::config::Config,
+    kind: &str,
+    name: &str,
+    agent: Option<&str>,
+) -> Result<ScriptSource, ServeError> {
+    let target = resolve(config, kind, name, agent)?;
     guard(&target, Presence::Required)?;
     read_script(&target)
 }
 
 /// Read a script that [`guard`] has already accepted.
-fn read_script(target: &Target) -> Result<Json<ScriptSource>, ApiError> {
-    let content = match std::fs::read_to_string(&target.path) {
-        Ok(content) => content,
-        Err(e) => {
-            return Err(err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("cannot read '{}': {e}", target.path.display()),
-            ));
-        }
-    };
+fn read_script(target: &Target) -> Result<ScriptSource, ServeError> {
+    let content = std::fs::read_to_string(&target.path).map_err(|e| {
+        ServeError::Internal(format!("cannot read '{}': {e}", target.path.display()))
+    })?;
     let label = target.path.display().to_string();
     let (compiles, error) = status_pair(compile_status(target.kind, &label, &content, &[]));
     let meta = provider_meta(target.kind, &content);
@@ -1015,7 +1052,7 @@ fn read_script(target: &Target) -> Result<Json<ScriptSource>, ApiError> {
     // there, so there is nothing here that redacting would protect and a great
     // deal that it would break: an editor that saved what it was shown would
     // write the redaction back over the real script.
-    Ok(Json(ScriptSource {
+    Ok(ScriptSource {
         kind: target.kind.as_str().to_string(),
         name: target.name.clone(),
         source: target.scope.to_string(),
@@ -1025,7 +1062,7 @@ fn read_script(target: &Target) -> Result<Json<ScriptSource>, ApiError> {
         compiles,
         error,
         provider: meta,
-    }))
+    })
 }
 
 /// The `{name}` a resolved path is addressed by. The path was built by joining
@@ -1047,13 +1084,29 @@ pub(super) async fn put_script(
     Query(q): Query<ScriptQuery>,
     Json(body): Json<WriteScriptReq>,
 ) -> Result<Json<ScriptWritten>, ApiError> {
-    let target = resolve(&state.current_config(), &kind, &name, q.agent.as_deref())?;
-    if let Err(e) = std::fs::create_dir_all(&target.dir) {
-        return Err(err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("cannot create '{}': {e}", target.dir.display()),
-        ));
-    }
+    write_one(
+        &state.current_config(),
+        &kind,
+        &name,
+        q.agent.as_deref(),
+        &body.content,
+    )
+    .map(Json)
+    .map_err(|e| super::core::error::as_api_error(&e))
+}
+
+/// Write one script, for whichever surface asked.
+pub(super) fn write_one(
+    config: &crate::config::Config,
+    kind: &str,
+    name: &str,
+    agent: Option<&str>,
+    content: &str,
+) -> Result<ScriptWritten, ServeError> {
+    let target = resolve(config, kind, name, agent)?;
+    std::fs::create_dir_all(&target.dir).map_err(|e| {
+        ServeError::Internal(format!("cannot create '{}': {e}", target.dir.display()))
+    })?;
     // After the directory exists, so containment is asked of a path that can be
     // canonicalized rather than of one that merely might be.
     guard(&target, Presence::Optional)?;
@@ -1061,30 +1114,27 @@ pub(super) async fn put_script(
     // containment check would let a symlink planted at an intermediate name
     // make this `mkdir` outside the agent's directory. `guard` has just proved
     // the whole path resolves inside it.
-    if let Err(e) = std::fs::create_dir_all(&target.file_dir) {
-        return Err(err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("cannot create '{}': {e}", target.file_dir.display()),
-        ));
-    }
-    write_script(&target, &body.content)
+    std::fs::create_dir_all(&target.file_dir).map_err(|e| {
+        ServeError::Internal(format!(
+            "cannot create '{}': {e}",
+            target.file_dir.display()
+        ))
+    })?;
+    write_script(&target, content)
 }
 
 /// Write a script that [`guard`] has already accepted.
-fn write_script(target: &Target, content: &str) -> Result<Json<ScriptWritten>, ApiError> {
-    if let Err(e) = std::fs::write(&target.path, content) {
-        return Err(err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("cannot write '{}': {e}", target.path.display()),
-        ));
-    }
+fn write_script(target: &Target, content: &str) -> Result<ScriptWritten, ServeError> {
+    std::fs::write(&target.path, content).map_err(|e| {
+        ServeError::Internal(format!("cannot write '{}': {e}", target.path.display()))
+    })?;
     let label = target.path.display().to_string();
     let (compiles, error) = status_pair(compile_status(target.kind, &label, content, &[]));
-    Ok(Json(ScriptWritten {
+    Ok(ScriptWritten {
         path: label,
         compiles,
         error,
-    }))
+    })
 }
 
 /// `DELETE /api/scripts/{kind}/{name}[?agent=<name>]` (admin only): remove it.
@@ -1093,20 +1143,28 @@ pub(super) async fn delete_script(
     AxumPath((kind, name)): AxumPath<(String, String)>,
     Query(q): Query<ScriptQuery>,
 ) -> Result<StatusCode, ApiError> {
-    let target = resolve(&state.current_config(), &kind, &name, q.agent.as_deref())?;
+    remove_one(&state.current_config(), &kind, &name, q.agent.as_deref())
+        .map(|()| StatusCode::NO_CONTENT)
+        .map_err(|e| super::core::error::as_api_error(&e))
+}
+
+/// Remove one script, for whichever surface asked.
+pub(super) fn remove_one(
+    config: &crate::config::Config,
+    kind: &str,
+    name: &str,
+    agent: Option<&str>,
+) -> Result<(), ServeError> {
+    let target = resolve(config, kind, name, agent)?;
     guard(&target, Presence::Required)?;
     remove_script(&target)
 }
 
 /// Remove a script that [`guard`] has already accepted.
-fn remove_script(target: &Target) -> Result<StatusCode, ApiError> {
-    match std::fs::remove_file(&target.path) {
-        Ok(()) => Ok(StatusCode::NO_CONTENT),
-        Err(e) => Err(err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("cannot delete '{}': {e}", target.path.display()),
-        )),
-    }
+fn remove_script(target: &Target) -> Result<(), ServeError> {
+    std::fs::remove_file(&target.path).map_err(|e| {
+        ServeError::Internal(format!("cannot delete '{}': {e}", target.path.display()))
+    })
 }
 
 /// `POST /api/scripts/validate`: compile without writing.
@@ -1118,15 +1176,25 @@ fn remove_script(target: &Target) -> Result<StatusCode, ApiError> {
 pub(super) async fn validate_script(
     Json(body): Json<ValidateScriptReq>,
 ) -> Result<Json<ValidateScriptResp>, ApiError> {
-    let Some(kind) = ScriptKind::parse(&body.kind) else {
-        return Err(err(
-            StatusCode::BAD_REQUEST,
-            format!("Unknown script kind '{}': expected {KIND_LIST}", body.kind),
-        ));
-    };
     let hooks: Vec<&str> = body.hooks.iter().map(String::as_str).collect();
-    let (valid, error) = status_pair(compile_status(kind, "script", &body.content, &hooks));
-    Ok(Json(ValidateScriptResp { valid, error }))
+    compiled(&body.kind, &body.content, &hooks)
+        .map(Json)
+        .map_err(|e| super::core::error::as_api_error(&e))
+}
+
+/// Compile a script without writing it, for whichever surface asked.
+pub(super) fn compiled(
+    kind: &str,
+    content: &str,
+    hooks: &[&str],
+) -> Result<ValidateScriptResp, ServeError> {
+    let Some(kind) = ScriptKind::parse(kind) else {
+        return Err(ServeError::BadRequest(format!(
+            "Unknown script kind '{kind}': expected {KIND_LIST}"
+        )));
+    };
+    let (valid, error) = status_pair(compile_status(kind, "script", content, hooks));
+    Ok(ValidateScriptResp { valid, error })
 }
 
 #[cfg(test)]

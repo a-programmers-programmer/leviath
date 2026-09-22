@@ -166,7 +166,10 @@ fn agent_editor_sections() -> Vec<HelpSection> {
                     "ctrl-s",
                     "save (checks first; errors block it and open the problems)",
                 ),
-                ("tab", "move the keys between the canvas and the inspector"),
+                (
+                    "tab",
+                    "from the canvas: the inspector; on a stage's inspector: the next tab (shift-tab the one before); elsewhere: the canvas",
+                ),
                 (
                     "ctrl-z / ctrl-y",
                     "undo / redo an edit (ctrl-shift-z redoes too)",
@@ -214,22 +217,26 @@ fn agent_editor_sections() -> Vec<HelpSection> {
                 ),
                 (
                     "← → / h l",
-                    "change the row in place: cycle a choice, step a number, flip a toggle",
+                    "change the row in place: cycle a choice, step a number, flip a toggle, move a model in its chain",
                 ),
-                ("1 2 3", "a stage's tabs: behaviour, model & tools, context"),
+                (
+                    "1 2 3 4",
+                    "a stage's tabs: behaviour, inputs & outputs, models & tools, context & tools",
+                ),
                 (
                     "x / backspace",
-                    "remove the row: a model from the chain, a routing rule",
+                    "remove the row: a model from the chain, a routing rule, a file declaration, a list of types",
                 ),
-                ("← → on a model", "move it earlier or later in the chain"),
+                (
+                    "enter on a region, a file or a loop",
+                    "opens it in a window over the editor; esc closes the window",
+                ),
+                ("h / l on a model", "move it earlier or later in the chain"),
                 (
                     "drag ⠿",
                     "pick a model up by its grip and drop it anywhere in the chain; the rest of the row still selects text",
                 ),
-                (
-                    "esc",
-                    "back: a region or a loop's path returns to where it was opened from, otherwise the canvas",
-                ),
+                ("esc", "close the window, or move the keys to the canvas"),
                 (
                     "click",
                     "pick a row (again to open it); click a tab to switch",
@@ -369,7 +376,7 @@ fn detail_sections() -> Vec<HelpSection> {
                 ("i", "respond, or send a message to a running agent run"),
                 (
                     "enter on Deny with feedback",
-                    "open a box for what the run should do instead; ^Enter or the Send button sends it with the deny, esc goes back to the prompt",
+                    "open a box for what the run should do instead; ^S or the Send button sends it with the deny, esc goes back to the prompt",
                 ),
                 ("g", "the stage graph explorer"),
                 ("t", "the band: the run's path, or the whole blueprint"),
@@ -388,6 +395,8 @@ fn detail_sections() -> Vec<HelpSection> {
                 ("enter / space", "fold or unfold a row"),
                 ("click", "the same, on the row under the pointer"),
                 ("[ / ]", "previous / next region"),
+                ("v", "open the stored part under the cursor with the OS"),
+                ("w", "write it into the run's working directory"),
             ],
         },
         HelpSection {
@@ -424,7 +433,11 @@ fn detail_sections() -> Vec<HelpSection> {
         HelpSection {
             title: "Writing a response (i)",
             entries: vec![
-                ("ctrl+enter", "send (needs the kitty keyboard protocol)"),
+                ("ctrl+s", "send"),
+                (
+                    "ctrl+enter",
+                    "also sends (needs the kitty keyboard protocol)",
+                ),
                 ("enter", "insert a newline; so does alt+enter"),
                 ("tab", "move to the Send button; enter or space there sends"),
                 ("pgup / pgdn", "scroll the document above the prompt"),
@@ -454,17 +467,57 @@ fn new_run_sections() -> Vec<HelpSection> {
                 ("↑ ↓", "select an agent"),
                 ("any letter", "filter the list"),
                 ("backspace", "shorten the filter"),
-                ("tab / enter", "move to the task"),
+                (
+                    "tab / enter",
+                    "move to the inputs, when the agent has any, else to the task",
+                ),
                 ("esc", "clear the filter, then close"),
                 ("F1", "this help (? types a question mark here)"),
             ],
         },
         HelpSection {
-            title: "New run: task",
+            title: "New run: inputs",
             entries: vec![
                 (
+                    "↑ ↓",
+                    "choose a slot: one per region the agent takes from the caller",
+                ),
+                (
+                    "enter / ^O",
+                    "on a file slot, open the picker to choose files from the working directory",
+                ),
+                ("type", "text, on a slot that takes it"),
+                (
+                    "enter",
+                    "on a text slot, the next slot; after the last, the task",
+                ),
+                ("tab", "the task"),
+                ("shift-tab / esc", "back to the agent list"),
+            ],
+        },
+        HelpSection {
+            title: "New run: file picker",
+            entries: vec![
+                ("↑ ↓", "move through the files the region takes"),
+                ("type", "filter the list by name"),
+                (
+                    "space",
+                    "select or deselect the highlighted file (a one-file region swaps instead)",
+                ),
+                (
+                    "enter",
+                    "confirm the selection (it never selects on its own, so a slot can be left empty)",
+                ),
+                ("esc", "cancel without changing the slot"),
+            ],
+        },
+        HelpSection {
+            title: "New run: task",
+            entries: vec![
+                ("ctrl+s", "start the run"),
+                (
                     "ctrl+enter",
-                    "start the run (needs the kitty keyboard protocol)",
+                    "also starts it (needs the kitty keyboard protocol)",
                 ),
                 ("enter", "insert a newline; so does alt+enter"),
                 ("@", "reference a file from the working directory"),
@@ -600,7 +653,7 @@ mod tests {
             pending_request: None,
             last_answered_request_id: None,
             context_snapshot: None,
-            stages: vec![],
+            stages: Default::default(),
             workdir: "/tmp/test".to_string(),
             task: "test task".to_string(),
             title: Some("My Test".to_string()),
@@ -947,6 +1000,8 @@ mod tests {
         let buf = rendered_buffer(&terminal);
         assert!(buf.contains("the whole blueprint"), "t: {buf}");
         assert!(buf.contains("snake the path again"), "R: {buf}");
+        assert!(buf.contains("open the stored part"), "v: {buf}");
+        assert!(buf.contains("run's working directory"), "w: {buf}");
     }
 
     /// Work in flight wears its own glyph, not the check of work that is done.

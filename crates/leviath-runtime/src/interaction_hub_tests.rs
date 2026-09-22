@@ -106,7 +106,7 @@ async fn a_batch_waiting_on_a_prompt_does_not_hold_the_tool_lane() {
         Box::new(move || {
             Box::pin(async move {
                 let response = asking.ask(req("q1")).await;
-                vec![("q1".to_string(), response.value.unwrap_or_default())]
+                vec![("q1".to_string(), response.value.unwrap_or_default().into())]
             })
         }),
     );
@@ -120,7 +120,7 @@ async fn a_batch_waiting_on_a_prompt_does_not_hold_the_tool_lane() {
         Box::new(move || {
             Box::pin(async move {
                 answering.answer(InteractionResponse::text("q1", "hello"));
-                vec![("answered".to_string(), "ok".to_string())]
+                vec![("answered".to_string(), "ok".into())]
             })
         }),
     );
@@ -131,7 +131,12 @@ async fn a_batch_waiting_on_a_prompt_does_not_hold_the_tool_lane() {
             .await
             .expect("both batches finished")
             .expect("an outcome arrived");
-        answers.extend(outcome.results);
+        answers.extend(
+            outcome
+                .results
+                .into_iter()
+                .map(|(id, r)| (id, r.into_string())),
+        );
     }
     answers.sort();
     assert_eq!(
@@ -379,7 +384,11 @@ fn the_timeout_reads_back_through_the_hub_and_its_backends() {
     assert_eq!(hub.timeout_secs(), None, "a fresh hub waits indefinitely");
     hub.set_timeout_secs(Some(7));
     assert_eq!(hub.timeout_secs(), Some(7));
-    assert_eq!(hub.backend_for("agent-a").timeout_secs(), Some(7));
+    let backend = hub.backend_for("agent-a");
+    assert_eq!(backend.timeout_secs(), Some(7));
+    // A caller minting a request id asks the backend whose run it is: the id
+    // has to carry it, and the backend is what the caller holds.
+    assert_eq!(backend.agent_id(), "agent-a");
     hub.set_timeout_secs(None);
     assert_eq!(hub.timeout_secs(), None, "cleared again");
 }
@@ -429,9 +438,13 @@ fn a_deny_with_feedback_survives_the_wire_and_the_journal() {
     write_record(
         &mut buf,
         &RunRecord::ToolCallDone {
+            execution_id: String::new(),
+            outcome: None,
             iteration: 1,
             call_id: "c1".to_string(),
-            result: "[denied] User declined tool call 'bash'. Feedback: use the API".to_string(),
+            result: "[denied] User declined tool call 'bash'. Feedback: use the API"
+                .to_string()
+                .into(),
             at: 0,
         },
     )
@@ -441,4 +454,265 @@ fn a_deny_with_feedback_survives_the_wire_and_the_journal() {
         &records[0],
         RunRecord::ToolCallDone { result, .. } if result.ends_with("Feedback: use the API")
     ));
+}
+
+// ─── The record of what a person answered ─────────────────────────────────────
+
+/// Each way a request settles is recorded, and the three are told apart.
+///
+/// They have to be: an answer, a request nobody answered in time, and one
+/// withdrawn when the run was cancelled all hand the waiting caller the same
+/// neutral response, so the record is the only thing that distinguishes them.
+#[tokio::test]
+async fn each_way_a_request_ends_is_recorded_as_itself() {
+    use leviath_core::interaction::{ApprovalScope, Settlement};
+
+    let hub = InteractionHub::new();
+
+    // Answered: an approval, with the scope the person chose.
+    let asked = hub.clone();
+    let answered = tokio::spawn(async move {
+        asked
+            .submit(
+                "run-1",
+                InteractionRequest::tool_approval(
+                    "approve-1",
+                    "shell",
+                    serde_json::json!({"command": "rm -rf build"}),
+                    "implement",
+                    &[],
+                ),
+            )
+            .await
+    });
+    settle().await;
+    hub.answer(InteractionResponse {
+        request_id: "approve-1".to_string(),
+        value: None,
+        choice_index: Some(1),
+        approved: Some(true),
+        scope: Some(ApprovalScope::Run),
+        feedback: None,
+        parts: Vec::new(),
+    });
+    answered.await.expect("the ask completes");
+
+    // Cancelled: the run went away with the question still open.
+    let asked = hub.clone();
+    let cancelled = tokio::spawn(async move { asked.submit("run-1", req("ask-2")).await });
+    settle().await;
+    assert!(hub.cancel("ask-2"));
+    cancelled.await.expect("the ask completes");
+
+    let settled = hub.take_settled();
+    assert_eq!(settled.len(), 2, "one record per question: {settled:?}");
+
+    let (run, first) = &settled[0];
+    assert_eq!(run, "run-1", "the record names the run that asked");
+    assert_eq!(first.request_id, "approve-1");
+    assert_eq!(first.tool.as_deref(), Some("shell"));
+    assert_eq!(first.stage, "implement");
+    assert!(
+        first.prompt.contains("rm -rf build"),
+        "the prompt is what the person saw: {}",
+        first.prompt
+    );
+    let Settlement::Answered {
+        approved,
+        scope,
+        choice,
+        ..
+    } = &first.settlement
+    else {
+        panic!("an answered approval is answered: {:?}", first.settlement);
+    };
+    assert_eq!(*approved, Some(true));
+    assert_eq!(*scope, Some(ApprovalScope::Run), "and at which scope");
+    assert_eq!(*choice, Some(1));
+    assert!(first.asked_at <= first.at, "asked before it settled");
+
+    assert_eq!(settled[1].1.settlement, Settlement::Cancelled);
+
+    // Drained, so the next tick does not write them again.
+    assert!(hub.take_settled().is_empty());
+}
+
+/// A request nobody answers in time is recorded as the timeout it was.
+///
+/// On a paused clock, because `Some(0)` means "no deadline" here: a deadline
+/// that fires has to be a real one, advanced past.
+#[tokio::test(start_paused = true)]
+async fn an_unanswered_request_is_recorded_as_a_timeout() {
+    use leviath_core::interaction::Settlement;
+
+    let hub = InteractionHub::new();
+    hub.set_timeout_secs(Some(2));
+    let asked = hub.clone();
+    let expired = tokio::spawn(async move { asked.submit("run-2", req("ask-late")).await });
+    settle().await;
+    tokio::time::advance(Duration::from_secs(3)).await;
+    settle().await;
+    expired.await.expect("the ask completes");
+
+    let settled = hub.take_settled();
+    assert_eq!(settled.len(), 1);
+    assert_eq!(settled[0].1.settlement, Settlement::TimedOut);
+    assert_eq!(settled[0].0, "run-2");
+    assert!(
+        settled[0].1.asked_at <= settled[0].1.at,
+        "asked before it gave up"
+    );
+}
+
+/// Cancelling a run records every question it still had open, so a cancelled
+/// run does not look like one nobody ever asked anything.
+#[tokio::test]
+async fn cancelling_a_run_records_each_open_question() {
+    use leviath_core::interaction::Settlement;
+
+    let hub = InteractionHub::new();
+    for id in ["ask-a", "ask-b"] {
+        let asked = hub.clone();
+        tokio::spawn(async move { asked.submit("run-3", req(id)).await });
+    }
+    // Somebody else's question, which a cancel of run-3 must not touch.
+    let other = hub.clone();
+    tokio::spawn(async move { other.submit("run-4", req("ask-c")).await });
+    settle().await;
+
+    assert_eq!(hub.cancel_for_agent("run-3"), 2);
+
+    let settled = hub.take_settled();
+    assert_eq!(settled.len(), 2);
+    assert!(
+        settled
+            .iter()
+            .all(|(run, r)| run == "run-3" && r.settlement == Settlement::Cancelled),
+        "{settled:?}"
+    );
+    let mut ids: Vec<&str> = settled.iter().map(|(_, r)| r.request_id.as_str()).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, ["ask-a", "ask-b"]);
+}
+
+/// Two runs, one provider that names both their tool calls `call_1`, and both
+/// asking at once. Each gets its own answer.
+///
+/// This is the shape that used to lose one: the hub holds every run's open
+/// requests under one key space, so with ids that carried only the tool-call id
+/// the second ask replaced the first, the first run was handed the neutral
+/// answer nobody gave it, and the answer a person then gave to "that" id went
+/// to the second run.
+#[tokio::test]
+async fn two_runs_whose_provider_repeats_a_tool_call_id_each_keep_their_own_prompt() {
+    use leviath_core::interaction::ApprovalScope;
+
+    let hub = InteractionHub::new();
+    // What the two runs' providers minted. Identical, which is what a
+    // per-conversation counter produces and what the mock provider does.
+    let tool_call_id = "call_1";
+
+    let mut asks = Vec::new();
+    for run in ["run-a", "run-b"] {
+        let asked = hub.clone();
+        let id = leviath_core::interaction::request_id(run, "approve", tool_call_id);
+        asks.push((
+            run,
+            id.clone(),
+            tokio::spawn(async move {
+                asked
+                    .submit(
+                        run,
+                        InteractionRequest::tool_approval(
+                            id,
+                            "shell",
+                            serde_json::json!({"command": "echo hello"}),
+                            "main",
+                            &[],
+                        ),
+                    )
+                    .await
+            }),
+        ));
+    }
+    settle().await;
+
+    // Both are open, and they are two different requests.
+    let open = hub.pending();
+    assert_eq!(open.len(), 2, "both runs are waiting: {open:?}");
+    assert_eq!(
+        asks[0].1, "run-a-approve-call_1",
+        "the id names the run that asked"
+    );
+    assert_ne!(asks[0].1, asks[1].1, "two runs, two ids");
+
+    // Answering one names one. `run-a` is denied, `run-b` approved, and neither
+    // gets the other's answer.
+    for (run, id, _) in &asks {
+        let approved = *run == "run-b";
+        assert!(
+            hub.answer(InteractionResponse {
+                request_id: id.clone(),
+                value: None,
+                choice_index: None,
+                approved: Some(approved),
+                scope: Some(ApprovalScope::Once),
+                feedback: None,
+                parts: Vec::new(),
+            }),
+            "{id} is open"
+        );
+    }
+    for (run, _, task) in asks {
+        let answer = task.await.expect("the ask completes");
+        assert_eq!(
+            answer.approved,
+            Some(run == "run-b"),
+            "{run} got its own answer"
+        );
+    }
+    assert!(hub.pending().is_empty(), "nothing is left open");
+}
+
+/// An id that is somehow already open refuses the arriving request instead of
+/// replacing the one open.
+///
+/// Unreachable through the ids this daemon mints, which is why it is an error
+/// in the log and a settlement of its own in the journal rather than a quiet
+/// replacement: the request already open may be on somebody's screen.
+#[tokio::test]
+async fn a_second_request_under_an_open_id_is_refused_not_swapped_in() {
+    use leviath_core::interaction::Settlement;
+
+    let hub = InteractionHub::new();
+    let asked = hub.clone();
+    let first = tokio::spawn(async move { asked.submit("run-a", req("same-id")).await });
+    settle().await;
+
+    // The arriving one is answered immediately, with the neutral response an
+    // approval reads as not-approved.
+    let arriving = hub.submit("run-b", req("same-id")).await;
+    assert_eq!(arriving.request_id, "same-id");
+    assert_eq!(arriving.value.as_deref(), Some(""), "the neutral answer");
+    assert_eq!(arriving.approved, None, "nothing was approved");
+
+    // The one already open is untouched, and still belongs to the run that
+    // opened it.
+    let open = hub.pending();
+    assert_eq!(open.len(), 1, "the open request stayed: {open:?}");
+    assert_eq!(open[0].0, "run-a", "and it is still run-a's");
+    assert!(!first.is_finished(), "run-a is still waiting");
+
+    // The refusal is in the journal, against the run that was refused, and it
+    // is not a denial and not a cancellation.
+    let settled = hub.take_settled();
+    assert_eq!(settled.len(), 1, "one record: {settled:?}");
+    assert_eq!(settled[0].0, "run-b", "recorded against the run refused");
+    assert_eq!(settled[0].1.request_id, "same-id");
+    assert_eq!(settled[0].1.settlement, Settlement::Refused);
+
+    // And the run that kept its prompt can still be answered.
+    assert!(hub.answer(InteractionResponse::text("same-id", "go on")));
+    let answer = first.await.expect("the ask completes");
+    assert_eq!(answer.value.as_deref(), Some("go on"));
 }

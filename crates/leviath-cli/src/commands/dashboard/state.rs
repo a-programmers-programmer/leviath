@@ -7,7 +7,6 @@ use tokio::sync::mpsc;
 
 use crate::tui::widgets::markdown_edit::MarkdownEdit;
 
-use super::graph::load_stage_graph;
 use super::helpers::truncate;
 use super::types::*;
 use crate::runstate::{self, RunStatus};
@@ -90,6 +89,9 @@ pub(crate) struct Dashboard {
     /// so tests can count loads and pin that `,`/`.` read the archive once
     /// per run, not once per keypress.
     pub(super) history_loader: fn(&str) -> Vec<leviath_core::run_archive::RunPoint>,
+    /// A run's archive stat, which decides whether `history` is still
+    /// current. Injected beside `history_loader` for the same reason.
+    pub(super) history_stamp: fn(&str) -> Option<runstate::FileStamp>,
     /// Scroll offset for detail view content: 0 = bottom (auto-scroll), >0 = scrolled up
     pub(super) detail_scroll: usize,
     /// Selected option index for MultipleChoice/ToolApproval/Confirm input
@@ -104,15 +106,21 @@ pub(crate) struct Dashboard {
     pub(super) context_history_idx: Option<usize>,
     /// True after the first sync completes; suppresses startup toasts for pre-existing state.
     pub(super) initial_sync_done: bool,
-    // ── Poll caches ───────────────────────────────────────────────────────────
-    // The sync tick runs at 10Hz across every run on disk, and meta.json,
-    // stages.json, and context.json change at most once per persist tick.
-    // Re-reading and re-parsing them each tick costs ~100 MB/s of
-    // allocate-parse-free with 50 runs on disk; these stat-gated caches hold
-    // the steady state to stat calls.
-    pub(super) meta_cache: runstate::StatCache<runstate::RunMeta>,
-    pub(super) stages_cache: runstate::StatCache<Vec<leviath_core::run_meta::StageRecord>>,
-    pub(super) context_cache: runstate::StatCache<runstate::ContextSnapshot>,
+    // ── Run state ─────────────────────────────────────────────────────────────
+    /// The loader thread's end, in the real dashboard: the runs directory is
+    /// read there, never on the draw loop. `None` in tests, which read through
+    /// `run_loader` instead.
+    pub(super) run_feed: Option<super::run_loader::RunFeed>,
+    /// The newest snapshot from `run_feed`, applied every tick until the next.
+    pub(super) run_snapshot: Option<std::sync::Arc<super::run_loader::RunSnapshot>>,
+    /// Reads the runs directory in place when there is no `run_feed`.
+    pub(super) run_loader: super::run_loader::RunLoader,
+    /// True from start-up until the first snapshot lands, so the list says it
+    /// is loading rather than that there are no runs.
+    pub(super) runs_loading: bool,
+    /// Runs deleted here, and when: a snapshot read before that moment still
+    /// lists them, and must not bring the rows back.
+    pub(super) deleted_runs: std::collections::HashMap<String, std::time::Instant>,
     /// Monotonic tick counter for animations (spinner, toast timeouts)
     pub(super) tick_count: u64,
     /// Active toast notifications
@@ -209,6 +217,13 @@ pub(crate) struct Dashboard {
     /// Workdir-relative file paths the `@` completion offers, walked once when
     /// the screen opens rather than per keystroke.
     pub(super) new_run_files: Vec<String>,
+    /// One slot per caller-input region of the selected blueprint.
+    pub(super) new_run_inputs: Vec<super::new_run_inputs::NewRunInput>,
+    /// The slot the Inputs pane's cursor is on.
+    pub(super) new_run_input_selected: usize,
+    /// The agent path the slots were built for, so a selection that has not
+    /// moved keeps what was typed.
+    pub(super) new_run_inputs_key: String,
     /// True while an `@` file reference is being typed, so the completion
     /// popup has the keys.
     pub(super) new_run_file_ref: bool,
@@ -217,6 +232,9 @@ pub(crate) struct Dashboard {
     pub(super) new_run_file_query: String,
     /// Highlighted row of the completion popup.
     pub(super) new_run_file_selected: usize,
+    /// The file picker modal over the Inputs pane, when one is open, so a file
+    /// reaches a region by being chosen rather than by a typed name.
+    pub(super) new_run_picker: Option<super::new_run_picker::FilePicker>,
     /// A run started from the new-run screen whose page to open once the
     /// daemon reports it, with the ticks left to wait for that.
     pub(super) pending_open_run: Option<(String, u32)>,
@@ -232,6 +250,13 @@ pub(crate) struct Dashboard {
     /// consequences, and a toggle that survives out of sight is one a user can
     /// leave on and forget.
     pub(super) new_run_yolo: bool,
+    /// The yolo profile runs started from this screen run under, when
+    /// unattended is on and `Ctrl-Y` has stepped past plain yolo. `None` with
+    /// `new_run_yolo` set is the bare flag.
+    pub(super) new_run_yolo_profile: Option<String>,
+    /// The profiles `yolo.toml` defined when the screen opened, in file
+    /// order, which `Ctrl-Y` steps through after plain yolo.
+    pub(super) new_run_profiles: Vec<std::sync::Arc<crate::yolo::YoloProfile>>,
     /// Paths the screen reads its agents and file candidates from.
     pub(super) new_run_ctx: NewRunContext,
     /// The Agents screen (`a`): catalog and editor. Boxed: it carries a
@@ -334,8 +359,9 @@ impl Dashboard {
     pub(super) fn update_display_indices(&mut self) {
         // Drop marks whose runs no longer exist, so a deleted or vanished run
         // cannot linger in a later group kill or delete.
-        let agents = &self.agents;
-        self.marked.retain(|id| agents.iter().any(|a| a.id == *id));
+        let ids: std::collections::HashSet<&str> =
+            self.agents.iter().map(|a| a.id.as_str()).collect();
+        self.marked.retain(|id| ids.contains(id.as_str()));
         let query = self.list_search_query.to_lowercase();
         let status_priority = |s: &AgentDisplayStatus| -> u8 {
             match s {
@@ -398,8 +424,7 @@ impl Dashboard {
         let tree_rows: Vec<RunTreeRow> = if query.is_empty() {
             // Roots keep the status-sorted order; an agent whose parent is absent
             // is treated as a root so it can't disappear from the list.
-            let present: std::collections::HashSet<&str> =
-                self.agents.iter().map(|a| a.id.as_str()).collect();
+            let present = &ids;
             let roots: Vec<usize> = indices
                 .iter()
                 .copied()
@@ -482,29 +507,41 @@ impl Dashboard {
         self.context_history_idx = None;
     }
 
-    /// Make sure the cached archive covers `run_id` and is not older than the
-    /// TTL. This is the ONLY place the archive is loaded: `,`/`.` used to
-    /// re-read and re-replay the whole `run.lvr` on every keypress.
+    /// Make sure the cached archive covers `run_id` and holds everything in
+    /// it. This is the ONLY place the archive is loaded, so `,`/`.` step
+    /// through memory rather than replaying `run.lvr` per keypress.
+    ///
+    /// The archive is looked at once per TTL and read again only when its
+    /// stat moved: a finished run's archive cannot change, and it can be tens
+    /// of MB to replay on the draw loop.
     pub(super) fn ensure_history(&mut self, run_id: &str) {
         use super::history::{HISTORY_TTL_TICKS, RunHistoryCache};
-        let fresh = self.history.as_ref().is_some_and(|h| {
-            h.run_id == run_id
-                && self.tick_count.saturating_sub(h.loaded_at_tick) < HISTORY_TTL_TICKS
-        });
-        if fresh {
-            return;
+        let tick = self.tick_count;
+        let stamp_of = self.history_stamp;
+        if let Some(h) = self.history.as_mut().filter(|h| h.run_id == run_id) {
+            if tick.saturating_sub(h.checked_at_tick) < HISTORY_TTL_TICKS {
+                return;
+            }
+            if stamp_of(run_id) == h.stamp {
+                h.checked_at_tick = tick;
+                return;
+            }
         }
         // A run switch drops any browsed position along with the old archive.
         if self.history.as_ref().is_some_and(|h| h.run_id != run_id) {
             self.context_history_idx = None;
         }
+        // Stat before reading: an append that lands during the read makes the
+        // next check read again, rather than hiding behind a newer stamp.
+        let stamp = stamp_of(run_id);
         let points = (self.history_loader)(run_id);
         let visits = super::history::derive_visits(&points);
         self.history = Some(RunHistoryCache {
             run_id: run_id.to_string(),
             points,
             visits,
-            loaded_at_tick: self.tick_count,
+            checked_at_tick: tick,
+            stamp,
         });
     }
 
@@ -826,31 +863,41 @@ impl Dashboard {
     /// number of descendants the fold hides; none of them are emitted.
     /// Returns `Vec<(original_index, row)>`.
     pub(super) fn build_tree_order(&self, root_order: &[usize]) -> Vec<(usize, RunTreeRow)> {
-        let mut result = Vec::new();
+        let children = self.children_index();
+        let mut result = Vec::with_capacity(self.agents.len());
         for &idx in root_order {
-            self.collect_tree_children(idx, "", &mut result, true);
+            self.collect_tree_children(idx, "", &children, &mut result, true);
         }
         result
     }
 
-    /// The agent indices whose `parent_id` is `idx`'s id.
-    fn children_of(&self, idx: usize) -> Vec<usize> {
-        let agent_id = &self.agents[idx].id;
-        self.agents
+    /// Every agent's children, as agent indices in agent order, indexed by
+    /// the parent's agent index. One pass over the runs, so the tree walk
+    /// looks children up: rescanning every run for every node is quadratic,
+    /// and with thousands of runs it outweighs everything else in a tick.
+    fn children_index(&self) -> Vec<Vec<usize>> {
+        let by_id: std::collections::HashMap<&str, usize> = self
+            .agents
             .iter()
             .enumerate()
-            .filter(|(_, a)| a.parent_id.as_deref() == Some(agent_id))
-            .map(|(i, _)| i)
-            .collect()
+            .map(|(i, a)| (a.id.as_str(), i))
+            .collect();
+        let mut children = vec![Vec::new(); self.agents.len()];
+        for (i, agent) in self.agents.iter().enumerate() {
+            if let Some(&parent) = agent.parent_id.as_deref().and_then(|p| by_id.get(p)) {
+                children[parent].push(i);
+            }
+        }
+        children
     }
 
     /// How many rows a fold on `idx` hides: its children, their children, and
     /// so on, whatever their own fold state (the number is what the row shows,
     /// and "4 hidden" that is really 9 would be a lie).
-    fn descendant_count(&self, idx: usize) -> usize {
-        self.children_of(idx)
-            .into_iter()
-            .map(|c| 1 + self.descendant_count(c))
+    fn descendant_count(children: &[Vec<usize>], idx: usize) -> usize {
+        children[idx]
+            .iter()
+            .map(|&c| 1 + Self::descendant_count(children, c))
             .sum()
     }
 
@@ -858,10 +905,11 @@ impl Dashboard {
         &self,
         idx: usize,
         prefix: &str,
+        index: &[Vec<usize>],
         result: &mut Vec<(usize, RunTreeRow)>,
         is_root: bool,
     ) {
-        let children = self.children_of(idx);
+        let children = &index[idx];
         let collapsed = self.collapsed_runs.contains(&self.agents[idx].id);
         result.push((
             idx,
@@ -874,7 +922,7 @@ impl Dashboard {
                 expandable: !children.is_empty(),
                 collapsed: collapsed && !children.is_empty(),
                 hidden: if collapsed {
-                    self.descendant_count(idx)
+                    Self::descendant_count(index, idx)
                 } else {
                     0
                 },
@@ -894,7 +942,7 @@ impl Dashboard {
                 format!("{}{}", base, connector)
             };
 
-            self.collect_tree_children(child_idx, &child_prefix, result, false);
+            self.collect_tree_children(child_idx, &child_prefix, index, result, false);
         }
     }
 
@@ -912,9 +960,9 @@ impl Dashboard {
             return;
         }
         let before = self.collapsed_runs.len();
-        let agents = &self.agents;
-        self.collapsed_runs
-            .retain(|id| agents.iter().any(|a| a.id == *id));
+        let ids: std::collections::HashSet<&str> =
+            self.agents.iter().map(|a| a.id.as_str()).collect();
+        self.collapsed_runs.retain(|id| ids.contains(id.as_str()));
         // Only on the tick a run actually disappears, not ten times a second.
         if self.collapsed_runs.len() != before {
             self.save_ui_state();
@@ -990,7 +1038,7 @@ mod tests {
             pending_request: None,
             last_answered_request_id: None,
             context_snapshot: None,
-            stages: vec![],
+            stages: Default::default(),
             workdir: "/tmp".to_string(),
             task: "test task".to_string(),
             title: None,
@@ -1302,7 +1350,22 @@ mod tests {
         // The visit timeline came along for free.
         assert_eq!(dash.selected_history().unwrap().visits.len(), 1);
 
-        // Past the TTL the cache refreshes (a live run keeps growing).
+        // Past the TTL an archive that has not changed is not read again: a
+        // finished run's history is read once.
+        dash.tick_count += super::super::history::HISTORY_TTL_TICKS;
+        dash.step_context_history(-1);
+        assert_eq!(LOADS.load(Ordering::SeqCst), 1);
+
+        // One that has grown is (a live run keeps appending).
+        static STAMPS: AtomicUsize = AtomicUsize::new(0);
+        fn growing_stamp(_run_id: &str) -> Option<crate::runstate::FileStamp> {
+            let len = STAMPS.fetch_add(1, Ordering::SeqCst) as u64;
+            Some(crate::runstate::FileStamp {
+                mtime: std::time::UNIX_EPOCH,
+                len,
+            })
+        }
+        dash.history_stamp = growing_stamp;
         dash.tick_count += super::super::history::HISTORY_TTL_TICKS;
         dash.step_context_history(-1);
         assert_eq!(LOADS.load(Ordering::SeqCst), 2);
@@ -1748,7 +1811,7 @@ mod tests {
             true,
         ));
         agent.stage_index = 0;
-        agent.stages = vec![crate::runstate::StageRecord::new("main".to_string(), 0)];
+        agent.stages = vec![crate::runstate::StageRecord::new("main".to_string(), 0)].into();
         dash.agents.push(agent);
         dash.update_display_indices();
         dash.selected_stage = 0;
@@ -1771,7 +1834,8 @@ mod tests {
         agent.stages = vec![
             crate::runstate::StageRecord::new("main".to_string(), 0),
             crate::runstate::StageRecord::new("code".to_string(), 1),
-        ];
+        ]
+        .into();
         dash.agents.push(agent);
         dash.update_display_indices();
         dash.selected_stage = 1; // Wrong stage
@@ -2025,7 +2089,8 @@ mod tests {
             crate::runstate::StageRecord::new("plan".to_string(), 0),
             crate::runstate::StageRecord::new("code".to_string(), 1),
             crate::runstate::StageRecord::new("review".to_string(), 2),
-        ];
+        ]
+        .into();
         dash.agents.push(agent);
         dash.update_display_indices();
 
@@ -2142,7 +2207,7 @@ mod tests {
             true,
         ));
         agent.stage_index = 0;
-        agent.stages = vec![crate::runstate::StageRecord::new("main".to_string(), 0)];
+        agent.stages = vec![crate::runstate::StageRecord::new("main".to_string(), 0)].into();
         dash.agents.push(agent);
         dash.update_display_indices();
         dash.selected_stage = 0;
@@ -2158,7 +2223,7 @@ mod tests {
         let mut dash = make_test_dashboard();
         let mut agent = make_test_agent("run-1", AgentDisplayStatus::Waiting);
         agent.waiting_prompt = Some("prompt text".to_string());
-        agent.pending_request = None; // no structured request - legacy path
+        agent.pending_request = None; // a prompt with no structured request
         agent.stage_index = 0;
         dash.agents.push(agent);
         dash.update_display_indices();
@@ -3402,7 +3467,7 @@ mod tests {
                 // A finished run's record is re-read once a second, not every
                 // tick; this test is about the toast path, not the window, so
                 // the cache forgets the run before the next sync.
-                dash.meta_cache = Default::default();
+                dash.run_loader = Default::default();
                 dash.sync_from_run_state(); // second sync: transitions Complete -> Error
 
                 let agent = dash.agents.iter().find(|a| a.id == run_id).unwrap();
@@ -3832,5 +3897,68 @@ mod tests {
         dash.list_search_query.clear();
         dash.cycle_sort_mode();
         assert!(dash.marked.contains("run-1"));
+    }
+
+    /// With a loader thread feeding it, the list says it is loading until the
+    /// first snapshot lands, then keeps using the newest one it has, and the
+    /// loader is told which run the cursor is on.
+    #[test]
+    fn a_fed_list_loads_from_its_snapshots() {
+        crate::runstate::with_isolated_runs_dir("dash-fed-list", |_d| {
+            runstate::create_run(&make_run_meta("fed-run", RunStatus::Complete)).unwrap();
+            let (feed, snapshots, shown) = super::super::run_loader::RunFeed::detached();
+            let mut dash = make_test_dashboard();
+            dash.run_feed = Some(feed);
+            dash.runs_loading = true;
+
+            dash.sync_from_run_state();
+            assert!(dash.agents.is_empty(), "nothing has been read yet");
+            assert!(dash.runs_loading);
+
+            let snapshot = super::super::run_loader::RunLoader::default().collect(None, true);
+            snapshots.send(Some(std::sync::Arc::new(snapshot))).unwrap();
+            dash.sync_from_run_state();
+            assert_eq!(dash.agents.len(), 1);
+            assert!(!dash.runs_loading);
+
+            // No newer snapshot: the one it has still drives the list, and
+            // the run now under the cursor is named to the loader.
+            dash.sync_from_run_state();
+            assert_eq!(dash.agents.len(), 1);
+            assert_eq!(shown.try_recv().unwrap(), Some("fed-run".to_string()));
+        });
+    }
+
+    /// A run deleted here is left out of a snapshot read before the delete,
+    /// which still lists it; a snapshot read after it has the final word.
+    #[test]
+    fn a_deleted_run_stays_gone_until_a_later_snapshot() {
+        crate::runstate::with_isolated_runs_dir("dash-deleted-run", |_d| {
+            runstate::create_run(&make_run_meta("gone-run", RunStatus::Complete)).unwrap();
+            let mut loader = super::super::run_loader::RunLoader::default();
+            let before = loader.collect(None, true);
+            let deleted_at = before.taken_at + std::time::Duration::from_millis(1);
+            let mut dash = make_test_dashboard();
+            dash.deleted_runs.insert("gone-run".to_string(), deleted_at);
+
+            dash.apply_run_snapshot(&before);
+            assert!(
+                dash.agents.is_empty(),
+                "the stale snapshot does not bring it back"
+            );
+            assert!(dash.deleted_runs.contains_key("gone-run"));
+
+            // Waited out rather than spun on: whether a spin's body runs at all
+            // depends on how long the lines above took, so on a slower machine
+            // the clock is already past the tombstone and the body is a region
+            // no run enters. Sleeping the remaining time plus a millisecond
+            // passes the same deadline with no branch to be uncovered.
+            let remaining = deleted_at.saturating_duration_since(std::time::Instant::now());
+            std::thread::sleep(remaining + std::time::Duration::from_millis(1));
+            let after = loader.collect(None, true);
+            dash.apply_run_snapshot(&after);
+            assert!(dash.deleted_runs.is_empty());
+            assert_eq!(dash.agents.len(), 1, "still on disk, so still listed");
+        });
     }
 }
