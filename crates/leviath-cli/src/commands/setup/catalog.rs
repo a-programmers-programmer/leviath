@@ -32,12 +32,10 @@ pub enum Credential {
 /// Where a provider's choice lives in a [`Config`], as the row itself
 /// declares it.
 ///
-/// Adding a provider used to mean adding an arm to `stored_credential`, one
-/// to `set_credential`, sometimes one to `is_configured`, and an entry in
-/// `configured_providers` - four places, none of which the compiler would
-/// mention if you missed them, and one of which shipped missed. A row that
-/// carries its own accessors is one place instead, and the functions below
-/// are then written once against any provider rather than once per provider.
+/// A row carries its own accessors so that adding a provider is one place,
+/// and the functions below are written once against any provider. Spread
+/// over per-provider arms in four functions, a new provider is four edits the
+/// compiler cannot ask for, and a missed one ships.
 #[derive(Clone, Copy)]
 pub enum Setting {
     /// One `Option<String>` on the config: an API key, or a base URL.
@@ -99,6 +97,40 @@ pub struct Provider {
     pub setting: Setting,
 }
 
+impl Provider {
+    /// How this provider authenticates, the wizard's top-level grouping: a
+    /// browser subscription login, an API key, or a local/custom endpoint.
+    pub(crate) fn auth_kind(&self) -> &'static str {
+        match self.credential {
+            Credential::Signin => "Subscription logins",
+            Credential::ApiKey => "API key",
+            Credential::BaseUrl | Credential::Endpoint => "Local and custom",
+        }
+    }
+
+    /// What this provider makes, the wizard's grouping within an auth kind.
+    /// A provider files under every kind it makes, so OpenAI is found under
+    /// video as well as text: the kinds are the models it serves, not a
+    /// single label.
+    pub(crate) fn kinds(&self) -> &'static [&'static str] {
+        match self.id {
+            "meshy" => &[KIND_3D],
+            "openai" | "google" | "xai" | "grok" => &[KIND_TEXT, KIND_VIDEO, KIND_AUDIO],
+            "meta" => &[KIND_TEXT, KIND_AUDIO],
+            _ => &[KIND_TEXT],
+        }
+    }
+}
+
+/// Chat models, and the image models beside them.
+pub(crate) const KIND_TEXT: &str = "Text and images";
+/// Video generation.
+pub(crate) const KIND_VIDEO: &str = "Video";
+/// Text to speech, transcription and music.
+pub(crate) const KIND_AUDIO: &str = "Speech and audio";
+/// 3D models and their textures.
+pub(crate) const KIND_3D: &str = "3D models and textures";
+
 /// Every provider the wizard offers, in the order it offers them.
 pub(crate) fn providers() -> Vec<Provider> {
     vec![
@@ -119,7 +151,8 @@ pub(crate) fn providers() -> Vec<Provider> {
         Provider {
             id: "openai",
             display: "OpenAI",
-            blurb: "GPT models.",
+            blurb: "GPT chat models, GPT Image, Sora video, speech and Whisper \
+                    transcription.",
             credential: Credential::ApiKey,
             hint: "sk-...",
             env_var: Some("OPENAI_API_KEY"),
@@ -132,8 +165,9 @@ pub(crate) fn providers() -> Vec<Provider> {
         },
         Provider {
             id: "google",
-            display: "Google (Gemini)",
-            blurb: "Gemini models.",
+            display: "Google",
+            blurb: "Gemini chat and image models, Veo video, Gemini speech and Lyria \
+                    music.",
             credential: Credential::ApiKey,
             hint: "AIza...",
             env_var: Some("GOOGLE_API_KEY"),
@@ -142,6 +176,37 @@ pub(crate) fn providers() -> Vec<Provider> {
             setting: Setting::Text {
                 read: |c| c.providers.google_api_key.clone(),
                 write: |c, v| c.providers.google_api_key = v,
+            },
+        },
+        Provider {
+            id: "xai",
+            display: "xAI",
+            blurb: "Grok chat, image, video and speech models, billed to an xAI API \
+                    balance.",
+            credential: Credential::ApiKey,
+            hint: "xai-...",
+            env_var: Some("XAI_API_KEY"),
+            signup_url: Some("https://console.x.ai"),
+            preset_url: None,
+            setting: Setting::Text {
+                read: |c| c.providers.xai_api_key.clone(),
+                write: |c, v| c.providers.xai_api_key = v,
+            },
+        },
+        Provider {
+            id: "meta",
+            display: "Meta",
+            blurb: "Muse Spark chat, Muse Image and Muse Voice Transcribe, billed to a \
+                    Meta developer account.",
+            credential: Credential::ApiKey,
+            // Meta publishes no key prefix; Verify is the check.
+            hint: "your Meta Model API key",
+            env_var: Some("META_AI_API_KEY"),
+            signup_url: Some("https://dev.meta.ai/"),
+            preset_url: None,
+            setting: Setting::Text {
+                read: |c| c.providers.meta_api_key.clone(),
+                write: |c, v| c.providers.meta_api_key = v,
             },
         },
         Provider {
@@ -159,8 +224,38 @@ pub(crate) fn providers() -> Vec<Provider> {
             },
         },
         Provider {
+            id: "meshy",
+            display: "Meshy",
+            blurb: "Generative 3D: reference images or a mesh in, a textured \
+                    model out.",
+            credential: Credential::ApiKey,
+            hint: "msy_...",
+            env_var: Some("MESHY_API_KEY"),
+            signup_url: Some("https://www.meshy.ai/api"),
+            preset_url: None,
+            setting: Setting::Text {
+                read: |c| c.providers.meshy_api_key.clone(),
+                write: |c, v| c.providers.meshy_api_key = v,
+            },
+        },
+        Provider {
+            id: "bedrock",
+            display: "AWS Bedrock",
+            blurb: "Claude, Nova, Llama, Mistral and more, billed to an AWS account. \
+                    Takes a Bedrock API key; the region defaults to us-east-1.",
+            credential: Credential::ApiKey,
+            hint: "ABSK...",
+            env_var: Some("AWS_BEARER_TOKEN_BEDROCK"),
+            signup_url: Some("https://console.aws.amazon.com/bedrock/home#/api-keys"),
+            preset_url: None,
+            setting: Setting::Text {
+                read: |c| c.providers.bedrock_api_key.clone(),
+                write: |c, v| c.providers.bedrock_api_key = v,
+            },
+        },
+        Provider {
             id: "codex",
-            display: "OpenAI Codex (ChatGPT subscription)",
+            display: "OpenAI Codex",
             blurb: "GPT-5.x billed to a ChatGPT plan instead of an API balance. \
                     Signs in with a browser.",
             credential: Credential::Signin,
@@ -174,8 +269,23 @@ pub(crate) fn providers() -> Vec<Provider> {
             },
         },
         Provider {
+            id: "grok",
+            display: "Grok",
+            blurb: "Grok billed to a SuperGrok or X Premium+ plan instead of an API \
+                    balance. Signs in with a browser.",
+            credential: Credential::Signin,
+            hint: "",
+            env_var: None,
+            signup_url: Some("https://grok.com"),
+            preset_url: None,
+            setting: Setting::Switch {
+                read: |c| c.providers.grok_enabled,
+                write: |c, v| c.providers.grok_enabled = v,
+            },
+        },
+        Provider {
             id: "ollama",
-            display: "Ollama (local)",
+            display: "Ollama",
             blurb: "Models running on this machine. No key needed.",
             credential: Credential::BaseUrl,
             hint: DEFAULT_OLLAMA_URL,
@@ -296,8 +406,7 @@ pub(crate) fn stored_credential(config: &Config, id: &str) -> Option<String> {
 
 /// Write a provider's credential into a config. `None` clears it.
 pub(crate) fn set_credential(config: &mut Config, id: &str, value: Option<String>) {
-    // An id the catalog does not have goes nowhere, which is what a
-    // `_ => {}` arm used to say.
+    // An id the catalog does not have goes nowhere.
     let Some(row) = row(id) else {
         return;
     };
@@ -321,11 +430,20 @@ pub(crate) fn is_configured(config: &Config, id: &str) -> bool {
     }
 }
 
+/// Whether a browser sign-in provider is switched on in this config. `false`
+/// for any id that is not one.
+pub(crate) fn signin_enabled(config: &Config, id: &str) -> bool {
+    match row(id).map(|p| (p.credential, p.setting)) {
+        Some((Credential::Signin, Setting::Switch { read, .. })) => read(config),
+        _ => false,
+    }
+}
+
 /// Every provider this config has configured, in catalog order.
 ///
-/// Derived from the table rather than restated: the list that decides which
-/// providers can be the default used to be its own hard-coded tuple, and a
-/// provider missing from it was configured, usable, and not offered.
+/// Derived from the table rather than kept as a list of its own: a provider
+/// missing from a hand-kept list is configured, usable, and never offered as
+/// the default.
 pub(crate) fn configured(config: &Config) -> Vec<&'static str> {
     providers()
         .into_iter()
@@ -412,7 +530,29 @@ mod tests {
         for p in &all {
             assert!(!p.display.is_empty(), "provider {} has no label", p.id);
             assert!(!p.blurb.is_empty(), "provider {} has no blurb", p.id);
+            // Every provider files under an auth kind and a modality, the two
+            // headings the wizard groups by.
+            let auth = p.auth_kind();
+            let id = p.id;
+            assert!(
+                ["Subscription logins", "API key", "Local and custom"].contains(&auth),
+                "provider {id} has an unknown auth kind {auth}"
+            );
+            assert!(!p.kinds().is_empty(), "provider {id} makes nothing");
         }
+        // The catalog carries all four auth kinds and every kind in use, so
+        // the classifier's arms are all exercised.
+        assert!(all.iter().any(|p| p.credential == Credential::Signin));
+        assert!(all.iter().any(|p| p.credential == Credential::BaseUrl));
+        assert!(all.iter().any(|p| p.credential == Credential::Endpoint));
+        for kind in [KIND_TEXT, KIND_VIDEO, KIND_AUDIO, KIND_3D] {
+            assert!(
+                all.iter().any(|p| p.kinds().contains(&kind)),
+                "nothing makes {kind}"
+            );
+        }
+        let meta = all.iter().find(|p| p.id == "meta").unwrap();
+        assert_eq!(meta.kinds(), [KIND_TEXT, KIND_AUDIO]);
     }
 
     #[test]

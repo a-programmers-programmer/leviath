@@ -9,13 +9,15 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+pub mod revision;
 mod stage_ledger;
 
 // Re-exported flat rather than left behind a path of their own: the stage ledger
 // moved out of this file because the file got long, and that is a fact about
 // where the source lives, not about what a caller should have to type.
 pub use stage_ledger::{
-    MAX_STAGE_VISITS, StageCall, StageRecord, StageRunStatus, StageVisitRecord,
+    MAX_STAGE_VISITS, StageCall, StageModelUse, StageRecord, StageRunStatus, StageVisitRecord,
+    stage_models_of,
 };
 
 /// Current status of a background run.
@@ -177,6 +179,17 @@ pub enum SetupBlocker {
     /// Every candidate is out of service, for reasons that do not agree or are
     /// not known. The remedy names what was tried last.
     ProvidersUnavailable,
+    /// The provider could not be reached at all: the name did not resolve,
+    /// the connection was refused, or the TLS handshake failed. The network
+    /// or the address is what to check.
+    ProviderUnreachable,
+    /// The provider was reached and did not answer in time. It is up, but
+    /// slow, or the request was large; a resume tries again.
+    ProviderTimedOut,
+    /// The provider was reached and failed: a server error, a reply that
+    /// stopped part-way, or one that could not be read. Nothing about the
+    /// setup is known to be wrong; a resume tries again once it recovers.
+    ProviderFailed,
 }
 
 impl std::fmt::Display for SetupBlocker {
@@ -187,6 +200,9 @@ impl std::fmt::Display for SetupBlocker {
             Self::AuthFailed => f.write_str("key"),
             Self::Forbidden => f.write_str("access"),
             Self::ProvidersUnavailable => f.write_str("providers"),
+            Self::ProviderUnreachable => f.write_str("unreachable"),
+            Self::ProviderTimedOut => f.write_str("timed out"),
+            Self::ProviderFailed => f.write_str("failed"),
         }
     }
 }
@@ -292,6 +308,15 @@ impl std::fmt::Display for WaitReason {
             Self::Children { outstanding } => write!(f, "children({outstanding})"),
             // The remedy is a sentence; this is a table cell. The blocker is
             // the half that fits, and the half that says which screen to open.
+            // The three that describe the provider rather than something the
+            // install lacks say what happened to it.
+            Self::NeedsSetup {
+                blocker:
+                    blocker @ (SetupBlocker::ProviderUnreachable
+                    | SetupBlocker::ProviderTimedOut
+                    | SetupBlocker::ProviderFailed),
+                ..
+            } => write!(f, "provider {blocker}"),
             Self::NeedsSetup { blocker, .. } => write!(f, "needs {blocker}"),
         }
     }
@@ -380,6 +405,25 @@ pub struct RunMeta {
     /// before resolution. Later stages may use a different one; this is not
     /// rewritten to follow them.
     pub model: Option<String>,
+    /// Every provider and model some stage of this run has run an inference
+    /// on, in the order the run first reached each.
+    ///
+    /// The set, not the assignment: an entry says the run ran on that pair and
+    /// never which stage did, and one pair two stages shared appears once.
+    /// [`StageRecord::models`] is the per-stage answer, and `stages.json` is
+    /// where to read it.
+    ///
+    /// Here as well as there because a listing reads this file per run and
+    /// nothing else, so "which runs ran on this model" is a question the
+    /// listing can answer without opening a ledger for every run on the
+    /// machine.
+    ///
+    /// Empty on a run that has billed no call, and on every run recorded
+    /// before Leviath kept this. Never reconstructed from
+    /// [`model`](Self::model), which is the entry stage's resolution and says
+    /// nothing about the stages after it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stage_models: Vec<StageModelUse>,
     /// Always 0. There is no worker process per run: the daemon hosts every run
     /// as an entity in one shared world, so no run has a pid of its own.
     ///
@@ -527,6 +571,13 @@ pub struct RunMeta {
     /// to attended, so nothing is escalated retroactively.
     #[serde(default)]
     pub yolo: bool,
+    /// The named yolo profile (`--yolo=<name>`) the run was launched under,
+    /// persisted with `yolo` for the same reason: a restart that dropped the
+    /// name would resume a carefully scoped run under bare `--yolo`, which is
+    /// the escalating direction. Absent for the bare flag and for runs written
+    /// before profiles existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yolo_profile: Option<String>,
     /// How much of the blueprint's `[read_paths]` the config granted, as
     /// resolved at spawn. `None` for a blueprint that declared none, and for
     /// runs written before this field existed.
@@ -580,6 +631,16 @@ pub struct RunMeta {
     /// pair the user may never have named.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_override: Option<String>,
+
+    /// The SHA-256 of the manifest this run executed, in lowercase hex.
+    ///
+    /// The identity of the run's blueprint snapshot
+    /// (`files::BLUEPRINT_SNAPSHOT_FILE`), so a reader can tell whether the
+    /// installed blueprint is still the one that ran. Absent for a run written
+    /// before snapshots existed, where the answer is genuinely unknown rather
+    /// than "the same".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blueprint_digest: Option<String>,
 }
 
 /// How many `[read_paths]` entries a run's blueprint declared, and how many of
@@ -746,6 +807,22 @@ impl RunFlags {
             self.modified_files.push(path.to_string());
         }
     }
+
+    /// Note a path that changed on disk without a modifying tool naming it -
+    /// a file a `shell` command created or rewrote, found by scanning the
+    /// working directory. It joins the list (deduped, capped) but does not
+    /// touch `modified_file_count`, which counts modifying *tool calls*: a
+    /// shell call is not one, and a scan that ran twice must not double-count
+    /// the same file. Returns whether the path was newly added.
+    pub fn note_modified_path(&mut self, path: &str) -> bool {
+        if self.modified_files.len() >= MAX_TRACKED_MODIFIED_FILES
+            || self.modified_files.iter().any(|p| p == path)
+        {
+            return false;
+        }
+        self.modified_files.push(path.to_string());
+        true
+    }
 }
 
 impl RunMeta {
@@ -790,6 +867,7 @@ impl RunMeta {
             agent_path,
             task,
             model,
+            stage_models: Vec::new(),
             pid: 0,
             status: RunStatus::Starting,
             current_stage: String::new(),
@@ -826,8 +904,10 @@ impl RunMeta {
             waiting_on: None,
             output_request: None,
             model_override: None,
+            blueprint_digest: None,
             flags: RunFlags::default(),
             yolo: false,
+            yolo_profile: None,
             read_paths: None,
         }
     }
@@ -883,8 +963,9 @@ impl RunMeta {
 /// One content entry within a region, captured at snapshot time.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RegionEntrySnapshot {
-    /// The entry's text, exactly as it sat in the live region.
-    pub content: String,
+    /// The entry's parts, exactly as they sat in the live region. Reads as
+    /// text; a plain string in an older snapshot loads as one text part.
+    pub content: crate::region::EntryContent,
     /// The entry's token cost as counted when it was added, carried through the
     /// snapshot so a reload does not have to re-tokenize to rebuild budgets.
     pub tokens: usize,
@@ -1418,20 +1499,38 @@ mod tests {
                 "providers_unavailable",
                 "providers",
             ),
+            (
+                SetupBlocker::ProviderUnreachable,
+                "provider_unreachable",
+                "unreachable",
+            ),
+            (
+                SetupBlocker::ProviderTimedOut,
+                "provider_timed_out",
+                "timed out",
+            ),
+            (SetupBlocker::ProviderFailed, "provider_failed", "failed"),
         ] {
             assert_eq!(serde_json::to_value(blocker).unwrap(), wire);
             assert_eq!(blocker.to_string(), label);
             let back: SetupBlocker = serde_json::from_value(serde_json::json!(wire)).unwrap();
             assert_eq!(back, blocker);
             // The row renders the kind, not the sentence: a remedy is a
-            // sentence and this is a table cell.
+            // sentence and this is a table cell. A blocker that describes the
+            // provider says what happened to it rather than what is needed.
+            let lead = match blocker {
+                SetupBlocker::ProviderUnreachable
+                | SetupBlocker::ProviderTimedOut
+                | SetupBlocker::ProviderFailed => "provider",
+                _ => "needs",
+            };
             assert_eq!(
                 WaitReason::NeedsSetup {
                     blocker,
                     remedy: "a whole sentence that would not fit".to_string(),
                 }
                 .to_string(),
-                format!("needs {label}")
+                format!("{lead} {label}")
             );
         }
     }
@@ -1596,7 +1695,7 @@ mod tests {
                 current_tokens: 10,
                 max_tokens: 50,
                 entries: vec![RegionEntrySnapshot {
-                    content: "hi".to_string(),
+                    content: "hi".into(),
                     tokens: 1,
                     kind: crate::region::EntryKind::UserMessage,
                     metadata: Some(serde_json::json!({"a": 1})),
@@ -1659,6 +1758,29 @@ mod tests {
     }
 
     #[test]
+    fn note_modified_path_joins_the_list_without_touching_the_call_count() {
+        let mut flags = RunFlags::default();
+        // A modifying tool call: counts and lists.
+        flags.record_modification("plot_chart.py");
+        // A shell creation, noted from a workdir scan: lists, but is not a
+        // modifying tool call, so the count stays 1 - and a second scan that
+        // finds it again neither re-adds nor re-counts.
+        assert!(flags.note_modified_path("chart.png"));
+        assert!(!flags.note_modified_path("chart.png"));
+        assert_eq!(flags.modified_file_count, 1);
+        assert_eq!(flags.modified_files, vec!["plot_chart.py", "chart.png"]);
+
+        // Past the cap it stops adding and says so.
+        let mut full = RunFlags::default();
+        for i in 0..MAX_TRACKED_MODIFIED_FILES {
+            assert!(full.note_modified_path(&format!("f{i}.png")));
+        }
+        assert!(!full.note_modified_path("one-too-many.png"));
+        assert_eq!(full.modified_files.len(), MAX_TRACKED_MODIFIED_FILES);
+        assert_eq!(full.modified_file_count, 0);
+    }
+
+    #[test]
     fn run_meta_flags_default_for_older_files() {
         // A meta.json written before `flags` existed has no such key at all.
         let mut meta = RunMeta::new(
@@ -1679,5 +1801,51 @@ mod tests {
         assert!(!json.to_string().contains("flags"));
         let back: RunMeta = serde_json::from_value(json).unwrap();
         assert_eq!(back.flags, RunFlags::default());
+    }
+
+    /// A `meta.json` from a build that never recorded the models still loads,
+    /// and reports none rather than being filled in from `model`.
+    #[test]
+    fn run_meta_from_an_older_file_reports_no_stage_models() {
+        let meta = sample_meta();
+        let mut json = serde_json::to_value(&meta).unwrap();
+        // The key is absent on a fresh record too, since the roll-up is empty;
+        // removing it is what makes this a file no build of Leviath wrote it
+        // into rather than one that wrote it empty.
+        assert!(
+            json.as_object_mut()
+                .unwrap()
+                .remove("stage_models")
+                .is_none(),
+            "an empty roll-up writes no key"
+        );
+        let back: RunMeta = serde_json::from_value(json).unwrap();
+        assert_eq!(back.run_id, "run-1", "the rest of the record still reads");
+        assert_eq!(back.model.as_deref(), Some("claude-sonnet-4-6"));
+        assert!(
+            back.stage_models.is_empty(),
+            "the entry stage's model is not evidence about any other stage"
+        );
+    }
+
+    /// The roll-up reaches the file, so a listing that has parsed `meta.json`
+    /// can answer which models a run ran on without opening its ledger.
+    #[test]
+    fn run_meta_carries_the_stage_model_rollup() {
+        let mut meta = sample_meta();
+        meta.stage_models = vec![
+            StageModelUse {
+                provider: "anthropic".to_string(),
+                model: "claude-opus-5".to_string(),
+            },
+            StageModelUse {
+                provider: "openai".to_string(),
+                model: "gpt-5.5".to_string(),
+            },
+        ];
+        let json = serde_json::to_string(&meta).unwrap();
+        assert!(json.contains("\"stage_models\""), "{json}");
+        let back: RunMeta = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.stage_models, meta.stage_models);
     }
 }

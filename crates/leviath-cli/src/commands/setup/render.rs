@@ -72,7 +72,31 @@ pub(crate) fn draw(frame: &mut Frame, wizard: &Wizard) {
         reorder.draw(frame, frame.area());
     } else if wizard.show_help {
         draw_help(frame, frame.area(), &help_sections(), &wizard.help_scroll);
+    } else if let Some(index) = wizard.modal_index() {
+        draw_provider_modal(frame, frame.area(), wizard, index);
     }
+}
+
+/// A provider's setup modal: its card in a popup over the Providers screen,
+/// with the three ways out at its foot.
+/// The wizard's cursor and scroll are the modal's while it is open, so the
+/// card scrolls to the cursor the way a screen does.
+fn draw_provider_modal(frame: &mut Frame, area: Rect, wizard: &Wizard, index: usize) {
+    use crate::tui::widgets::popup::{centered, popup_frame};
+    let title = format!(" Set up {} ", wizard.providers[index].provider.display);
+    let popup = centered(80, 85, area);
+    // The window is at least the wizard's minimum by the time this draws, so
+    // the popup always leaves room inside its border.
+    let inner = popup_frame(frame, popup, &title, C_ACCENT);
+    let mut screen = build_provider_card(wizard, index);
+    screen.blank();
+    for (position, button) in super::state::ModalButton::ALL.iter().enumerate() {
+        let focused = wizard.cursor == wizard.modal_card_rows() + position;
+        screen.row();
+        screen.push(button_line(button.label(), focused));
+    }
+    let screen = screen.wrapped(inner.width as usize);
+    draw_screen(frame, inner, popup, &screen, wizard.cursor, wizard.scroll);
 }
 
 /// The help overlay's content, matching the bindings in `input.rs`.
@@ -87,6 +111,12 @@ fn help_sections() -> [HelpSection; 5] {
                 ("← → / h l", "change a choice"),
                 ("space", "select / toggle"),
                 ("enter", "act on the focused row; Continue moves on"),
+                ("enter", "on a provider, opens its setup in a modal"),
+                (
+                    "a / d",
+                    "on Providers: add a provider / remove the one under the cursor",
+                ),
+                ("v", "in a provider's modal: verify and use"),
                 ("enter", "on a default, opens a searchable list"),
                 ("tab", "next screen"),
                 ("shift-tab / esc", "previous screen"),
@@ -155,6 +185,26 @@ fn draw_header(frame: &mut Frame, area: Rect, wizard: &Wizard) {
             Style::default().fg(C_DIM)
         };
         spans.push(Span::styled(step.title(), style));
+    }
+    // A window too narrow for the whole trail gets the one fact it carries,
+    // where you are, rather than a trail cut off at the border.
+    let room = area.width.saturating_sub(2) as usize;
+    if spans
+        .iter()
+        .map(|s| s.content.chars().count())
+        .sum::<usize>()
+        > room
+    {
+        spans.truncate(1);
+        spans.push(Span::styled(
+            format!(
+                "Step {} of {}: {}",
+                current + 1,
+                Step::ALL.len(),
+                wizard.step.title()
+            ),
+            Style::default().fg(C_ACCENT).add_modifier(Modifier::BOLD),
+        ));
     }
 
     frame.render_widget(
@@ -226,12 +276,14 @@ fn draw_body(frame: &mut Frame, area: Rect, wizard: &Wizard) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    // The screen's own cursor and scroll, not the modal's while one is up.
     draw_screen(
         frame,
         inner,
         area,
         &build_screen(wizard).wrapped(inner.width as usize),
-        wizard,
+        wizard.screen_cursor(),
+        wizard.screen_scroll(),
     );
 }
 
@@ -257,7 +309,12 @@ pub(crate) fn row_at(area: Rect, wizard: &Wizard, column: u16, row: u16) -> Opti
     }
 
     let screen = build_screen(wizard).wrapped(inner.width as usize);
-    let offset = first_visible(&screen, wizard, inner.height as usize);
+    let offset = first_visible(
+        &screen,
+        wizard.screen_cursor(),
+        wizard.screen_scroll(),
+        inner.height as usize,
+    );
     let line = offset + (row - inner.y) as usize;
     // The row that owns this line is the last one starting at or before it,
     // and only if the line is still inside the screen's content.
@@ -293,7 +350,6 @@ fn build_screen(wizard: &Wizard) -> Screen {
     match wizard.step {
         Step::Welcome => build_welcome(wizard),
         Step::Providers => build_providers(wizard),
-        Step::ProviderDetail => build_provider_detail(wizard),
         Step::Defaults | Step::Limits => build_fields(wizard),
         Step::Agents => build_agents(wizard),
         Step::Mcp => build_mcp(wizard),
@@ -426,21 +482,21 @@ fn wrap_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
 /// The first line to show, given where the user last scrolled and where the
 /// cursor is.
 ///
-/// The cursor wins. `wizard.scroll` is what the wheel and the page keys move,
-/// but a selection the user cannot see is worse than a lost scroll position,
-/// so an off-screen cursor pulls the viewport back to it.
-fn first_visible(screen: &Screen, wizard: &Wizard, height: usize) -> usize {
+/// The cursor wins. `scroll` is what the wheel and the page keys move, but a
+/// selection the user cannot see is worse than a lost scroll position, so an
+/// off-screen cursor pulls the viewport back to it.
+fn first_visible(screen: &Screen, cursor: usize, scroll: usize, height: usize) -> usize {
     let total = screen.lines.len();
     let max = total.saturating_sub(height);
-    let mut offset = wizard.scroll.min(max);
-    let Some(&start) = screen.rows.get(wizard.cursor) else {
+    let mut offset = scroll.min(max);
+    let Some(&start) = screen.rows.get(cursor) else {
         return offset;
     };
     // The row runs to the start of the next one, so a two-line field scrolls
     // into view whole rather than showing its label with the help cut off.
     let end = screen
         .rows
-        .get(wizard.cursor + 1)
+        .get(cursor + 1)
         .copied()
         .unwrap_or(total)
         .max(start + 1);
@@ -454,11 +510,18 @@ fn first_visible(screen: &Screen, wizard: &Wizard, height: usize) -> usize {
 
 /// Render a built screen into `inner`, with a scrollbar on `outer`'s border
 /// when there is more than fits.
-fn draw_screen(frame: &mut Frame, inner: Rect, outer: Rect, screen: &Screen, wizard: &Wizard) {
+fn draw_screen(
+    frame: &mut Frame,
+    inner: Rect,
+    outer: Rect,
+    screen: &Screen,
+    cursor: usize,
+    scroll: usize,
+) {
     // At least one row: the floor in `draw` leaves the body three rows and its
     // border takes two.
     let height = inner.height as usize;
-    let offset = first_visible(screen, wizard, height);
+    let offset = first_visible(screen, cursor, scroll, height);
     frame.render_widget(
         Paragraph::new(screen.lines.clone()).scroll((offset.min(u16::MAX as usize) as u16, 0)),
         inner,
@@ -538,20 +601,37 @@ fn build_welcome(wizard: &Wizard) -> Screen {
     .finish(wizard)
 }
 
+/// The providers this install has, one row each, then the add row. The rest
+/// of the catalog is behind "Add a provider", so the screen is as long as
+/// the install rather than as long as the catalog.
 fn build_providers(wizard: &Wizard) -> Screen {
     let mut screen = Screen::default();
-    for (index, row) in wizard.providers.iter().enumerate() {
-        let mark = if row.selected {
-            GLYPH_COMPLETE
-        } else {
-            GLYPH_PENDING
+    let visible = wizard.visible_providers();
+    if visible.is_empty() {
+        screen.push(Line::from(Span::styled(
+            "No providers yet. Leviath needs at least one to run an agent.",
+            Style::default().fg(C_WARN),
+        )));
+    } else {
+        screen.push(Line::from(Span::styled(
+            "Configured providers. Enter opens one to change or check it; d removes it.",
+            Style::default().fg(C_MUTED),
+        )));
+    }
+    screen.blank();
+    for (position, &index) in visible.iter().enumerate() {
+        let row = &wizard.providers[index];
+        let (mark, colour) = match &row.outcome {
+            super::verify::Outcome::Reachable { .. } => (GLYPH_COMPLETE, C_SUCCESS),
+            super::verify::Outcome::Failed { .. } => (GLYPH_ERROR, C_ERROR),
+            super::verify::Outcome::Skipped => (GLYPH_PENDING, C_DIM),
         };
         let mut spans = vec![
+            Span::styled(format!("{mark} "), Style::default().fg(colour)),
             Span::styled(
-                format!("{mark} "),
-                Style::default().fg(if row.selected { C_SUCCESS } else { C_DIM }),
+                row.provider.display,
+                name_style(position == wizard.screen_cursor()),
             ),
-            Span::styled(row.provider.display, name_style(index == wizard.cursor)),
         ];
         let entries = wizard.endpoints_under(row.provider.id).len();
         if let Some(var) = row.from_env {
@@ -569,38 +649,31 @@ fn build_providers(wizard: &Wizard) -> Screen {
                 Style::default().fg(C_MUTED),
             ));
         }
+        spans.push(Span::styled(
+            format!(
+                "  {} · {}",
+                row.provider.auth_kind(),
+                row.provider.kinds().join(", ")
+            ),
+            Style::default().fg(C_DIM),
+        ));
         screen.row();
         screen.push(Line::from(spans));
-        screen.push(Line::from(Span::styled(
-            format!("    {}", row.provider.blurb),
-            Style::default().fg(C_DIM),
-        )));
+        screen.push(status_line(wizard, index));
     }
+    screen.blank();
+    screen.row();
+    screen.push(button_line("Add a provider…", wizard.on_add_provider()));
     screen.finish(wizard)
 }
 
-fn build_provider_detail(wizard: &Wizard) -> Screen {
-    let Some(index) = wizard.detail_row() else {
-        // Forced onto an empty credential screen (tests do): only the button.
-        return Screen::default().finish(wizard);
-    };
-    // `detail_row` yields an index into `providers`, so this is a read rather
-    // than a lookup that could miss.
+/// The setup modal's card for the provider at `index`: its blurb, its
+/// credential row or sign-in status, the check's answer, and its action rows.
+/// The modal adds its own buttons below.
+fn build_provider_card(wizard: &Wizard, index: usize) -> Screen {
     let row = &wizard.providers[index];
-    let position = wizard.detail + 1;
-    let total = wizard.selected_providers().len();
 
     let mut lines = vec![
-        Line::from(vec![
-            Span::styled(
-                row.provider.display,
-                Style::default().fg(C_WHITE).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("   {position} of {total}"),
-                Style::default().fg(C_DIM),
-            ),
-        ]),
         Line::from(Span::styled(
             row.provider.blurb,
             Style::default().fg(C_MUTED),
@@ -608,9 +681,9 @@ fn build_provider_detail(wizard: &Wizard) -> Screen {
         Line::from(""),
     ];
 
-    // The credential row is the screen's one cursor row; the marker shows
-    // whether it or the Continue button holds focus.
-    let row_marker = if wizard.on_continue() { "  " } else { "› " };
+    // The credential row is the card's one cursor row above the actions; the
+    // marker shows whether it holds focus.
+    let row_marker = if wizard.cursor == 0 { "› " } else { "  " };
     let credential_row = lines.len();
     match row.provider.credential {
         Credential::ApiKey | Credential::BaseUrl => {
@@ -701,7 +774,7 @@ fn build_provider_detail(wizard: &Wizard) -> Screen {
         screen.row();
         screen.push(button_line(&action.label(row), focused));
     }
-    screen.finish(wizard)
+    screen
 }
 
 /// A clickable action, drawn the same way the Continue button is so that what
@@ -756,16 +829,35 @@ fn status_line(wizard: &Wizard, index: usize) -> Line<'static> {
         super::verify::Outcome::Reachable { .. } => Line::from(vec![
             Span::styled(format!("{GLYPH_COMPLETE} "), Style::default().fg(C_SUCCESS)),
             Span::styled(row.outcome.summary(), Style::default().fg(C_SUCCESS)),
+            Span::styled(checked_when(row.checked_at), Style::default().fg(C_DIM)),
         ]),
         super::verify::Outcome::Failed { .. } => Line::from(vec![
             Span::styled(format!("{GLYPH_ERROR} "), Style::default().fg(C_ERROR)),
             Span::styled(row.outcome.summary(), Style::default().fg(C_ERROR)),
+            Span::styled(checked_when(row.checked_at), Style::default().fg(C_DIM)),
         ]),
     }
 }
 
+/// " · checked 2 hours ago", or nothing for an outcome with no time: an
+/// outcome learned from the capability cache says when, so a person can tell
+/// a check from this morning from one made last month.
+fn checked_when(checked_at: Option<i64>) -> String {
+    checked_at
+        .map(|then| {
+            format!(
+                " · checked {}",
+                super::state::checks::checked_ago(chrono::Utc::now().timestamp(), then)
+            )
+        })
+        .unwrap_or_default()
+}
+
 fn build_fields(wizard: &Wizard) -> Screen {
     let mut screen = Screen::default();
+    // The label column is the widest label on this screen plus a gap, so a
+    // long label never runs into its value.
+    let label_w = column_width(wizard.fields().iter().map(|field| field.label));
     for (index, field) in wizard.fields().iter().enumerate() {
         let selected = index == wizard.cursor;
         let hint = match &field.value {
@@ -779,7 +871,7 @@ fn build_fields(wizard: &Wizard) -> Screen {
                 if selected { "› " } else { "  " },
                 Style::default().fg(C_ACCENT),
             ),
-            Span::styled(format!("{:<28}", field.label), name_style(selected)),
+            Span::styled(format!("{:<label_w$}", field.label), name_style(selected)),
         ];
         match &wizard.edit {
             Some(edit) if edit.target == super::state::EditTarget::Field(index) => {
@@ -806,6 +898,7 @@ fn build_fields(wizard: &Wizard) -> Screen {
 
 fn build_agents(wizard: &Wizard) -> Screen {
     let mut screen = Screen::default();
+    let name_w = column_width(wizard.agents.iter().map(|row| row.agent.name));
     for (index, row) in wizard.agents.iter().enumerate() {
         let mark = if row.selected {
             GLYPH_COMPLETE
@@ -827,7 +920,7 @@ fn build_agents(wizard: &Wizard) -> Screen {
                 Style::default().fg(if row.selected { C_SUCCESS } else { C_DIM }),
             ),
             Span::styled(
-                format!("{:<22}", row.agent.name),
+                format!("{:<name_w$}", row.agent.name),
                 name_style(index == wizard.cursor),
             ),
             Span::styled(action, action_style),
@@ -838,6 +931,12 @@ fn build_agents(wizard: &Wizard) -> Screen {
 
 fn build_mcp(wizard: &Wizard) -> Screen {
     let mut screen = Screen::default();
+    let name_w = column_width(
+        wizard
+            .mcp
+            .iter()
+            .map(|row| row.candidate.config.name.as_str()),
+    );
     for (index, row) in wizard.mcp.iter().enumerate() {
         let mark = if row.selected {
             GLYPH_COMPLETE
@@ -883,7 +982,7 @@ fn build_mcp(wizard: &Wizard) -> Screen {
                 Style::default().fg(if row.selected { C_SUCCESS } else { C_DIM }),
             ),
             Span::styled(
-                format!("{:<22}", row.candidate.config.name),
+                format!("{:<name_w$}", row.candidate.config.name),
                 name_style(index == wizard.cursor),
             ),
             Span::styled(endpoint, Style::default().fg(C_MUTED)),
@@ -978,7 +1077,7 @@ fn footer_hints(wizard: &Wizard) -> Vec<Hint> {
     if wizard.reorder.is_some() {
         return vec![
             hint("drag ⠿", "move a row"),
-            hint("shift+↑↓", "move"),
+            hint("shift+↑↓/K J", "move"),
             hint("enter", "keep the order"),
             hint("esc", "cancel"),
         ];
@@ -988,6 +1087,15 @@ fn footer_hints(wizard: &Wizard) -> Vec<Hint> {
             hint("enter", "save"),
             hint("esc", "cancel"),
             hint("←→", "move cursor"),
+        ];
+    }
+    if wizard.modal.is_some() {
+        return vec![
+            hint("↑↓", "move"),
+            hint("enter", "edit/press"),
+            hint("v", "verify and use"),
+            hint("esc", "cancel"),
+            hint("^R", "reveal"),
         ];
     }
     // Every step ends the same way: help, save-from-anywhere, quit. Ctrl-R
@@ -1006,20 +1114,11 @@ fn footer_hints(wizard: &Wizard) -> Vec<Hint> {
         Step::Providers => tail(
             vec![
                 hint("↑↓", "move"),
-                hint("space/enter", "select"),
-                hint("o", "signup"),
-                hint("v", "check"),
+                hint("enter", "set up"),
+                hint("a", "add"),
+                hint("d", "remove"),
+                hint("v", "check all"),
                 hint("tab", "next"),
-            ],
-            true,
-        ),
-        Step::ProviderDetail => tail(
-            vec![
-                hint("enter", "edit"),
-                hint("v", "check"),
-                hint("o", "signup"),
-                hint("tab", "next"),
-                hint("esc", "back"),
             ],
             true,
         ),
@@ -1059,6 +1158,12 @@ fn draw_footer(frame: &mut Frame, area: Rect, wizard: &Wizard) {
     draw_hint_bar(frame, area, message, &hints, true);
 }
 
+/// The width of a column holding every one of `names`: the widest plus a
+/// two-cell gap, so the longest entry still stands clear of what follows it.
+fn column_width<'a>(names: impl Iterator<Item = &'a str>) -> usize {
+    names.map(|name| name.chars().count()).max().unwrap_or(0) + 2
+}
+
 /// Highlight style for the row under the cursor.
 fn name_style(selected: bool) -> Style {
     if selected {
@@ -1071,7 +1176,7 @@ fn name_style(selected: bool) -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::setup::state::{Edit, EditTarget, FieldValue, Wizard};
+    use crate::commands::setup::state::{Edit, EditTarget, FieldValue, ModalButton, Wizard};
     use crate::config::Config;
     use crate::tui::TestBackendHarness;
     use ratatui::Terminal;
@@ -1084,19 +1189,34 @@ mod tests {
         terminal.backend().text()
     }
 
+    /// The row of `providers` for a catalog id.
+    fn provider_row(wizard: &Wizard, id: &str) -> usize {
+        wizard
+            .providers
+            .iter()
+            .position(|r| r.provider.id == id)
+            .expect("the catalog offers it")
+    }
+
     /// A provider blurb on a narrow window must wrap, not clip: the tail of
     /// the longest sentence (the custom endpoint blurb ends in "them.") has to
-    /// reach the screen.
+    /// reach the screen inside the setup modal.
     #[test]
     fn narrow_window_wraps_provider_blurbs_instead_of_clipping() {
         let (_dir, mut w) = wizard();
+        let custom = provider_row(&w, "openai-compatible");
         w.enter(Step::Providers);
-        let mut terminal = Terminal::new(TestBackendHarness::new(48, 44)).unwrap();
-        terminal.draw(|frame| draw(frame, &w)).unwrap();
-        let screen = terminal.backend().text();
+        w.open_provider_modal(custom);
+        // Tall enough that the whole card fits from the top, so this test is
+        // about the narrow WIDTH wrapping rather than scrolling.
+        let screen = rendered_at(&w, 48, 64);
         assert!(
-            screen.contains("    them."),
+            screen.contains("them."),
             "the blurb tail must survive a 48-column window:\n{screen}"
+        );
+        assert!(
+            screen.contains("Endpoint 1: openai-compatible"),
+            "the form follows the folded blurb:\n{screen}"
         );
     }
 
@@ -1200,7 +1320,7 @@ mod tests {
         terminal.backend().text()
     }
 
-    /// The tuning screen has thirteen two-line fields, which is more than most
+    /// The tuning screen has fourteen two-line fields, which is more than most
     /// windows are tall. Drawn as a `List` it would stop at the bottom of the
     /// pane, leaving the last fields and the Continue button unreachable with
     /// no sign they existed.
@@ -1213,7 +1333,7 @@ mod tests {
         let top = rendered_at(&w, 90, 20);
         assert!(top.contains("Max concurrent inferences"), "{top}");
         assert!(
-            !top.contains("Max bytes one run may write"),
+            !top.contains("Load ./.env"),
             "the far end of the form is not on the first screenful:\n{top}"
         );
         // The scrollbar is what says there is more, since nothing else can.
@@ -1221,7 +1341,7 @@ mod tests {
 
         w.scroll_end();
         let bottom = rendered_at(&w, 90, 20);
-        assert!(bottom.contains("Max bytes one run may write"), "{bottom}");
+        assert!(bottom.contains("Load ./.env"), "{bottom}");
         assert!(
             bottom.contains("Continue:"),
             "the button has to be reachable:\n{bottom}"
@@ -1254,6 +1374,168 @@ mod tests {
         w.scroll_home();
         assert_eq!(w.cursor, 0);
         assert!(rendered_at(&w, 90, 20).contains("Max concurrent inferences"));
+    }
+
+    /// The Providers screen is the install, not the catalog: only configured
+    /// providers are listed, each with where its credential came from and
+    /// what kind of provider it is, and the rest wait behind the add row.
+    #[test]
+    fn the_providers_screen_lists_only_configured_providers() {
+        let (_dir, mut w) = wizard();
+        w.enter(Step::Providers);
+        let empty = rendered(&w);
+        assert!(
+            empty.contains("No providers yet. Leviath needs at least one to run an agent."),
+            "{empty}"
+        );
+        assert!(
+            empty.contains("› [ Add a provider… ]"),
+            "the add row is first with nothing above it:\n{empty}"
+        );
+        assert!(
+            empty.contains("[ Continue (add a provider first) ]"),
+            "{empty}"
+        );
+        assert!(
+            !empty.contains("Anthropic"),
+            "the catalog is not the list:\n{empty}"
+        );
+
+        w.providers[0].selected = true;
+        w.providers[0].value = "sk-ant-x".to_string();
+        let ollama = provider_row(&w, "ollama");
+        w.providers[ollama].selected = true;
+        let screen = rendered(&w);
+        assert!(
+            screen.contains("Anthropic  (set)  API key · Text and images"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("Ollama  Local and custom · Text and images"),
+            "{screen}"
+        );
+        assert!(screen.contains("not checked yet"), "{screen}");
+        assert!(
+            !screen.contains("OpenAI"),
+            "not configured, not listed:\n{screen}"
+        );
+        assert!(!screen.contains("No providers yet"), "{screen}");
+        assert!(
+            screen.contains("[ Continue: Defaults (2 configured) ]"),
+            "{screen}"
+        );
+        assert!(screen.contains("enter set up"), "{screen}");
+
+        // The glyph and the status line follow the check.
+        w.providers[0].outcome = crate::commands::setup::verify::Outcome::Reachable {
+            models: vec!["a".to_string(), "b".to_string()],
+        };
+        let checked = rendered(&w);
+        assert!(
+            checked.contains(&format!("{GLYPH_COMPLETE} Anthropic")),
+            "{checked}"
+        );
+        assert!(checked.contains("2 models"), "{checked}");
+    }
+
+    /// The add flow draws each of its levels over the Providers screen, and
+    /// the last choice opens the provider's modal.
+    #[test]
+    fn the_add_picker_draws_each_level_and_ends_in_the_modal() {
+        let (_dir, mut w) = wizard();
+        w.enter(Step::Providers);
+        w.open_add_provider();
+        let top = rendered(&w);
+        assert!(top.contains("Add a provider"), "{top}");
+        assert!(top.contains("How is the provider reached?"), "{top}");
+        for category in ["API key", "Subscription logins", "Local and custom"] {
+            assert!(top.contains(category), "{category} missing:\n{top}");
+        }
+        assert!(top.contains("paste a key"), "{top}");
+
+        w.settle_picker_choice(0);
+        let kinds = rendered(&w);
+        assert!(kinds.contains("Add a provider: API key"), "{kinds}");
+        assert!(kinds.contains("3D models and textures"), "{kinds}");
+        assert!(kinds.contains("Anthropic, OpenAI"), "{kinds}");
+
+        w.settle_picker_choice(0);
+        let providers = rendered(&w);
+        assert!(
+            providers.contains("Add a provider: Text and images"),
+            "{providers}"
+        );
+        assert!(providers.contains("Which provider?"), "{providers}");
+        assert!(providers.contains("Claude models."), "{providers}");
+
+        w.settle_picker_choice(0);
+        let modal = rendered(&w);
+        assert!(modal.contains(" Set up Anthropic "), "{modal}");
+        assert!(modal.contains("[ Verify and use ]"), "{modal}");
+        assert!(!modal.contains("Which provider?"), "{modal}");
+    }
+
+    /// The Providers screen keeps its own cursor while a modal is up: moving
+    /// over the modal's card and buttons must not move the highlight, or the
+    /// viewport, of the screen underneath it.
+    #[test]
+    fn the_modal_leaves_the_screen_underneath_where_it_was() {
+        let (_dir, mut w) = wizard();
+        w.providers[0].selected = true;
+        w.enter(Step::Providers);
+        let add_row = w.visible_providers().len();
+        w.cursor = add_row;
+        w.open_provider_modal(0);
+        assert!(
+            w.on_add_provider(),
+            "the screen's cursor stays on the add row"
+        );
+        w.scroll_end();
+        assert!(
+            w.on_add_provider(),
+            "the modal's cursor moved, the screen's did not"
+        );
+        let screen = rendered(&w);
+        assert!(
+            screen.contains("› [ Add a"),
+            "the add row keeps its marker under the modal:\n{screen}"
+        );
+        assert!(
+            screen.contains("› [ Cancel ]"),
+            "the modal's own cursor is on its last button:\n{screen}"
+        );
+        w.cancel_modal();
+        assert_eq!(w.cursor, add_row);
+    }
+
+    /// Hit-testing on the Providers screen maps onto the listed providers,
+    /// then the add row, then the button, and a provider's status line
+    /// belongs to its row.
+    #[test]
+    fn a_click_on_the_providers_screen_lands_on_a_row_the_add_row_or_the_button() {
+        let (_dir, mut w) = wizard();
+        w.providers[0].selected = true;
+        w.providers[1].selected = true;
+        w.enter(Step::Providers);
+        let area = Rect::new(0, 0, 140, 44);
+        // The body starts under the three-row header and its own border:
+        // the intro line, a blank, then two lines per provider.
+        let top = 4;
+        assert_eq!(
+            row_at(area, &w, 5, top),
+            None,
+            "the intro line is not a row"
+        );
+        assert_eq!(row_at(area, &w, 5, top + 2), Some(0));
+        assert_eq!(
+            row_at(area, &w, 5, top + 3),
+            Some(0),
+            "the status line is its row's"
+        );
+        assert_eq!(row_at(area, &w, 5, top + 4), Some(1));
+        assert_eq!(row_at(area, &w, 5, top + 7), Some(2), "the add row");
+        assert_eq!(row_at(area, &w, 5, top + 9), Some(3), "the Continue button");
+        assert_eq!(row_at(area, &w, 5, top + 10), None, "past the content");
     }
 
     /// A cursor past the end of the rows draws the top of the screen rather
@@ -1309,12 +1591,17 @@ mod tests {
         w.providers[0].outcome = crate::commands::setup::verify::Outcome::Reachable {
             models: vec!["claude-opus-4".to_string()],
         };
-        w.enter(Step::Defaults);
-        w.cursor = 1;
-        w.open_picker("Default model", w.defaults[1].value.options().to_vec(), 0);
+        w.show_advanced = true;
+        w.enter(Step::Limits);
+        w.cursor = Wizard::OVERRIDE_FIELD;
+        w.open_picker(
+            "Override model",
+            w.limits[Wizard::OVERRIDE_FIELD].value.options().to_vec(),
+            0,
+        );
 
         let screen = rendered(&w);
-        assert!(screen.contains("Default model"), "{screen}");
+        assert!(screen.contains("Override model"), "{screen}");
         assert!(
             screen.contains("never sent to a different provider"),
             "the precedence prose is the point of the screen:\n{screen}"
@@ -1328,17 +1615,28 @@ mod tests {
         assert!(rendered(&w).contains("Nothing matches that."));
     }
 
-    /// The reorder modal draws over the screen, and the footer switches to its
+    /// The reorder modal draws over the screen with the order and, dimmed,
+    /// the configured providers left out of it; the footer switches to its
     /// bindings while it is open.
     #[test]
     fn the_reorder_modal_and_its_footer_draw() {
         let (_dir, mut w) = wizard();
         w.providers[0].selected = true;
+        w.providers[1].selected = true;
         w.enter(Step::Defaults);
         w.cursor = 0;
         w.open_reorder();
         let screen = rendered(&w);
         assert!(screen.contains("Provider priority"), "{screen}");
+        assert!(screen.contains("1. anthropic"), "{screen}");
+        assert!(
+            screen.contains("OpenAI (not in the order)"),
+            "a configured provider outside the order is shown as such:\n{screen}"
+        );
+        assert!(
+            screen.contains("A provider left out is never chosen for a bare model name"),
+            "{screen}"
+        );
         assert!(
             screen.contains("keep the order"),
             "the footer switched: {screen}"
@@ -1473,21 +1771,21 @@ mod tests {
 
         let screen = rendered(&w);
         assert!(
-            screen.contains("$ANTHROPIC_API_KEY"),
+            screen.contains("Anthropic  ($ANTHROPIC_API_KEY)  API key · Text and images"),
             "the environment source must be visible:\n{screen}"
         );
-        assert!(screen.contains("(set)"), "{screen}");
+        assert!(
+            screen.contains("OpenAI  (set)  API key · Text and images"),
+            "{screen}"
+        );
         assert!(!screen.contains("sk-oai"), "a key leaked:\n{screen}");
     }
 
-    /// Put the codex card on screen, with nothing else selected.
+    /// Put the codex card on screen in its setup modal, with nothing else
+    /// selected.
     fn codex_card() -> (tempfile::TempDir, Wizard, usize) {
         let (dir, mut w) = wizard();
-        let index = w
-            .providers
-            .iter()
-            .position(|r| r.provider.id == "codex")
-            .expect("the codex row is offered");
+        let index = provider_row(&w, "codex");
         for row in &mut w.providers {
             row.selected = false;
             // Cleared rather than trusted: `Wizard::new` reads the grant store
@@ -1496,7 +1794,8 @@ mod tests {
             row.signed_in = None;
         }
         w.providers[index].selected = true;
-        w.enter(Step::ProviderDetail);
+        w.enter(Step::Providers);
+        w.open_provider_modal(index);
         (dir, w, index)
     }
 
@@ -1508,8 +1807,10 @@ mod tests {
         let (_dir, mut w, index) = codex_card();
 
         let waiting = rendered(&w);
+        assert!(waiting.contains(" Set up OpenAI Codex "), "{waiting}");
         assert!(waiting.contains("Not signed in yet"), "{waiting}");
         assert!(waiting.contains("Sign in with your browser"), "{waiting}");
+        assert!(waiting.contains("Nothing to type here."), "{waiting}");
         assert!(
             !waiting.contains("API key:"),
             "no field is offered:\n{waiting}"
@@ -1518,15 +1819,23 @@ mod tests {
             !waiting.contains("lev auth login"),
             "setup sends nobody to another command:\n{waiting}"
         );
-        // Nothing to check and nothing to forget until there is a sign-in.
-        assert!(!waiting.contains("Check this credential"), "{waiting}");
+        // Nothing to forget until there is a sign-in; the check is the
+        // modal's own button either way.
         assert!(!waiting.contains("Sign out"), "{waiting}");
+        assert!(waiting.contains("[ Verify and use ]"), "{waiting}");
 
         w.providers[index].signed_in = Some("someone@example.com (plus plan)".to_string());
         let signed_in = rendered(&w);
-        assert!(signed_in.contains("someone@example.com"), "{signed_in}");
-        assert!(signed_in.contains("Check this credential"), "{signed_in}");
+        assert!(
+            signed_in.contains("Signed in: someone@example.com"),
+            "{signed_in}"
+        );
+        assert!(
+            signed_in.contains("Sign in again, as a different account"),
+            "{signed_in}"
+        );
         assert!(signed_in.contains("Sign out"), "{signed_in}");
+        assert!(!signed_in.contains("Nothing to type here."), "{signed_in}");
     }
 
     /// While the browser is open the card says so, and shows the URL for a
@@ -1568,7 +1877,8 @@ mod tests {
         let (_dir, mut w) = wizard();
         w.providers[0].selected = true;
         w.providers[0].value = "sk-ant-secret-value-here".to_string();
-        w.enter(Step::ProviderDetail);
+        w.enter(Step::Providers);
+        w.open_provider_modal(0);
 
         let hidden = rendered(&w);
         // Last four characters, not the first eight - see `catalog::redact`.
@@ -1589,8 +1899,8 @@ mod tests {
     #[test]
     fn a_key_being_typed_is_masked_until_revealed() {
         let (_dir, mut w) = wizard();
-        w.providers[0].selected = true;
-        w.enter(Step::ProviderDetail);
+        w.enter(Step::Providers);
+        w.open_provider_modal(0);
         w.edit = Some(Edit {
             target: EditTarget::Credential(0),
             line: crate::tui::widgets::line_edit::LineEdit::new("sk-typing".to_string(), true),
@@ -1607,9 +1917,9 @@ mod tests {
     #[test]
     fn an_empty_credential_shows_its_placeholder_or_its_source() {
         let (_dir, mut w) = wizard();
-        w.providers[0].selected = true;
-        w.enter(Step::ProviderDetail);
-        assert!(rendered(&w).contains("sk-ant-..."));
+        w.enter(Step::Providers);
+        w.open_provider_modal(0);
+        assert!(rendered(&w).contains("API key: (sk-ant-...)"));
 
         w.providers[0].from_env = Some("ANTHROPIC_API_KEY");
         let screen = rendered(&w);
@@ -1624,16 +1934,13 @@ mod tests {
     fn a_base_url_is_never_masked() {
         // It is not a secret, and hiding it would just be annoying.
         let (_dir, mut w) = wizard();
-        let ollama = w
-            .providers
-            .iter()
-            .position(|r| r.provider.id == "ollama")
-            .expect("ollama is offered");
+        let ollama = provider_row(&w, "ollama");
         w.providers[ollama].selected = true;
         w.providers[ollama].value = "http://box:11434".to_string();
-        w.enter(Step::ProviderDetail);
+        w.enter(Step::Providers);
+        w.open_provider_modal(ollama);
 
-        assert!(rendered(&w).contains("http://box:11434"));
+        assert!(rendered(&w).contains("Base URL: http://box:11434"));
     }
 
     #[test]
@@ -1641,7 +1948,8 @@ mod tests {
         let (_dir, mut w) = wizard();
         w.providers[0].selected = true;
         w.providers[0].value = "sk-ant".to_string();
-        w.enter(Step::ProviderDetail);
+        w.enter(Step::Providers);
+        w.open_provider_modal(0);
 
         assert!(rendered(&w).contains("not checked yet"));
 
@@ -1658,6 +1966,19 @@ mod tests {
             message: "rejected - check the key".into(),
         };
         assert!(rendered(&w).contains("rejected"));
+
+        // An outcome that knows when it was learned says so, which is what
+        // tells a check from this session apart from last week's.
+        w.providers[0].checked_at = Some(chrono::Utc::now().timestamp() - 2 * 3_600);
+        let screen = rendered(&w);
+        assert!(
+            screen.contains("rejected - check the key · checked 2 hours ago"),
+            "{screen}"
+        );
+        w.providers[0].outcome = crate::commands::setup::verify::Outcome::Reachable {
+            models: vec!["a".into()],
+        };
+        assert!(rendered(&w).contains("1 model · checked 2 hours ago"));
     }
 
     #[test]
@@ -1682,45 +2003,136 @@ mod tests {
         );
     }
 
+    /// With nothing that would change, the dialog says so instead of
+    /// announcing a list with nothing in it.
     #[test]
-    fn the_quit_and_no_provider_dialogs_draw_their_buttons() {
+    fn the_quit_dialog_says_when_nothing_would_change() {
         let (_dir, mut w) = wizard();
+        for row in &mut w.agents {
+            row.selected = false;
+        }
+        w.dirty = true;
+        w.open_quit_confirm();
+        let screen = rendered(&w);
+        assert!(
+            screen.contains("Nothing has been written yet, and nothing would change."),
+            "{screen}"
+        );
+        assert!(!screen.contains("discards these choices"), "{screen}");
+    }
+
+    /// The quit dialog says what quitting would discard: the review's lines,
+    /// up to eight of them, then a count of the rest.
+    #[test]
+    fn the_quit_dialog_lists_the_choices_it_would_discard() {
+        let (_dir, mut w) = wizard();
+        w.dirty = true;
         w.open_quit_confirm();
         let screen = rendered(&w);
         assert!(screen.contains("Quit setup?"), "{screen}");
+        assert!(
+            screen.contains("Nothing has been written yet. Quitting discards these choices:"),
+            "{screen}"
+        );
+        assert!(screen.contains("[ Quit ]"), "{screen}");
         assert!(screen.contains("[ Stay ]"), "{screen}");
+        // A fresh wizard's one change is the bundled agents.
+        assert!(
+            screen.contains(&format!(
+                "agents: {} to install",
+                crate::bundled::BUNDLED_AGENTS.len()
+            )),
+            "{screen}"
+        );
+        assert!(!screen.contains(" more"), "{screen}");
 
+        // Past `Wizard::QUIT_CHANGES_SHOWN` (eight), the rest is counted
+        // rather than listed.
         w.confirm = None;
-        w.open_no_providers_confirm();
+        for row in w
+            .providers
+            .iter_mut()
+            .filter(|r| r.provider.credential == Credential::ApiKey)
+        {
+            row.selected = true;
+            row.value = "a-key".to_string();
+        }
+        let ollama = provider_row(&w, "ollama");
+        w.providers[ollama].selected = true;
+        w.limits[0].value = FieldValue::Number(Some(2));
+        let changes = w.review_lines();
+        assert!(changes.len() > 8, "{changes:?}");
+        w.open_quit_confirm();
         let screen = rendered(&w);
-        assert!(screen.contains("No providers selected"), "{screen}");
-        assert!(screen.contains("[ Go back ]"), "{screen}");
-        assert!(screen.contains("[ Continue anyway ]"), "{screen}");
+        assert!(screen.contains(&changes[0]), "{screen}");
+        assert!(screen.contains(&changes[7]), "{screen}");
+        assert!(!screen.contains(&changes[8]), "{screen}");
+        assert!(
+            screen.contains(&format!("and {} more", changes.len() - 8)),
+            "{screen}"
+        );
     }
 
+    /// The modal's card carries the focus marker on its rows, then each of
+    /// its three buttons in turn; its footer is its own.
     #[test]
-    fn the_credential_screen_draws_nothing_when_no_provider_is_selected() {
+    fn the_modal_moves_the_focus_marker_over_its_card_and_its_buttons() {
         let (_dir, mut w) = wizard();
-        w.enter(Step::ProviderDetail);
-
-        // Just the chrome and the Continue button, no panic.
-        assert!(rendered(&w).contains("Credentials"));
-    }
-
-    #[test]
-    fn the_credential_screen_moves_the_focus_marker_onto_the_continue_button() {
-        let (_dir, mut w) = wizard();
-        w.providers[0].selected = true;
-        w.enter(Step::ProviderDetail);
+        w.enter(Step::Providers);
+        w.open_provider_modal(0);
 
         // Cursor on the credential row: the row carries the marker.
-        assert!(rendered(&w).contains("› API key:"));
+        let card = rendered(&w);
+        assert!(card.contains(" Set up Anthropic "), "{card}");
+        assert!(
+            card.contains("Claude models. The default for every shipped blueprint."),
+            "{card}"
+        );
+        assert!(card.contains("› API key: (sk-ant-...)"), "{card}");
+        assert!(
+            card.contains("Enter or click to edit.  Ctrl-R shows what you typed."),
+            "{card}"
+        );
+        assert!(card.contains("not checked yet"), "{card}");
+        assert!(card.contains("  [ Open the Anthropic key page ]"), "{card}");
+        for button in ModalButton::ALL {
+            assert!(
+                card.contains(&format!("  [ {} ]", button.label())),
+                "{button:?} is drawn unfocused:\n{card}"
+            );
+        }
 
-        // Cursor on the Continue button: the row loses it, the button gains it.
-        w.cursor = w.row_count();
+        w.cursor = 1;
+        assert!(rendered(&w).contains("› [ Open the Anthropic key page ]"));
+
+        // Each button in turn: it gains the marker, the row loses it.
+        let first = w.modal_card_rows();
+        for (offset, button) in ModalButton::ALL.iter().enumerate() {
+            w.cursor = first + offset;
+            let screen = rendered(&w);
+            assert!(
+                screen.contains(&format!("› [ {} ]", button.label())),
+                "{button:?}:\n{screen}"
+            );
+            assert!(!screen.contains("› API key:"), "{screen}");
+        }
+
         let screen = rendered(&w);
-        assert!(!screen.contains("› API key:"), "{screen}");
-        assert!(screen.contains("› [ Continue: Defaults ]"), "{screen}");
+        for hint in [
+            "enter edit/press",
+            "v verify and use",
+            "esc cancel",
+            "^R reveal",
+        ] {
+            assert!(
+                screen.contains(hint),
+                "modal footer missing {hint:?}:\n{screen}"
+            );
+        }
+        assert!(
+            !screen.contains("^S save"),
+            "saving waits for the modal to close:\n{screen}"
+        );
     }
 
     #[test]
@@ -1743,8 +2155,11 @@ mod tests {
         assert!(screen.contains("[enter]"), "numbers are typed");
         assert!(screen.contains("[enter/space]"), "booleans are toggled");
 
+        // The choices are the two model fields at the end of this screen.
         w.providers[0].selected = true;
-        w.enter(Step::Defaults);
+        w.show_advanced = true;
+        w.enter(Step::Limits);
+        w.scroll_end();
         assert!(rendered(&w).contains("enter/← →"), "choices are cycled");
     }
 
@@ -1761,6 +2176,49 @@ mod tests {
         // it out, so bumping a blueprint does not break this test.
         let not_installed = &crate::bundled::BUNDLED_AGENTS[1];
         assert!(screen.contains(&format!("install {}", not_installed.version)));
+    }
+
+    /// A label wider than a fixed column ran straight into its value. The
+    /// column is the widest label on the screen plus a gap, so even the
+    /// longest label has two spaces before its value.
+    #[test]
+    fn the_label_column_fits_the_widest_label() {
+        let (_dir, mut w) = wizard();
+        w.show_advanced = true;
+        w.enter(Step::Limits);
+        let screen = rendered(&w);
+        assert!(
+            screen.contains("Max bytes one tool call may write  "),
+            "{screen}"
+        );
+        assert!(!screen.contains("may write2"), "{screen}");
+    }
+
+    /// The MCP list's name column grows to the longest imported name.
+    #[test]
+    fn a_long_mcp_server_name_keeps_its_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let long = "a-very-long-mcp-server-name-indeed";
+        let candidate = crate::commands::setup::import::Candidate {
+            config: leviath_mcp::MCPServerConfig::http(long, "https://x.test/mcp"),
+            scope: String::new(),
+            inline_secrets: vec![],
+        };
+        let mut w = Wizard::new(
+            Config::default(),
+            &|_| None,
+            vec![("Cursor".to_string(), candidate)],
+            vec![],
+            dir.path(),
+            std::sync::Arc::new(|_| true),
+            Default::default(),
+        );
+        w.enter(Step::Mcp);
+        let screen = rendered(&w);
+        assert!(
+            screen.contains(&format!("{long}  https://x.test/mcp")),
+            "{screen}"
+        );
     }
 
     #[test]
@@ -1878,8 +2336,7 @@ mod tests {
         w.message = None;
         for (step, expected, credentials) in [
             (Step::Welcome, "enter begin", false),
-            (Step::Providers, "space/enter select", true),
-            (Step::ProviderDetail, "enter edit", true),
+            (Step::Providers, "enter set up", true),
             (Step::Defaults, "enter change", false),
             (Step::Limits, "enter change", false),
             (Step::Agents, "space/enter select", false),
@@ -1942,6 +2399,11 @@ mod tests {
                 "{step:?} missing from header"
             );
         }
+        // Too narrow for the trail: the header says where you are instead
+        // of cutting the trail off at the border.
+        let narrow = rendered_at(&w, 60, 30);
+        assert!(narrow.contains("Step 5 of 7: Agents"), "{narrow}");
+        assert!(!narrow.contains("MCP servers"), "{narrow}");
     }
 
     #[test]

@@ -5,9 +5,16 @@
 #
 # `source` records where a row came from: `both` when the two sources agreed,
 # `openrouter` or `litellm` when only one listed it, and `manual` for a row a
-# person wrote, which the refresh never overwrites.
+# person wrote, which the refresh never overwrites. A `[rate.long_context]`
+# block is the rate for a whole request once its prompt reaches `threshold`
+# tokens, from LiteLLM.
+#
+# `[[unit_rate]]` rows price media models per `image`, `video_second`,
+# `audio_hour`, `million_chars` or `clip`. Rows with `source = "litellm"` are
+# rewritten by the refresh; any other row a person wrote from the vendor's
+# price page, with `checked_on`, and the refresh keeps it as it is.
 
-read_on = "2026-08-31"
+read_on = "2026-09-17"
 
 [[rate]]
 provider = "anthropic"
@@ -54,11 +61,27 @@ cache_write = 3.75
 output = 15.0
 source = "litellm"
 
+[rate.long_context]
+threshold = 200000
+input = 6.0
+cache_read = 0.6
+cache_write = 7.5
+output = 22.5
+
 [[rate]]
 provider = "anthropic"
 prefix = "claude-fable-5"
 input = 10.0
 cache_read = 1.0
+cache_write = 12.5
+output = 50.0
+source = "both"
+
+[[rate]]
+provider = "anthropic"
+prefix = "claude-fable-5-1"
+input = 10.0
+cache_read = 0.25
 cache_write = 12.5
 output = 50.0
 source = "both"
@@ -77,6 +100,15 @@ provider = "anthropic"
 prefix = "claude-mythos-5"
 input = 10.0
 cache_read = 1.0
+cache_write = 12.5
+output = 50.0
+source = "litellm"
+
+[[rate]]
+provider = "anthropic"
+prefix = "claude-mythos-5-1"
+input = 10.0
+cache_read = 0.25
 cache_write = 12.5
 output = 50.0
 source = "litellm"
@@ -200,6 +232,15 @@ source = "both"
 
 [[rate]]
 provider = "google"
+prefix = "deep-research-pro-preview-12-2025"
+input = 2.0
+cache_read = 2.0
+cache_write = 2.0
+output = 12.0
+source = "litellm"
+
+[[rate]]
+provider = "google"
 prefix = "gemini-2.0-flash"
 input = 0.1
 cache_read = 0.025
@@ -224,6 +265,13 @@ cache_read = 1.25
 cache_write = 1.25
 output = 10.0
 source = "litellm"
+
+[rate.long_context]
+threshold = 200000
+input = 2.5
+cache_read = 2.5
+cache_write = 2.5
+output = 15.0
 
 [[rate]]
 provider = "google"
@@ -272,12 +320,28 @@ source = "litellm"
 
 [[rate]]
 provider = "google"
+prefix = "gemini-2.5-flash-preview-tts"
+input = 0.5
+cache_read = 0.5
+cache_write = 0.5
+output = 10.0
+source = "litellm"
+
+[[rate]]
+provider = "google"
 prefix = "gemini-2.5-pro"
 input = 1.25
 cache_read = 0.125
 cache_write = 1.25
 output = 10.0
 source = "both"
+
+[rate.long_context]
+threshold = 200000
+input = 2.5
+cache_read = 0.25
+cache_write = 2.5
+output = 15.0
 
 [[rate]]
 provider = "google"
@@ -313,7 +377,7 @@ input = 2.0
 cache_read = 0.2
 cache_write = 2.0
 output = 12.0
-source = "openrouter"
+source = "both"
 
 [[rate]]
 provider = "google"
@@ -324,6 +388,13 @@ cache_write = 2.0
 output = 12.0
 source = "litellm"
 
+[rate.long_context]
+threshold = 200000
+input = 4.0
+cache_read = 0.4
+cache_write = 4.0
+output = 18.0
+
 [[rate]]
 provider = "google"
 prefix = "gemini-3.1-flash-image"
@@ -331,7 +402,7 @@ input = 0.5
 cache_read = 0.5
 cache_write = 0.5
 output = 3.0
-source = "openrouter"
+source = "both"
 
 [[rate]]
 provider = "google"
@@ -353,6 +424,15 @@ source = "litellm"
 
 [[rate]]
 provider = "google"
+prefix = "gemini-3.1-flash-tts-preview"
+input = 1.0
+cache_read = 1.0
+cache_write = 1.0
+output = 20.0
+source = "litellm"
+
+[[rate]]
+provider = "google"
 prefix = "gemini-3.1-pro"
 input = 2.0
 cache_read = 0.2
@@ -368,6 +448,13 @@ cache_read = 0.2
 cache_write = 2.0
 output = 12.0
 source = "both"
+
+[rate.long_context]
+threshold = 200000
+input = 4.0
+cache_read = 0.4
+cache_write = 4.0
+output = 18.0
 
 [[rate]]
 provider = "google"
@@ -398,6 +485,24 @@ source = "litellm"
 
 [[rate]]
 provider = "google"
+prefix = "gemini-3.5-transcribe"
+input = 2.0
+cache_read = 2.0
+cache_write = 2.0
+output = 12.0
+source = "litellm"
+
+[[rate]]
+provider = "google"
+prefix = "gemini-3.5-transcribe-live"
+input = 3.5
+cache_read = 3.5
+cache_write = 3.5
+output = 21.0
+source = "litellm"
+
+[[rate]]
+provider = "google"
 prefix = "gemini-3.6-flash"
 input = 0.75
 cache_read = 0.075
@@ -416,6 +521,15 @@ source = "both"
 
 [[rate]]
 provider = "google"
+prefix = "gemini-3.8-flash"
+input = 0.75
+cache_read = 0.075
+cache_write = 0.75
+output = 3.75
+source = "both"
+
+[[rate]]
+provider = "google"
 prefix = "gemini-exp-1206"
 input = 0.3
 cache_read = 0.03
@@ -426,19 +540,19 @@ source = "litellm"
 [[rate]]
 provider = "google"
 prefix = "gemini-flash-latest"
-input = 0.3
-cache_read = 0.03
-cache_write = 0.3
-output = 2.5
+input = 0.75
+cache_read = 0.075
+cache_write = 0.75
+output = 3.75
 source = "litellm"
 
 [[rate]]
 provider = "google"
 prefix = "gemini-flash-lite-latest"
-input = 0.1
-cache_read = 0.01
-cache_write = 0.1
-output = 0.4
+input = 0.3
+cache_read = 0.03
+cache_write = 0.3
+output = 2.5
 source = "litellm"
 
 [[rate]]
@@ -480,11 +594,18 @@ source = "litellm"
 [[rate]]
 provider = "google"
 prefix = "gemini-pro-latest"
-input = 1.25
-cache_read = 0.125
-cache_write = 1.25
-output = 10.0
+input = 2.0
+cache_read = 0.2
+cache_write = 2.0
+output = 12.0
 source = "litellm"
+
+[rate.long_context]
+threshold = 200000
+input = 4.0
+cache_read = 0.4
+cache_write = 4.0
+output = 18.0
 
 [[rate]]
 provider = "google"
@@ -507,10 +628,10 @@ source = "litellm"
 [[rate]]
 provider = "google"
 prefix = "gemini-robotics-er-2-preview"
-input = 2.0
-cache_read = 0.2
-cache_write = 2.0
-output = 10.0
+input = 1.0
+cache_read = 0.1
+cache_write = 1.0
+output = 5.0
 source = "litellm"
 
 [[rate]]
@@ -561,10 +682,10 @@ source = "openrouter"
 [[rate]]
 provider = "google"
 prefix = "gemma-4-26b-a4b-it"
-input = 0.07
-cache_read = 0.07
-cache_write = 0.07
-output = 0.34
+input = 0.09
+cache_read = 0.05
+cache_write = 0.09
+output = 0.3
 source = "openrouter"
 
 [[rate]]
@@ -575,6 +696,60 @@ cache_read = 0.05
 cache_write = 0.09
 output = 0.34
 source = "openrouter"
+
+[[rate]]
+provider = "google"
+prefix = "nano-banana-pro-preview"
+input = 2.0
+cache_read = 2.0
+cache_write = 2.0
+output = 12.0
+source = "litellm"
+
+[[rate]]
+provider = "meta"
+prefix = "muse-spark-1.1"
+input = 1.25
+cache_read = 0.15
+cache_write = 1.25
+output = 4.25
+source = "both"
+
+[[rate]]
+provider = "meta"
+prefix = "muse-spark-1.2"
+input = 1.25
+cache_read = 0.15
+cache_write = 1.25
+output = 4.25
+source = "both"
+
+[[rate]]
+provider = "meta"
+prefix = "muse-spark-1.2-contributor"
+input = 0.1
+cache_read = 0.002
+cache_write = 0.1
+output = 0.2
+source = "both"
+
+[[rate]]
+provider = "meta"
+prefix = "muse-spark-1.3"
+input = 1.25
+cache_read = 0.15
+cache_write = 1.25
+output = 4.25
+source = "both"
+
+[[rate]]
+provider = "meta"
+prefix = "muse-spark-1.3-contributor"
+input = 0.1
+cache_read = 0.002
+cache_write = 0.1
+output = 0.2
+source = "both"
 
 [[rate]]
 provider = "openai"
@@ -596,12 +771,37 @@ source = "litellm"
 
 [[rate]]
 provider = "openai"
+prefix = "chatgpt-image-latest"
+input = 5.0
+cache_read = 1.25
+cache_write = 5.0
+output = 10.0
+source = "litellm"
+
+[[rate]]
+provider = "openai"
+prefix = "computer-use-preview"
+input = 3.0
+cache_read = 3.0
+cache_write = 3.0
+output = 12.0
+source = "litellm"
+
+[[rate]]
+provider = "openai"
 prefix = "daybreak-blue-latest"
 input = 4.0
 cache_read = 0.4
 cache_write = 5.0
 output = 20.0
 source = "litellm"
+
+[rate.long_context]
+threshold = 272000
+input = 8.0
+cache_read = 0.8
+cache_write = 10.0
+output = 30.0
 
 [[rate]]
 provider = "openai"
@@ -611,6 +811,13 @@ cache_read = 1.25
 cache_write = 15.625
 output = 75.0
 source = "litellm"
+
+[rate.long_context]
+threshold = 272000
+input = 25.0
+cache_read = 2.5
+cache_write = 31.25
+output = 112.5
 
 [[rate]]
 provider = "openai"
@@ -758,6 +965,24 @@ source = "both"
 
 [[rate]]
 provider = "openai"
+prefix = "gpt-4o-mini-transcribe"
+input = 1.25
+cache_read = 1.25
+cache_write = 1.25
+output = 5.0
+source = "litellm"
+
+[[rate]]
+provider = "openai"
+prefix = "gpt-4o-mini-tts"
+input = 0.6
+cache_read = 0.6
+cache_write = 0.6
+output = 10.0
+source = "litellm"
+
+[[rate]]
+provider = "openai"
 prefix = "gpt-5"
 input = 1.25
 cache_read = 0.125
@@ -864,6 +1089,13 @@ cache_write = 2.5
 output = 15.0
 source = "both"
 
+[rate.long_context]
+threshold = 272000
+input = 5.0
+cache_read = 0.5
+cache_write = 5.0
+output = 22.5
+
 [[rate]]
 provider = "openai"
 prefix = "gpt-5.4-image-2"
@@ -909,6 +1141,22 @@ cache_write = 5.0
 output = 30.0
 source = "both"
 
+[rate.long_context]
+threshold = 272000
+input = 10.0
+cache_read = 1.0
+cache_write = 10.0
+output = 45.0
+
+[[rate]]
+provider = "openai"
+prefix = "gpt-5.5-cyber"
+input = 12.5
+cache_read = 1.25
+cache_write = 12.5
+output = 75.0
+source = "litellm"
+
 [[rate]]
 provider = "openai"
 prefix = "gpt-5.5-pro"
@@ -927,6 +1175,13 @@ cache_write = 5.0
 output = 20.0
 source = "litellm"
 
+[rate.long_context]
+threshold = 272000
+input = 8.0
+cache_read = 0.8
+cache_write = 10.0
+output = 30.0
+
 [[rate]]
 provider = "openai"
 prefix = "gpt-5.6-cyber"
@@ -936,6 +1191,13 @@ cache_write = 15.625
 output = 75.0
 source = "litellm"
 
+[rate.long_context]
+threshold = 272000
+input = 25.0
+cache_read = 2.5
+cache_write = 31.25
+output = 112.5
+
 [[rate]]
 provider = "openai"
 prefix = "gpt-5.6-luna"
@@ -944,6 +1206,13 @@ cache_read = 0.02
 cache_write = 0.25
 output = 1.2
 source = "both"
+
+[rate.long_context]
+threshold = 272000
+input = 0.4
+cache_read = 0.04
+cache_write = 0.5
+output = 1.8
 
 [[rate]]
 provider = "openai"
@@ -962,6 +1231,29 @@ cache_read = 0.2
 cache_write = 2.5
 output = 12.0
 source = "both"
+
+[rate.long_context]
+threshold = 272000
+input = 4.0
+cache_read = 0.4
+cache_write = 5.0
+output = 18.0
+
+[[rate]]
+provider = "openai"
+prefix = "gpt-6-astra"
+input = 10.0
+cache_read = 1.0
+cache_write = 12.5
+output = 50.0
+source = "both"
+
+[rate.long_context]
+threshold = 272000
+input = 20.0
+cache_read = 2.0
+cache_write = 25.0
+output = 75.0
 
 [[rate]]
 provider = "openai"
@@ -992,6 +1284,42 @@ source = "openrouter"
 
 [[rate]]
 provider = "openai"
+prefix = "gpt-image-1"
+input = 5.0
+cache_read = 1.25
+cache_write = 5.0
+output = 40.0
+source = "litellm"
+
+[[rate]]
+provider = "openai"
+prefix = "gpt-image-1-mini"
+input = 2.0
+cache_read = 0.2
+cache_write = 2.0
+output = 8.0
+source = "litellm"
+
+[[rate]]
+provider = "openai"
+prefix = "gpt-image-1.5"
+input = 5.0
+cache_read = 1.25
+cache_write = 5.0
+output = 10.0
+source = "litellm"
+
+[[rate]]
+provider = "openai"
+prefix = "gpt-image-2"
+input = 5.0
+cache_read = 1.25
+cache_write = 5.0
+output = 30.0
+source = "litellm"
+
+[[rate]]
+provider = "openai"
 prefix = "gpt-oss-120b"
 input = 0.037
 cache_read = 0.037
@@ -1016,6 +1344,15 @@ cache_read = 0.0375
 cache_write = 0.075
 output = 0.3
 source = "openrouter"
+
+[[rate]]
+provider = "openai"
+prefix = "gpt-rosalind-research"
+input = 5.0
+cache_read = 0.5
+cache_write = 5.0
+output = 25.0
+source = "litellm"
 
 [[rate]]
 provider = "openai"
@@ -1070,3 +1407,739 @@ cache_read = 0.275
 cache_write = 1.1
 output = 4.4
 source = "both"
+
+[[rate]]
+provider = "xai"
+prefix = "grok-3"
+input = 1.25
+cache_read = 0.2
+cache_write = 1.25
+output = 2.5
+source = "litellm"
+
+[rate.long_context]
+threshold = 200000
+input = 2.5
+cache_read = 0.4
+cache_write = 2.5
+output = 5.0
+
+[[rate]]
+provider = "xai"
+prefix = "grok-4"
+input = 1.25
+cache_read = 0.2
+cache_write = 1.25
+output = 2.5
+source = "litellm"
+
+[rate.long_context]
+threshold = 200000
+input = 2.5
+cache_read = 0.4
+cache_write = 2.5
+output = 5.0
+
+[[rate]]
+provider = "xai"
+prefix = "grok-4.5"
+input = 2.0
+cache_read = 0.3
+cache_write = 2.0
+output = 6.0
+source = "both"
+
+[rate.long_context]
+threshold = 200000
+input = 4.0
+cache_read = 0.6
+cache_write = 4.0
+output = 12.0
+
+[[rate]]
+provider = "xai"
+prefix = "grok-4.6"
+input = 2.0
+cache_read = 0.5
+cache_write = 2.0
+output = 6.0
+source = "both"
+
+[rate.long_context]
+threshold = 200000
+input = 4.0
+cache_read = 1.0
+cache_write = 4.0
+output = 12.0
+
+[[rate]]
+provider = "xai"
+prefix = "grok-build-0.1"
+input = 1.0
+cache_read = 0.2
+cache_write = 1.0
+output = 2.0
+source = "both"
+
+[rate.long_context]
+threshold = 200000
+input = 2.0
+cache_read = 0.4
+cache_write = 2.0
+output = 4.0
+
+[[rate]]
+provider = "xai"
+prefix = "grok-build-latest"
+input = 2.0
+cache_read = 0.3
+cache_write = 2.0
+output = 6.0
+source = "litellm"
+
+[rate.long_context]
+threshold = 200000
+input = 4.0
+cache_read = 0.6
+cache_write = 4.0
+output = 12.0
+
+[[rate]]
+provider = "xai"
+prefix = "grok-code-fast"
+input = 1.0
+cache_read = 0.2
+cache_write = 1.0
+output = 2.0
+source = "litellm"
+
+[rate.long_context]
+threshold = 200000
+input = 2.0
+cache_read = 0.4
+cache_write = 2.0
+output = 4.0
+
+[[unit_rate]]
+provider = "meta"
+prefix = "muse-image-1.0"
+unit = "image"
+usd = 0.01
+source = "manual"
+checked_on = "2026-09-16"
+
+[[unit_rate]]
+provider = "xai"
+prefix = "grok-stt"
+unit = "audio_hour"
+usd = 0.1
+source = "manual"
+checked_on = "2026-09-16"
+
+[[unit_rate]]
+provider = "xai"
+prefix = "grok-tts"
+unit = "million_chars"
+usd = 15.0
+source = "manual"
+checked_on = "2026-09-16"
+
+[[unit_rate]]
+provider = "bedrock"
+prefix = "amazon.nova-canvas-v1:0"
+unit = "image"
+usd = 0.06
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "bedrock"
+prefix = "amazon.titan-image-generator-v1"
+unit = "image"
+usd = 0.008
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "bedrock"
+prefix = "amazon.titan-image-generator-v2"
+unit = "image"
+usd = 0.008
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "bedrock"
+prefix = "amazon.titan-image-generator-v2:0"
+unit = "image"
+usd = 0.008
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "bedrock"
+prefix = "stability.sd3-5-large-v1:0"
+unit = "image"
+usd = 0.08
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "bedrock"
+prefix = "stability.sd3-large-v1:0"
+unit = "image"
+usd = 0.08
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "bedrock"
+prefix = "stability.stable-conservative-upscale-v1:0"
+unit = "image"
+usd = 0.4
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "bedrock"
+prefix = "stability.stable-creative-upscale-v1:0"
+unit = "image"
+usd = 0.6
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "bedrock"
+prefix = "stability.stable-fast-upscale-v1:0"
+unit = "image"
+usd = 0.03
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "bedrock"
+prefix = "stability.stable-image-control-sketch-v1:0"
+unit = "image"
+usd = 0.07
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "bedrock"
+prefix = "stability.stable-image-control-structure-v1:0"
+unit = "image"
+usd = 0.07
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "bedrock"
+prefix = "stability.stable-image-core-v1:0"
+unit = "image"
+usd = 0.04
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "bedrock"
+prefix = "stability.stable-image-core-v1:1"
+unit = "image"
+usd = 0.04
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "bedrock"
+prefix = "stability.stable-image-erase-object-v1:0"
+unit = "image"
+usd = 0.07
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "bedrock"
+prefix = "stability.stable-image-inpaint-v1:0"
+unit = "image"
+usd = 0.07
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "bedrock"
+prefix = "stability.stable-image-remove-background-v1:0"
+unit = "image"
+usd = 0.07
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "bedrock"
+prefix = "stability.stable-image-search-recolor-v1:0"
+unit = "image"
+usd = 0.07
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "bedrock"
+prefix = "stability.stable-image-search-replace-v1:0"
+unit = "image"
+usd = 0.07
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "bedrock"
+prefix = "stability.stable-image-style-guide-v1:0"
+unit = "image"
+usd = 0.07
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "bedrock"
+prefix = "stability.stable-image-ultra-v1:0"
+unit = "image"
+usd = 0.14
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "bedrock"
+prefix = "stability.stable-image-ultra-v1:1"
+unit = "image"
+usd = 0.14
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "bedrock"
+prefix = "stability.stable-outpaint-v1:0"
+unit = "image"
+usd = 0.06
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "bedrock"
+prefix = "stability.stable-style-transfer-v1:0"
+unit = "image"
+usd = 0.08
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "bedrock"
+prefix = "us.amazon.nova-canvas-v1:0"
+unit = "image"
+usd = 0.06
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "google"
+prefix = "gemini-2.0-flash-exp-image-generation"
+unit = "image"
+usd = 0.039
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "google"
+prefix = "imagen-3.0-fast-generate-001"
+unit = "image"
+usd = 0.02
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "google"
+prefix = "imagen-3.0-generate-001"
+unit = "image"
+usd = 0.04
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "google"
+prefix = "imagen-3.0-generate-002"
+unit = "image"
+usd = 0.04
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "google"
+prefix = "imagen-4.0-fast-generate-001"
+unit = "image"
+usd = 0.02
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "google"
+prefix = "imagen-4.0-generate-001"
+unit = "image"
+usd = 0.04
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "google"
+prefix = "imagen-4.0-ultra-generate-001"
+unit = "image"
+usd = 0.06
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "google"
+prefix = "lyria-3-clip-preview"
+unit = "clip"
+usd = 0.04
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "google"
+prefix = "lyria-3-pro-preview"
+unit = "clip"
+usd = 0.08
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "google"
+prefix = "lyria-3.5"
+unit = "clip"
+usd = 0.08
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "google"
+prefix = "lyria-3.5-clip-preview"
+unit = "clip"
+usd = 0.04
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "google"
+prefix = "lyria-3.5-pro-preview"
+unit = "clip"
+usd = 0.08
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "google"
+prefix = "veo-2.0-generate-001"
+unit = "video_second"
+usd = 0.35
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "google"
+prefix = "veo-3.1-fast-generate-001"
+unit = "video_second"
+usd = 0.1
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "google"
+prefix = "veo-3.1-fast-generate-preview"
+unit = "video_second"
+usd = 0.1
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "google"
+prefix = "veo-3.1-generate-001"
+unit = "video_second"
+usd = 0.4
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "google"
+prefix = "veo-3.1-generate-preview"
+unit = "video_second"
+usd = 0.4
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "google"
+prefix = "veo-3.1-lite-generate-preview"
+unit = "video_second"
+usd = 0.05
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "meta"
+prefix = "muse-voice-transcribe-1.0"
+unit = "audio_hour"
+usd = 0.18
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "openai"
+prefix = "dall-e-2"
+unit = "image"
+usd = 0.02
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "openai"
+prefix = "dall-e-3"
+unit = "image"
+usd = 0.04
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "openai"
+prefix = "gpt-4o-mini-transcribe"
+unit = "audio_hour"
+usd = 0.18
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "openai"
+prefix = "gpt-4o-mini-transcribe-2025-03-20"
+unit = "audio_hour"
+usd = 0.18
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "openai"
+prefix = "gpt-4o-mini-transcribe-2025-12-15"
+unit = "audio_hour"
+usd = 0.18
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "openai"
+prefix = "gpt-4o-mini-tts"
+unit = "audio_hour"
+usd = 0.9
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "openai"
+prefix = "gpt-4o-mini-tts-2025-03-20"
+unit = "audio_hour"
+usd = 0.9
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "openai"
+prefix = "gpt-4o-mini-tts-2025-12-15"
+unit = "audio_hour"
+usd = 0.9
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "openai"
+prefix = "gpt-4o-transcribe"
+unit = "audio_hour"
+usd = 0.36
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "openai"
+prefix = "gpt-4o-transcribe-diarize"
+unit = "audio_hour"
+usd = 0.36
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "openai"
+prefix = "gpt-live-transcribe"
+unit = "audio_hour"
+usd = 1.02
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "openai"
+prefix = "gpt-realtime-whisper"
+unit = "audio_hour"
+usd = 1.02
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "openai"
+prefix = "gpt-transcribe"
+unit = "audio_hour"
+usd = 0.27
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "openai"
+prefix = "sora-2"
+unit = "video_second"
+usd = 0.1
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "openai"
+prefix = "sora-2-pro"
+unit = "video_second"
+usd = 0.3
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "openai"
+prefix = "sora-2-pro-high-res"
+unit = "video_second"
+usd = 0.5
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "openai"
+prefix = "tts-1"
+unit = "million_chars"
+usd = 15.0
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "openai"
+prefix = "tts-1-1106"
+unit = "million_chars"
+usd = 15.0
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "openai"
+prefix = "tts-1-hd"
+unit = "million_chars"
+usd = 30.0
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "openai"
+prefix = "tts-1-hd-1106"
+unit = "million_chars"
+usd = 30.0
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "openai"
+prefix = "whisper-1"
+unit = "audio_hour"
+usd = 0.36
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "xai"
+prefix = "grok-imagine-image"
+unit = "image"
+usd = 0.02
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "xai"
+prefix = "grok-imagine-image-2.0"
+unit = "image"
+usd = 0.06
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "xai"
+prefix = "grok-imagine-image-2026-03-02"
+unit = "image"
+usd = 0.02
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "xai"
+prefix = "grok-imagine-image-pro"
+unit = "image"
+usd = 0.05
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "xai"
+prefix = "grok-imagine-image-quality"
+unit = "image"
+usd = 0.05
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "xai"
+prefix = "grok-imagine-image-quality-20260403"
+unit = "image"
+usd = 0.05
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "xai"
+prefix = "grok-imagine-image-quality-latest"
+unit = "image"
+usd = 0.05
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "xai"
+prefix = "grok-imagine-video"
+unit = "video_second"
+usd = 0.05
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "xai"
+prefix = "grok-imagine-video-1.5"
+unit = "video_second"
+usd = 0.08
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "xai"
+prefix = "grok-imagine-video-1.5-2026-05-30"
+unit = "video_second"
+usd = 0.08
+source = "litellm"
+checked_on = "2026-09-17"
+
+[[unit_rate]]
+provider = "xai"
+prefix = "grok-imagine-video-1.5-preview"
+unit = "video_second"
+usd = 0.08
+source = "litellm"
+checked_on = "2026-09-17"

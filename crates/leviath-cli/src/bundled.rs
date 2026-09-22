@@ -838,7 +838,10 @@ mod tests {
 
     /// Every provider `lev setup` can configure, built so a test can ask them
     /// what they serve. Claude Code is a transport rather than a provider a
-    /// stage names, so it is not in this list.
+    /// stage names, so it is not in this list; nor is Bedrock, whose ids are
+    /// region-prefixed vendor ids (`us.anthropic.claude-sonnet-5`) that a
+    /// bundled stage naming `claude-sonnet-5` does not resolve on by
+    /// spelling. The provider crate proves its own routing.
     ///
     /// The keys are never used: `serves_model` reads a table compiled into the
     /// build, which is exactly the offline answer wanted here.
@@ -873,6 +876,10 @@ mod tests {
                     client.clone(),
                     key(),
                 )),
+            ),
+            (
+                "meshy",
+                Box::new(leviath_providers::MeshyProvider::new(client.clone(), key())),
             ),
             (
                 "ollama",
@@ -1161,7 +1168,8 @@ mod tests {
             for stage in &blueprint.stages {
                 for (target, edge) in stage.transitions.iter().flatten() {
                     let Some(gate) = &edge.gate else { continue };
-                    let checks = gate.require_modifications
+                    let checks = gate.require_region_entries.is_some()
+                        || gate.require_modifications
                         || gate.region.is_some()
                         || gate.require_region_updated.is_some();
                     assert!(
@@ -1213,6 +1221,9 @@ mod tests {
                     "openrouter" => std::sync::Arc::new(
                         leviath_providers::OpenRouterProvider::new(client(), key()),
                     ),
+                    "meshy" => {
+                        std::sync::Arc::new(leviath_providers::MeshyProvider::new(client(), key()))
+                    }
                     _ => std::sync::Arc::new(leviath_providers::OllamaProvider::new(client())),
                 };
                 r.register((*name).to_string(), p);
@@ -1267,9 +1278,13 @@ mod tests {
 
                 // A real default provider, because the reordering only runs
                 // when one is set and registered. Passing the empty default
-                // skips that block entirely and tests nothing.
+                // skips that block entirely and tests nothing. Every provider
+                // is in the preference, since a bare name only resolves to a
+                // provider listed there and this test is about which model
+                // wins, not which providers are allowed.
                 let defaults = leviath_runtime::pipeline::ModelDefaults {
                     provider: "openrouter".to_string(),
+                    provider_order: providers.iter().map(|(n, _)| (*n).to_string()).collect(),
                     ..Default::default()
                 };
                 let (got_provider, got_model) = leviath_runtime::pipeline::resolve_stage_model(
@@ -1405,6 +1420,16 @@ mod tests {
                 leviath_core::manifest::parse_manifest(manifest).expect("manifest parses");
 
             for stage in &blueprint.stages {
+                // Portability is about stages that fall back to the user's
+                // configured default. A stage that pins its models on purpose
+                // (`allow_user_default = false`) is opting out of it - an image
+                // or 3D stage cannot be provider-portable, because a vendor like
+                // Anthropic has no image model at all - so it is not held to the
+                // every-provider rule. Stages that allow the default (every
+                // other bundled stage) still are.
+                if !stage.model.allow_user_default {
+                    continue;
+                }
                 let stage_name = &stage.name;
                 let listed: Vec<&str> = stage
                     .model
@@ -1422,6 +1447,14 @@ mod tests {
                         .any(|(n, p)| *n != "openrouter" && p.serves_model(key).is_some())
                 };
                 for (name, provider) in &providers {
+                    // A media-only provider (Meshy makes 3D models, not text) is
+                    // a supplement a machine adds alongside a text provider for
+                    // the stages that need it, never its sole provider - no one
+                    // runs an LLM stage on Meshy - so the text-portability rule
+                    // does not apply to it.
+                    if *name == "meshy" {
+                        continue;
+                    }
                     let reachable = stage.model.models.iter().any(|entry| {
                         if !entry.provider.is_empty() {
                             return entry.provider == *name;
@@ -1477,6 +1510,9 @@ mod tests {
         );
         crate::lint::LintEnv {
             known_tools,
+            // Empty on purpose: no bundled blueprint grants a tool group, so
+            // the group-aware checks have nothing to classify here.
+            tool_sources: std::collections::HashMap::new(),
             known_models: crate::commands::models::closed_catalog_models(),
             available_providers: None,
             read_paths: None,
@@ -1488,6 +1524,7 @@ mod tests {
             provider_refusals: std::collections::HashMap::new(),
             unrouted_models: std::collections::HashSet::new(),
             model_windows: crate::commands::models::builtin_model_windows(),
+            retention_refusals: std::collections::HashMap::new(),
         }
     }
 

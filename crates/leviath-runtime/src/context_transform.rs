@@ -67,7 +67,12 @@ pub(crate) fn apply_context_transforms(
     if let Some(mut child_window) = world.get_mut::<ContextWindow>(child) {
         for (to_region, content) in writes {
             let tokens = leviath_core::estimate_tokens(&content);
-            let _ = child_window.add_to_region(&to_region, content, tokens);
+            let _ = child_window.add_to_region_caused(
+                leviath_core::ContextCause::Transform,
+                &to_region,
+                content,
+                tokens,
+            );
         }
         wrote_to_child = true;
     }
@@ -132,6 +137,16 @@ pub(crate) fn dispatch_content_summary(
             commands.entity(entity).remove::<PendingContentSummary>();
             continue;
         };
+        // The content is the run's own; a model zero retention refuses is not
+        // sent it, and the raw content stays.
+        if let Some(refusal) = providers
+            .0
+            .retention_refusal(&config.provider, &config.model)
+        {
+            tracing::warn!("content summary skipped: its model is {refusal}");
+            commands.entity(entity).remove::<PendingContentSummary>();
+            continue;
+        }
         let Some(permit) = stage.pools.try_acquire(&config.provider, &config.model) else {
             continue; // pool full - retry next tick (keep the pending marker)
         };
@@ -139,10 +154,13 @@ pub(crate) fn dispatch_content_summary(
             .0
             .iter()
             .map(|(region, content)| {
-                (
-                    region.clone(),
-                    crate::pipeline::compaction_request(config, content, region),
-                )
+                let mut request = crate::pipeline::compaction_request(config, content, region);
+                // The summary carries the run's content, so the zero-retention
+                // fields ride it the way they ride a stage's own request.
+                providers
+                    .0
+                    .apply_retention_knobs(&config.provider, &mut request.extra);
+                (region.clone(), request)
             })
             .collect();
         stage.runtime.spawn(run_compaction_job(
@@ -182,7 +200,12 @@ pub(crate) fn collect_content_summary(
         if let Ok(summaries) = outcome.result {
             for (region, summary) in summaries {
                 let tokens = leviath_core::estimate_tokens(&summary);
-                window.replace_region(&region, summary, tokens);
+                window.replace_region(
+                    leviath_core::ContextCause::Transform,
+                    &region,
+                    summary,
+                    tokens,
+                );
             }
         }
         commands
@@ -563,6 +586,7 @@ mod tests {
                 },
                 finish_reason: FinishReason::Complete,
                 reasoning: None,
+                parts: Vec::new(),
             })
         }
         async fn count_tokens(&self, _t: &str, _m: &str) -> usize {
@@ -582,6 +606,7 @@ mod tests {
     fn agent_state(status: AgentStatus) -> AgentState {
         AgentState {
             agent_id: "child".to_string(),
+            current_visit: String::new(),
             current_stage: "s".to_string(),
             iteration: 0,
             status,
@@ -758,6 +783,30 @@ mod tests {
         run_dispatch(&mut world2);
         assert!(world2.get::<PendingContentSummary>(e2).is_none());
         assert!(world2.get::<AwaitingContentSummary>(e2).is_none());
+    }
+
+    /// A summary sends the parent's content, so a model zero retention
+    /// refuses is never called and the raw content stays.
+    #[tokio::test]
+    async fn dispatch_drops_pending_for_a_model_zero_retention_refuses() {
+        let (mut world, _rx) =
+            summary_world(true, false, InferencePools::new(InferencePoolConfig::new()));
+        world.resource_mut::<Providers>().0.set_retention(
+            leviath_providers::retention::RetentionSettings {
+                zero_requested: true,
+                ..Default::default()
+            },
+        );
+        let e = world
+            .spawn((
+                agent_state(AgentStatus::Active),
+                settings(),
+                PendingContentSummary(vec![("task".to_string(), "raw".to_string())]),
+            ))
+            .id();
+        run_dispatch(&mut world);
+        assert!(world.get::<PendingContentSummary>(e).is_none());
+        assert!(world.get::<AwaitingContentSummary>(e).is_none());
     }
 
     #[tokio::test]

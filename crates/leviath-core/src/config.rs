@@ -43,11 +43,18 @@ impl Default for TitleConfig {
     }
 }
 
-/// Configuration for structured observability export.
+/// The default cap on each log file Leviath writes for itself (the daemon's
+/// `daemon.log`, a server's `serve-<name>.log`): 5 MiB, with one rolled
+/// backup, so a long-lived process holds at most about 10 MiB of its own
+/// output on disk.
+pub const DEFAULT_LOG_FILE_MAX_BYTES: u64 = 5 * 1024 * 1024;
+
+/// Configuration for structured observability export, and for the daemon's
+/// own log file.
 ///
-/// Off by default: telemetry costs a background export pipeline and most
-/// interactive users have the dashboard instead. When enabled, spans, metrics
-/// and log records for every run flow to the configured exporter.
+/// Export is off by default: telemetry costs a background export pipeline and
+/// most interactive users have the dashboard instead. When enabled, spans,
+/// metrics and log records for every run flow to the configured exporter.
 ///
 /// Example config:
 /// ```toml
@@ -56,8 +63,9 @@ impl Default for TitleConfig {
 /// exporter = "otlp"
 /// endpoint = "http://localhost:4318"
 /// service_name = "leviath"
+/// log_file_max_bytes = 5242880
 /// ```
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObservabilityConfig {
     /// Whether to export telemetry at all (default: false).
     #[serde(default)]
@@ -76,6 +84,52 @@ pub struct ObservabilityConfig {
     /// The `service.name` resource attribute. Falls back to
     /// `OTEL_SERVICE_NAME`, then to `"leviath"`.
     pub service_name: Option<String>,
+
+    /// Bytes a log file Leviath writes for itself may reach before it is
+    /// rolled to `<name>.1`, replacing the previous one: the daemon's
+    /// `daemon.log` and each `lev serve`'s `serve-<name>.log`, under the data
+    /// directory. `0` never rolls. Default: 5 MiB.
+    #[serde(default = "default_log_file_max_bytes")]
+    pub log_file_max_bytes: u64,
+
+    /// Whether every run writes the exact request it sent the model into its
+    /// journal, once per provider attempt (default: false).
+    ///
+    /// **A captured request is the whole prompt.** It holds whatever the run's
+    /// context held at that moment: file contents a tool read, command output,
+    /// pasted credentials, the task somebody typed. A run directory is a plain
+    /// file on disk with no encryption of its own, so turning this on makes
+    /// every reader of that directory a reader of every prompt.
+    ///
+    /// There is no size cap. Each call re-sends the whole window, so a captured
+    /// run's journal grows by roughly the context size per attempt, and a long
+    /// run with a large window can write hundreds of megabytes.
+    ///
+    /// Read at spawn, so a change applies to runs started after it. One run can
+    /// be captured on its own with the `capture_model_input` spawn option, which
+    /// is the setting to reach for when the question is about a single run.
+    #[serde(default)]
+    pub capture_model_input: bool,
+}
+
+fn default_log_file_max_bytes() -> u64 {
+    DEFAULT_LOG_FILE_MAX_BYTES
+}
+
+impl Default for ObservabilityConfig {
+    /// Export off, request capture off, the OTLP exporter when export is turned
+    /// on, and the default log cap. Hand-written so the empty-table serde
+    /// default and `Default` agree on the cap.
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            exporter: TelemetryExporterKind::Otlp,
+            endpoint: None,
+            service_name: None,
+            log_file_max_bytes: DEFAULT_LOG_FILE_MAX_BYTES,
+            capture_model_input: false,
+        }
+    }
 }
 
 /// Which telemetry exporter to build.
@@ -249,6 +303,7 @@ enabled = false
         assert_eq!(cfg.exporter, TelemetryExporterKind::Otlp);
         assert!(cfg.endpoint.is_none());
         assert!(cfg.service_name.is_none());
+        assert_eq!(cfg.log_file_max_bytes, DEFAULT_LOG_FILE_MAX_BYTES);
         // An empty TOML table and the hand-written Default must agree.
         let parsed: ObservabilityConfig = toml::from_str("").unwrap();
         assert_eq!(parsed, cfg);
@@ -261,12 +316,14 @@ enabled = true
 exporter = "stdout"
 endpoint = "http://collector:4318"
 service_name = "leviath-prod"
+log_file_max_bytes = 1048576
 "#;
         let cfg: ObservabilityConfig = toml::from_str(toml_str).unwrap();
         assert!(cfg.enabled);
         assert_eq!(cfg.exporter, TelemetryExporterKind::Stdout);
         assert_eq!(cfg.endpoint.as_deref(), Some("http://collector:4318"));
         assert_eq!(cfg.service_name.as_deref(), Some("leviath-prod"));
+        assert_eq!(cfg.log_file_max_bytes, 1_048_576);
         let serialized = toml::to_string(&cfg).unwrap();
         let back: ObservabilityConfig = toml::from_str(&serialized).unwrap();
         assert_eq!(back, cfg);

@@ -1,7 +1,7 @@
 //! Config and models endpoints.
 
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, HeaderValue};
 use axum::response::Json;
 
 use super::types::*;
@@ -46,7 +46,7 @@ fn gateways_of(c: &Config) -> Vec<GatewayInfo> {
 /// disk. Every other field here describes the config in force; without this
 /// one a client had no way to tell "your edit is applied" from "your edit did
 /// not parse and is being ignored".
-fn redact(
+pub(super) fn redact(
     c: &Config,
     requests: &super::request_limits::RequestLimits,
     health: &crate::daemon::config_reload::ConfigHealth,
@@ -56,17 +56,24 @@ fn redact(
         config_error,
         config_mtime,
         default_provider: c.default_provider.clone(),
-        default_model: c.default_model.clone(),
+        override_model: c.override_model.clone(),
+        fallback_model: c.fallback_model.clone(),
         provider_order: c.providers.provider_order.clone(),
         has_anthropic_key: c.providers.anthropic_api_key.is_some(),
         has_openai_key: c.providers.openai_api_key.is_some(),
         has_google_key: c.providers.google_api_key.is_some(),
         has_openrouter_key: c.openrouter_api_key.is_some(),
+        has_bedrock_key: c.providers.bedrock_api_key.is_some(),
+        has_xai_key: c.providers.xai_api_key.is_some(),
+        has_meta_key: c.providers.meta_api_key.is_some(),
+        bedrock_region: c.providers.bedrock_region.clone(),
         ollama_base_url: c.ollama_base_url.clone(),
         // The switch or the address: either is a choice, and a console
         // drawing "Ollama is on" should not have to know which one was used.
         ollama_enabled: c.providers.ollama_enabled || c.ollama_base_url.is_some(),
         codex_enabled: c.providers.codex_enabled,
+        grok_enabled: c.providers.grok_enabled,
+        file_uploads: c.providers.file_uploads,
         codex_reasoning_effort: c.providers.codex_reasoning_effort.clone(),
         codex_verbosity: c.providers.codex_verbosity.clone(),
         codex_replay_reasoning: c.providers.codex_replay_reasoning,
@@ -77,37 +84,6 @@ fn redact(
         capabilities: API_CAPABILITIES.iter().map(|c| c.to_string()).collect(),
         limits: ApiLimits::current(requests),
     }
-}
-
-/// The reasoning efforts the Codex route accepts.
-const CODEX_EFFORTS: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh"];
-
-/// The text verbosities it accepts.
-const CODEX_VERBOSITIES: &[&str] = &["low", "medium", "high"];
-
-/// Refuse a value outside `allowed`, naming what was expected.
-///
-/// The provider drops a setting it does not recognise, so an unchecked typo
-/// is saved, reported back by `GET /api/config`, and silently does nothing -
-/// the same class of quiet no-op a mistyped `gate` key is in a blueprint.
-fn validated(
-    value: Option<String>,
-    allowed: &[&str],
-    what: &str,
-) -> Result<Option<String>, ApiError> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    if allowed.contains(&value.as_str()) {
-        return Ok(Some(value));
-    }
-    Err(err(
-        StatusCode::BAD_REQUEST,
-        format!(
-            "unknown Codex {what} '{value}'; use one of {}",
-            allowed.join(", ")
-        ),
-    ))
 }
 
 /// `GET /api/config`. Reads the file rather than a start-up copy, so an edit
@@ -130,142 +106,20 @@ pub(super) async fn put_config(
     State(state): State<AppState>,
     Json(req): Json<WriteConfigReq>,
 ) -> Result<Json<RedactedConfig>, ApiError> {
-    let paths = super::mcp::admin_paths();
-    let path = &paths.config;
-    let mut config = Config::load_from_path_public(path).map_err(|e| {
-        err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to read config: {e}"),
-        )
-    })?;
-
-    if let Some(v) = req.default_provider {
-        config.default_provider = v;
-    }
-    // A present list replaces the order whole; an empty one clears it back to
-    // `default_provider` alone. Absent leaves it untouched, like every other
-    // partial field here.
-    if let Some(order) = req.provider_order {
-        config.providers.provider_order = order;
-    }
-    // Three states rather than the two every field around it has: absent
-    // leaves the pin alone, `null` removes it so each blueprint picks its own
-    // model again, and a string pins that one. Written as a `match` because
-    // the read has to distinguish "the key was not sent" from "the key was
-    // sent as null", which an `if let Some` on a single `Option` cannot.
-    match req.default_model {
-        None => {}
-        Some(None) => config.default_model = None,
-        // Refused rather than treated as a clear: `""` is not a model id, and
-        // a form that posts its empty box should be told, not obeyed. The
-        // check runs before anything is saved, so the file is untouched.
-        Some(Some(v)) if v.trim().is_empty() => {
-            return Err(err(
-                StatusCode::BAD_REQUEST,
-                "default_model must not be empty; send null to clear it".to_string(),
-            ));
-        }
-        Some(Some(v)) => config.default_model = Some(v),
-    }
-    if let Some(v) = req.anthropic_key {
-        config.providers.anthropic_api_key = Some(v);
-    }
-    if let Some(v) = req.openai_key {
-        config.providers.openai_api_key = Some(v);
-    }
-    if let Some(v) = req.google_key {
-        config.providers.google_api_key = Some(v);
-    }
-    if let Some(v) = req.openrouter_key {
-        config.openrouter_api_key = Some(v);
-    }
-    if let Some(v) = req.ollama_base_url {
-        config.ollama_base_url = Some(v);
-    }
-    // Checked before anything is written, like the gateway kind below: the
-    // provider silently ignores a value it does not know, so a console that
-    // sent a typo would see it saved and never take effect.
-    let effort = validated(
-        req.codex_reasoning_effort,
-        CODEX_EFFORTS,
-        "reasoning effort",
-    )?;
-    let verbosity = validated(req.codex_verbosity, CODEX_VERBOSITIES, "verbosity")?;
-    config.providers.ollama_enabled = req
-        .ollama_enabled
-        .unwrap_or(config.providers.ollama_enabled);
-    config.providers.codex_enabled = req.codex_enabled.unwrap_or(config.providers.codex_enabled);
-    config.providers.codex_replay_reasoning = req
-        .codex_replay_reasoning
-        .unwrap_or(config.providers.codex_replay_reasoning);
-    config.providers.codex_reasoning_effort = effort.or(config.providers.codex_reasoning_effort);
-    config.providers.codex_verbosity = verbosity.or(config.providers.codex_verbosity);
-    // Field by field, like everything above: a gateway names only what it is
-    // changing, so a console can edit a base URL without knowing the key or
-    // sending it back through the browser.
-    for gateway in req.gateways.unwrap_or_default() {
-        // Read before the entry is created, so a bad kind leaves the config
-        // exactly as it was rather than with a half-made entry.
-        let kind = match gateway.kind.as_deref() {
-            None => None,
-            Some(text) => Some(
-                crate::config::ModelProviderKind::parse(text).ok_or_else(|| {
-                    err(
-                        StatusCode::BAD_REQUEST,
-                        format!(
-                            "gateway '{}': unknown kind '{text}'; use \"script\" or \
-                             \"openai-compatible\"",
-                            gateway.name
-                        ),
-                    )
-                })?,
-            ),
-        };
-        let entry = config.model_providers.entry(gateway.name).or_default();
-        if let Some(v) = kind {
-            entry.kind = Some(v);
-        }
-        if let Some(v) = gateway.base_url {
-            entry.base_url = Some(v);
-        }
-        if let Some(v) = gateway.api_key {
-            entry.api_key = Some(v);
-        }
-        if let Some(v) = gateway.script {
-            entry.script = Some(v);
-        }
-        if let Some(v) = gateway.headers {
-            entry.headers = Some(v);
-        }
-        if let Some(v) = gateway.models {
-            entry.models = Some(v);
-        }
-    }
-    // Removals run last, so one request that both edits and deletes cannot
-    // depend on which half was applied first.
-    for name in req.remove_gateways.unwrap_or_default() {
-        config.model_providers.remove(&name);
-    }
-    // The same check the loader makes, made before the write: a file this
-    // would refuse to read back is not a file worth saving.
-    for (name, provider) in &config.model_providers {
-        provider
-            .validate(name)
-            .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
-    }
-
-    config.save_to_path_public(path).map_err(|e| {
-        err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to write config: {e}"),
-        )
-    })?;
+    let config =
+        super::core::config::write(req).map_err(|e| super::core::error::as_api_error(&e))?;
     // Health read *after* the write, so the answer describes the file this
     // request just left behind. A write this route made always parses - it
-    // serializes a `Config` and the refusals above ran first - so this is
+    // serializes a `Config` and the refusals inside ran first - so this is
     // normally healthy; it is not assumed, because the file could equally have
     // been broken by hand a moment ago and rewritten by something else.
     let health = state.config.health();
+    // The models a settings page asks for next are the new config's, so the
+    // catalogue starts on them now rather than when that request arrives.
+    state
+        .caches
+        .model_catalog
+        .request_refresh(state.current_config(), true);
     Ok(Json(redact(&config, &state.limits.request_limits, &health)))
 }
 
@@ -288,12 +142,27 @@ pub(super) async fn probe_models_with(
     req: ProbeModelsReq,
     build_client: leviath_providers::provider::HttpClientFactory<'_>,
 ) -> Result<Json<ProbeModelsResp>, ApiError> {
+    probed(req, build_client)
+        .await
+        .map(|models| Json(ProbeModelsResp { models }))
+        .map_err(|e| super::core::error::as_api_error(&e))
+}
+
+/// What an OpenAI-compatible endpoint says it serves, for whichever surface
+/// asked.
+///
+/// Built the same way a written gateway would be, so the probe cannot succeed
+/// where the gateway then fails.
+pub(super) async fn probed(
+    req: ProbeModelsReq,
+    build_client: leviath_providers::provider::HttpClientFactory<'_>,
+) -> Result<Vec<String>, super::core::error::ServeError> {
+    use super::core::error::ServeError;
+
     let (valid, message) = validate_base_url(&req.base_url);
     if !valid {
-        return Err(err(StatusCode::BAD_REQUEST, message.unwrap_or_default()));
+        return Err(ServeError::BadRequest(message.unwrap_or_default()));
     }
-    // The same provider a written gateway would get, built the same way, so
-    // the probe cannot succeed where the gateway then fails.
     let mut creds = leviath_runtime::provider_creds::ProviderCreds::openai_compatible(
         "probe",
         req.base_url.trim(),
@@ -307,17 +176,17 @@ pub(super) async fn probe_models_with(
         std::slice::from_ref(&creds),
         build_client,
     )
-    .map_err(|e| err(StatusCode::BAD_GATEWAY, e.to_string()))?;
-    // Registered unconditionally under the name above: an endpoint cred
-    // needs neither a key nor a reachable port to register.
+    .map_err(|e| ServeError::Upstream(e.to_string()))?;
+    // Registered unconditionally under the name above: an endpoint cred needs
+    // neither a key nor a reachable port to register.
     let provider = registry.get("probe").expect("an endpoint cred registers");
     let models = provider
         .list_models()
         .await
-        .map_err(|e| err(StatusCode::BAD_GATEWAY, e.to_string()))?;
+        .map_err(|e| ServeError::Upstream(e.to_string()))?;
     let mut ids: Vec<String> = models.into_iter().map(|m| m.id).collect();
     ids.sort();
-    Ok(Json(ProbeModelsResp { models: ids }))
+    Ok(ids)
 }
 
 /// How long the probe waits on the server. A person is watching a form.
@@ -343,7 +212,16 @@ fn validate_key_format(provider: &str, key: &str) -> (bool, Option<String>) {
                 (false, Some("OpenAI keys start with `sk-`.".to_string()))
             }
         }
-        "google" | "openrouter" => {
+        "xai" => {
+            if key.starts_with("xai-") {
+                (true, None)
+            } else {
+                (false, Some("xAI keys start with `xai-`.".to_string()))
+            }
+        }
+        // A Bedrock key has no house prefix worth checking: long-term keys
+        // start `ABSK`, short-term ones do not. Meta publishes none.
+        "google" | "openrouter" | "bedrock" | "meta" => {
             if key.trim().is_empty() {
                 (false, Some("Key must not be empty.".to_string()))
             } else {
@@ -382,144 +260,104 @@ fn validate_base_url(url: &str) -> (bool, Option<String>) {
 }
 
 pub(super) async fn validate_config_key(Json(req): Json<ValidateKeyReq>) -> Json<ValidateKeyResp> {
-    // The URL is checked first: a gateway with both wrong is more usefully
-    // told about the address than about the key, since the key cannot be
-    // judged beyond being present.
-    if let Some(base_url) = &req.base_url {
-        let (valid, message) = validate_base_url(base_url);
-        if !valid {
-            return Json(ValidateKeyResp { valid, message });
-        }
-    }
-    let (valid, message) = validate_key_format(&req.provider, &req.key);
-    Json(ValidateKeyResp { valid, message })
+    Json(checked_key(
+        &req.provider,
+        &req.key,
+        req.base_url.as_deref(),
+    ))
 }
 
-/// How long the models route waits for a provider to describe its own models.
+/// Whether a key looks like one of that provider's, for whichever surface asked.
 ///
-/// Shorter than the daemon's start-up prime: this is a page load, and a limit
-/// that arrives after the page has rendered is worth less than a fast answer
-/// that admits which numbers are guesses.
-const MODELS_PRIME_TIMEOUT_SECS: u64 = 5;
+/// Format only: nothing is dialled and nothing is written, which is what makes it
+/// safe to run on every keystroke of a form. `checkProvider` is the one that asks
+/// the account.
+///
+/// The URL is checked first, because a gateway with both wrong is more usefully
+/// told about the address: a key cannot be judged beyond being present until
+/// there is somewhere to send it.
+pub(super) fn checked_key(provider: &str, key: &str, base_url: Option<&str>) -> ValidateKeyResp {
+    if let Some(base_url) = base_url {
+        let (valid, message) = validate_base_url(base_url);
+        if !valid {
+            return ValidateKeyResp { valid, message };
+        }
+    }
+    let (valid, message) = validate_key_format(provider, key);
+    ValidateKeyResp { valid, message }
+}
 
+/// `GET /api/models`: every model every configured provider reports, from the
+/// catalogue this server keeps rather than from the providers on each request.
+///
+/// `X-Leviath-Catalog-Age` says how many seconds ago the list was built and
+/// `X-Leviath-Catalog-Complete` whether every provider answered when it was.
+/// `?refresh=1` asks the providers again and waits for them.
 pub(super) async fn get_models(
     State(state): State<AppState>,
     Query(query): Query<ModelsQuery>,
-) -> Json<Vec<ModelEntry>> {
-    models_with(
-        &state,
-        &leviath_providers::provider::build_http_client,
-        &query,
-    )
-    .await
+) -> (HeaderMap, Json<Vec<ModelEntry>>) {
+    models_with(&state, &query).await
 }
 
-/// [`get_models`], with client construction injected so the "no usable HTTPS
-/// client" answer is reachable from a test.
+/// [`get_models`], callable from a test without a request.
 pub(super) async fn models_with(
     state: &AppState,
-    build_client: leviath_providers::provider::HttpClientFactory<'_>,
     query: &ModelsQuery,
-) -> Json<Vec<ModelEntry>> {
-    let mut models = list_models_from_config(&state.current_config(), build_client).await;
+) -> (HeaderMap, Json<Vec<ModelEntry>>) {
+    let (listing, _) = state
+        .caches
+        .model_catalog
+        .models(state.current_config(), query.refresh)
+        .await;
     // Filtered here rather than left to the caller because the interesting
     // case is two providers serving the *same* model ids: `openai` and
     // `codex` both answer to `gpt-5.5`, and they bill to different places.
     // A client that wants one of them should be able to ask for it rather
     // than fetch both and match on a string it had to know.
+    let mut models = listing.value.clone();
     if let Some(provider) = query.provider.as_deref() {
         models.retain(|m| m.provider == provider);
     }
-    Json(models)
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        super::model_catalog::CATALOG_AGE,
+        HeaderValue::from(listing.age_secs()),
+    );
+    headers.insert(
+        super::model_catalog::CATALOG_COMPLETE,
+        HeaderValue::from_static(if listing.complete { "true" } else { "false" }),
+    );
+    (headers, Json(models))
 }
 
 /// Every model every configured provider reports, as `provider/id`: what the
 /// dashboard's agent editor offers once the providers have answered.
+///
+/// Asks the providers directly rather than through a catalogue: the
+/// dashboard asks once per session, off its UI loop.
 pub(crate) async fn list_model_ids(
     config: &crate::config::Config,
     build_client: leviath_providers::provider::HttpClientFactory<'_>,
 ) -> Vec<String> {
-    list_models_from_config(config, build_client)
-        .await
-        .into_iter()
-        .map(|m| format!("{}/{}", m.provider, m.id))
-        .collect()
-}
-
-/// Every model every configured provider reports, for `GET /api/models` and
-/// the dashboard's agent editor alike.
-///
-/// Iterates `resolvable_names` rather than `provider_names`, so a Rhai script
-/// provider is asked too. `provider_names` returns natively registered
-/// providers only, and a script provider is reachable through `get` alone, so
-/// iterating that instead lists a script provider under the gateways while
-/// offering none of its models - on the new-run page, in the agent editor and
-/// in settings alike.
-pub(super) async fn list_models_from_config(
-    config: &crate::config::Config,
-    build_client: leviath_providers::provider::HttpClientFactory<'_>,
-) -> Vec<ModelEntry> {
-    // Nothing to list if no client could be built; the endpoint answers with an
-    // empty set rather than failing the request, matching how it treats a
-    // provider whose `list_models` errors.
+    // Nothing to list if no client could be built, matching how a provider
+    // whose listing errors is treated: left out rather than fatal.
     let Ok(registry) = crate::commands::run::session::build_provider_registry_from_config_with(
         config,
         build_client,
     ) else {
         return Vec::new();
     };
-    // Ask each provider what its models are before asking what they can hold.
-    //
-    // Without this the route published the compiled-in guess for every provider
-    // whose real answer is a network call away - which is most of them, and
-    // includes the two that had learned to fetch it. Measured against a running
-    // server: Ollama reported a name-matched 131,072 for a model whose server
-    // says 262,144, and OpenRouter reported builtin limits for all 418 of its
-    // models. Only Google looked right, and only because its listing reads the
-    // limits inline rather than through the primed table.
-    //
-    // The route already makes one network call per provider to list at all, so
-    // this is a second bounded one, not a new class of cost. A provider that
-    // does not answer in time keeps its compiled table and says so through
-    // `limits_source`.
-    registry
-        .prime_capabilities(
-            std::time::Duration::from_secs(MODELS_PRIME_TIMEOUT_SECS),
-            &[],
-        )
-        .await;
-    let mut models = Vec::new();
-
-    for provider_name in registry.resolvable_names() {
-        // A script name is a candidate until it compiles, so unlike the old
-        // `provider_names` loop this cannot assume the lookup succeeds. A
-        // script that will not load is skipped with its own log line already
-        // written by the layer, exactly as a provider whose `list_models`
-        // errors is skipped below.
-        let Some(provider) = registry.get(&provider_name) else {
-            continue;
-        };
-        if let Ok(list) = provider.list_models().await {
-            for m in list {
-                models.push(ModelEntry {
-                    id: m.id,
-                    provider: m.provider,
-                    display_name: m.display_name,
-                    max_context_tokens: m.capabilities.max_context_tokens,
-                    max_output_tokens: m.capabilities.max_output_tokens,
-                    limits_source: limits_source_label(m.capabilities.limits_source),
-                    supports_tools: m.capabilities.supports_tools,
-                    supports_temperature: m.capabilities.supports_temperature,
-                    learned: m.learned,
-                    released: m.released,
-                    retires: m.retires,
-                    pricing: m.pricing,
-                });
-            }
-        }
-    }
-
+    let (models, _) = super::model_catalog::collect_models(
+        &std::sync::Arc::new(registry),
+        super::model_catalog::PROVIDER_TIMEOUT,
+        true,
+    )
+    .await;
     models
+        .into_iter()
+        .map(|m| format!("{}/{}", m.provider, m.id))
+        .collect()
 }
 
 /// The wire spelling of a [`LimitsSource`].
@@ -527,7 +365,7 @@ pub(super) async fn list_models_from_config(
 /// Written out here rather than serialized from the enum so the API's
 /// vocabulary is visible at the boundary that publishes it: a rename in the
 /// providers crate should not silently change what a console reads.
-fn limits_source_label(source: leviath_providers::LimitsSource) -> String {
+pub(super) fn limits_source_label(source: leviath_providers::LimitsSource) -> String {
     match source {
         leviath_providers::LimitsSource::Api => "api",
         leviath_providers::LimitsSource::Builtin => "builtin",
@@ -587,6 +425,7 @@ mod tests {
     fn state_without_a_reachable_ollama() -> AppState {
         let (tx, _) = broadcast::channel::<ServerEvent>(64);
         AppState {
+            caches: Default::default(),
             update_check: Default::default(),
             update_jobs: Default::default(),
             config: crate::commands::serve::testutil::fixed_config(Config {
@@ -603,6 +442,7 @@ mod tests {
             mcp: crate::commands::serve::mcp::McpAdmin::default(),
             providers: crate::commands::serve::providers::ProviderAdmin::default(),
             limits: Default::default(),
+            signer: Default::default(),
         }
     }
 
@@ -635,6 +475,7 @@ mod tests {
         }
         let (tx, _) = broadcast::channel::<ServerEvent>(64);
         let state = AppState {
+            caches: Default::default(),
             update_check: Default::default(),
             update_jobs: Default::default(),
             config: crate::commands::serve::testutil::fixed_config(config),
@@ -643,11 +484,10 @@ mod tests {
             mcp: crate::commands::serve::mcp::McpAdmin::default(),
             providers: crate::commands::serve::providers::ProviderAdmin::default(),
             limits: Default::default(),
+            signer: Default::default(),
         };
-        let build = leviath_providers::provider::build_http_client;
-
         // Unfiltered: the same id under both providers.
-        let Json(all) = super::models_with(&state, &build, &Default::default()).await;
+        let (_, Json(all)) = super::models_with(&state, &Default::default()).await;
         // Sorted: the registry's iteration order is not the contract here,
         // the pair of entries under one id is.
         let mut shared: Vec<&str> = all
@@ -663,11 +503,11 @@ mod tests {
         assert_eq!(shared, ["alpha", "zeta"], "{listed:?}");
 
         // Filtered: one of them, and the id is still there.
-        let Json(narrowed) = super::models_with(
+        let (_, Json(narrowed)) = super::models_with(
             &state,
-            &build,
             &super::ModelsQuery {
                 provider: Some("zeta".to_string()),
+                refresh: false,
             },
         )
         .await;
@@ -681,11 +521,11 @@ mod tests {
 
         // A provider this machine does not have lists nothing, rather than
         // erroring: "no models" is the honest answer.
-        let Json(none) = super::models_with(
+        let (_, Json(none)) = super::models_with(
             &state,
-            &build,
             &super::ModelsQuery {
                 provider: Some("not-a-provider".to_string()),
+                refresh: false,
             },
         )
         .await;
@@ -695,6 +535,7 @@ mod tests {
     fn test_state() -> AppState {
         let (tx, _) = broadcast::channel::<ServerEvent>(64);
         AppState {
+            caches: Default::default(),
             update_check: Default::default(),
             update_jobs: Default::default(),
             config: crate::commands::serve::testutil::fixed_config(Config::default()),
@@ -703,12 +544,14 @@ mod tests {
             mcp: crate::commands::serve::mcp::McpAdmin::default(),
             providers: crate::commands::serve::providers::ProviderAdmin::default(),
             limits: Default::default(),
+            signer: Default::default(),
         }
     }
 
     fn test_state_with_keys() -> AppState {
         let (tx, _) = broadcast::channel::<ServerEvent>(64);
         AppState {
+            caches: Default::default(),
             update_check: Default::default(),
             update_jobs: Default::default(),
             config: crate::commands::serve::testutil::fixed_config(Config {
@@ -737,6 +580,7 @@ mod tests {
             mcp: crate::commands::serve::mcp::McpAdmin::default(),
             providers: crate::commands::serve::providers::ProviderAdmin::default(),
             limits: Default::default(),
+            signer: Default::default(),
         }
     }
 
@@ -881,7 +725,7 @@ mod tests {
         // every one it guesses would be hardcoded and eventually wrong.
         assert_eq!(
             config.limits.max_limit,
-            crate::commands::serve::runs::MAX_LIMIT
+            crate::commands::serve::core::runs::MAX_LIMIT
         );
         assert_eq!(
             config.limits.max_file_bytes,
@@ -925,6 +769,7 @@ mod tests {
     async fn get_config_agent_paths_included() {
         let (tx, _) = broadcast::channel::<ServerEvent>(64);
         let state = AppState {
+            caches: Default::default(),
             update_check: Default::default(),
             update_jobs: Default::default(),
             config: crate::commands::serve::testutil::fixed_config(Config {
@@ -939,6 +784,7 @@ mod tests {
             mcp: crate::commands::serve::mcp::McpAdmin::default(),
             providers: crate::commands::serve::providers::ProviderAdmin::default(),
             limits: Default::default(),
+            signer: Default::default(),
         };
         let app = Router::new()
             .route("/api/config", get(get_config))
@@ -963,6 +809,7 @@ mod tests {
     fn test_state_listing_models() -> AppState {
         let (tx, _) = broadcast::channel::<ServerEvent>(64);
         AppState {
+            caches: Default::default(),
             update_check: Default::default(),
             update_jobs: Default::default(),
             config: crate::commands::serve::testutil::fixed_config(Config {
@@ -981,6 +828,7 @@ mod tests {
             mcp: crate::commands::serve::mcp::McpAdmin::default(),
             providers: crate::commands::serve::providers::ProviderAdmin::default(),
             limits: Default::default(),
+            signer: Default::default(),
         }
     }
 
@@ -1063,13 +911,12 @@ mod tests {
         // than take the endpoint down with it.
         std::fs::write(providers.join("broken.rhai"), "fn initialize(config) { #{").unwrap();
 
-        let models = temp_env::async_with_vars(
-            [("LEVIATH_HOME", Some(home.path()))],
-            list_models_from_config(
-                &Config::default(),
-                &leviath_providers::provider::build_http_client,
-            ),
-        )
+        let models = temp_env::async_with_vars([("LEVIATH_HOME", Some(home.path()))], async {
+            let (listing, _) = crate::commands::serve::model_catalog::ModelCatalog::default()
+                .models(Arc::new(Config::default()), false)
+                .await;
+            listing.value.clone()
+        })
         .await;
 
         let scripted: Vec<_> = models.iter().filter(|m| m.provider == "scripted").collect();
@@ -1081,6 +928,23 @@ mod tests {
             !models.iter().any(|m| m.provider == "broken"),
             "a script that will not compile is skipped, not fatal"
         );
+    }
+
+    /// No usable HTTPS client means nothing to list, not a failure.
+    #[tokio::test]
+    async fn list_model_ids_is_empty_when_no_client_can_be_built() {
+        let config = Config {
+            providers: crate::config::ProviderConfig {
+                anthropic_api_key: Some("test-key".to_string()),
+                ..Config::default().providers
+            },
+            ..Config::default()
+        };
+        let ids = super::list_model_ids(&config, &|_t| {
+            Err(leviath_providers::provider::malformed_url_error())
+        })
+        .await;
+        assert!(ids.is_empty());
     }
 
     /// The dashboard's flat `provider/id` list is the same enumeration.
@@ -1103,15 +967,22 @@ mod tests {
     fn redacted_config_hides_keys() {
         let config = RedactedConfig {
             default_provider: "anthropic".to_string(),
-            default_model: None,
+            override_model: None,
+            fallback_model: None,
             provider_order: Vec::new(),
             has_anthropic_key: true,
             has_openai_key: false,
             has_google_key: false,
             has_openrouter_key: false,
+            has_bedrock_key: false,
+            has_xai_key: false,
+            has_meta_key: false,
+            bedrock_region: None,
             ollama_base_url: None,
             ollama_enabled: false,
             codex_enabled: false,
+            grok_enabled: false,
+            file_uploads: true,
             codex_reasoning_effort: None,
             codex_verbosity: None,
             codex_replay_reasoning: true,
@@ -1136,15 +1007,22 @@ mod tests {
     fn redacted_config_with_ollama_url() {
         let config = RedactedConfig {
             default_provider: "ollama".to_string(),
-            default_model: None,
+            override_model: None,
+            fallback_model: None,
             provider_order: Vec::new(),
             has_anthropic_key: false,
             has_openai_key: false,
             has_google_key: false,
             has_openrouter_key: false,
+            has_bedrock_key: true,
+            has_xai_key: false,
+            has_meta_key: false,
+            bedrock_region: Some("eu-west-1".to_string()),
             ollama_base_url: Some("http://localhost:11434".to_string()),
             ollama_enabled: false,
             codex_enabled: false,
+            grok_enabled: false,
+            file_uploads: true,
             codex_reasoning_effort: None,
             codex_verbosity: None,
             codex_replay_reasoning: true,
@@ -1167,6 +1045,7 @@ mod tests {
     fn state_with_config_path(path: std::path::PathBuf) -> (AppState, AdminPaths) {
         let (tx, _) = broadcast::channel::<ServerEvent>(64);
         let state = AppState {
+            caches: Default::default(),
             update_check: Default::default(),
             update_jobs: Default::default(),
             config: crate::commands::serve::testutil::fixed_config(Config::default()),
@@ -1175,6 +1054,7 @@ mod tests {
             mcp: crate::commands::serve::mcp::McpAdmin::default(),
             providers: crate::commands::serve::providers::ProviderAdmin::default(),
             limits: Default::default(),
+            signer: Default::default(),
         };
         (state, paths_for(path))
     }
@@ -1195,6 +1075,7 @@ mod tests {
     fn state_watching_config_path(path: std::path::PathBuf) -> (AppState, AdminPaths) {
         let (tx, _) = broadcast::channel::<ServerEvent>(64);
         let state = AppState {
+            caches: Default::default(),
             update_check: Default::default(),
             update_jobs: Default::default(),
             config: Arc::new(crate::daemon::config_reload::ConfigReloader::new(
@@ -1206,6 +1087,7 @@ mod tests {
             mcp: crate::commands::serve::mcp::McpAdmin::default(),
             providers: crate::commands::serve::providers::ProviderAdmin::default(),
             limits: Default::default(),
+            signer: Default::default(),
         };
         (state, paths_for(path))
     }
@@ -1505,11 +1387,13 @@ mod tests {
 
         let body = serde_json::json!({
             "default_provider": "openai",
-            "default_model": "gpt-5",
+            "override_model": "gpt-5",
             "anthropic_key": "sk-ant-x",
             "openai_key": "sk-openai-x",
             "google_key": "g-x",
             "openrouter_key": "or-x",
+            "bedrock_key": "ABSK-x",
+            "bedrock_region": " us-west-2 ",
             "ollama_base_url": "http://ollama:11434"
         })
         .to_string();
@@ -1525,6 +1409,8 @@ mod tests {
         assert!(
             rc.has_anthropic_key && rc.has_openai_key && rc.has_google_key && rc.has_openrouter_key
         );
+        assert!(rc.has_bedrock_key);
+        assert_eq!(rc.bedrock_region.as_deref(), Some("us-west-2"));
         assert_eq!(rc.default_provider, "openai");
 
         let saved = Config::load_from_path_public(&path).unwrap();
@@ -1538,9 +1424,11 @@ mod tests {
         );
         assert_eq!(saved.providers.google_api_key.as_deref(), Some("g-x"));
         assert_eq!(saved.openrouter_api_key.as_deref(), Some("or-x"));
-        assert_eq!(saved.default_model.as_deref(), Some("gpt-5"));
+        assert_eq!(saved.providers.bedrock_api_key.as_deref(), Some("ABSK-x"));
+        assert_eq!(saved.providers.bedrock_region.as_deref(), Some("us-west-2"));
+        assert_eq!(saved.override_model.as_deref(), Some("gpt-5"));
         assert_eq!(
-            rc.default_model.as_deref(),
+            rc.override_model.as_deref(),
             Some("gpt-5"),
             "the answer reports the pin it just wrote"
         );
@@ -1550,14 +1438,28 @@ mod tests {
         );
     }
 
-    /// A config with `default_model` pinned to `gpt-5`, saved at `path`.
+    /// `""` is not a region, and a stray form field must not lose the one
+    /// that was set.
+    #[tokio::test]
+    async fn a_blank_bedrock_region_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        Config::default().save_to_path_public(&path).unwrap();
+        let body = serde_json::json!({ "bedrock_region": "  " }).to_string();
+        let resp = put_config_request(state_with_config_path(path.clone()), &body).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+        let saved = Config::load_from_path_public(&path).unwrap();
+        assert!(saved.providers.bedrock_region.is_none());
+    }
+
+    /// A config with `override_model` pinned to `gpt-5`, saved at `path`.
     ///
     /// A named helper rather than a closure at each call site: a closure is a
     /// separate region per site, and four of them are four uncovered regions
     /// the day one test stops running.
     fn pinned_config_at(path: &std::path::Path) {
         let pinned = Config {
-            default_model: Some("gpt-5".to_string()),
+            override_model: Some("gpt-5".to_string()),
             ..Default::default()
         };
         pinned.save_to_path_public(path).unwrap();
@@ -1572,7 +1474,7 @@ mod tests {
     /// as "nothing is set". Collapsing the two is what left the picker
     /// drawing an empty box over a machine with a model pinned.
     #[tokio::test]
-    async fn get_config_reports_the_default_model_when_set_and_null_when_not() {
+    async fn get_config_reports_the_override_model_when_set_and_null_when_not() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         Config::default().save_to_path_public(&path).unwrap();
@@ -1580,11 +1482,11 @@ mod tests {
 
         let unset = get_config_request(state.clone()).await;
         assert!(
-            unset.get("default_model").is_some(),
+            unset.get("override_model").is_some(),
             "the key is always there, so its absence can mean something else"
         );
         assert!(
-            unset["default_model"].is_null(),
+            unset["override_model"].is_null(),
             "nothing pinned reads as null"
         );
 
@@ -1592,13 +1494,13 @@ mod tests {
         bump_mtime(&path);
 
         let set = get_config_request(state).await;
-        assert_eq!(set["default_model"], "gpt-5");
+        assert_eq!(set["override_model"], "gpt-5");
     }
 
     /// The partial-update rule the rest of the body follows: a key this
     /// request does not mention is left exactly as it was.
     #[tokio::test]
-    async fn put_config_without_default_model_leaves_the_pin_alone() {
+    async fn put_config_without_override_model_leaves_the_pin_alone() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         pinned_config_at(&path);
@@ -1609,7 +1511,7 @@ mod tests {
 
         let saved = Config::load_from_path_public(&path).unwrap();
         assert_eq!(
-            saved.default_model.as_deref(),
+            saved.override_model.as_deref(),
             Some("gpt-5"),
             "an absent key changes nothing"
         );
@@ -1620,11 +1522,11 @@ mod tests {
     /// goes back to the model its blueprint names.
     ///
     /// The file is what is checked, not the struct in memory. "Cleared" has
-    /// to survive the save: a `None` that still serialized a `default_model`
+    /// to survive the save: a `None` that still serialized a `override_model`
     /// line would read back as pinned on the next load, and the console would
     /// see its own clear undone one request later.
     #[tokio::test]
-    async fn put_config_with_null_clears_the_default_model_from_the_file() {
+    async fn put_config_with_null_clears_the_override_model_from_the_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         pinned_config_at(&path);
@@ -1633,7 +1535,7 @@ mod tests {
             "the pin starts out on disk"
         );
 
-        let body = serde_json::json!({ "default_model": null }).to_string();
+        let body = serde_json::json!({ "override_model": null }).to_string();
         let resp = put_config_request(state_with_config_path(path.clone()), &body).await;
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -1641,17 +1543,118 @@ mod tests {
             .unwrap();
         let answer: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(
-            answer["default_model"].is_null(),
+            answer["override_model"].is_null(),
             "the answer already reports it gone"
         );
 
         let on_disk = std::fs::read_to_string(&path).unwrap();
         assert!(
-            !on_disk.contains("default_model"),
+            !on_disk.contains("override_model"),
             "the key is gone from the file, not merely None in memory"
         );
         let reread = Config::load_from_path_public(&path).unwrap();
-        assert_eq!(reread.default_model, None, "and it stays gone on re-read");
+        assert_eq!(reread.override_model, None, "and it stays gone on re-read");
+    }
+
+    /// A provider key has the same three states: a string sets it, `null`
+    /// clears it from the file (taking the provider out of the install), and
+    /// an empty string is refused with a message that names the key.
+    #[tokio::test]
+    async fn put_config_sets_clears_and_refuses_a_provider_key_like_the_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        let body = serde_json::json!({ "anthropic_key": "sk-ant-set" }).to_string();
+        let resp = put_config_request(state_with_config_path(path.clone()), &body).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            Config::load_from_path_public(&path)
+                .unwrap()
+                .providers
+                .anthropic_api_key
+                .as_deref(),
+            Some("sk-ant-set")
+        );
+
+        let body = serde_json::json!({ "anthropic_key": null }).to_string();
+        let resp = put_config_request(state_with_config_path(path.clone()), &body).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let answer: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(answer["has_anthropic_key"], false, "{answer}");
+        assert_eq!(
+            Config::load_from_path_public(&path)
+                .unwrap()
+                .providers
+                .anthropic_api_key,
+            None,
+            "the key is gone on re-read"
+        );
+
+        let body = serde_json::json!({ "openrouter_key": "  " }).to_string();
+        let resp = put_config_request(state_with_config_path(path.clone()), &body).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&bytes).to_string();
+        assert!(text.contains("openrouter_key"), "{text}");
+        assert!(text.contains("null to clear"), "{text}");
+    }
+
+    /// `fallback_model` has the same three states as `override_model`: a
+    /// string sets it, `null` clears it from the file, and an empty string is
+    /// refused with a message that names the key.
+    #[tokio::test]
+    async fn put_config_sets_clears_and_refuses_the_fallback_model_like_the_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        Config::default().save_to_path_public(&path).unwrap();
+        let state = state_with_config_path(path.clone());
+
+        let resp = put_config_request(state.clone(), r#"{"fallback_model": "haiku"}"#).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let answer: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(answer["fallback_model"], "haiku");
+        assert!(
+            answer["override_model"].is_null(),
+            "the other setting is untouched"
+        );
+        assert_eq!(
+            Config::load_from_path_public(&path)
+                .unwrap()
+                .fallback_model
+                .as_deref(),
+            Some("haiku")
+        );
+
+        let resp = put_config_request(state.clone(), r#"{"fallback_model": ""}"#).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&bytes).contains("fallback_model must not be empty"),
+            "the refusal names the key"
+        );
+        assert_eq!(
+            Config::load_from_path_public(&path)
+                .unwrap()
+                .fallback_model
+                .as_deref(),
+            Some("haiku"),
+            "nothing was written on refusal"
+        );
+
+        let resp = put_config_request(state, r#"{"fallback_model": null}"#).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(!on_disk.contains("fallback_model"), "cleared from the file");
     }
 
     /// An empty string is not a clear and not a model id, so it is a 400.
@@ -1662,17 +1665,17 @@ mod tests {
     /// `openai-compatible` gateway with an empty `base_url` is refused, and
     /// like that one it is refused before anything is written.
     #[tokio::test]
-    async fn put_config_refuses_an_empty_default_model() {
+    async fn put_config_refuses_an_empty_override_model() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         pinned_config_at(&path);
 
-        for body in [r#"{"default_model": ""}"#, r#"{"default_model": "   "}"#] {
+        for body in [r#"{"override_model": ""}"#, r#"{"override_model": "   "}"#] {
             let resp = put_config_request(state_with_config_path(path.clone()), body).await;
             assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
             let saved = Config::load_from_path_public(&path).unwrap();
             assert_eq!(
-                saved.default_model.as_deref(),
+                saved.override_model.as_deref(),
                 Some("gpt-5"),
                 "a refused write leaves the file as it was"
             );
@@ -2002,10 +2005,14 @@ mod tests {
         assert_eq!(validate_key_format("anthropic", "sk-ant-1"), (true, None));
         assert!(!validate_key_format("anthropic", "nope").0);
         assert_eq!(validate_key_format("openai", "sk-1"), (true, None));
+        assert_eq!(validate_key_format("xai", "xai-1"), (true, None));
+        assert!(!validate_key_format("xai", "sk-1").0);
         assert!(!validate_key_format("openai", "nope").0);
         assert_eq!(validate_key_format("google", "g"), (true, None));
         assert!(!validate_key_format("google", "  ").0);
         assert_eq!(validate_key_format("openrouter", "or"), (true, None));
+        assert_eq!(validate_key_format("bedrock", "ABSK"), (true, None));
+        assert!(!validate_key_format("bedrock", " ").0);
         // A name this build does not know is a custom gateway, not a mistake.
         // Its key has no house format, so the only judgement available is
         // whether one was given at all.
@@ -2195,6 +2202,17 @@ mod tests {
         // passes while exercising none of what it is named for.
         let (tx, _) = broadcast::channel::<ServerEvent>(64);
         let state = AppState {
+            caches: crate::commands::serve::caches::ServeCaches {
+                model_catalog: crate::commands::serve::model_catalog::ModelCatalog::with_builder(
+                    Arc::new(|config| {
+                        crate::commands::run::session::build_provider_registry_from_config_with(
+                            config,
+                            &|_t| Err(leviath_providers::provider::malformed_url_error()),
+                        )
+                    }),
+                ),
+                ..Default::default()
+            },
             update_check: Default::default(),
             update_jobs: Default::default(),
             config: crate::commands::serve::testutil::fixed_config(Config {
@@ -2209,13 +2227,9 @@ mod tests {
             mcp: crate::commands::serve::mcp::McpAdmin::default(),
             providers: crate::commands::serve::providers::ProviderAdmin::default(),
             limits: Default::default(),
+            signer: Default::default(),
         };
-        let Json(models) = super::models_with(
-            &state,
-            &|_t| Err(leviath_providers::provider::malformed_url_error()),
-            &Default::default(),
-        )
-        .await;
+        let (_, Json(models)) = super::models_with(&state, &Default::default()).await;
         assert!(models.is_empty());
     }
 }

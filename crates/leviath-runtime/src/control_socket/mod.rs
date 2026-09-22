@@ -29,11 +29,11 @@ use crate::host::{ControlOp, DaemonHealth, RunListEntry, SpawnArgs, WorldEvent};
 use leviath_core::interaction::{InteractionRequest, InteractionResponse};
 
 mod client;
-pub use client::{ControlClient, RESTART_GRACE, WorldEventStream};
+pub use client::{CodeMismatch, ControlClient, LinkStatus, RESTART_GRACE, WorldEventStream};
 #[cfg(test)]
 use client::{
-    DEFAULT_CONTROL_TIMEOUT_SECS, LinkStatus, SPAWN_CONTROL_TIMEOUT_SECS, is_transient,
-    request_timeout, timeout_for,
+    DEFAULT_CONTROL_TIMEOUT_SECS, SPAWN_CONTROL_TIMEOUT_SECS, is_transient, request_timeout,
+    timeout_for,
 };
 
 #[cfg(unix)]
@@ -73,12 +73,37 @@ pub(super) const INVALID_REQUEST: &str = "invalid request";
 /// dropped unprocessed, which makes a retry safe even for a spawn.
 pub(super) const SHUTTING_DOWN: &str = "daemon is shutting down";
 
-/// The most one connection may send before the stream is cut.
+/// The most one request may send before the stream is cut.
 ///
-/// A spawn request carries a task string and region seeds, so the cap has to be
-/// generous; 8 MiB is far past anything a real caller sends and still bounds
-/// what an unauthenticated peer can make the daemon buffer.
-const MAX_REQUEST_BYTES: u64 = 8 * 1024 * 1024;
+/// A spawn request carries its task, its region seeds and every attached part
+/// as base64 on the one line, so the cap has to hold a file the size of
+/// `[mime] max_part_bytes` (32 MiB, which base64 grows to 43 MiB) with room
+/// for the rest of the request. It sat at 8 MiB from before parts existed,
+/// when a request was text, and a `lev run --attach` of a 7 MB mesh - an
+/// ordinary Meshy output - was cut mid-line and refused as a JSON parse
+/// error. 64 MiB is the same figure the daemon allows for the largest JSON
+/// body it buffers from a provider, and still bounds what an unauthenticated
+/// peer can make it hold. A request at or over it is refused by name (see
+/// [`over_cap_refusal`]).
+const MAX_REQUEST_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The reply to a request the cap cut off.
+///
+/// Its own wording rather than the parse error the truncated line produces
+/// (`EOF while parsing a string at line 1 column 8388608`), which named the
+/// symptom and not the limit. Deliberately not prefixed with
+/// [`INVALID_REQUEST`]: the client treats that prefix as "the two ends run
+/// different code", which this is not.
+fn over_cap_refusal(max_request_bytes: u64) -> ControlResponse {
+    ControlResponse::Error {
+        message: format!(
+            "request is over the control socket's {} limit and was cut off; attached files \
+             travel inside the request, so send fewer or smaller ones ([mime] max_part_bytes \
+             bounds each)",
+            leviath_core::mime::human_size(max_request_bytes)
+        ),
+    }
+}
 
 /// A shared secret that proves a control-channel caller is this same user.
 ///
@@ -243,6 +268,9 @@ pub enum ControlRequest {
         /// Optional target region.
         #[serde(default)]
         target_region: Option<String>,
+        /// Files attached to the message, landing in the same entry.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        parts: Vec<leviath_core::mime::InboundPart>,
     },
     /// List open interactions awaiting an answer.
     ListInteractions,
@@ -317,8 +345,12 @@ pub enum ControlResponse {
         finished: Vec<RunListEntry>,
         /// How the daemon itself is doing. Defaulted when absent so a listing
         /// from an older daemon still parses.
+        ///
+        /// Boxed: the reading is several hundred bytes of lane occupancy, and
+        /// every other reply on this socket is a handful, so carrying it inline
+        /// would make every frame the size of the largest one.
         #[serde(default)]
-        health: DaemonHealth,
+        health: Box<DaemonHealth>,
     },
     /// A listing of open interactions.
     Interactions {
@@ -502,19 +534,21 @@ async fn dispatch(req: ControlRequest, op_tx: &UnboundedSender<ControlOp>) -> Co
             ControlResponse::List {
                 runs: listing.runs,
                 finished: listing.finished,
-                health: listing.health,
+                health: Box::new(listing.health),
             }
         }
         ControlRequest::Message {
             agent_id,
             content,
             target_region,
+            parts,
         } => {
             let (reply, rx) = oneshot::channel();
             let _ = op_tx.send(ControlOp::Message {
                 agent_id,
                 content,
                 target_region,
+                parts,
                 reply,
             });
             ControlResponse::Ok {
@@ -656,9 +690,9 @@ fn authenticated_reply(hello: bool, identity: &DaemonIdentity) -> ControlRespons
 
 /// [`handle_connection_as`] with the per-request cap injected.
 ///
-/// The cap is a parameter purely so a test can cross it without pushing 8 MiB
-/// through a duplex - and crossing it is the only way to tell a per-request
-/// budget from a per-connection one.
+/// The cap is a parameter purely so a test can cross it without pushing tens
+/// of MiB through a duplex - and crossing it is the only way to tell a
+/// per-request budget from a per-connection one, or to see the refusal.
 async fn handle_connection_capped<S>(
     stream: S,
     op_tx: UnboundedSender<ControlOp>,
@@ -690,7 +724,10 @@ where
     // directly. Production always passes one.
     let mut authenticated = token.is_none();
     while let Some(line) = lines.next_line().await? {
-        // Refill this request's budget for the next one.
+        // A spent budget means `take` ended this line at the cap, not the
+        // peer: what arrived is the head of something larger. Noted before
+        // the refill, which is what makes the budget per request.
+        let over_cap = lines.get_ref().get_ref().limit() == 0;
         lines.get_mut().get_mut().set_limit(max_request_bytes);
         if line.trim().is_empty() {
             continue;
@@ -723,6 +760,34 @@ where
             )
             .await;
             return Ok(());
+        }
+
+        // Refused by name, then the tail of the cut line is drained up to its
+        // newline and the loop goes on. Read on as-is, that tail would parse as
+        // a run of garbage requests, each answered `invalid request`; closing
+        // instead is no better, because a socket closed with unread inbound
+        // data resets the peer rather than ending its stream (Linux), which
+        // can discard the very reply that says what went wrong. Drained in
+        // small pieces so the tail is never buffered whole.
+        if over_cap {
+            write_line(&mut write_half, &over_cap_refusal(max_request_bytes)).await;
+            let mut piece = Vec::new();
+            loop {
+                piece.clear();
+                lines.get_mut().get_mut().set_limit(64 * 1024);
+                // A read error here is treated as the end of the tail: the
+                // loop below reads next, and surfaces the error itself.
+                let n = lines
+                    .get_mut()
+                    .read_until(b'\n', &mut piece)
+                    .await
+                    .unwrap_or(0);
+                if n == 0 || piece.last() == Some(&b'\n') {
+                    break;
+                }
+            }
+            lines.get_mut().get_mut().set_limit(max_request_bytes);
+            continue;
         }
 
         let response = match serde_json::from_str::<ControlRequest>(&line) {
@@ -912,6 +977,7 @@ mod tests {
             tool_calls: 7,
             last_progress_at: Some(1_000),
             unattended: false,
+            yolo_profile: None,
             empty_output: false,
             read_paths: None,
             has_final_output: false,
@@ -939,6 +1005,9 @@ mod tests {
                     // arm exists to keep the double answering every op rather
                     // than to serve a socket path.
                     ControlOp::Result { reply, .. } => {
+                        let _ = reply.send(None);
+                    }
+                    ControlOp::Blob { reply, .. } => {
                         let _ = reply.send(None);
                     }
                     ControlOp::Pause { reply, .. }
@@ -1078,6 +1147,130 @@ mod tests {
             .expect("it ends cleanly");
     }
 
+    /// A request past the cap is refused by name, its tail is swallowed, and
+    /// the connection goes on serving.
+    ///
+    /// `take` cuts the stream at the cap, so before this the daemon parsed the
+    /// truncated line and answered `invalid request: EOF while parsing a string
+    /// at line 1 column 8388608` - which is what a `lev run --attach` of a 7 MB
+    /// mesh got, with nothing in it to say there was a limit or what it was -
+    /// and then read the rest of the line as more requests. Closing instead
+    /// would reset a Linux peer with data still unread, and could drop the
+    /// refusal with it.
+    #[tokio::test]
+    async fn a_request_over_the_cap_is_refused_by_name() {
+        let (op_tx, op_rx) = mpsc::unbounded_channel();
+        spawn_fake_host(op_rx);
+        let (mut listener, id, _dir) = test_listener();
+        let server = tokio::spawn(async move {
+            let stream = listener
+                .accept()
+                .await
+                .expect("accept succeeds")
+                .expect("our own connection is admitted");
+            handle_connection_capped(
+                stream,
+                op_tx,
+                no_events(),
+                None,
+                DaemonIdentity::this_process("test"),
+                40,
+            )
+            .await
+        });
+
+        let stream = connect(&id).await.unwrap();
+        let (read_half, mut write_half) = tokio::io::split(stream);
+        let mut lines = BufReader::new(read_half).lines();
+
+        // A spawn-sized line: well past the cap before its newline, and long
+        // enough that the drain needs more than one piece to reach it.
+        let line = format!("{{\"op\":\"list\",\"pad\":\"{}\"}}\n", "x".repeat(200_000));
+        write_half.write_all(line.as_bytes()).await.unwrap();
+        let resp = lines
+            .next_line()
+            .await
+            .expect("the connection stays readable")
+            .expect("the refusal arrives");
+        assert!(resp.contains(r#""result":"error""#), "{resp}");
+        assert!(
+            resp.contains("over the control socket's 40 B limit"),
+            "names the cap: {resp}"
+        );
+        assert!(!resp.contains(INVALID_REQUEST), "not a parse error: {resp}");
+        // The rest of the oversized line was swallowed, not parsed as further
+        // requests, and the connection still serves: an ordinary request on it
+        // is answered with the success shape.
+        let req = ControlRequest::List;
+        let mut line = serde_json::to_string(&req).unwrap();
+        line.push('\n');
+        write_half.write_all(line.as_bytes()).await.unwrap();
+        let resp = lines
+            .next_line()
+            .await
+            .expect("the connection stays readable")
+            .expect("the connection stays open after a refusal");
+        assert!(
+            !resp.contains(r#""result":"error""#),
+            "the next request is answered, not refused: {resp}"
+        );
+
+        drop(write_half);
+        drop(lines);
+        server
+            .await
+            .expect("the handler task joins")
+            .expect("it ends cleanly");
+    }
+
+    /// A peer that hangs up partway through an oversized request: the refusal
+    /// still goes out, the drain sees the stream end, and the handler returns
+    /// cleanly rather than waiting for a newline that will never come.
+    #[tokio::test]
+    async fn a_peer_that_hangs_up_mid_oversized_request_ends_the_drain() {
+        let (op_tx, op_rx) = mpsc::unbounded_channel();
+        spawn_fake_host(op_rx);
+        let (mut listener, id, _dir) = test_listener();
+        let server = tokio::spawn(async move {
+            let stream = listener
+                .accept()
+                .await
+                .expect("accept succeeds")
+                .expect("our own connection is admitted");
+            handle_connection_capped(
+                stream,
+                op_tx,
+                no_events(),
+                None,
+                DaemonIdentity::this_process("test"),
+                40,
+            )
+            .await
+        });
+
+        let stream = connect(&id).await.unwrap();
+        let (read_half, mut write_half) = tokio::io::split(stream);
+        let mut lines = BufReader::new(read_half).lines();
+
+        // Past the cap, and no newline ever follows.
+        let head = format!("{{\"op\":\"list\",\"pad\":\"{}", "x".repeat(200));
+        write_half.write_all(head.as_bytes()).await.unwrap();
+        let resp = lines
+            .next_line()
+            .await
+            .expect("the connection stays readable")
+            .expect("the refusal arrives");
+        assert!(resp.contains("over the control socket's"), "{resp}");
+
+        // Hang up with the request unfinished; the drain ends on EOF.
+        drop(write_half);
+        drop(lines);
+        server
+            .await
+            .expect("the handler task joins")
+            .expect("it ends cleanly");
+    }
+
     /// Every op this double receives has to be answered. A caller waits on a
     /// oneshot, so an unhandled op is not a wrong answer, it is a hang - and
     /// `ControlOp::Result` is the one op no `ControlRequest` builds, so nothing
@@ -1095,6 +1288,23 @@ mod tests {
             })
             .expect("the fake host is listening");
 
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), answer)
+                .await
+                .expect("an unanswered op hangs its caller")
+                .expect("the reply channel stays open"),
+            None
+        );
+
+        // The other embed-only op, the bytes behind an artifact.
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        op_tx
+            .send(ControlOp::Blob {
+                run_id: "run-a".to_string(),
+                sha256: "ab".repeat(32),
+                reply,
+            })
+            .expect("the fake host is listening");
         assert_eq!(
             tokio::time::timeout(std::time::Duration::from_secs(5), answer)
                 .await
@@ -1134,6 +1344,10 @@ mod tests {
                 agent_id: "a".to_string(),
                 content: "hi".to_string(),
                 target_region: None,
+                parts: vec![leviath_core::mime::InboundPart::from_bytes(
+                    "a.png",
+                    vec![1, 2, 3],
+                )],
             },
             ControlRequest::AnswerInteraction {
                 response: InteractionResponse::text("q1", "yes"),
@@ -1160,11 +1374,15 @@ mod tests {
                 callback_url: None,
                 callback_secret: None,
                 yolo: false,
+                yolo_profile: None,
                 no_seed_commands: false,
                 allow: Vec::new(),
                 max_depth: None,
                 parent_run_id: None,
+                worker_stage: None,
                 output: None,
+                parts: Vec::new(),
+                capture_model_input: true,
             }),
         })
         .await;
@@ -1214,7 +1432,7 @@ mod tests {
             ControlResponse::List {
                 runs: vec![listing_entry()],
                 finished: vec![ended],
-                health: DaemonHealth::default(),
+                health: Box::default(),
             }
         );
     }
@@ -1230,7 +1448,7 @@ mod tests {
             ControlResponse::List {
                 runs: vec![],
                 finished: vec![],
-                health: DaemonHealth::default(),
+                health: Box::default(),
             }
         );
     }
@@ -1845,7 +2063,7 @@ mod tests {
             std::mem::discriminant(&ControlResponse::List {
                 runs: vec![],
                 finished: vec![],
-                health: DaemonHealth::default(),
+                health: Box::default(),
             })
         );
 
@@ -1921,7 +2139,7 @@ mod tests {
             std::mem::discriminant(&ControlResponse::List {
                 runs: vec![],
                 finished: vec![],
-                health: DaemonHealth::default(),
+                health: Box::default(),
             })
         );
         assert_eq!(
@@ -2135,7 +2353,7 @@ mod tests {
             ControlResponse::List {
                 runs: vec![],
                 finished: vec![],
-                health: DaemonHealth::default(),
+                health: Box::default(),
             }
         );
         assert_eq!(
@@ -2362,6 +2580,7 @@ mod tests {
                 agent_id: run(),
                 content: run(),
                 target_region: None,
+                parts: Vec::new(),
             },
             ControlRequest::AnswerInteraction {
                 response: InteractionResponse {
@@ -2371,6 +2590,7 @@ mod tests {
                     approved: None,
                     scope: None,
                     feedback: None,
+                    parts: Vec::new(),
                 },
             },
             ControlRequest::CancelInteraction { request_id: run() },

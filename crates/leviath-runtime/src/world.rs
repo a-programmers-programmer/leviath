@@ -44,12 +44,14 @@ use crate::pipeline::{
     abort_terminal_work, check_workspace_health, collect_compaction, collect_inference,
     collect_tools, collect_transition_choice, deliver_messages, detect_stuck_stage,
     dispatch_compaction, dispatch_edge_compact, dispatch_inference, dispatch_persistence,
-    dispatch_tools, dispatch_transition_choice, enforce_max_iterations, fail_stalled_dispatch,
-    fail_wedged_runs, gate_requires_children, handle_empty_response, poll_dynamic_tool_refresh,
+    dispatch_tools, dispatch_transition_choice, enforce_max_iterations,
+    fail_runs_with_unwritable_journals, fail_stalled_dispatch, fail_wedged_runs,
+    gate_requires_children, handle_empty_response, journal_interactions, poll_dynamic_tool_refresh,
     process_response, reflect_interaction_status, refresh_advertised_tools,
-    require_context_regions, require_fan_out, require_final_output, resolve_transition,
-    run_after_inference_hooks, run_before_inference_hooks, run_stage_enter_hooks,
-    run_stage_exit_hooks, run_terminal_hooks, run_tool_call_hooks, sync_tool_stages,
+    require_context_regions, require_fan_out, require_final_output, rescan_before_dispatch,
+    resolve_transition, run_after_inference_hooks, run_before_inference_hooks,
+    run_stage_enter_hooks, run_stage_exit_hooks, run_terminal_hooks, run_tool_call_hooks,
+    sync_tool_stages,
 };
 use crate::providers::ProviderRegistry;
 use crate::tool_bridge::ToolLane;
@@ -153,6 +155,8 @@ pub(crate) struct LaneSnapshot {
     pub tools_workers: usize,
     /// The lane full with batches still queued behind it.
     pub tools_saturated: bool,
+    /// What the persistence lane has written, and what it has lost.
+    pub journal: crate::persist_stats::JournalHealth,
 }
 
 impl LaneSnapshot {
@@ -358,12 +362,24 @@ impl PipelineWorld {
         // Retained so `flush_and_stop` can drain it on shutdown. Left to its own
         // devices otherwise: it exits when the world (and thus its PersistenceStage
         // sender) is dropped.
-        let persist_task = runtime.spawn(persistence_worker(runs_dir, persist_rx));
+        let blob_store = crate::blob_store::store_for(runs_dir.as_deref());
+        let persist_stats = Arc::new(crate::persist_stats::PersistLaneStats::new());
+        let persist_task = runtime.spawn(persistence_worker(
+            runs_dir,
+            persist_rx,
+            persist_stats.clone(),
+        ));
         let ip_runtime = runtime.clone();
         let gp_runtime = runtime.clone();
 
         let mut world = World::new();
         world.insert_resource(OwnWorldId(id));
+        // Stored mime parts and the registry that types them. The registry
+        // starts as the compiled defaults; a host layers the operator's
+        // `[mime_types]` on by replacing the resource, as it does telemetry.
+        world.insert_resource(crate::blob_store::BlobStoreHandle(blob_store));
+        world.insert_resource(crate::blob_store::MimeRegistryHandle::default());
+        world.insert_resource(crate::blob_store::MimeLimits::default());
         world.insert_resource(Providers(providers));
         world.insert_resource(InferenceStage {
             // The wake goes into the pools, not just the bridges: freeing a slot
@@ -403,6 +419,7 @@ impl PipelineWorld {
         world.insert_resource(ToolStage::new(tool_job_tx, tool_stats));
         world.insert_resource(ToolResults(tool_res_rx));
         world.insert_resource(PersistenceStage(persist_tx));
+        world.insert_resource(crate::pipeline::PersistLaneHealth(persist_stats));
         world.insert_resource(MessageIntake(msg_rx));
         // Telemetry defaults to the no-op sink; a host that wants export
         // replaces the resource after construction (as `build_host` does).
@@ -437,8 +454,14 @@ impl PipelineWorld {
                 // `stuck` escape edge. Runs after the hard cap so that always wins.
                 detect_stuck_stage,
                 // Stop a run whose working directory vanished, rather than let
-                // every tool fail with ENOENT for the rest of the run.
-                check_workspace_health,
+                // every tool fail with ENOENT for the rest of the run. Beside it,
+                // the same kind of guard about the other half of the
+                // filesystem: a run whose journal the lane could not write is
+                // failed here, before anything else on this tick moves it, so it
+                // stops rather than taking one more turn its history cannot
+                // record. Paired for bevy's 20-system `.chain()` limit, like the
+                // groups below.
+                (check_workspace_health, fail_runs_with_unwritable_journals).chain(),
                 // Tag dynamic_tools agents that have pending tool changes, then
                 // apply the re-advertisement before the next request is assembled
                 // so a newly-discovered tool is visible.
@@ -475,7 +498,12 @@ impl PipelineWorld {
                 crate::gate_prompt::collect_gate_prompt,
                 // `on_tool_call` before the policy and taint layers see the
                 // calls, so a hook can narrow what runs and never widen it.
-                (run_tool_call_hooks, dispatch_tools).chain(),
+                // The rescan is ahead of both: dispatch refuses a call the
+                // advertised set does not offer, so an agent that asked to look
+                // again before each batch has to be looked at here, or a tool
+                // that arrived since its turn was built is refused for another
+                // one.
+                (rescan_before_dispatch, run_tool_call_hooks, dispatch_tools).chain(),
                 collect_tools,
                 // Apply any resolved stage-boundary interaction-point answers
                 // before the stage decides its transition.
@@ -585,7 +613,12 @@ impl PipelineWorld {
                 // Mirror open interaction-hub requests into agent status
                 // (Active ↔ Waiting) so the dashboard surfaces blocked prompts;
                 // must run before persistence so the status change is written.
-                reflect_interaction_status,
+                // Paired with the record of what a person answered, which runs
+                // every tick: that record is the only trace a run stopped for
+                // somebody, and a run whose last act was answering a prompt
+                // changes nothing else for the snapshot to carry. One tuple
+                // member because this group is at bevy's limit.
+                (reflect_interaction_status, journal_interactions).chain(),
                 // Fail a run nothing can drive at all. After every dispatch and
                 // collect system, so a marker set anywhere on this tick counts;
                 // after the interaction reflection, so an agent that just parked
@@ -891,6 +924,11 @@ impl PipelineWorld {
             tools_parked: tools.parked(),
             tools_workers: tools.workers(),
             tools_saturated: tools.is_saturated(),
+            journal: self
+                .world
+                .resource::<crate::pipeline::PersistLaneHealth>()
+                .0
+                .report(),
         }
     }
 
@@ -1248,6 +1286,7 @@ mod tests {
 
     fn text(content: &str) -> InferenceResponse {
         InferenceResponse {
+            parts: Vec::new(),
             content: content.to_string(),
             tool_calls: vec![],
             tokens_used: TokenUsage {
@@ -1284,12 +1323,7 @@ mod tests {
             _progress: crate::pipeline::ToolProgress,
         ) -> BoxedToolExec {
             Box::new(move || {
-                Box::pin(async move {
-                    calls
-                        .into_iter()
-                        .map(|c| (c.id, "ok".to_string()))
-                        .collect()
-                })
+                Box::pin(async move { calls.into_iter().map(|c| (c.id, "ok".into())).collect() })
             })
         }
     }
@@ -1313,6 +1347,7 @@ mod tests {
     fn agent_state() -> AgentState {
         AgentState {
             agent_id: "a".to_string(),
+            current_visit: String::new(),
             current_stage: "s".to_string(),
             iteration: 0,
             status: AgentStatus::Active,
@@ -1355,11 +1390,13 @@ mod tests {
                 batch_tool_hint: false,
                 shell_hint: false,
                 request_timeout_secs: None,
+                as_text: Vec::new(),
             },
             routing: None,
             accepts_messages: true,
             context_layout: None,
             context_hide: Vec::new(),
+            context_reset: Vec::new(),
             system_prompt: None,
         }
     }
@@ -1883,6 +1920,7 @@ mod tests {
                 agent_id: "a".to_string(),
                 content: "hello".to_string(),
                 target_region: Some("conversation".to_string()),
+                parts: Vec::new(),
             })
             .unwrap();
         world.tick(); // deliver_messages runs
@@ -1941,6 +1979,7 @@ mod tests {
             agent_id: "a".to_string(),
             content: "x".to_string(),
             target_region: None,
+            parts: Vec::new(),
         });
         assert!(err.is_err());
     }
@@ -2020,6 +2059,7 @@ mod tests {
                 outcome: crate::inference_bridge::InferenceOutcome {
                     entity: e.entity(),
                     latency: std::time::Duration::ZERO,
+                    attempt_id: String::new(),
                     result: Ok(text("t1")),
                     pricing: None,
                 },
@@ -2074,6 +2114,7 @@ mod tests {
                 outcome: crate::inference_bridge::InferenceOutcome {
                     entity: e.entity(),
                     latency: std::time::Duration::ZERO,
+                    attempt_id: String::new(),
                     result: Ok(text("t1")),
                     pricing: None,
                 },
@@ -2273,6 +2314,7 @@ mod tests {
                     tools: vec![],
                     fallbacks: Vec::new(),
                     output: None,
+                    notes: Vec::new(),
                 }],
                 hints(true),
             )
@@ -2324,7 +2366,9 @@ mod tests {
                 callback_secret: None,
                 title: None,
                 title_error: None,
+                blueprint_digest: None,
                 unattended: false,
+                yolo_profile: None,
                 read_paths: None,
                 output_request: None,
                 model_override: None,
@@ -2416,7 +2460,9 @@ mod tests {
                 callback_secret: None,
                 title: None,
                 title_error: None,
+                blueprint_digest: None,
                 unattended: false,
+                yolo_profile: None,
                 read_paths: None,
                 output_request: None,
                 model_override: None,
@@ -2524,7 +2570,9 @@ mod tests {
                 callback_secret: None,
                 title: None,
                 title_error: None,
+                blueprint_digest: None,
                 unattended: false,
+                yolo_profile: None,
                 read_paths: None,
                 output_request: None,
                 model_override: None,
@@ -2648,7 +2696,9 @@ mod tests {
                 callback_secret: None,
                 title: None,
                 title_error: None,
+                blueprint_digest: None,
                 unattended: false,
+                yolo_profile: None,
                 read_paths: None,
                 output_request: None,
                 model_override: None,
@@ -2716,7 +2766,9 @@ mod tests {
                 callback_secret: None,
                 title: None,
                 title_error: None,
+                blueprint_digest: None,
                 unattended: false,
+                yolo_profile: None,
                 read_paths: None,
                 output_request: None,
                 model_override: None,
@@ -2776,7 +2828,7 @@ mod tests {
                 current_tokens: 4,
                 max_tokens: 10_000,
                 entries: vec![RegionEntrySnapshot {
-                    content: "restored turn".to_string(),
+                    content: "restored turn".into(),
                     tokens: 4,
                     kind: EntryKind::UserMessage,
                     metadata: None,
@@ -2845,6 +2897,7 @@ mod tests {
                 tools: vec![],
                 fallbacks: Vec::new(),
                 output: None,
+                notes: Vec::new(),
             }],
             hints(true),
         );

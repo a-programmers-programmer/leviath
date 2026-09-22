@@ -158,6 +158,7 @@ impl Dashboard {
                 self.toggle_context_row();
             }
             ClickTarget::NewRunStart => self.submit_new_run(),
+            ClickTarget::NewRunInput(index) => self.click_new_run_input(index),
             ClickTarget::ResponseSend => self.submit_input(),
         }
         true
@@ -193,7 +194,7 @@ mod tests {
             pending_request: None,
             last_answered_request_id: None,
             context_snapshot: None,
-            stages: vec![],
+            stages: Default::default(),
             workdir: "/tmp".to_string(),
             task: "test".to_string(),
             title: Some(id.to_string()),
@@ -379,7 +380,8 @@ mod tests {
         let mut agent = make_test_agent("run-1");
         agent.stages = (0..3)
             .map(|i| crate::runstate::StageRecord::new(format!("stage{i}"), i))
-            .collect();
+            .collect::<Vec<_>>()
+            .into();
         dash.agents.push(agent);
         dash.update_display_indices();
         dash.detail_view = true;
@@ -423,7 +425,7 @@ mod tests {
                 current_tokens: 10,
                 max_tokens: 50,
                 entries: vec![leviath_core::run_meta::RegionEntrySnapshot {
-                    content: "hello".to_string(),
+                    content: "hello".to_string().into(),
                     tokens: 5,
                     kind: Default::default(),
                     metadata: None,
@@ -464,7 +466,8 @@ mod tests {
                 let mut agent = make_test_agent("run-final-chip");
                 agent.stages = (0..3)
                     .map(|i| crate::runstate::StageRecord::new(format!("stage{i}"), i))
-                    .collect();
+                    .collect::<Vec<_>>()
+                    .into();
                 crate::commands::dashboard::test_support::seed_run_with_final_output(
                     "run-final-chip",
                     "stage2",

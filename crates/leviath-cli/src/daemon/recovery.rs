@@ -76,6 +76,22 @@ pub(crate) fn reload_persisted_agents(
             Some((meta, parked_on_fanout))
         })
         .collect();
+    // A run that finished while no daemon was there to see it (or whose
+    // daemon died before its uploads were deleted) deletes them now.
+    let providers = world
+        .world()
+        .resource::<leviath_runtime::pipeline::Providers>();
+    for (meta, _) in &candidates {
+        if matches!(
+            meta.status,
+            RunStatus::Complete | RunStatus::Error | RunStatus::Cancelled
+        ) {
+            leviath_runtime::provider_files::forget_in_background(
+                runs_dir.join(&meta.run_id),
+                &providers.0,
+            );
+        }
+    }
     // Order phase: drop terminal runs and rank the rest actionable-first (in-flight
     // inference / pending tool results before blocked-on-input), so interrupted work
     // that can make progress resumes ahead of runs that can't.
@@ -295,7 +311,9 @@ fn reload_one(
 ) -> Result<Entity, String> {
     let args = SpawnArgs {
         run_id: meta.run_id.clone(),
-        blueprint_path: meta.agent_path.clone(),
+        // The run's own snapshot when it has one, so a restart resumes the
+        // manifest the run started with rather than an edited installed file.
+        blueprint_path: crate::daemon::setup::blueprint_source(run_dir, &meta.agent_path),
         task: meta.task.clone(),
         // Region seed content isn't replayed on reload: the window is restored
         // from the persisted context snapshot after build_agent, so re-seeding
@@ -322,16 +340,26 @@ fn reload_one(
         // `--allow` and `--max-depth` stay unpersisted: losing them narrows what
         // the run may do, which is the harmless direction.
         yolo: meta.yolo,
+        // And the profile with it: a scoped run that came back as bare
+        // `--yolo` would have escalated across a restart.
+        yolo_profile: meta.yolo_profile.clone(),
         // Belt and braces: seeds aren't replayed on reload at all (see above),
         // so a resumed run can never re-execute a command seed.
         no_seed_commands: true,
         allow: Vec::new(),
         max_depth: None,
         parent_run_id: meta.parent_run_id.clone(),
+        worker_stage: None,
         // Restored for the same reason `yolo` is: a reload that dropped the
         // caller's requested shape would silently revert the run to the
         // blueprint's partway through, and the caller would never see why.
         output: meta.output_request.clone(),
+        parts: Vec::new(),
+        // Unlike `yolo`, not restored: losing it writes less into the journal
+        // rather than more, which is the direction `allow` and `max_depth` are
+        // dropped for. A machine-wide `capture_model_input` still applies here,
+        // because `build_agent` reads the config it is handed.
+        capture_model_input: false,
     };
     let entity = build_agent_for_reload(world.world_mut(), deps, &args)?;
 
@@ -647,6 +675,7 @@ mod tests {
         let dir = runs_dir.join(run_id);
         std::fs::create_dir_all(&dir).unwrap();
         let meta = RunMeta {
+            stage_models: Vec::new(),
             // A span still open when the daemon died at `updated_at`, so a
             // reload has something to settle rather than carry forward.
             active: Some(leviath_core::run_meta::ActiveClock {
@@ -680,6 +709,7 @@ mod tests {
             error: None,
             title: Some("Resume Me".to_string()),
             title_error: None,
+            blueprint_digest: None,
             metadata: std::collections::HashMap::new(),
             callback_url: Some("http://cb".to_string()),
             callback_secret: None,
@@ -700,6 +730,7 @@ mod tests {
                 ..Default::default()
             },
             yolo: false,
+            yolo_profile: None,
             read_paths: None,
             // Non-default on purpose, like `flags` above: proves a reload puts
             // the run's answer back rather than dropping it (and then erasing
@@ -1052,7 +1083,7 @@ mod tests {
                 current_tokens: 4,
                 max_tokens: 100_000,
                 entries: vec![leviath_core::run_meta::RegionEntrySnapshot {
-                    content: "earlier turn".to_string(),
+                    content: "earlier turn".to_string().into(),
                     tokens: 4,
                     kind: leviath_core::region::EntryKind::UserMessage,
                     metadata: None,
@@ -1307,10 +1338,11 @@ mod tests {
         result: Option<&str>,
     ) -> leviath_core::run_archive::ToolCallRecord {
         leviath_core::run_archive::ToolCallRecord {
+            execution_id: String::new(),
             id: id.to_string(),
             name: name.to_string(),
             arguments: "{}".to_string(),
-            result: result.map(str::to_string),
+            result: result.map(Into::into),
             thought_signature: None,
         }
     }
@@ -1360,12 +1392,16 @@ mod tests {
                     at: 3,
                     stage_index: 0,
                     iteration: 9,
+                    visit_id: String::new(),
+                    requested_by: String::new(),
                     response: "writing then running".to_string(),
                 },
                 RunRecord::ToolCallDone {
+                    execution_id: String::new(),
+                    outcome: None,
                     iteration: 9,
                     call_id: "c_done".to_string(),
-                    result: "Wrote 42 bytes to x.txt".to_string(),
+                    result: "Wrote 42 bytes to x.txt".to_string().into(),
                     at: 4,
                 },
             ],
@@ -1415,6 +1451,86 @@ mod tests {
         );
     }
 
+    /// A batch the dispatcher answered itself is journaled, and a reload replays
+    /// none of it.
+    ///
+    /// This is the hazard the whole rule exists for. A replay lands the recorded
+    /// results in the conversation and does **not** redo a context tool's write,
+    /// so replaying this batch would restore a turn saying `context_write: ok`
+    /// over a region that never received the content - a window that lies, which
+    /// is worse than a turn the run simply issues again. `fold` refuses to make
+    /// such a batch pending, and this asserts the consequence at the layer that
+    /// would have been wrong: what the resumed run's conversation holds.
+    #[tokio::test]
+    async fn reload_replays_nothing_of_a_batch_the_dispatcher_answered_itself() {
+        use leviath_core::run_archive::RunRecord;
+        let agent = agent_dir();
+        let manifest = agent.path().join("agent.leviath");
+        let mpath = manifest.to_str().unwrap();
+        let runs = tempfile::tempdir().unwrap();
+
+        write_run(runs.path(), "run-inline", mpath, RunStatus::Running, None);
+        // The window the crash left: the write never reached it, which is
+        // exactly the state a replay would paper over.
+        let ctx = ContextSnapshot {
+            stage_name: "implement".to_string(),
+            total_tokens: 0,
+            max_tokens: 100_000,
+            regions: vec![],
+        };
+        write_run_archive(runs.path(), "run-inline", mpath, 0, 9, 99, &ctx);
+        append_archive_records(
+            runs.path(),
+            "run-inline",
+            &[RunRecord::ToolBatch {
+                calls: vec![batch_call("c1", "context_write", Some("ok"))],
+                at: 3,
+                stage_index: 0,
+                iteration: 9,
+                visit_id: String::new(),
+                requested_by: String::new(),
+                response: "writing the plan".to_string(),
+            }],
+        );
+
+        let (mut world, cli) = test_world();
+        let hub = InteractionHub::new();
+        let mcp = Arc::new(Mutex::new(ToolExecutor::new()));
+        let restored = reload_persisted_agents(
+            &mut world,
+            crate::daemon::spawn::SpawnDeps {
+                tool_service: cli.as_ref(),
+                config: &Config::default(),
+                shared_mcp: mcp,
+                mcp_tool_defs: &[],
+                mcp_tool_owners: &Default::default(),
+                hub: &hub,
+                now_secs: 999,
+                subagent_tx: sub_tx().clone(),
+            },
+            runs.path(),
+        );
+
+        assert_eq!(restored.len(), 1);
+        // Nothing at all: a replay would put the turn here and the answer the
+        // dispatcher gave itself beside it, over a region that never received
+        // the content. Asserted as a count rather than as two searches for what
+        // is absent, which is the same claim and leaves no arm behind.
+        let entries = conversation_of(&world, restored[0].1.entity());
+        assert!(
+            entries.is_empty(),
+            "nothing of the batch is replayed: {entries:?}"
+        );
+        // The run carries on by re-issuing the turn, which is what it did before
+        // such a batch was journaled at all.
+        assert!(
+            world
+                .world()
+                .get::<leviath_runtime::pipeline::ReadyToInfer>(restored[0].1.entity())
+                .is_some()
+        );
+    }
+
     /// The batch's assistant turn already reached the persisted window before
     /// the crash (apply_tool_results ran; the Progress record landed): fold
     /// clears the pending batch, so reload appends nothing a second time.
@@ -1440,7 +1556,7 @@ mod tests {
                 max_tokens: 100_000,
                 entries: vec![
                     leviath_core::run_meta::RegionEntrySnapshot {
-                        content: "done".to_string(),
+                        content: "done".to_string().into(),
                         tokens: 1,
                         kind: EntryKind::AssistantTurn {
                             tool_calls: vec![leviath_core::region::SerializedToolCall {
@@ -1456,7 +1572,7 @@ mod tests {
                         reasoning: None,
                     },
                     leviath_core::run_meta::RegionEntrySnapshot {
-                        content: "Wrote it".to_string(),
+                        content: "Wrote it".to_string().into(),
                         tokens: 1,
                         kind: EntryKind::ToolResult {
                             tool_call_id: "c1".to_string(),
@@ -1481,6 +1597,8 @@ mod tests {
                 at: 3,
                 stage_index: 0,
                 iteration: 9,
+                visit_id: String::new(),
+                requested_by: String::new(),
                 response: "done".to_string(),
             }],
         );
@@ -1787,6 +1905,7 @@ mod tests {
             active: vec![("item-1".to_string(), "worker-fo".to_string())],
             summaries: vec![],
             failures: vec![],
+            parts: vec![],
             paused: false,
         };
         std::fs::write(
@@ -2161,7 +2280,7 @@ mod tests {
         });
         // One closed stay, priced, so the money survives the reload rather than
         // restarting from zero the way the tokens would.
-        analyze.begin_visit(10);
+        analyze.begin_visit(10, leviath_core::execution::mint_visit_id());
         analyze.record_call(
             &leviath_core::run_meta::StageCall {
                 prompt_tokens: 1_234,
@@ -2185,7 +2304,7 @@ mod tests {
             since: Some(200),
         });
         // And so is the visit it was on, with a clock of its own left running.
-        implement.begin_visit(20);
+        implement.begin_visit(20, leviath_core::execution::mint_visit_id());
         implement.visits[0].active = Some(leviath_core::run_meta::ActiveClock {
             banked_secs: 3,
             since: Some(200),
@@ -2371,5 +2490,50 @@ mod tests {
         assert!(!is_finished(&RunStatus::Cancelled));
         assert!(!is_finished(&RunStatus::Running));
         assert!(!is_finished(&RunStatus::WaitingInput));
+    }
+
+    /// A profiled run comes back under its profile, not under bare `--yolo`:
+    /// the name is restored and the profile's held checkpoints stay held.
+    #[tokio::test]
+    async fn reload_keeps_a_profiled_run_under_its_profile() {
+        crate::config::with_isolated_config_path_async("reload_yolo_profile", |cfg| async move {
+            std::fs::write(
+                cfg.join("yolo.toml"),
+                "[careful]\ndefault = \"ask\"\ncheckpoints = \"ask\"\n",
+            )
+            .unwrap();
+            let agent = agent_dir();
+            let manifest = agent.path().join("agent.leviath");
+            let runs = tempfile::tempdir().unwrap();
+            write_run(
+                runs.path(),
+                "run-prof",
+                manifest.to_str().unwrap(),
+                RunStatus::Running,
+                None,
+            );
+            let meta_path = runs.path().join("run-prof").join("meta.json");
+            let mut meta: RunMeta =
+                serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+            meta.yolo = true;
+            meta.yolo_profile = Some("careful".to_string());
+            std::fs::write(&meta_path, serde_json::to_string(&meta).unwrap()).unwrap();
+
+            let (world, entity) = reload_single(runs.path(), "run-prof").await;
+            let md = world
+                .world()
+                .get::<RunMetadata>(entity)
+                .expect("reloaded run has metadata");
+            assert!(md.unattended);
+            assert_eq!(md.yolo_profile.as_deref(), Some("careful"));
+            assert!(
+                world
+                    .world()
+                    .get::<leviath_runtime::components::InteractionAutoApprove>(entity)
+                    .is_none(),
+                "the profile's held checkpoints hold across a reload"
+            );
+        })
+        .await;
     }
 }

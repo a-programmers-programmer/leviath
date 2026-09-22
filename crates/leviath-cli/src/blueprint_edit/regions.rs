@@ -10,7 +10,7 @@ use super::doc::ManifestDoc;
 use super::stages::set_or_remove_int;
 use super::tables::{
     child_mut, ensure_child, ensure_parent, get_str, remove_and_report_empty, rename_key, set_bool,
-    set_or_remove_str, set_str,
+    set_or_remove_str, set_str, set_strings,
 };
 use super::{EditError, require_name};
 
@@ -58,6 +58,8 @@ pub(crate) enum RegionField {
     Overflow,
     /// `description`.
     Description,
+    /// `accepts`, typed as a list: commas or spaces between patterns.
+    Accepts,
 }
 
 /// A value for a [`RegionField`].
@@ -202,6 +204,14 @@ impl ManifestDoc {
             (RegionField::Description, RegionValue::Text(t)) => {
                 set_or_remove_str(table, "description", &t);
             }
+            (RegionField::Accepts, RegionValue::Text(t)) => {
+                let list = super::mime::split_list(&t);
+                if list.is_empty() {
+                    table.remove("accepts");
+                } else {
+                    set_strings(table, "accepts", &list);
+                }
+            }
             (RegionField::Seed, RegionValue::Text(t)) => {
                 let is_table = table
                     .get("seed")
@@ -327,6 +337,69 @@ impl ManifestDoc {
             overrides.as_table_like_mut().expect("ensure_child checked"),
             tool,
             region,
+        );
+        Ok(())
+    }
+
+    /// Rewrite `[stages.<name>.output_routing]` from `entries` (mime pattern to
+    /// region). An empty list removes the table. The whole table is rebuilt
+    /// rather than diffed, since the editor edits it as one field.
+    pub(crate) fn set_output_routing(
+        &mut self,
+        stage: &str,
+        entries: &[(String, String)],
+    ) -> Result<(), EditError> {
+        let stage_item = self
+            .stage_item_mut(stage)
+            .ok_or_else(|| EditError::NoSuchStage(stage.to_string()))?;
+        if entries.is_empty() {
+            stage_item
+                .as_table_like_mut()
+                .expect("a stage is a table")
+                .remove("output_routing");
+            return Ok(());
+        }
+        let routing = ensure_child(stage_item, "output_routing")?;
+        let table = routing.as_table_like_mut().expect("ensure_child checked");
+        let stale: Vec<String> = table.iter().map(|(k, _)| k.to_string()).collect();
+        for key in stale {
+            table.remove(&key);
+        }
+        for (pattern, region) in entries {
+            set_str(table, pattern, region);
+        }
+        Ok(())
+    }
+
+    /// Set `[stages.<name>.context] reset`; an empty list deletes the key, and
+    /// the `context` table with it when nothing else is left there.
+    pub(crate) fn set_context_reset(
+        &mut self,
+        stage: &str,
+        regions: &[String],
+    ) -> Result<(), EditError> {
+        let stage_item = self
+            .stage_item_mut(stage)
+            .ok_or_else(|| EditError::NoSuchStage(stage.to_string()))?;
+        if regions.is_empty() {
+            if let Some(context) = child_mut(stage_item, "context")
+                && remove_and_report_empty(
+                    context.as_table_like_mut().expect("child_mut checked"),
+                    "reset",
+                )
+            {
+                stage_item
+                    .as_table_like_mut()
+                    .expect("a stage is a table")
+                    .remove("context");
+            }
+            return Ok(());
+        }
+        let context = ensure_parent(stage_item, "context")?;
+        set_strings(
+            context.as_table_like_mut().expect("ensure_parent checked"),
+            "reset",
+            regions,
         );
         Ok(())
     }

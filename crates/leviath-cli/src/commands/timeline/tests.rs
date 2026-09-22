@@ -48,9 +48,11 @@ fn status(status: RunStatus, at: i64) -> RunRecord {
 
 fn tool_done(at: i64) -> RunRecord {
     RunRecord::ToolCallDone {
+        execution_id: String::new(),
+        outcome: None,
         iteration: 1,
         call_id: "c1".to_string(),
-        result: "ok".to_string(),
+        result: "ok".to_string().into(),
         at,
     }
 }
@@ -90,6 +92,8 @@ fn journal() -> Vec<RunRecord> {
             at: 1_010,
             stage_index: 0,
             iteration: 1,
+            visit_id: String::new(),
+            requested_by: String::new(),
             response: String::new(),
         },
         tool_done(1_012),

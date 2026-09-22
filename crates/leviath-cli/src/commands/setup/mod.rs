@@ -80,13 +80,56 @@ pub struct SetupArgs {
     #[arg(long)]
     pub openrouter_key: Option<String>,
 
+    /// AWS Bedrock API key (a Bedrock API key, sent as a bearer token; not
+    /// an AWS access key)
+    #[arg(long)]
+    pub bedrock_key: Option<String>,
+
+    /// AWS region for Bedrock (default: us-east-1; also read from AWS_REGION)
+    #[arg(long)]
+    pub bedrock_region: Option<String>,
+
+    /// xAI API key, for Grok models billed to an xAI API balance
+    #[arg(long)]
+    pub xai_key: Option<String>,
+
+    /// Meta Model API key, for Muse models (also read from META_AI_API_KEY)
+    #[arg(long)]
+    pub meta_key: Option<String>,
+
+    /// Upload media parts to a provider's own file storage once and send the
+    /// id after, on the providers that have one (default: true). Off keeps
+    /// every part inline. Zero data retention turns uploads off regardless
+    #[arg(long)]
+    pub file_uploads: Option<bool>,
+
+    /// Ask every provider for zero data retention (ZDR): nothing of a prompt
+    /// or reply is kept once the reply is returned. Bedrock's account mode
+    /// is set to none, OpenAI is sent store=false, OpenRouter routes only to
+    /// zero-retention endpoints, and a stage whose model cannot give it is
+    /// refused. `lev providers retention` says what each provider keeps
+    #[arg(long)]
+    pub zero_retention: Option<bool>,
+
+    /// Providers your organisation holds a zero data retention agreement
+    /// with, comma separated (anthropic, openai, google). No API can read a
+    /// contract, so it is declared here. Replaces the configured list
+    #[arg(long, value_delimiter = ',')]
+    pub zero_retention_agreements: Option<Vec<String>>,
+
     /// Ollama base URL (default: http://localhost:11434)
     #[arg(long)]
     pub ollama_url: Option<String>,
 
-    /// Default model override (e.g. claude-sonnet-4-6)
+    /// One model every stage starts on, ahead of what its blueprint names
+    /// (e.g. claude-sonnet-4-6). Unset lets each blueprint decide.
     #[arg(long)]
-    pub default_model: Option<String>,
+    pub override_model: Option<String>,
+
+    /// The model a stage falls back to when none of the models it names is
+    /// configured here.
+    #[arg(long)]
+    pub fallback_model: Option<String>,
 
     /// Enable the Claude Code CLI transport (runs on your Claude subscription
     /// instead of an API key). Off unless set: the CLI adds its own context to
@@ -105,6 +148,12 @@ pub struct SetupArgs {
     /// watching a browser, so on this path sign in with `lev auth login codex`.
     #[arg(long)]
     pub codex: Option<bool>,
+
+    /// Enable Grok billed to a SuperGrok or X Premium+ plan instead of an xAI
+    /// API balance. Like `--codex`, this only flips the switch: sign in with
+    /// `lev auth login grok`
+    #[arg(long)]
+    pub grok: Option<bool>,
 
     /// Install the bundled agent blueprints without asking
     #[arg(long)]
@@ -134,6 +183,23 @@ pub struct SetupEnv {
     pub ui_state_path: Option<PathBuf>,
 }
 
+impl SetupEnv {
+    /// The shared capability cache, where every surface records what a
+    /// provider said when it was last asked. The wizard opens on those
+    /// records and adds its own.
+    ///
+    /// Beside the UI state file, because both live in the data directory:
+    /// the binary's UI state path is `~/.leviath/ui-state.json` and the
+    /// cache is `~/.leviath/model_capabilities.json`. Derived rather than a
+    /// field of its own so a test that keeps the UI state out of the real
+    /// home (`None`, or a tempdir) keeps the cache out of it too.
+    pub fn capability_cache_path(&self) -> Option<PathBuf> {
+        self.ui_state_path
+            .as_deref()
+            .map(|p| p.with_file_name("model_capabilities.json"))
+    }
+}
+
 // The real `SetupEnv` - the user's actual home, a real `std::env` lookup, and
 // a real browser - is built in the binary, where those leaves belong. Nothing
 // in the library reaches the real environment, so no test can either.
@@ -145,6 +211,15 @@ pub struct SetupEnv {
 pub fn run_non_interactive(args: &SetupArgs, env: &SetupEnv) -> anyhow::Result<()> {
     let mut config = Config::load_from_path_public(&env.config_path).unwrap_or_default();
     apply_flags(&mut config, args);
+    // The wizard refuses to finish without a provider; this path is scripted
+    // and writes what it was given, so it says so instead. A config with no
+    // provider is a valid file that cannot run an agent.
+    if configured_providers(&config).is_empty() {
+        eprintln!(
+            "warning: no provider is configured; runs will fail until one is (give a key \
+             flag, or run `lev setup` interactively)"
+        );
+    }
 
     let agents = if args.install_agents {
         crate::bundled::plan_agent_actions(&env.agents_dir)
@@ -205,17 +280,48 @@ fn apply_flags(config: &mut Config, args: &SetupArgs) {
     if let Some(ref k) = args.openrouter_key {
         config.openrouter_api_key = Some(k.clone());
     }
+    if let Some(ref k) = args.bedrock_key {
+        config.providers.bedrock_api_key = Some(k.clone());
+    }
+    if let Some(ref r) = args.bedrock_region {
+        config.providers.bedrock_region = Some(r.clone());
+    }
+    if let Some(ref k) = args.xai_key {
+        config.providers.xai_api_key = Some(k.clone());
+    }
+    if let Some(ref k) = args.meta_key {
+        config.providers.meta_api_key = Some(k.clone());
+    }
+    if let Some(on) = args.file_uploads {
+        config.providers.file_uploads = on;
+    }
+    if let Some(on) = args.zero_retention {
+        config.providers.zero_retention = on;
+    }
+    if let Some(ref names) = args.zero_retention_agreements {
+        config.providers.zero_retention_agreements = names
+            .iter()
+            .map(|n| n.trim().to_string())
+            .filter(|n| !n.is_empty())
+            .collect();
+    }
     if let Some(ref u) = args.ollama_url {
         config.ollama_base_url = Some(u.clone());
     }
-    if let Some(ref m) = args.default_model {
-        config.default_model = Some(m.clone());
+    if let Some(ref m) = args.override_model {
+        config.override_model = Some(m.clone());
+    }
+    if let Some(ref m) = args.fallback_model {
+        config.fallback_model = Some(m.clone());
     }
     if let Some(enabled) = args.claude_code {
         config.providers.claude_code_enabled = enabled;
     }
     if let Some(enabled) = args.codex {
         config.providers.codex_enabled = enabled;
+    }
+    if let Some(enabled) = args.grok {
+        config.providers.grok_enabled = enabled;
     }
     if let Some(ref e) = args.claude_code_effort {
         config.providers.claude_code_effort = Some(e.clone());
@@ -253,7 +359,7 @@ pub(crate) fn configured_providers(config: &Config) -> Vec<String> {
         // `--codex true` make an unauthenticated provider the host default,
         // and the very next run would fail on a credential nobody was asked
         // for.
-        .filter(|id| *id != leviath_providers::codex::PROVIDER_NAME || codex_grant_exists())
+        .filter(|id| kind(id) != Some(catalog::Credential::Signin) || grant_exists(id))
         .collect();
     // A provider that needed no credential sorts last, and the first name in
     // this list is what `--default-provider` picks when nothing else says.
@@ -280,11 +386,11 @@ pub(crate) fn configured_providers(config: &Config) -> Vec<String> {
         .collect()
 }
 
-/// Whether a Codex sign-in has actually been taken.
-fn codex_grant_exists() -> bool {
-    leviath_providers::codex::ProviderAuthStore::default_path()
-        .and_then(|path| leviath_providers::codex::ProviderAuthStore::load(&path).ok())
-        .is_some_and(|store| store.get(leviath_providers::codex::PROVIDER_NAME).is_some())
+/// Whether a sign-in to `provider` has actually been taken.
+fn grant_exists(provider: &str) -> bool {
+    leviath_providers::oauth::ProviderAuthStore::default_path()
+        .and_then(|path| leviath_providers::oauth::ProviderAuthStore::load(&path).ok())
+        .is_some_and(|store| store.get(provider).is_some())
 }
 
 /// Point `default_provider` at a provider this config can actually reach.
@@ -322,7 +428,7 @@ pub fn build_wizard(env: &SetupEnv) -> Wizard {
         .as_deref()
         .map(|p| crate::ui_state::load(p).setup)
         .unwrap_or_default();
-    Wizard::new(
+    let mut wizard = Wizard::new(
         base,
         &env.env_lookup,
         candidates,
@@ -331,6 +437,16 @@ pub fn build_wizard(env: &SetupEnv) -> Wizard {
         env.opener.clone(),
         remembered,
     )
+    .with_check_store(env.capability_cache_path());
+    // What the daemon, `lev models`, or an earlier wizard already found out.
+    if let Some(cache) = env
+        .capability_cache_path()
+        .as_deref()
+        .and_then(leviath_providers::CapabilityCache::load)
+    {
+        wizard.seed_checks(&cache);
+    }
+    wizard
 }
 
 /// Answer verification requests until the wizard drops its sender.
@@ -499,11 +615,20 @@ mod tests {
             openai_key: None,
             google_key: None,
             openrouter_key: None,
+            bedrock_key: None,
+            bedrock_region: None,
+            zero_retention: None,
+            zero_retention_agreements: None,
             ollama_url: None,
-            default_model: None,
+            override_model: None,
+            fallback_model: None,
             claude_code: None,
             claude_code_effort: None,
             codex: None,
+            grok: None,
+            xai_key: None,
+            meta_key: None,
+            file_uploads: None,
             install_agents: false,
         }
     }
@@ -526,6 +651,64 @@ mod tests {
             // a plan writes its declines here and never to the real file.
             ui_state_path: Some(dir.join("ui-state.json")),
         }
+    }
+
+    #[test]
+    fn the_xai_meta_grok_and_upload_flags_write_their_keys() {
+        let mut config = Config::default();
+        let flags = SetupArgs {
+            xai_key: Some("xai-k".into()),
+            meta_key: Some("m-k".into()),
+            file_uploads: Some(false),
+            grok: Some(true),
+            ..args()
+        };
+        apply_flags(&mut config, &flags);
+        assert_eq!(config.providers.xai_api_key.as_deref(), Some("xai-k"));
+        assert_eq!(config.providers.meta_api_key.as_deref(), Some("m-k"));
+        assert!(!config.providers.file_uploads);
+        assert!(config.providers.grok_enabled);
+    }
+
+    /// The two retention flags write the switch and replace the agreement
+    /// list, trimmed of blanks; unset, both leave the config alone.
+    #[test]
+    fn the_retention_flags_write_the_switch_and_the_agreements() {
+        let mut config = Config::default();
+        config.providers.zero_retention_agreements = vec!["groq".to_string()];
+        apply_flags(&mut config, &args());
+        assert!(!config.providers.zero_retention);
+        assert_eq!(
+            config.providers.zero_retention_agreements,
+            vec!["groq".to_string()]
+        );
+
+        apply_flags(
+            &mut config,
+            &SetupArgs {
+                zero_retention: Some(true),
+                zero_retention_agreements: Some(vec![
+                    " anthropic".to_string(),
+                    String::new(),
+                    "openai ".to_string(),
+                ]),
+                ..args()
+            },
+        );
+        assert!(config.providers.zero_retention);
+        assert_eq!(
+            config.providers.zero_retention_agreements,
+            vec!["anthropic".to_string(), "openai".to_string()]
+        );
+    }
+
+    /// A wizard with one provider configured: the loop will not finish
+    /// without one, so every test that saves starts from here.
+    fn configured_wizard(env: &SetupEnv) -> Wizard {
+        let mut wizard = build_wizard(env);
+        wizard.providers[0].selected = true;
+        wizard.providers[0].value = "sk-test".to_string();
+        wizard
     }
 
     // ─── default_provider retargeting ───────────────────────────────────────
@@ -670,12 +853,12 @@ mod tests {
         temp_env::with_var("LEVIATH_HOME", Some(dir.path()), || {
             let mut config = Config::default();
             config.providers.codex_enabled = true;
-            assert!(!codex_grant_exists());
+            assert!(!grant_exists("codex"));
             assert!(!configured_providers(&config).contains(&"codex".to_string()));
 
             let path =
-                leviath_providers::codex::ProviderAuthStore::default_path().expect("a home is set");
-            let mut store = leviath_providers::codex::ProviderAuthStore::default();
+                leviath_providers::oauth::ProviderAuthStore::default_path().expect("a home is set");
+            let mut store = leviath_providers::oauth::ProviderAuthStore::default();
             store.set(
                 "codex",
                 leviath_providers::ProviderGrant {
@@ -686,7 +869,7 @@ mod tests {
             );
             store.save(&path).unwrap();
 
-            assert!(codex_grant_exists());
+            assert!(grant_exists("codex"));
             assert!(configured_providers(&config).contains(&"codex".to_string()));
 
             // And a grant with the provider turned off still does not count.
@@ -716,16 +899,18 @@ mod tests {
             // Codex counts as configured only once it is signed in, so the
             // grant has to exist before the question is asked.
             let grants =
-                leviath_providers::codex::ProviderAuthStore::default_path().expect("a home is set");
-            let mut store = leviath_providers::codex::ProviderAuthStore::default();
-            store.set(
-                "codex",
-                leviath_providers::ProviderGrant {
-                    access_token: "at".to_string(),
-                    refresh_token: "rt".to_string(),
-                    ..Default::default()
-                },
-            );
+                leviath_providers::oauth::ProviderAuthStore::default_path().expect("a home is set");
+            let mut store = leviath_providers::oauth::ProviderAuthStore::default();
+            for signed_in in ["codex", "grok"] {
+                store.set(
+                    signed_in,
+                    leviath_providers::ProviderGrant {
+                        access_token: "at".to_string(),
+                        refresh_token: "rt".to_string(),
+                        ..Default::default()
+                    },
+                );
+            }
             store.save(&grants).unwrap();
 
             for provider in crate::commands::setup::catalog::providers() {
@@ -793,8 +978,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         temp_env::with_var("LEVIATH_HOME", Some(dir.path()), || {
             let grants =
-                leviath_providers::codex::ProviderAuthStore::default_path().expect("a home is set");
-            let mut store = leviath_providers::codex::ProviderAuthStore::default();
+                leviath_providers::oauth::ProviderAuthStore::default_path().expect("a home is set");
+            let mut store = leviath_providers::oauth::ProviderAuthStore::default();
             store.set(
                 "codex",
                 leviath_providers::ProviderGrant {
@@ -877,8 +1062,11 @@ mod tests {
             openai_key: Some("sk-oai".to_string()),
             google_key: Some("goog".to_string()),
             openrouter_key: Some("sk-or".to_string()),
+            bedrock_key: Some("ABSK-x".to_string()),
+            bedrock_region: Some("eu-west-1".to_string()),
             ollama_url: Some("http://box:11434".to_string()),
-            default_model: Some("m".to_string()),
+            override_model: Some("m".to_string()),
+            fallback_model: Some("f".to_string()),
             claude_code: Some(true),
             claude_code_effort: Some("xhigh".to_string()),
             ..args()
@@ -894,8 +1082,14 @@ mod tests {
         assert_eq!(written.providers.openai_api_key.as_deref(), Some("sk-oai"));
         assert_eq!(written.providers.google_api_key.as_deref(), Some("goog"));
         assert_eq!(written.openrouter_api_key.as_deref(), Some("sk-or"));
+        assert_eq!(written.providers.bedrock_api_key.as_deref(), Some("ABSK-x"));
+        assert_eq!(
+            written.providers.bedrock_region.as_deref(),
+            Some("eu-west-1")
+        );
         assert_eq!(written.ollama_base_url.as_deref(), Some("http://box:11434"));
-        assert_eq!(written.default_model.as_deref(), Some("m"));
+        assert_eq!(written.override_model.as_deref(), Some("m"));
+        assert_eq!(written.fallback_model.as_deref(), Some("f"));
         assert!(written.providers.claude_code_enabled);
         assert_eq!(
             written.providers.claude_code_effort.as_deref(),
@@ -903,12 +1097,27 @@ mod tests {
         );
     }
 
+    /// The environment is scoped for the first call, because "is any provider
+    /// configured" reads two things `SetupEnv` does not carry: the provider keys
+    /// in the environment, which the config overlay picks up, and the sign-in
+    /// grant store under the data root. Unscoped, whether the no-provider
+    /// warning fires depends on what the developer has exported.
     #[test]
     fn the_non_interactive_path_installs_agents_only_when_asked() {
         let dir = tempfile::tempdir().unwrap();
         let env = env_in(dir.path());
-
-        run_non_interactive(&args(), &env).unwrap();
+        // One combined list: `temp_env` holds a process-wide lock across the
+        // closure, so a second scope inside this one would deadlock.
+        let mut vars = crate::config::config_isolation_vars(dir.path());
+        vars.push((
+            "LEVIATH_HOME",
+            Some(dir.path().to_path_buf().into_os_string()),
+        ));
+        temp_env::with_vars(vars, || {
+            // No keys anywhere, so the scripted path says so rather than writing
+            // a config that cannot run an agent and saying nothing.
+            run_non_interactive(&args(), &env).unwrap();
+        });
         assert!(!env.agents_dir.exists(), "nothing was asked for");
 
         run_non_interactive(
@@ -1008,6 +1217,72 @@ mod tests {
         assert_eq!(wizard.mcp[0].candidate.config.name, "fs");
     }
 
+    /// The wizard opens on what another surface already learned: a check the
+    /// daemon or `lev models` recorded for the key this config holds shows,
+    /// with its models and when, and the wizard writes its own checks back to
+    /// the same file.
+    #[test]
+    fn the_wizard_opens_on_checks_recorded_elsewhere() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = env_in(dir.path());
+        run_non_interactive(
+            &SetupArgs {
+                anthropic_key: Some("sk-ant-stored".to_string()),
+                ..args()
+            },
+            &env,
+        )
+        .unwrap();
+        let cache_path = env.capability_cache_path().expect("a store");
+        let mut cache = leviath_providers::CapabilityCache::new(1_000);
+        cache.set_model_ids("anthropic", &["claude-opus-5".to_string()]);
+        cache.record_check(
+            "anthropic",
+            leviath_providers::ProviderCheck {
+                checked_at: 1_000,
+                credential: Some(
+                    crate::provider_checks::CheckKey::load_or_create(&cache_path)
+                        .expect("a key beside the cache")
+                        .fingerprint("sk-ant-stored"),
+                ),
+                outcome: leviath_providers::CheckOutcome::Reachable { models: 1 },
+            },
+        );
+        cache.save(&cache_path).unwrap();
+
+        let wizard = build_wizard(&env);
+        let row = wizard
+            .providers
+            .iter()
+            .find(|r| r.provider.id == "anthropic")
+            .expect("configured");
+        assert_eq!(
+            row.outcome,
+            verify::Outcome::Reachable {
+                models: vec!["claude-opus-5".to_string()]
+            }
+        );
+        assert_eq!(row.checked_at, Some(1_000));
+        assert_eq!(wizard.check_store.as_deref(), Some(cache_path.as_path()));
+    }
+
+    /// The binary's UI state path puts the cache exactly where the daemon
+    /// and `lev models` write it, and no UI state path means no cache.
+    #[test]
+    fn the_cache_sits_where_every_other_surface_writes_it() {
+        temp_env::with_var("LEVIATH_HOME", Some("/tmp/leviath-cache-path"), || {
+            let dir = tempfile::tempdir().unwrap();
+            let mut env = env_in(dir.path());
+            env.ui_state_path = crate::ui_state::default_path();
+            assert_eq!(
+                env.capability_cache_path(),
+                leviath_core::paths::capability_cache_path()
+            );
+            env.ui_state_path = None;
+            assert_eq!(env.capability_cache_path(), None);
+        });
+    }
+
     #[test]
     fn a_missing_config_file_starts_from_defaults() {
         let dir = tempfile::tempdir().unwrap();
@@ -1099,7 +1374,7 @@ mod tests {
     #[tokio::test]
     async fn saving_returns_the_plan_the_wizard_describes() {
         let dir = tempfile::tempdir().unwrap();
-        let mut wizard = build_wizard(&env_in(dir.path()));
+        let mut wizard = configured_wizard(&env_in(dir.path()));
         let mut terminal = test_terminal();
         // A tick with no input, then save - covering the poll-timeout path.
         let mut events = TestEventSource::new_with_nones(vec![
@@ -1154,7 +1429,7 @@ mod tests {
     #[tokio::test]
     async fn a_click_is_routed_with_the_window_it_was_made_in() {
         let dir = tempfile::tempdir().unwrap();
-        let mut wizard = build_wizard(&env_in(dir.path()));
+        let mut wizard = configured_wizard(&env_in(dir.path()));
         wizard.enter(state::Step::Providers);
         let mut terminal = test_terminal();
         let size = terminal.size().expect("the test backend has a size");
@@ -1162,9 +1437,11 @@ mod tests {
         // The row the click has to land on is asked for, not assumed, so the
         // test does not encode a layout.
         let row = (0..area.height)
-            .find(|y| render::row_at(area, &wizard, 4, *y) == Some(1))
-            .expect("the second provider is on screen");
+            .find(|y| render::row_at(area, &wizard, 4, *y) == Some(0))
+            .expect("the configured provider is on screen");
 
+        // The click opens the provider's setup modal; Esc cancels it; Ctrl-S
+        // then finishes with the provider still configured.
         let mut events = TestEventSource::new(vec![
             crossterm::event::Event::Mouse(crossterm::event::MouseEvent {
                 kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
@@ -1172,6 +1449,7 @@ mod tests {
                 row,
                 modifiers: KeyModifiers::empty(),
             }),
+            key(KeyCode::Esc),
             key_with(KeyCode::Char('s'), KeyModifiers::CONTROL),
         ]);
 
@@ -1185,10 +1463,13 @@ mod tests {
         .unwrap()
         .expect("ctrl-s finished it");
 
-        assert!(
-            wizard.providers[1].selected,
-            "the click selected what it landed on"
+        assert!(wizard.modal.is_none(), "Esc closed what the click opened");
+        assert_eq!(
+            wizard.message.as_deref(),
+            Some("Cancelled; nothing changed."),
+            "the click opened the modal, which Esc then cancelled"
         );
+        assert!(wizard.providers[0].selected);
         assert!(!plan.agents.is_empty());
     }
 
@@ -1196,7 +1477,7 @@ mod tests {
     #[tokio::test]
     async fn clicking_apply_and_finish_ends_the_wizard() {
         let dir = tempfile::tempdir().unwrap();
-        let mut wizard = build_wizard(&env_in(dir.path()));
+        let mut wizard = configured_wizard(&env_in(dir.path()));
         wizard.enter(state::Step::Review);
         let mut terminal = test_terminal();
         let size = terminal.size().expect("the test backend has a size");
@@ -1270,7 +1551,7 @@ mod tests {
     async fn saving_writes_the_config_and_installs_the_agents() {
         let dir = tempfile::tempdir().unwrap();
         let env = env_in(dir.path());
-        let mut wizard = build_wizard(&env);
+        let mut wizard = configured_wizard(&env);
         let mut setup = TestSetup::new();
         let mut events =
             TestEventSource::new(vec![key_with(KeyCode::Char('s'), KeyModifiers::CONTROL)]);
@@ -1356,7 +1637,7 @@ mod tests {
         let mut env = env_in(dir.path());
         let blocked = dir.path().join("not-a-dir");
         std::fs::write(&blocked, "").unwrap();
-        let mut wizard = build_wizard(&env);
+        let mut wizard = configured_wizard(&env);
         env.config_path = blocked.join("config.toml");
         let mut setup = TestSetup::new();
         let mut events =
@@ -1421,6 +1702,13 @@ mod tests {
         let mut setup = TestSetup::new();
         let mut events =
             TestEventSource::new(vec![key_with(KeyCode::Char('s'), KeyModifiers::CONTROL)]);
+        // The wizard is built from the file, and will not finish without a
+        // provider, so the file starts with one.
+        std::fs::write(
+            &env.config_path,
+            "[providers]\nanthropic_api_key = \"sk-test\"\n",
+        )
+        .unwrap();
 
         execute_with(&args(), &env, &mut setup, &mut events, true)
             .await

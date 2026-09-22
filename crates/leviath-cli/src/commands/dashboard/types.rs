@@ -190,6 +190,8 @@ pub(super) enum ClickTarget {
     ContextRow(usize),
     /// The new-run screen's Start button.
     NewRunStart,
+    /// A slot of the new-run screen's Inputs pane, by index.
+    NewRunInput(usize),
     /// The Send button under the response box (or the Save button under an
     /// in-place document edit): a click sends what was typed.
     ResponseSend,
@@ -364,8 +366,8 @@ pub(crate) struct DashboardAgent {
     /// stat-gated cache, and cloning a full context window per tick is the
     /// churn that cache exists to remove.
     pub context_snapshot: Option<std::sync::Arc<runstate::ContextSnapshot>>,
-    /// Per-stage records from stages.json
-    pub stages: Vec<StageRecord>,
+    /// Per-stage records from stages.json, shared with the loader's cache.
+    pub stages: std::sync::Arc<Vec<StageRecord>>,
     /// Working directory the agent ran in
     pub workdir: String,
     /// Original task prompt
@@ -424,8 +426,13 @@ pub(super) enum DaemonCommand {
     Answer {
         response: interaction::InteractionResponse,
     },
-    /// Deliver a mid-run message to a running agent.
-    Message { agent_id: String, content: String },
+    /// Deliver a mid-run message to a running agent, with the files a
+    /// `@path` in it named.
+    Message {
+        agent_id: String,
+        content: String,
+        parts: Vec<leviath_core::mime::InboundPart>,
+    },
 }
 
 /// The result of a [`DaemonCommand`], drained each tick.
@@ -547,6 +554,8 @@ pub(super) struct McpContext {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum NewRunPane {
     Agents,
+    /// The slots for the blueprint's caller-input regions, when it has any.
+    Inputs,
     Task,
     /// The Start button under the task editor: Enter or Space on it starts
     /// the run, which is how a terminal without the kitty keyboard protocol
@@ -595,6 +604,14 @@ pub(super) struct SpawnCommand {
     pub(super) workdir: String,
     /// Whether the run approves its own tool calls.
     pub(super) yolo: bool,
+    /// The yolo profile it does that under, when one was picked.
+    pub(super) yolo_profile: Option<String>,
+    /// The files the task named with `@path`, read from the workdir, and
+    /// the files the Inputs pane's slots named, each in its region.
+    pub(super) parts: Vec<leviath_core::mime::InboundPart>,
+    /// Text the Inputs pane's slots seed regions with, by caller key: what
+    /// `--<key> text` sends on the command line.
+    pub(super) regions: std::collections::HashMap<String, String>,
 }
 
 /// The result of a [`SpawnCommand`], drained each tick and shown as a toast.
@@ -715,7 +732,8 @@ mod tests {
             cmd,
             DaemonCommand::Message {
                 agent_id: "a".to_string(),
-                content: "b".to_string()
+                content: "b".to_string(),
+                parts: Vec::new(),
             }
         );
     }
@@ -750,7 +768,7 @@ mod tests {
             pending_request: None,
             last_answered_request_id: None,
             context_snapshot: None,
-            stages: vec![],
+            stages: Default::default(),
             workdir: "/tmp".to_string(),
             task: "do stuff".to_string(),
             title: Some("My Task".to_string()),

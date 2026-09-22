@@ -42,12 +42,12 @@ your own PATH.
 
 Paste it into PowerShell rather than Command Prompt. The old form that spawned PowerShell from
 cmd (`powershell -ExecutionPolicy Bypass -c "..."`) is the launch pattern endpoint protection
-refuses on managed machines - it answered "Access is denied." before anything ran.
+refuses on managed machines. It answered "Access is denied." before anything ran.
 
 If Windows Defender or another antivirus quarantines `lev.exe`, that is a false positive on a new,
 unsigned binary, not something it found. You can check the file is exactly what this repo's CI
-built with `gh attestation verify "$env:LOCALAPPDATA\Leviath\bin\lev.exe" --repo GEMISIS/leviath`,
-then restore it from quarantine or add the folder to the exclusions; reporting it as a false
+built with `gh attestation verify "$env:LOCALAPPDATA\Leviath\bin\lev.exe" --repo GEMISIS/leviath`.
+Then restore it from quarantine, or add the folder to the exclusions. Reporting it as a false
 positive to your vendor helps every later install.
 
 Check it worked:
@@ -82,7 +82,7 @@ scoop install leviath
 <details>
 <summary>Switch to the beta or alpha channel</summary>
 
-`stable` is the default and is what you want unless you have a reason to be ahead of it. To ride a
+`stable` is the default. It is what you want unless you have a reason to be ahead of it. To ride a
 faster channel, pass it to the installer:
 
 ```bash
@@ -115,9 +115,9 @@ To embed the runtime in your own application instead of running the CLI, add the
 
 ## Configure a provider
 
-One provider is all you need: an API key from Anthropic, OpenAI, Google AI, or OpenRouter; a
-ChatGPT subscription you sign in to (OpenAI Codex, no key); or a local [Ollama](https://ollama.com)
-with no key at all.
+One provider is all you need. That can be an API key from Anthropic, OpenAI, Google AI, xAI, Meta,
+or OpenRouter. It can be a ChatGPT or Grok subscription you sign in to (OpenAI Codex or Grok, no
+key). It can also be a local [Ollama](https://ollama.com) with no key at all.
 
 ```bash
 lev setup
@@ -147,8 +147,8 @@ Two flags matter more than they look:
 - `--default-model <provider>/<model>` sets the model every stage falls back to. Without a default
   model, a blueprint's own list decides, which may not pick your provider.
 
-The other credential flags are `--openai-key`, `--google-key`, `--openrouter-key`, and
-`--ollama-url`. See [`lev setup`](/docs/cli#lev-setup) for the full set.
+The other credential flags are `--openai-key`, `--google-key`, `--openrouter-key`,
+`--bedrock-key` (with `--bedrock-region`), and `--ollama-url`. See [`lev setup`](/docs/cli#lev-setup) for the full set.
 
 </details>
 
@@ -191,7 +191,8 @@ structured answers.
 Expect to be asked things along the way. The agent **stops and waits** before it writes a file or
 runs a shell command. Answer in `lev dash` (select the run, `Enter`, then `i`) or with
 [`lev respond`](/docs/interaction), or pass `--yolo` to pre-approve everything for an unattended
-run.
+run. To pre-approve some of it and keep the rest,
+[write a yolo profile](/docs/first-yolo-profile).
 
 > [!TIP]
 > Prefer a visual UI? Serve the daemon over HTTP and open
@@ -207,6 +208,21 @@ On Windows the agent's shell is `cmd.exe`, not a POSIX shell, and Leviath tells 
 [which shell you get](/docs/tools#which-shell-you-get), and
 [Troubleshooting](/docs/troubleshooting#windows-quoting-and-environment-variables) for PowerShell
 quoting and environment-variable syntax.
+
+## Keep it up to date
+
+One command brings everything current: the binary, the bundled agents, and the config file.
+
+```bash
+lev update --check        # show what would change, touch nothing
+lev update                # do it
+```
+
+The binary is upgraded with whatever installed it (Homebrew, Scoop, the install script), and then
+the agents in `~/.leviath/agents` and the config beside them are offered the same treatment. That
+second half is the reason to use `lev update` rather than `brew upgrade` alone: a package manager
+hands you a new binary and says nothing about blueprints written for the old one. The full flag
+list is under [`lev update`](/docs/cli#lev-update).
 
 ## Create your own
 

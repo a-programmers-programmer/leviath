@@ -45,6 +45,10 @@ impl Dashboard {
             self.editor_add_region_key(&key);
             return;
         }
+        if self.editor().add_artifact.is_some() {
+            self.editor_add_artifact_key(&key);
+            return;
+        }
         if self.editor().line.is_some() {
             self.editor_line_key(&key);
             return;
@@ -73,12 +77,24 @@ impl Dashboard {
                 let editor = self.editor();
                 editor.problems_open = !editor.problems_open;
             }
-            KeyCode::Tab => {
-                let editor = self.editor();
-                editor.focus = match editor.focus {
-                    Focus::Canvas => Focus::Inspector,
-                    Focus::Inspector => Focus::Canvas,
+            // A window keeps the keys until it closes. From the canvas Tab
+            // moves the keys to the inspector; on a stage's inspector Tab and
+            // Shift-Tab walk its tabs (the arrows change a row there, as they
+            // do on every panel); on an inspector without tabs Tab goes back
+            // to the canvas, as Esc does everywhere.
+            KeyCode::Tab | KeyCode::BackTab if self.editor().modal.is_none() => {
+                let (focus, tab) = {
+                    let editor = self.editor();
+                    (editor.focus, editor.panel_tab())
                 };
+                match (focus, tab) {
+                    (Focus::Canvas, _) => self.editor().focus = Focus::Inspector,
+                    (Focus::Inspector, Some(tab)) => {
+                        let delta = if key.code == KeyCode::BackTab { -1 } else { 1 };
+                        self.editor_set_tab(tab.step(delta));
+                    }
+                    (Focus::Inspector, None) => self.editor().focus = Focus::Canvas,
+                }
             }
             _ => match self.editor().focus {
                 Focus::Canvas => self.editor_canvas_key(key.code),
@@ -120,8 +136,8 @@ impl Dashboard {
     fn editor_inspector_key(&mut self, code: KeyCode) {
         match code {
             KeyCode::Esc => {
-                if self.editor().panel_anchor.is_some() {
-                    self.editor_leave_region();
+                if self.editor().modal.is_some() {
+                    self.editor_close_modal();
                 } else {
                     self.editor().focus = Focus::Canvas;
                 }
@@ -144,18 +160,22 @@ impl Dashboard {
             KeyCode::Enter => self.editor_activate(),
             KeyCode::Left | KeyCode::Char('h') => self.editor_adjust(-1),
             KeyCode::Right | KeyCode::Char('l') => self.editor_adjust(1),
-            KeyCode::Char(c @ '1'..='3') => {
-                let tab = StageTab::ALL[(c as usize) - ('1' as usize)];
-                let editor = self.editor();
-                if let Panel::Stage { name, .. } = &editor.panel {
-                    editor.panel = Panel::Stage {
-                        name: name.clone(),
-                        tab,
-                    };
-                    editor.cursor = 0;
-                }
+            KeyCode::Char(c @ '1'..='4') => {
+                self.editor_set_tab(StageTab::ALL[(c as usize) - ('1' as usize)]);
             }
             _ => {}
+        }
+    }
+
+    /// Switch a stage panel to `tab`; nothing on any other panel.
+    fn editor_set_tab(&mut self, tab: StageTab) {
+        let editor = self.editor();
+        if let Panel::Stage { name, .. } = &editor.panel {
+            editor.panel = Panel::Stage {
+                name: name.clone(),
+                tab,
+            };
+            editor.cursor = 0;
         }
     }
 
@@ -218,6 +238,21 @@ impl Dashboard {
         }
     }
 
+    /// Keys while the name of a new artifact is being typed.
+    fn editor_add_artifact_key(&mut self, key: &KeyEvent) {
+        let mut line = self.editor().add_artifact.take().expect("callers check");
+        match line.handle_key(key) {
+            EditOutcome::Pending => self.editor().add_artifact = Some(line),
+            EditOutcome::Cancel => {}
+            EditOutcome::Commit => {
+                let name = line.value().trim().to_string();
+                if !name.is_empty() {
+                    self.editor_add_artifact(&name);
+                }
+            }
+        }
+    }
+
     /// Keys on the chooser.
     fn editor_picker_key(&mut self, key: &KeyEvent) {
         let (purpose, mut picker) = self.editor().picker.take().expect("callers check");
@@ -257,6 +292,25 @@ impl Dashboard {
         };
         if editor.overlay.is_some() || editor.line.is_some() || editor.add_stage.is_some() {
             return false;
+        }
+        // A window takes every click: one on its rows picks or opens a row,
+        // one anywhere else is swallowed, so nothing under it moves.
+        if editor.modal.is_some() {
+            if event.kind != MouseEventKind::Down(MouseButton::Left) {
+                return true;
+            }
+            let hit = editor.modal_hit.clone();
+            if let Some(i) = hit.rows.iter().position(|y| *y == event.row)
+                && event.column >= hit.area.x
+                && event.column < hit.area.x + hit.area.width
+            {
+                let was = editor.cursor;
+                editor.cursor = i;
+                if was == i {
+                    self.editor_activate();
+                }
+            }
+            return true;
         }
         // A drag that began on a grip owns the mouse until it is released,
         // wherever the pointer wanders. Answering these itself is what stops
@@ -337,12 +391,22 @@ impl Dashboard {
         match outcome {
             PickerOutcome::Pending => self.editor().picker = Some((purpose, picker)),
             PickerOutcome::Cancelled => {}
-            PickerOutcome::ChosenMany(chosen) => self.editor_settle_tools(&chosen),
+            PickerOutcome::ChosenMany(chosen) => match purpose {
+                PickerFor::MimeTypes(id) => {
+                    let values = chosen
+                        .iter()
+                        .map(|i| picker.options[*i].value.clone())
+                        .collect();
+                    self.editor_settle_types(&id, values);
+                }
+                _ => self.editor_settle_tools(&chosen),
+            },
             PickerOutcome::Chosen(index) => {
                 let value = picker.options[index].value.clone();
                 match purpose {
                     PickerFor::Field(id) => self.editor_pick(&id, &value),
                     PickerFor::ConnectFrom(from) => self.editor_connect(&from, &value),
+                    PickerFor::MimeTypes(id) => self.editor_settle_types(&id, vec![value]),
                     other => self.editor_settle_more(other, &value),
                 }
             }
@@ -441,7 +505,7 @@ impl Dashboard {
         match self.editor().panel.clone() {
             Panel::Stage { name, .. } => self.editor_request_delete_stage(&name),
             Panel::Edge { from, to } => self.editor_delete_edge(&from, &to),
-            Panel::Agent | Panel::External(_) | Panel::Region { .. } => {
+            Panel::Agent | Panel::External(_) | Panel::Region { .. } | Panel::Artifact { .. } => {
                 self.editor().message = Some("Select a stage or a path to delete".to_string());
             }
         }

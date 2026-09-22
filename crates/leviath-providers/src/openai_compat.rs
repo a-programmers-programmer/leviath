@@ -114,6 +114,19 @@ pub fn message_to_openai_with(
     content: &MessageContent,
     tool_args: ToolArgsFormat,
 ) -> Vec<serde_json::Value> {
+    message_to_chat(role, content, tool_args, crate::mime::openai_part)
+}
+
+/// How a stored part becomes a content part of a chat message.
+pub(crate) type PartEncoder = fn(&ContentBlock) -> Option<serde_json::Value>;
+
+/// [`message_to_openai_with`], naming how a stored part is written too.
+fn message_to_chat(
+    role: &str,
+    content: &MessageContent,
+    tool_args: ToolArgsFormat,
+    encode_part: PartEncoder,
+) -> Vec<serde_json::Value> {
     match content {
         MessageContent::Text(text) => {
             vec![serde_json::json!({ "role": role, "content": text })]
@@ -162,6 +175,12 @@ pub fn message_to_openai_with(
                 })
                 .collect();
 
+            // Stored parts, as this shape's content parts. A `tool` message
+            // takes a string only, so mime beside a tool result travels in a
+            // `user` message after the results.
+            let mime_parts: Vec<serde_json::Value> =
+                blocks.iter().filter_map(encode_part).collect();
+
             // A block list can carry calls and results at once (a compacted
             // turn, or a stage that folded both into one entry). Emitting only
             // the calls silently dropped the results, leaving a function-call
@@ -186,7 +205,19 @@ pub fn message_to_openai_with(
                 })
             }));
             if out.is_empty() {
-                out.push(serde_json::json!({ "role": role, "content": text_parts.join("") }));
+                let text = text_parts.join("");
+                if mime_parts.is_empty() {
+                    out.push(serde_json::json!({ "role": role, "content": text }));
+                } else {
+                    let mut parts = Vec::new();
+                    if !text.is_empty() {
+                        parts.push(serde_json::json!({ "type": "text", "text": text }));
+                    }
+                    parts.extend(mime_parts);
+                    out.push(serde_json::json!({ "role": role, "content": parts }));
+                }
+            } else if !mime_parts.is_empty() {
+                out.push(serde_json::json!({ "role": "user", "content": mime_parts }));
             }
             out
         }
@@ -205,6 +236,17 @@ pub fn openai_messages(request: &InferenceRequest) -> Vec<serde_json::Value> {
 pub fn openai_messages_with(
     request: &InferenceRequest,
     tool_args: ToolArgsFormat,
+) -> Vec<serde_json::Value> {
+    chat_messages(request, tool_args, crate::mime::openai_part)
+}
+
+/// [`openai_messages_with`], naming how a stored part is written: the
+/// conversation repairs (unpaired calls, unsigned calls, turn order, a user
+/// turn) for a wire format whose parts are not OpenAI's.
+pub(crate) fn chat_messages(
+    request: &InferenceRequest,
+    tool_args: ToolArgsFormat,
+    encode_part: PartEncoder,
 ) -> Vec<serde_json::Value> {
     let mut messages: Vec<serde_json::Value> = Vec::new();
     // One system message, however many blocks the context assembled into.
@@ -232,7 +274,12 @@ pub fn openai_messages_with(
         }));
     }
     for msg in &request.messages {
-        messages.extend(message_to_openai_with(&msg.role, &msg.content, tool_args));
+        messages.extend(message_to_chat(
+            &msg.role,
+            &msg.content,
+            tool_args,
+            encode_part,
+        ));
     }
     // After the unpaired sweep, not before: a call with no answer is dropped
     // outright, and folding it first would preserve it as text instead.
@@ -530,56 +577,21 @@ impl ToolArgsFormat {
     }
 }
 
-/// Which key an OpenAI-dialect server expects the output-token cap under.
-///
-/// The dialect forked. OpenAI itself now *rejects* `max_tokens` on every current
-/// model with `HTTP 400 unsupported_parameter`, while OpenRouter and Gemini's
-/// compatibility endpoint still take it - so the field cannot simply be renamed
-/// for everyone without breaking the two that work.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TokenLimitField {
-    /// `max_tokens`: the original spelling, and what every compatibility server
-    /// in this workspace other than OpenAI accepts.
-    MaxTokens,
-    /// `max_completion_tokens`: what OpenAI requires.
-    MaxCompletionTokens,
-}
-
-impl TokenLimitField {
-    /// The JSON key this variant writes.
-    pub fn key(self) -> &'static str {
-        match self {
-            Self::MaxTokens => "max_tokens",
-            Self::MaxCompletionTokens => "max_completion_tokens",
-        }
-    }
-}
-
 /// Render a request as an OpenAI chat-completions body.
 ///
-/// Shared by every provider speaking that dialect - OpenAI itself, OpenRouter,
-/// and any `base_url` pointed at a compatible server - so one change to the wire
-/// shape reaches all of them rather than three copies drifting apart.
-///
-/// Uses [`TokenLimitField::MaxTokens`], which is what a compatibility server
-/// expects; OpenAI itself goes through [`build_openai_request_body_with`].
+/// Shared by every provider speaking that dialect - OpenRouter, Ollama, and any
+/// `base_url` pointed at a compatible server - so one change to the wire shape
+/// reaches all of them rather than copies drifting apart. The output cap goes
+/// under `max_tokens`, the key every compatibility server takes.
 pub fn build_openai_request_body(request: &InferenceRequest) -> serde_json::Value {
-    build_openai_request_body_with(request, TokenLimitField::MaxTokens)
-}
-
-/// [`build_openai_request_body`], naming the output-cap key explicitly.
-pub fn build_openai_request_body_with(
-    request: &InferenceRequest,
-    token_limit: TokenLimitField,
-) -> serde_json::Value {
     let messages = openai_messages(request);
 
     let mut body = serde_json::json!({
         "model": request.model,
         "temperature": crate::provider::json_number(request.temperature),
         "messages": messages,
+        "max_tokens": request.max_tokens,
     });
-    body[token_limit.key()] = serde_json::json!(request.max_tokens);
 
     if !request.tools.is_empty() {
         body["tools"] = tools_array(&request.tools);
@@ -593,36 +605,23 @@ pub fn build_openai_request_body_with(
     body
 }
 
-/// Whether an API error is OpenAI refusing tools *because* a reasoning effort
-/// is in play, which it resolves by being sent `reasoning_effort: "none"`.
-///
-/// The current reasoning models reject function tools together with a reasoning
-/// effort on `/v1/chat/completions`, and they apply an effort by default - so a
-/// request that never mentions `reasoning_effort` is refused for a field it did
-/// not set. The error says exactly that, and names the remedy.
-///
-/// Keyed on what the API said rather than on which model was asked, and
-/// deliberately: a model list is what failed here. Nothing in this crate knew
-/// `gpt-5.6` existed, and nothing should have to before it works.
-///
-/// The pairing is what makes this precise. A model that supports a reasoning
-/// effort but not the value `none` reports a different problem in a message
-/// that never mentions tools, and retrying *that* with `none` would resend the
-/// same rejection.
-pub(crate) fn tools_refused_over_reasoning_effort(detail: &str) -> bool {
-    let detail = detail.to_ascii_lowercase();
-    detail.contains("reasoning_effort") && detail.contains("function tool")
-}
-
 /// Whether the API refused the request over the temperature we sent.
 ///
-/// Some models take only their default temperature and reject any other value
-/// outright:
+/// A model may reject temperature two ways, and both mean "resend without it":
 ///
 /// ```text
 /// Unsupported value: 'temperature' does not support 0.7 with this model.
 /// Only the default (1) value is supported.
 /// ```
+/// ```text
+/// Unsupported parameter: 'temperature' is not supported with this model.
+/// ```
+///
+/// The first refuses a *value* (the model takes only its default); the second
+/// refuses the *parameter* outright (a reasoning or image model that takes no
+/// temperature at all). OpenRouter's `supported_parameters` lists temperature
+/// for these anyway - it describes the gateway's surface, not the backend's -
+/// so the catalogue says supported and the backend says no.
 ///
 /// The capability table said `gpt-5.5` supports temperature, because it matches
 /// the `gpt-5` family branch and the rest of that family does. It does not, and
@@ -632,7 +631,28 @@ pub(crate) fn tools_refused_over_reasoning_effort(detail: &str) -> bool {
 /// on the day it ships. The API already says so, so ask it rather than a list.
 pub(crate) fn temperature_refused(detail: &str) -> bool {
     let detail = detail.to_ascii_lowercase();
-    detail.contains("temperature") && detail.contains("does not support")
+    detail.contains("temperature")
+        && (detail.contains("does not support")
+            || detail.contains("not supported")
+            || detail.contains("unsupported"))
+}
+
+/// Whether the API refused the request over `max_tokens`.
+///
+/// OpenAI's reasoning models take the cap only as `max_completion_tokens`,
+/// and say so with `"param":"max_tokens","code":"unsupported_parameter"`.
+/// Compatible servers put that in front of every current OpenAI model, so
+/// asking the server beats a table of which ones refuse. A range complaint
+/// about the value ("max_tokens is too large") is not this refusal: the field
+/// was accepted, and renaming it would not help.
+pub(crate) fn token_limit_refused(detail: &str) -> bool {
+    let detail = detail.to_ascii_lowercase();
+    detail.contains("max_tokens")
+        && (detail.contains("unsupported_parameter")
+            || detail.contains("unsupported parameter")
+            || detail.contains("not supported")
+            || detail.contains("use 'max_completion_tokens'")
+            || detail.contains("use max_completion_tokens"))
 }
 
 /// The request's tools in the OpenAI `tools` wire shape.
@@ -846,6 +866,7 @@ pub fn parse_openai_response(body: &serde_json::Value) -> Result<InferenceRespon
     Ok(InferenceResponse {
         content,
         tool_calls,
+        parts: crate::mime_output::message_blobs(message),
         // The OpenAI shape reports a `prompt_tokens` that INCLUDES its
         // `prompt_tokens_details` breakdown, where Anthropic reports the three
         // separately. `TokenUsage::prompt_tokens` is the fresh figure, so the
@@ -969,6 +990,7 @@ pub fn parse_openai_sse_event(buffer: &mut String) -> Option<Option<Result<Strea
                         ),
                         finish_reason: None,
                         reasoning: None,
+                        parts: Vec::new(),
                     })));
                 }
                 continue;
@@ -1051,12 +1073,16 @@ pub fn parse_openai_sse_event(buffer: &mut String) -> Option<Option<Result<Strea
                 tokens,
                 finish_reason,
                 reasoning: None,
+                parts: crate::mime_output::message_blobs(delta),
             })));
         }
     }
 
     None
 }
+
+#[cfg(test)]
+mod mime_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1221,6 +1247,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_max_tokens_refusal_is_told_apart_from_other_errors() {
+        assert!(super::token_limit_refused(
+            "HTTP 400: {\"error\":{\"message\":\"Unsupported parameter: 'max_tokens' is not \
+             supported with this model. Use 'max_completion_tokens' instead.\",\
+             \"param\":\"max_tokens\",\"code\":\"unsupported_parameter\"}}"
+        ));
+        assert!(super::token_limit_refused(
+            "max_tokens: use max_completion_tokens for this model"
+        ));
+        assert!(!super::token_limit_refused(
+            "max_tokens is too large: 200000. This model supports at most 128000 completion tokens"
+        ));
+        assert!(!super::token_limit_refused(
+            "Unsupported parameter: 'temperature' is not supported with this model."
+        ));
+        assert!(!super::token_limit_refused("rate limited"));
+    }
+
     /// The refusal that killed a run, and the shapes that must NOT trip it.
     ///
     /// A false positive here silently drops the temperature the caller asked
@@ -1235,6 +1280,18 @@ mod tests {
         // Case is not guaranteed by the API.
         assert!(super::temperature_refused(
             "UNSUPPORTED VALUE: 'TEMPERATURE' DOES NOT SUPPORT 0.7"
+        ));
+        // The parameter refused outright (a reasoning or image model), the
+        // shape that killed sprites-to-model through OpenRouter.
+        assert!(super::temperature_refused(
+            "Unsupported parameter: 'temperature' is not supported with this model."
+        ));
+        assert!(super::temperature_refused(
+            "'temperature' is not supported with this model"
+        ));
+        // A terser variant that only the "unsupported" wording catches.
+        assert!(super::temperature_refused(
+            "Unsupported parameter: 'temperature'"
         ));
         // A different unsupported field is not ours to fix.
         assert!(!super::temperature_refused(
@@ -1667,6 +1724,30 @@ mod tests {
         assert_eq!(resp.tokens_used.completion_tokens, 5);
         assert_eq!(resp.tokens_used.total_tokens, 15);
         assert_eq!(resp.finish_reason, crate::provider::FinishReason::Complete);
+    }
+
+    /// A model that draws answers with data URIs; they come out as blobs
+    /// beside the text, and a streamed delta carries them the same way.
+    #[test]
+    fn parse_response_keeps_the_images_a_model_drew() {
+        let body = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": "here it is",
+                    "images": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AQID"}}]
+                },
+                "finish_reason": "stop"
+            }]
+        });
+        let response = parse_openai_response(&body).unwrap();
+        assert_eq!(response.content, "here it is");
+        assert_eq!(response.parts.len(), 1);
+        assert_eq!(response.parts[0].bytes, vec![1, 2, 3]);
+        // Named by content sha, not by position.
+        assert_eq!(
+            response.parts[0].name.as_deref(),
+            Some("image-039058c6f2c0.png")
+        );
     }
 
     #[test]
@@ -3405,28 +3486,6 @@ mod tests {
         assert!(
             body.get("max_completion_tokens").is_none(),
             "a compatibility server must not be sent the OpenAI-only key"
-        );
-    }
-
-    #[test]
-    fn openai_gets_max_completion_tokens_instead() {
-        // OpenAI rejects `max_tokens` outright on every current model:
-        // HTTP 400 unsupported_parameter. Sending both would be rejected too.
-        let req = sample_request();
-        let body = build_openai_request_body_with(&req, TokenLimitField::MaxCompletionTokens);
-        assert_eq!(body["max_completion_tokens"], 1024);
-        assert!(
-            body.get("max_tokens").is_none(),
-            "OpenAI must not be sent the key it rejects"
-        );
-    }
-
-    #[test]
-    fn each_variant_names_its_own_key() {
-        assert_eq!(TokenLimitField::MaxTokens.key(), "max_tokens");
-        assert_eq!(
-            TokenLimitField::MaxCompletionTokens.key(),
-            "max_completion_tokens"
         );
     }
 

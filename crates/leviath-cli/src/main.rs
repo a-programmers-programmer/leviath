@@ -108,6 +108,46 @@ async fn async_main() -> anyhow::Result<()> {
 /// command cores. Never compiled into the coverage-measured `--lib` build.
 struct RealExecutors;
 
+/// Runs `lev deps install` shell commands through the platform shell.
+struct SystemRunner;
+
+impl commands::deps::CommandRunner for SystemRunner {
+    fn run(&self, command: &str) -> Result<(), String> {
+        let status = if cfg!(windows) {
+            leviath_sys::child_command("cmd")
+                .arg("/C")
+                .arg(command)
+                .status()
+        } else {
+            leviath_sys::child_command("sh")
+                .arg("-c")
+                .arg(command)
+                .status()
+        };
+        match status {
+            Ok(s) if s.success() => Ok(()),
+            Ok(s) => Err(format!("command exited with {s}")),
+            Err(e) => Err(format!("could not run command: {e}")),
+        }
+    }
+}
+
+/// Asks `lev deps install` confirmations on the real terminal.
+struct StdinPrompt;
+
+impl commands::deps::Prompt for StdinPrompt {
+    fn confirm(&self, message: &str) -> bool {
+        use std::io::Write;
+        print!("{message} [y/N] ");
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line).is_err() {
+            return false;
+        }
+        matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+    }
+}
+
 impl RiskyExecutors for RealExecutors {
     async fn run(&self, args: commands::run::RunArgs) -> anyhow::Result<()> {
         real_run(args).await
@@ -145,11 +185,32 @@ impl RiskyExecutors for RealExecutors {
         real_setup(args).await
     }
 
+    async fn rage(&self, args: commands::rage::RageArgs) -> anyhow::Result<()> {
+        real_rage(args).await
+    }
+
     async fn dashboard(&self, args: DashboardArgs) -> anyhow::Result<()> {
         real_dashboard(args).await
     }
 
     async fn serve(&self, args: commands::serve::ServeArgs) -> anyhow::Result<()> {
+        // A server is long-lived and often runs under nohup or a supervisor,
+        // so it keeps its own capped log like the daemon does: one file per
+        // server, named for `--name` or the port. The cap is read once here,
+        // since a server has no reload path for `[observability]`.
+        let log_name = commands::serve::log_name(&args);
+        if let Some(path) = leviath_cli::logging::serve_log_path(&log_name)
+            && leviath_cli::logging::attach_log_file(
+                path.clone(),
+                std::io::IsTerminal::is_terminal(&io::stderr()),
+            )
+        {
+            let cap = leviath_cli::config::Config::load()
+                .map(|config| config.observability.log_file_max_bytes)
+                .unwrap_or(leviath_core::config::DEFAULT_LOG_FILE_MAX_BYTES);
+            leviath_cli::logging::set_log_file_cap(cap);
+            info!(path = %path.display(), "leviath serve writing its log here");
+        }
         // The HTTP API is a gateway to the shared-world daemon: ensure it's
         // running, then serve, routing agent actions through its control socket.
         ensure_daemon_running().await?;
@@ -279,9 +340,26 @@ impl RiskyExecutors for RealExecutors {
 
     async fn providers(&self, args: commands::providers::ProvidersArgs) -> anyhow::Result<()> {
         let env = commands::providers::ProvidersEnv {
+            bedrock_control_url: None,
+            bedrock_mantle_url: None,
             config_path: leviath_cli::config::Config::config_path(),
         };
         commands::providers::execute_with(args, &env).await
+    }
+
+    async fn deps(&self, args: commands::deps::DepsArgs) -> anyhow::Result<()> {
+        // The command logic is the tested `deps::execute_with`; only the real
+        // machine seams - the config path, env/PATH reads, the shell and the
+        // stdin prompt - are composed here.
+        let env = commands::deps::DepsEnv {
+            config_path: leviath_cli::config::Config::config_path(),
+            agents_dir: leviath_core::paths::agents_dir(),
+            probe: Box::new(leviath_cli::dependencies::SystemProbe),
+            runner: std::sync::Arc::new(SystemRunner),
+            prompt: Box::new(StdinPrompt),
+            os: commands::deps::host_os(),
+        };
+        commands::deps::execute_with(args, &env)
     }
 
     async fn update(&self, args: commands::update::UpdateArgs) -> anyhow::Result<()> {
@@ -413,7 +491,7 @@ async fn real_run(args: commands::run::RunArgs) -> anyhow::Result<()> {
             .unwrap_or_default();
         // `--yolo` means unattended, so it takes the warn-and-proceed path even
         // on a terminal: the flag's whole meaning is "do not stop to ask".
-        let interactive = std::io::IsTerminal::is_terminal(&io::stdin()) && !args.yolo;
+        let interactive = std::io::IsTerminal::is_terminal(&io::stdin()) && args.yolo.is_none();
         let ok = leviath_cli::workdir_guard::check(
             std::path::Path::new(&workdir),
             dirs::home_dir().as_deref(),
@@ -432,6 +510,8 @@ async fn real_run(args: commands::run::RunArgs) -> anyhow::Result<()> {
             return Ok(());
         }
     }
+    // Read here, where the paths the user typed still mean what they meant.
+    let parts = commands::run::attach::attach_all(&args.attach, &std::env::current_dir()?)?;
     let spawn_args = leviath_cli::daemon::client::resolve_spawn_args(
         leviath_cli::daemon::client::LaunchRequest {
             path,
@@ -439,7 +519,8 @@ async fn real_run(args: commands::run::RunArgs) -> anyhow::Result<()> {
             stdin_is_terminal: &|| std::io::IsTerminal::is_terminal(&io::stdin()),
             model: args.model,
             workdir: &workdir,
-            yolo: args.yolo,
+            yolo: args.yolo.is_some(),
+            yolo_profile: args.yolo.filter(|name| !name.is_empty()),
             allow: args.allow,
             max_depth: args.max_depth,
             regions: args.regions,
@@ -449,6 +530,7 @@ async fn real_run(args: commands::run::RunArgs) -> anyhow::Result<()> {
                 args.output_instructions,
                 args.output_schema,
             )?,
+            parts,
         },
     )?;
     // Deliberately after the resolve, not before. No `--task` opens an editor,
@@ -727,6 +809,19 @@ async fn real_daemon(args: commands::daemon::DaemonArgs) -> anyhow::Result<()> {
     // ignored with nothing in the log. A missing file still loads as
     // defaults; only a broken one is fatal, and the parse error lands in
     // `daemon.log` for whoever finds the daemon not running.
+    //
+    // The file is attached before the config is read for exactly that reason:
+    // a refusal to start has to be the first line in it, whichever way the
+    // daemon was started. The cap follows `[observability]` once the host is
+    // up (`telemetry_reload`).
+    if let Some(path) = leviath_cli::logging::daemon_log_path()
+        && leviath_cli::logging::attach_log_file(
+            path.clone(),
+            std::io::IsTerminal::is_terminal(&io::stderr()),
+        )
+    {
+        info!(path = %path.display(), "leviath daemon writing its log here");
+    }
     let config = leviath_cli::config::Config::load()
         .map_err(|e| anyhow::anyhow!("daemon refusing to start on a broken config: {e}"))?;
     let runs_dir = leviath_cli::runstate::runs_dir();
@@ -932,6 +1027,100 @@ async fn real_setup(args: commands::setup::SetupArgs) -> anyhow::Result<()> {
     };
     let mut events = CrosstermEventSource::open();
     commands::setup::execute_core(&mut wizard, &env, &mut setup, &mut events).await
+}
+
+/// Real `lev rage`: the real paths, the real environment, a daemon probe
+/// over the control socket that never starts one, and the real terminal.
+/// Everything it composes is the library's tested `execute_with`.
+async fn real_rage(args: commands::rage::RageArgs) -> anyhow::Result<()> {
+    use commands::rage::{DaemonSnapshot, RageEnv};
+    use commands::setup::import;
+
+    let home = leviath_cli::config::leviath_home_dir().unwrap_or_default();
+    let data_dir = leviath_core::paths::data_dir().unwrap_or_default();
+    let env = RageEnv {
+        config_path: leviath_cli::config::Config::config_path(),
+        runs_dir: leviath_cli::runstate::runs_dir(),
+        agents_dir: commands::setup::real_agents_dir(Some(&home)),
+        policy_dir: commands::rage::real_policy_dir(),
+        dashboard_log: commands::rage::real_dashboard_log_path(),
+        cwd: std::env::current_dir().unwrap_or_default(),
+        import_roots: import::Roots::new(
+            home,
+            dirs::config_dir().unwrap_or_default(),
+            std::env::current_dir().unwrap_or_default(),
+        ),
+        env_lookup: Box::new(|name| std::env::var(name).ok()),
+        env_names: Box::new(|| std::env::vars().map(|(name, _)| name).collect()),
+        daemon: Box::new(real_daemon_snapshot),
+        install: Box::new(commands::rage::real_install_description),
+        now: Box::new(chrono::Local::now),
+        data_dir,
+    };
+    // The probe below is synchronous over an async client, so it runs on a
+    // thread of its own rather than blocking this runtime's worker.
+    fn real_daemon_snapshot() -> DaemonSnapshot {
+        use leviath_runtime::control_socket::{ControlToken, is_daemon_running};
+        let mut snapshot = DaemonSnapshot {
+            cli_build: leviath_cli::daemon::setup::CURRENT_BUILD.to_string(),
+            build_on_disk: leviath_cli::daemon::setup::read_build_marker(),
+            ..DaemonSnapshot::default()
+        };
+        let Some(id) = leviath_cli::daemon::setup::control_address() else {
+            snapshot.note = Some("no home directory, so no control socket".to_string());
+            return snapshot;
+        };
+        if let Some(dir) = leviath_cli::daemon::setup::control_dir() {
+            snapshot.pid = ControlToken::read_pid(&dir);
+        }
+        snapshot.running = is_daemon_running(&id);
+        let mut count = 0;
+        if snapshot.running {
+            let listing = std::thread::spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| e.to_string())
+                    .and_then(|rt| {
+                        rt.block_on(async {
+                            control_client()
+                                .map_err(|e| e.to_string())?
+                                .list()
+                                .await
+                                .map_err(|e| e.to_string())
+                        })
+                    })
+            })
+            .join()
+            .unwrap_or_else(|_| Err("the probe thread panicked".to_string()));
+            match listing {
+                Ok(response) => {
+                    if let leviath_runtime::control_socket::ControlResponse::List { runs, .. } =
+                        &response
+                    {
+                        count = runs.len();
+                    }
+                    snapshot.listing = serde_json::to_value(&response).ok();
+                }
+                Err(e) => snapshot.note = Some(format!("the daemon did not answer: {e}")),
+            }
+        }
+        let supervision = resolve_service_unit().ok().map(|unit| {
+            commands::daemon_service::format_supervision(unit.path.exists(), &unit.path)
+        });
+        snapshot.status =
+            leviath_cli::daemon::lifecycle::status_lines(snapshot.running, count, supervision);
+        snapshot
+    }
+
+    let mut setup = CrosstermSetup {
+        viewport: Viewport::Fullscreen,
+        mouse_capture: false,
+        enabled: false,
+    };
+    let mut events = CrosstermEventSource::open();
+    let is_terminal = std::io::IsTerminal::is_terminal(&io::stdout());
+    commands::rage::execute_with(&args, &env, &mut setup, &mut events, is_terminal).await
 }
 
 /// Real [`TerminalSetup`]: enables raw mode, enters/leaves the real alternate

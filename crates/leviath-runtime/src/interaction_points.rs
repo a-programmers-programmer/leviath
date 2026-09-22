@@ -308,9 +308,13 @@ async fn run_interaction_point(ask: PointAsk, lane: PromptLane<InteractionPointO
         outcomes,
         wake,
     } = lane;
-    // Request ids are prefixed with the run id so concurrent runs at the same
-    // point (same name/round) never collide in the shared hub.
-    let ask_id = format!("{agent_id}-point-{}-{round}", point.name);
+    // The run id leads, so concurrent runs at the same point (same name, same
+    // round) never collide in the shared hub.
+    let ask_id = leviath_core::interaction::request_id(
+        &agent_id,
+        "point",
+        &format!("{}-{round}", point.name),
+    );
     let backend = hub.backend_for(agent_id);
     let req = build_point_request(&point, ask_id.clone(), &body);
     let resp = backend.ask(req).await;
@@ -570,7 +574,12 @@ pub(crate) fn dispatch_interaction_point(
                 body.clone()
             };
             let tokens = leviath_core::estimate_tokens(&content);
-            window.replace_region(region, content, tokens);
+            window.replace_region(
+                leviath_core::ContextCause::Interaction,
+                region,
+                content,
+                tokens,
+            );
         }
         // An unattended run (`--yolo`) approves the checkpoint instead of
         // opening a prompt nobody will answer. The document was published to its
@@ -800,7 +809,12 @@ fn inject(window: &mut ContextWindow, name: &str, prefix: &str, text: &str) {
     }
     let content = format!("User [{name}] {prefix}{text}");
     let tokens = leviath_core::estimate_tokens(&content);
-    let _ = window.add_to_region("conversation", content, tokens);
+    let _ = window.add_to_region_caused(
+        leviath_core::ContextCause::Interaction,
+        "conversation",
+        content,
+        tokens,
+    );
 }
 
 #[cfg(test)]
@@ -873,6 +887,7 @@ mod tests {
     fn agent_state(status: AgentStatus) -> AgentState {
         AgentState {
             agent_id: "run-1".to_string(),
+            current_visit: String::new(),
             current_stage: "plan".to_string(),
             iteration: 1,
             status,
@@ -900,6 +915,8 @@ mod tests {
 
     fn infer(text: &str) -> InferenceResult {
         InferenceResult {
+            parts: Vec::new(),
+            attempt_id: String::new(),
             response: text.to_string(),
             tool_calls: vec![],
             tokens_used: 0,

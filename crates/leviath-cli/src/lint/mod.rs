@@ -29,7 +29,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use leviath_core::Blueprint;
-use leviath_core::blueprint::StageMode;
+use leviath_core::blueprint::{StageMode, ToolGroup};
 use leviath_runtime::dynamic_interaction::BLOCKING_INTERACTION_TOOLS;
 use leviath_tools::canonical_tool_name;
 use serde::{Deserialize, Serialize};
@@ -156,6 +156,13 @@ pub(crate) struct LintEnv {
     /// MCP tools already resolved. Empty skips the unknown-tool check.
     pub known_tools: HashSet<String>,
 
+    /// Which group each known tool belongs to, so a check can say whether a
+    /// `@builtin`-style grant reaches a tool named elsewhere in the stage
+    /// (`required_tools`, `tool_permissions`). MCP tools are absent: their
+    /// `server__tool` shape already places them in [`ToolGroup::Mcp`]. Empty
+    /// means the question was never asked, and no group-aware check guesses.
+    pub tool_sources: HashMap<String, ToolGroup>,
+
     /// `(provider, model)` rows for providers whose catalog is closed enough to
     /// check against. A provider with no row here is not checked at all, which
     /// is what keeps open catalogs (Ollama, OpenRouter, script providers) from
@@ -225,6 +232,26 @@ pub(crate) struct LintEnv {
     /// unbounded-percentage check, because a warning that cannot name a number
     /// is a warning nobody acts on.
     pub model_windows: HashMap<(String, String), usize>,
+
+    /// Under `[providers] zero_retention`, the stages whose models keep
+    /// something: keyed by stage name, each entry the `provider/model` rows
+    /// that would be refused at spawn (the head) or dropped from failover
+    /// (a fallback), with the provider's reason. Asked of the same primed
+    /// registry the spawn gate asks, with the same settings. Empty when
+    /// nobody asked or the switch is off.
+    pub retention_refusals: HashMap<String, Vec<RetentionRefusal>>,
+}
+
+/// One model a stage names that cannot run with zero data retention.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RetentionRefusal {
+    /// `provider/model`, as the resolver would run it.
+    pub route: String,
+    /// Whether this is the model the stage would start on (refused at
+    /// spawn) or a fallback (dropped from failover).
+    pub head: bool,
+    /// What is kept and why, in the provider's words.
+    pub reason: String,
 }
 
 impl LintEnv {
@@ -243,11 +270,17 @@ impl LintEnv {
         // because `GET /api/tools` has to answer the same question and two
         // copies of "where does a tool come from" would not have stayed equal.
         // The lint wants only the names; the endpoint wants the sources too.
-        let known_tools =
-            crate::tool_inventory::ToolInventory::discover(Some(agent_dir), None).names();
+        let inventory = crate::tool_inventory::ToolInventory::discover(Some(agent_dir), None);
+        let known_tools = inventory.names();
+        let tool_sources = inventory
+            .tools
+            .iter()
+            .map(|t| (t.name.clone(), t.source.group()))
+            .collect();
 
         Self {
             known_tools,
+            tool_sources,
             known_models: crate::commands::models::closed_catalog_models(),
             available_providers: None,
             read_paths: None,
@@ -262,7 +295,74 @@ impl LintEnv {
             provider_refusals: HashMap::new(),
             unrouted_models: HashSet::new(),
             model_windows: crate::commands::models::builtin_model_windows(),
+            retention_refusals: HashMap::new(),
         }
+    }
+
+    /// Add, under `[providers] zero_retention`, which of each stage's models
+    /// cannot run with zero data retention: the one the stage would start
+    /// on, which the spawn gate refuses, and the fallbacks, which it drops.
+    /// Asked of the primed registry with the config's settings, so the
+    /// answer is the one a spawn would get (a Bedrock model the listing
+    /// never offers under mode `none`, an OpenRouter model with no
+    /// zero-retention endpoint, a provider whose agreement is not declared).
+    /// Nothing is recorded when the switch is off.
+    pub(crate) fn with_retention(
+        mut self,
+        blueprint: &Blueprint,
+        config: &crate::config::Config,
+        registry: &leviath_runtime::ProviderRegistry,
+    ) -> Self {
+        let defaults = crate::daemon::spawn::model_defaults(config);
+        if !defaults.retention.zero_requested {
+            return self;
+        }
+        for stage in &blueprint.stages {
+            let (provider, model) = leviath_runtime::pipeline::resolve_stage_model(
+                &stage.model,
+                None,
+                &defaults,
+                registry,
+            );
+            let mut refusals = Vec::new();
+            let mut seen = HashSet::new();
+            let mut consider = |provider: &str, model: &str, head: bool| {
+                let route = format!("{provider}/{model}");
+                if !seen.insert(route.clone()) {
+                    return;
+                }
+                let policy = registry.retention_with(&defaults.retention, provider, model);
+                if !policy.is_zero() {
+                    refusals.push(RetentionRefusal {
+                        route,
+                        head,
+                        reason: format!(
+                            "retention {}: {}",
+                            policy.retention.describe(),
+                            policy.note
+                        ),
+                    });
+                }
+            };
+            consider(&provider, &model, true);
+            // The pinned entries the stage names after its head, on providers
+            // this install has, which are what a failover would reach. An open
+            // entry resolves through the same preference the head did, and is
+            // judged there; a provider that is not configured here is not in
+            // the failover list either.
+            for entry in stage
+                .model
+                .models
+                .iter()
+                .filter(|e| !e.provider.is_empty() && registry.has(&e.provider))
+            {
+                consider(&entry.provider, &entry.model, false);
+            }
+            if !refusals.is_empty() {
+                self.retention_refusals.insert(stage.name.clone(), refusals);
+            }
+        }
+        self
     }
 
     /// Add the answer to "can this install reach the providers the blueprint
@@ -350,10 +450,12 @@ impl LintEnv {
             }
         }
 
-        // The open entries, asked the way the resolver asks: does *any*
-        // registered provider claim this model. A script provider is not in
-        // `native_providers`, so the machine's default is offered the question
-        // too, matching `resolve_stage_candidates`.
+        // The open entries, asked the way the resolver asks: does a provider
+        // in the preference claim this model. A provider outside the
+        // preference never serves a bare name, so it is not asked. A script
+        // provider is not in `native_providers`, so the machine's default is
+        // offered the question too, matching `resolve_stage_candidates`.
+        let defaults = crate::daemon::spawn::model_defaults(config);
         let default_script = registry.script_provider_named(&config.default_provider);
         for model in entries()
             .filter(|e| e.provider.is_empty())
@@ -363,7 +465,7 @@ impl LintEnv {
             let routed = registry
                 .native_providers()
                 .iter()
-                .any(|(_, p)| p.serves_model(key).is_some())
+                .any(|(name, p)| defaults.is_preferred(name) && p.serves_model(key).is_some())
                 || default_script
                     .as_ref()
                     .is_some_and(|p| p.serves_model(key).is_some());
@@ -425,6 +527,7 @@ pub(crate) fn lint_manifest(
         );
     }
 
+    findings.extend(lint_renamed_keys(content));
     findings.extend(lint_dropped_seeds(&declared, blueprint));
     findings.extend(lint_command_seeds(blueprint));
     findings.extend(lint_tool_seeds(blueprint));
@@ -437,18 +540,26 @@ pub(crate) fn lint_manifest(
     findings.extend(lint_compacted_deliverables(blueprint));
     findings.extend(lint_required_regions_enforceable(blueprint));
     findings.extend(lint_unbounded_percentage(blueprint, env));
+    findings.extend(lint_long_context_price(blueprint, env));
 
     let agent_permissions = blueprint.agent_tool_permissions();
 
+    findings.extend(lint_mime_types(blueprint));
     for stage in &blueprint.stages {
         let keys = declared.stage(&stage.name);
         findings.extend(lint_declarations(stage, keys));
         findings.extend(lint_tools(stage, env));
         findings.extend(lint_blocking_tools(stage));
         findings.extend(lint_tool_policies(stage, &agent_permissions));
+        findings.extend(lint_permission_clamp(stage, &agent_permissions));
         findings.extend(lint_models(stage, env));
+        findings.extend(lint_retention(stage, env));
         findings.extend(lint_output_stage(stage));
+        findings.extend(lint_output_stage_can_answer(stage));
         findings.extend(lint_fanout_escape(stage));
+        findings.extend(lint_fanout_worker_task(blueprint, stage));
+        findings.extend(lint_stage_mime(blueprint, stage));
+        findings.extend(lint_tool_accepts(stage));
     }
 
     // Worst first, stable within a severity so the order a check ran in is the
@@ -593,7 +704,15 @@ impl Declared {
 // than re-exported: `lint_manifest` is the only caller and the only entry point
 // anyone outside this module needs, so the individual checks stay internal.
 mod checks;
+mod fanout;
+mod mime;
+mod pricing;
+mod renamed;
 use checks::*;
+use fanout::*;
+use mime::*;
+use pricing::*;
+use renamed::*;
 mod security;
 use security::*;
 

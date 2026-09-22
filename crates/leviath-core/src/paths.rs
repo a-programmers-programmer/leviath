@@ -54,6 +54,17 @@ pub fn agents_dir() -> Option<PathBuf> {
     data_dir().map(|d| d.join("agents"))
 }
 
+/// The shared on-disk model-capability cache: `<home>/.leviath/model_capabilities.json`.
+///
+/// One path so every surface reads and writes the same file - the daemon writes
+/// it after priming, and a short-lived `lev models`, `lev validate` or serve
+/// handler fills a freshly built registry from it instead of each re-priming to
+/// its own conservative default. Read and written through
+/// `leviath_providers::CapabilityCache`.
+pub fn capability_cache_path() -> Option<PathBuf> {
+    data_dir().map(|d| d.join("model_capabilities.json"))
+}
+
 /// Whether `name` is safe to use as a single path component.
 ///
 /// Accepts `[A-Za-z0-9._-]+` and nothing else. Everything a caller supplies as
@@ -114,6 +125,39 @@ pub fn resolves_within(path: &Path, root: &Path) -> bool {
 
 /// Canonicalize a path for allowlist matching, failing closed.
 ///
+/// `~` and `~/rest` against `home`; anything else as written. `None` for a
+/// `~` with no home to expand to, which names nothing checkable.
+pub fn expand_home(text: &str, home: Option<&Path>) -> Option<PathBuf> {
+    if text == "~" {
+        return home.map(Path::to_path_buf);
+    }
+    match text.strip_prefix("~/") {
+        Some(rest) => home.map(|h| h.join(rest)),
+        None => Some(PathBuf::from(text)),
+    }
+}
+
+/// Fold `.` and `..` lexically. `None` when a `..` would climb past the root
+/// or the start of a relative path, which is a path that names nothing a
+/// rule should vouch for.
+pub fn fold_dot_dot(path: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match out.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    out.pop();
+                }
+                _ => return None,
+            },
+            other => out.push(other.as_os_str()),
+        }
+    }
+    Some(out)
+}
+
 /// The same machinery [`resolves_within`] uses, exposed for the `[read_paths]`
 /// resolver in `leviath-tools`: the deepest existing ancestor is
 /// canonicalized (which is where any symlink lives) and the unresolved tail
@@ -155,11 +199,41 @@ fn canonicalize_existing_prefix(path: &Path) -> Option<PathBuf> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_tilde_expands_against_home_or_names_nothing() {
+        let home = Path::new("/home/me");
+        assert_eq!(expand_home("~", Some(home)), Some(home.to_path_buf()));
+        assert_eq!(expand_home("~/x", Some(home)), Some(home.join("x")));
+        assert_eq!(expand_home("~/x", None), None);
+        assert_eq!(expand_home("~", None), None);
+        assert_eq!(expand_home("plain/x", None), Some(PathBuf::from("plain/x")));
+        assert_eq!(expand_home("~user/x", None), Some(PathBuf::from("~user/x")));
+    }
+
+    #[test]
+    fn dot_dot_folds_lexically_and_never_climbs_out() {
+        assert_eq!(
+            fold_dot_dot(Path::new("a/./b/../c")),
+            Some(PathBuf::from("a/c"))
+        );
+        assert_eq!(fold_dot_dot(Path::new("/a/..")), Some(PathBuf::from("/")));
+        // A leading `./` is the one `.` the component walk hands over.
+        assert_eq!(
+            fold_dot_dot(Path::new("./a/../b")),
+            Some(PathBuf::from("b"))
+        );
+        assert_eq!(fold_dot_dot(Path::new("../x")), None);
+        assert_eq!(fold_dot_dot(Path::new("/..")), None);
+        assert_eq!(
+            fold_dot_dot(Path::new("~/x/../y")),
+            Some(PathBuf::from("~/y"))
+        );
+    }
+
     /// Everything Leviath persists sits under one root, and `LEVIATH_HOME`
-    /// moves all of it together. Seven separate resolvers with three readings of
-    /// that variable is what this replaced - and the consequence was concrete: a
-    /// run that believed it was isolated wrote to the real
-    /// `~/.leviath/config.toml`.
+    /// moves all of it together. One resolver, because several with their own
+    /// readings of that variable let a run that believes it is isolated write
+    /// to the real `~/.leviath/config.toml`.
     #[test]
     fn every_data_path_follows_leviath_home_together() {
         temp_env::with_var("LEVIATH_HOME", Some("/tmp/lev-paths-test"), || {
@@ -170,6 +244,10 @@ mod tests {
             assert_eq!(tools_dir(), Some(data.join("tools")));
             assert_eq!(providers_dir(), Some(data.join("providers")));
             assert_eq!(agents_dir(), Some(data.join("agents")));
+            assert_eq!(
+                capability_cache_path(),
+                Some(data.join("model_capabilities.json"))
+            );
         });
     }
 

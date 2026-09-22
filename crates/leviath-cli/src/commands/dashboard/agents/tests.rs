@@ -63,7 +63,7 @@ pub(super) fn draw(dash: &mut Dashboard, w: u16, h: u16) -> Terminal<TestBackend
 }
 
 pub(super) fn text(dash: &mut Dashboard) -> String {
-    rendered_buffer(&draw(dash, 160, 50))
+    rendered_buffer(&draw(dash, 200, 50))
 }
 
 pub(super) fn open_editor_on(dash: &mut Dashboard, name: &str) {
@@ -586,18 +586,20 @@ fn the_canvas_adds_connects_selects_and_deletes_with_undo_behind_it() {
             .edge("review", "review")
             .is_some()
     );
-    assert!(text(&mut dash).contains("↺ loops"));
-    // The loop opened its own path panel; Esc goes back to the stage, a
-    // second Esc to the canvas.
+    // The loop opened its path in a window over the editor; Esc closes it
+    // onto the stage, with the badge on the box now in view, and a second
+    // Esc goes to the canvas.
     assert!(matches!(
         dash.agents().editor.as_ref().unwrap().panel,
         Panel::Edge { .. }
     ));
+    assert!(dash.agents().editor.as_ref().unwrap().modal.is_some());
     dash.handle_key(key(KeyCode::Esc));
     assert!(matches!(
         dash.agents().editor.as_ref().unwrap().panel,
         Panel::Stage { .. }
     ));
+    assert!(text(&mut dash).contains("↺ loops"));
     // Connect from nothing selected: a message.
     dash.handle_key(key(KeyCode::Esc));
     dash.agents()
@@ -861,7 +863,7 @@ fn the_inspector_edits_every_kind_of_field() {
     );
     // Mode: cycle with the arrows, then through the chooser to fan-out.
     dash.agents().editor.as_mut().unwrap().cursor = at(FieldId::StageMode);
-    dash.handle_key(key(KeyCode::Right));
+    dash.handle_key(key(KeyCode::Char('l')));
     assert_eq!(
         dash.agents()
             .editor
@@ -873,8 +875,8 @@ fn the_inspector_edits_every_kind_of_field() {
             .mode,
         crate::blueprint_edit::StageModeView::InteractivePoints
     );
-    dash.handle_key(key(KeyCode::Left));
-    dash.handle_key(key(KeyCode::Left));
+    dash.handle_key(key(KeyCode::Char('h')));
+    dash.handle_key(key(KeyCode::Char('h')));
     assert_eq!(
         dash.agents()
             .editor
@@ -902,11 +904,17 @@ fn the_inspector_edits_every_kind_of_field() {
     );
     // The fan-out rows are live now: worker kind, worker, merge, caps, policy.
     dash.agents().editor.as_mut().unwrap().cursor = at(FieldId::WorkerKind);
-    dash.handle_key(key(KeyCode::Right));
+    dash.handle_key(key(KeyCode::Char('l')));
     dash.handle_key(key(KeyCode::Enter));
     dash.handle_key(key(KeyCode::Enter));
+    // The workers are another agent: the worker is picked from the catalog,
+    // and "another…" names one that is not installed here.
     dash.agents().editor.as_mut().unwrap().cursor = at(FieldId::WorkerRef);
     dash.handle_key(key(KeyCode::Enter));
+    assert!(dash.agents().editor.as_ref().unwrap().picker.is_some());
+    type_str(&mut dash, "another");
+    dash.handle_key(key(KeyCode::Enter));
+    assert!(dash.agents().editor.as_ref().unwrap().line.is_some());
     type_str(&mut dash, "finish");
     dash.handle_key(key(KeyCode::Enter));
     let fan = dash
@@ -920,7 +928,7 @@ fn the_inspector_edits_every_kind_of_field() {
         .fan_out;
     assert_eq!(fan.worker.as_ref().map(|(_, v)| v.as_str()), Some("finish"));
     dash.agents().editor.as_mut().unwrap().cursor = at(FieldId::MergeStage);
-    dash.handle_key(key(KeyCode::Right));
+    dash.handle_key(key(KeyCode::Char('l')));
     assert_eq!(
         dash.agents()
             .editor
@@ -934,7 +942,7 @@ fn the_inspector_edits_every_kind_of_field() {
             .as_deref(),
         Some("finish")
     );
-    dash.handle_key(key(KeyCode::Left));
+    dash.handle_key(key(KeyCode::Char('h')));
     assert_eq!(
         dash.agents()
             .editor
@@ -948,8 +956,8 @@ fn the_inspector_edits_every_kind_of_field() {
         None
     );
     dash.agents().editor.as_mut().unwrap().cursor = at(FieldId::MaxWorkers);
-    dash.handle_key(key(KeyCode::Right));
-    dash.handle_key(key(KeyCode::Right));
+    dash.handle_key(key(KeyCode::Char('l')));
+    dash.handle_key(key(KeyCode::Char('l')));
     assert_eq!(
         dash.agents()
             .editor
@@ -962,9 +970,9 @@ fn the_inspector_edits_every_kind_of_field() {
             .max_workers,
         Some(2)
     );
-    dash.handle_key(key(KeyCode::Left));
-    dash.handle_key(key(KeyCode::Left));
-    dash.handle_key(key(KeyCode::Left));
+    dash.handle_key(key(KeyCode::Char('h')));
+    dash.handle_key(key(KeyCode::Char('h')));
+    dash.handle_key(key(KeyCode::Char('h')));
     assert_eq!(
         dash.agents()
             .editor
@@ -977,7 +985,7 @@ fn the_inspector_edits_every_kind_of_field() {
             .max_workers,
         None
     );
-    dash.handle_key(key(KeyCode::Left));
+    dash.handle_key(key(KeyCode::Char('h')));
     dash.agents().editor.as_mut().unwrap().cursor = at(FieldId::MaxItems);
     dash.handle_key(key(KeyCode::Enter));
     type_str(&mut dash, "7");
@@ -999,7 +1007,7 @@ fn the_inspector_edits_every_kind_of_field() {
     dash.handle_key(key(KeyCode::Enter));
     assert!(text(&mut dash).contains("is not a whole number"));
     dash.agents().editor.as_mut().unwrap().cursor = at(FieldId::OnWorkerFailure);
-    dash.handle_key(key(KeyCode::Right));
+    dash.handle_key(key(KeyCode::Char('l')));
     assert_eq!(
         dash.agents()
             .editor
@@ -1017,11 +1025,7 @@ fn the_inspector_edits_every_kind_of_field() {
     dash.handle_key(key(KeyCode::Enter));
     // Clearing the worker.
     dash.agents().editor.as_mut().unwrap().cursor = at(FieldId::WorkerRef);
-    dash.handle_key(key(KeyCode::Enter));
-    for _ in 0..8 {
-        dash.handle_key(key(KeyCode::Backspace));
-    }
-    dash.handle_key(key(KeyCode::Enter));
+    dash.handle_key(key(KeyCode::Char('x')));
     assert_eq!(
         dash.agents()
             .editor
@@ -1035,7 +1039,7 @@ fn the_inspector_edits_every_kind_of_field() {
         None
     );
     dash.agents().editor.as_mut().unwrap().cursor = at(FieldId::WorkerKind);
-    dash.handle_key(key(KeyCode::Right));
+    dash.handle_key(key(KeyCode::Char('l')));
     assert!(
         dash.agents()
             .editor
@@ -1047,6 +1051,65 @@ fn the_inspector_edits_every_kind_of_field() {
             .fan_out
             .worker
             .is_some()
+    );
+    // The worker is picked from a list: the agent's other stages when the
+    // workers are a stage of it, the catalog when they are another agent;
+    // a query is typed.
+    let worker = |dash: &mut Dashboard| {
+        dash.agents()
+            .editor
+            .as_ref()
+            .unwrap()
+            .doc
+            .stage("work2")
+            .unwrap()
+            .fan_out
+            .worker
+    };
+    let set_kind = |dash: &mut Dashboard, kind: &str| {
+        dash.agents().editor.as_mut().unwrap().cursor = at(FieldId::WorkerKind);
+        dash.handle_key(key(KeyCode::Enter));
+        type_str(dash, kind);
+        dash.handle_key(key(KeyCode::Enter));
+    };
+    set_kind(&mut dash, "worker_stage");
+    dash.agents().editor.as_mut().unwrap().cursor = at(FieldId::WorkerRef);
+    dash.handle_key(key(KeyCode::Enter));
+    assert!(dash.agents().editor.as_ref().unwrap().picker.is_some());
+    type_str(&mut dash, "finish");
+    dash.handle_key(key(KeyCode::Enter));
+    assert_eq!(
+        worker(&mut dash),
+        Some((
+            crate::blueprint_edit::WorkerKind::Stage,
+            "finish".to_string()
+        ))
+    );
+    set_kind(&mut dash, "worker_agent");
+    dash.agents().editor.as_mut().unwrap().cursor = at(FieldId::WorkerRef);
+    dash.handle_key(key(KeyCode::Enter));
+    type_str(&mut dash, "coder");
+    dash.handle_key(key(KeyCode::Enter));
+    assert_eq!(
+        worker(&mut dash),
+        Some((
+            crate::blueprint_edit::WorkerKind::Agent,
+            "coder".to_string()
+        ))
+    );
+    set_kind(&mut dash, "worker_query");
+    dash.agents().editor.as_mut().unwrap().cursor = at(FieldId::WorkerRef);
+    dash.handle_key(key(KeyCode::Enter));
+    assert!(dash.agents().editor.as_ref().unwrap().picker.is_none());
+    assert!(dash.agents().editor.as_ref().unwrap().line.is_some());
+    type_str(&mut dash, "s");
+    dash.handle_key(key(KeyCode::Enter));
+    assert_eq!(
+        worker(&mut dash),
+        Some((
+            crate::blueprint_edit::WorkerKind::Query,
+            "coders".to_string()
+        ))
     );
     // Back to autonomous: the fan-out rows are disabled and inert.
     dash.agents().editor.as_mut().unwrap().cursor = at(FieldId::StageMode);
@@ -1066,7 +1129,7 @@ fn the_inspector_edits_every_kind_of_field() {
     );
     dash.agents().editor.as_mut().unwrap().cursor = at(FieldId::MaxWorkers);
     dash.handle_key(key(KeyCode::Enter));
-    dash.handle_key(key(KeyCode::Right));
+    dash.handle_key(key(KeyCode::Char('l')));
     assert!(dash.agents().editor.as_ref().unwrap().line.is_none());
     // Description, tries, revisits, allow complete.
     dash.agents().editor.as_mut().unwrap().cursor = at(FieldId::StageDescription);
@@ -1085,7 +1148,7 @@ fn the_inspector_edits_every_kind_of_field() {
             .ends_with('!')
     );
     dash.agents().editor.as_mut().unwrap().cursor = at(FieldId::MaxIterations);
-    dash.handle_key(key(KeyCode::Right));
+    dash.handle_key(key(KeyCode::Char('l')));
     assert_eq!(
         dash.agents()
             .editor
@@ -1113,8 +1176,8 @@ fn the_inspector_edits_every_kind_of_field() {
         None
     );
     dash.agents().editor.as_mut().unwrap().cursor = at(FieldId::MaxRevisits);
-    dash.handle_key(key(KeyCode::Right));
-    dash.handle_key(key(KeyCode::Right));
+    dash.handle_key(key(KeyCode::Char('l')));
+    dash.handle_key(key(KeyCode::Char('l')));
     assert_eq!(
         dash.agents()
             .editor
@@ -1153,7 +1216,7 @@ fn the_inspector_edits_every_kind_of_field() {
             .allow_complete,
         Some(true)
     );
-    dash.handle_key(key(KeyCode::Right));
+    dash.handle_key(key(KeyCode::Char('l')));
     assert_eq!(
         dash.agents()
             .editor
@@ -1165,22 +1228,10 @@ fn the_inspector_edits_every_kind_of_field() {
             .allow_complete,
         None
     );
-    // Move down, then up; the tabs; the delete button (asks).
-    dash.agents().editor.as_mut().unwrap().cursor = at(FieldId::MoveDown);
-    dash.handle_key(key(KeyCode::Enter));
-    assert_eq!(
-        dash.agents().editor.as_ref().unwrap().doc.stage_names(),
-        ["finish", "work2"]
-    );
-    dash.agents().editor.as_mut().unwrap().cursor = at(FieldId::MoveUp);
-    dash.handle_key(key(KeyCode::Enter));
-    assert_eq!(
-        dash.agents().editor.as_ref().unwrap().doc.stage_names(),
-        ["work2", "finish"]
-    );
-    dash.handle_key(key(KeyCode::Char('2')));
-    assert!(text(&mut dash).contains("Model & tools"));
+    // The tabs; the delete button (asks).
     dash.handle_key(key(KeyCode::Char('3')));
+    assert!(text(&mut dash).contains("Models & tools"));
+    dash.handle_key(key(KeyCode::Char('2')));
     dash.handle_key(key(KeyCode::Char('1')));
     dash.handle_key(key(KeyCode::Char('j')));
     dash.handle_key(key(KeyCode::Char('k')));
@@ -1507,7 +1558,7 @@ fn the_definition_overlay_scrolls_and_copies() {
 fn the_mouse_selects_connects_and_moves_on_the_editor_canvas() {
     let (mut dash, root) = dashboard("mouse");
     open_editor_on(&mut dash, "own");
-    draw(&mut dash, 160, 50);
+    draw(&mut dash, 200, 50);
     // A click on the finish box selects it and the panel follows.
     let (x, y, _, _) = dash
         .agents()
@@ -1549,7 +1600,7 @@ fn the_mouse_selects_connects_and_moves_on_the_editor_canvas() {
         "moved and remembered"
     );
     // Drag from finish's source handle onto work: a new path.
-    draw(&mut dash, 160, 50);
+    draw(&mut dash, 200, 50);
     let (fx, fy, fr, fb) = dash
         .agents()
         .editor
@@ -1633,7 +1684,7 @@ fn the_mouse_selects_connects_and_moves_on_the_editor_canvas() {
     dash.handle_key(key(KeyCode::Esc));
     dash.handle_key(key(KeyCode::Char('y')));
     assert!(dash.agent_builder.as_ref().unwrap().editor.is_none());
-    draw(&mut dash, 160, 50);
+    draw(&mut dash, 200, 50);
     let preview = dash
         .pane_rects
         .iter()
@@ -1856,8 +1907,8 @@ fn the_corners_of_the_editor() {
     let fields = dash.agents().editor.as_ref().unwrap().fields();
     let at = |id: FieldId| fields.iter().position(|f| f.id == id).unwrap();
     dash.agents().editor.as_mut().unwrap().cursor = at(FieldId::StageMode);
-    dash.handle_key(key(KeyCode::Right));
-    dash.handle_key(key(KeyCode::Right));
+    dash.handle_key(key(KeyCode::Char('l')));
+    dash.handle_key(key(KeyCode::Char('l')));
     dash.agents().editor.as_mut().unwrap().cursor = at(FieldId::MergeStage);
     dash.handle_key(key(KeyCode::Enter));
     assert!(text(&mut dash).contains("Merge stage"));
@@ -2019,7 +2070,7 @@ fn typing_in_a_chooser_never_reaches_the_editor_keys() {
     open_editor_on(&mut dash, "coder");
     dash.handle_key(key(KeyCode::Right));
     dash.handle_key(key(KeyCode::Enter));
-    dash.handle_key(key(KeyCode::Char('2')));
+    dash.handle_key(key(KeyCode::Char('3')));
     dash.handle_key(key(KeyCode::Enter));
     assert!(dash.agents().editor.as_ref().unwrap().picker.is_some());
     type_str(&mut dash, "haiku");

@@ -89,7 +89,7 @@ impl TaintGate {
     /// Apply the `[mcp_overrides]` section of policy.toml to this gate.
     ///
     /// Each override starts from the tool's current classification and
-    /// replaces only the fields it sets, keyed the same `server.tool` way MCP
+    /// replaces only the fields it sets, keyed the same `server__tool` way MCP
     /// tools are named at dispatch. An unrecognized `direction` string keeps
     /// the existing direction and warns, rather than silently reclassifying
     /// a security property.
@@ -385,7 +385,13 @@ mod tests {
         window.add_region(region);
         if taint != TaintLevel::Public {
             window
-                .add_tainted_to_region("conv", "data".to_string(), 10, taint)
+                .add_tainted_to_region(
+                    leviath_core::ContextCause::ToolResult,
+                    "conv",
+                    "data".to_string(),
+                    10,
+                    taint,
+                )
                 .unwrap();
         }
         window
@@ -504,6 +510,43 @@ mod tests {
         assert!(decision.is_allowed());
     }
 
+    /// An override written in `policy.toml` has to reach the tool the model
+    /// actually called, and nothing in between may respell the name.
+    ///
+    /// This is the end of the chain the loader starts: `policy.toml` is parsed
+    /// into a key, the key is applied to the gate here, and the gate is asked
+    /// about a tool by the name dispatch used. It is deliberately written as
+    /// the whole chain rather than as three tests of the parts, because every
+    /// part agreed with itself while the chain was broken. The override was
+    /// parsed, stored under `server.tool`, and then looked up under
+    /// `server__tool`, so it never applied and nothing said so.
+    #[test]
+    fn an_override_from_policy_toml_reaches_the_dispatched_tool() {
+        let policy = leviath_core::PolicyConfig::from_toml(
+            r#"
+[mcp_overrides.tracker.tools.create_issue]
+sensitivity = "private"
+direction = "outbound"
+clearance = "public"
+"#,
+        )
+        .expect("the policy parses");
+
+        let mut gate = TaintGate::new(SecurityConfig::default());
+        gate.apply_mcp_overrides(&policy.mcp_overrides);
+
+        // The name the executor advertises, which is the name the model calls
+        // and therefore the name the gate is asked about.
+        let dispatched = leviath_core::mcp_names::advertised_name("tracker", "create_issue");
+        let classification = gate.tool_classification(&dispatched);
+        assert_eq!(classification.sensitivity, TaintLevel::Private);
+        assert_eq!(classification.clearance, TaintLevel::Public);
+        assert!(
+            classification.is_outbound(),
+            "an override that says outbound must make the gate treat it as outbound"
+        );
+    }
+
     #[test]
     fn apply_mcp_overrides_replaces_only_the_set_fields() {
         let mut gate = TaintGate::new(SecurityConfig::default());
@@ -600,10 +643,22 @@ mod tests {
         window.add_region(r2);
 
         window
-            .add_tainted_to_region("clean", "ok".to_string(), 5, TaintLevel::Public)
+            .add_tainted_to_region(
+                leviath_core::ContextCause::ToolResult,
+                "clean",
+                "ok".to_string(),
+                5,
+                TaintLevel::Public,
+            )
             .unwrap();
         window
-            .add_tainted_to_region("dirty", "secret".to_string(), 5, TaintLevel::Private)
+            .add_tainted_to_region(
+                leviath_core::ContextCause::ToolResult,
+                "dirty",
+                "secret".to_string(),
+                5,
+                TaintLevel::Private,
+            )
             .unwrap();
 
         let decision = gate.check_traditional("agent-1", "shell", &window);

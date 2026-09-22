@@ -9,7 +9,12 @@
 
 use leviath_core::RegionKind;
 
-use crate::components::ContextWindow;
+use crate::components::{ContextWindow, Pushed};
+
+/// What every change this module makes is recorded as: the model called a tool
+/// and the region moved because of it. Named once because a dozen call sites
+/// state it, and they must all state the same thing.
+const TOOL_CAUSE: leviath_core::ContextCause = leviath_core::ContextCause::ContextTool;
 
 /// Whether a tool name is a context self-management tool this module handles.
 pub(crate) fn is_context_tool(name: &str) -> bool {
@@ -23,6 +28,16 @@ pub(crate) fn is_context_tool(name: &str) -> bool {
 /// The string argument under `key`, if the model passed one.
 fn str_arg<'a>(args: &'a serde_json::Value, key: &str) -> Option<&'a str> {
     args.get(key).and_then(|v| v.as_str())
+}
+
+/// The reply when `key` names no entry in `region`.
+fn no_such_key(key: &str, region: &str) -> String {
+    format!("[not found] No entry with key '{key}' in region '{region}'")
+}
+
+/// The reply when `region`, holding `len` entries, has none at `at`.
+fn no_such_index(region: &str, len: usize, at: usize) -> String {
+    format!("[not found] Region '{region}' has {len} entries, so there is none at {at}")
 }
 
 /// The reply for a tool call that left out `key`.
@@ -95,13 +110,16 @@ pub(crate) fn handle_context_tool(
                 return missing("item");
             };
             let tokens = leviath_core::estimate_tokens(item);
-            match checklist_region(window, region_name) {
-                Err(e) => e,
+            let before = window.begin_change(region_name);
+            let (result, added) = match checklist_region(window, region_name) {
+                Err(e) => (e, 0),
                 Ok(region) => match region.add_checklist_item(item.to_string(), tokens) {
-                    Ok(id) => format!("[ok] added item {id}"),
-                    Err(e) => format!("[error] {e}"),
+                    Ok(id) => (format!("[ok] added item {id}"), 1),
+                    Err(e) => (format!("[error] {e}"), 0),
                 },
-            }
+            };
+            window.commit_change(TOOL_CAUSE, before, Pushed::Into(added));
+            result
         }
         "todo_done" | "todo_note" => {
             let Some(region_name) = str_arg(args, "region") else {
@@ -114,7 +132,8 @@ pub(crate) fn handle_context_tool(
             if name == "todo_note" && note.is_none() {
                 return "[error] missing 'note' argument".to_string();
             }
-            match checklist_region(window, region_name) {
+            let before = window.begin_change(region_name);
+            let result = match checklist_region(window, region_name) {
                 Err(e) => e,
                 Ok(region) => {
                     let id = id as usize;
@@ -132,7 +151,11 @@ pub(crate) fn handle_context_tool(
                         true => format!("[ok] item {id} updated"),
                     }
                 }
-            }
+            };
+            // An id that matched one changes the item where it stands, so the
+            // entry count holds and only the tokens move.
+            window.commit_change(TOOL_CAUSE, before, Pushed::Nothing);
+            result
         }
         "context_write" => {
             let Some(region_name) = str_arg(args, "region") else {
@@ -147,21 +170,30 @@ pub(crate) fn handle_context_tool(
             let Some(is_hashmap) = is_hashmap_region(window, region_name) else {
                 return region_not_found(region_name, window);
             };
+            let before = window.begin_change(region_name);
             let region = window.get_region_mut(region_name).expect("region present");
             if is_hashmap {
                 let Some(k) = key else {
                     return "[error] HashMap regions require a 'key' argument".to_string();
                 };
-                match region.upsert_by_key(k, content.to_string(), tokens) {
+                let result = match region.upsert_by_key(k, content.to_string(), tokens) {
                     Ok(()) => format!("Stored in '{region_name}' section under key '{k}'."),
                     Err(e) => format!("[error] {e}"),
-                }
+                };
+                window.commit_change(TOOL_CAUSE, before, Pushed::Upsert);
+                result
             } else {
                 // Through the window method (not region.clear + add directly)
                 // so a custom region's on_write hook sees the write BEFORE the
                 // region is cleared, and a refusal reaches the model as an
                 // error instead of a false "Stored".
-                match window.agent_replace_region(region_name, key, content.to_string(), tokens) {
+                match window.agent_replace_region(
+                    TOOL_CAUSE,
+                    region_name,
+                    key,
+                    content.to_string(),
+                    tokens,
+                ) {
                     Ok(()) => match key {
                         Some(k) => format!("Stored in '{region_name}' section under key '{k}'."),
                         None => format!("Stored in '{region_name}' section."),
@@ -183,21 +215,24 @@ pub(crate) fn handle_context_tool(
             let Some(is_hashmap) = is_hashmap_region(window, region_name) else {
                 return region_not_found(region_name, window);
             };
+            let before = window.begin_change(region_name);
             let region = window.get_region_mut(region_name).expect("region present");
             if is_hashmap {
                 let Some(k) = key else {
                     return "[error] HashMap regions require a 'key' argument for append"
                         .to_string();
                 };
-                if let Some(existing) = region.get_by_key(k) {
+                let result = if let Some(existing) = region.get_by_key(k) {
                     let new_content = format!("{}\n{}", existing.content, content);
                     let new_tokens = leviath_core::estimate_tokens(&new_content);
-                    // Upserting an already-present key updates in place with no
-                    // budget check, so this cannot fail.
-                    region
-                        .upsert_by_key(k, new_content, new_tokens)
-                        .expect("infallible: existing HashMap key updates in place");
-                    format!("Appended to '{region_name}' section under key '{k}'.")
+                    // In-place update skips the token budget, but still runs
+                    // content-schema validation when the region has one.
+                    match region.upsert_by_key(k, new_content, new_tokens) {
+                        Ok(()) => {
+                            format!("Appended to '{region_name}' section under key '{k}'.")
+                        }
+                        Err(e) => format!("[error] {e}"),
+                    }
                 } else {
                     match region.upsert_by_key(k, content.to_string(), tokens) {
                         Ok(()) => {
@@ -205,7 +240,9 @@ pub(crate) fn handle_context_tool(
                         }
                         Err(e) => format!("[error] {e}"),
                     }
-                }
+                };
+                window.commit_change(TOOL_CAUSE, before, Pushed::Upsert);
+                result
             } else {
                 // Same routing rationale as context_write above. The key is
                 // honoured here rather than dropped: it was accepted on every
@@ -214,6 +251,7 @@ pub(crate) fn handle_context_tool(
                 // Agent origin: this is the model's own write, so a custom
                 // region's refusal comes back here as the error the model reads.
                 match window.add_to_region_keyed(
+                    Some(TOOL_CAUSE),
                     crate::components::WriteOrigin::Agent,
                     region_name,
                     key,
@@ -239,26 +277,33 @@ pub(crate) fn handle_context_tool(
                 Some(r) => r,
                 None => return region_not_found(region_name, window),
             };
-            if matches!(region.kind, RegionKind::HashMap { .. }) {
-                if let Some(k) = key {
-                    match region.get_by_key(k) {
-                        Some(entry) => entry.content.clone(),
-                        None => {
-                            format!("[not found] No entry with key '{k}' in region '{region_name}'")
-                        }
+            if let Some(k) = key {
+                // A key names one entry on every region kind, the same way
+                // `context_delete` finds it: a routed image is keyed by its
+                // file name, and a write can name its entry. Reading one
+                // render out of sixteen must not hand back all sixteen.
+                match region.get_by_key(k) {
+                    Some(entry) => entry.content.to_string(),
+                    None => no_such_key(k, region_name),
+                }
+            } else if matches!(region.kind, RegionKind::HashMap { .. }) {
+                let mut lines = Vec::new();
+                for entry in &region.content {
+                    if let Some(k) = &entry.key {
+                        lines.push(format!("  {} ({} tokens)", k, entry.tokens));
                     }
+                }
+                if lines.is_empty() {
+                    format!("Section '{region_name}' is empty.")
                 } else {
-                    let mut lines = Vec::new();
-                    for entry in &region.content {
-                        if let Some(k) = &entry.key {
-                            lines.push(format!("  {} ({} tokens)", k, entry.tokens));
-                        }
-                    }
-                    if lines.is_empty() {
-                        format!("Section '{region_name}' is empty.")
-                    } else {
-                        format!("Section '{region_name}' entries:\n{}", lines.join("\n"))
-                    }
+                    format!("Section '{region_name}' entries:\n{}", lines.join("\n"))
+                }
+            } else if let Some(i) = args.get("index").and_then(serde_json::Value::as_u64) {
+                // An unkeyed entry is named by the index `context_list` shows.
+                let at = usize::try_from(i).unwrap_or(usize::MAX);
+                match region.content.get(at) {
+                    Some(entry) => entry.content.to_string(),
+                    None => no_such_index(region_name, region.content.len(), at),
                 }
             } else {
                 let text = region
@@ -284,6 +329,7 @@ pub(crate) fn handle_context_tool(
             let key = args.get("key").and_then(|v| v.as_str());
             let index = args.get("index").and_then(serde_json::Value::as_u64);
             let oldest = args.get("oldest").and_then(serde_json::Value::as_u64);
+            let before = window.begin_change(region_name);
             let region = window.get_region_mut(region_name).expect("region present");
             // One selector at a time, checked in the order an agent is most
             // likely to have meant. Naming none of them is the interesting
@@ -294,7 +340,7 @@ pub(crate) fn handle_context_tool(
                     if region.remove_by_key(k) {
                         format!("Released '{k}' from '{region_name}'.")
                     } else {
-                        format!("[not found] No entry with key '{k}' in region '{region_name}'")
+                        no_such_key(k, region_name)
                     }
                 }
                 (None, Some(i), _) => {
@@ -302,12 +348,7 @@ pub(crate) fn handle_context_tool(
                     if region.remove_at(at) {
                         format!("Released entry {at} from '{region_name}'.")
                     } else {
-                        format!(
-                            "[not found] Region '{}' has {} entries, so there is none at {}",
-                            region_name,
-                            region.content.len(),
-                            at
-                        )
+                        no_such_index(region_name, region.content.len(), at)
                     }
                 }
                 (None, None, Some(n)) => {
@@ -320,6 +361,7 @@ pub(crate) fn handle_context_tool(
                 }
             };
             window.current_tokens = window.calculate_tokens();
+            window.commit_change(TOOL_CAUSE, before, Pushed::Nothing);
             result
         }
         "context_list" => {
@@ -745,6 +787,63 @@ mod tests {
         );
     }
 
+    /// A key names one entry on every region kind, and an index names an
+    /// unkeyed one. Read whole, a pinned region of many renders answered a
+    /// question about one of them with all of them.
+    #[test]
+    fn read_by_key_and_by_index_on_a_pinned_region() {
+        let mut w = ContextWindow::new(100_000);
+        w.add_region(Region::new("refs".to_string(), RegionKind::Pinned, 10_000));
+        w.add_to_region_keyed(
+            None,
+            crate::components::WriteOrigin::System,
+            "refs",
+            Some("front.png"),
+            "the front view".to_string(),
+            3,
+        )
+        .unwrap();
+        w.add_to_region("refs", "an unkeyed note".to_string(), 3)
+            .unwrap();
+
+        let by_key = call(
+            &mut w,
+            "context_read",
+            json!({"region": "refs", "key": "front.png"}),
+        );
+        assert_eq!(by_key, "the front view");
+        let by_index = call(
+            &mut w,
+            "context_read",
+            json!({"region": "refs", "index": 1}),
+        );
+        assert_eq!(by_index, "an unkeyed note");
+        let missing_key = call(
+            &mut w,
+            "context_read",
+            json!({"region": "refs", "key": "back.png"}),
+        );
+        assert!(
+            missing_key.contains("[not found] No entry with key 'back.png'"),
+            "{missing_key}"
+        );
+        let missing_index = call(
+            &mut w,
+            "context_read",
+            json!({"region": "refs", "index": 9}),
+        );
+        assert!(
+            missing_index.contains("has 2 entries, so there is none at 9"),
+            "{missing_index}"
+        );
+        // Neither selector: the whole region, as before.
+        let whole = call(&mut w, "context_read", json!({"region": "refs"}));
+        assert!(
+            whole.contains("the front view") && whole.contains("an unkeyed note"),
+            "{whole}"
+        );
+    }
+
     #[test]
     fn append_over_budget_errors() {
         let mut w = ContextWindow::new(100_000);
@@ -922,7 +1021,7 @@ mod tests {
             "brain".to_string(),
             RegionKind::Custom {
                 script: "b.rhai".to_string(),
-                persistent: false,
+                pinned: false,
             },
             100,
         ));
@@ -942,7 +1041,7 @@ mod tests {
             "brain".to_string(),
             RegionKind::Custom {
                 script: "s.rhai".to_string(),
-                persistent: false,
+                pinned: false,
             },
             1000,
         ));

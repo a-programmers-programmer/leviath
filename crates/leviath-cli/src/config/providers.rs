@@ -27,6 +27,35 @@ pub struct ProviderConfig {
     #[serde(default)]
     pub google_api_key: Option<String>,
 
+    /// Meshy API key. Meshy is a generative 3D provider: reference images or
+    /// an existing mesh in, a textured model out.
+    #[serde(default)]
+    pub meshy_api_key: Option<String>,
+
+    /// AWS Bedrock API key, sent as a bearer token. Made in the Bedrock
+    /// console under API keys; not an AWS access key. Env fallback
+    /// `AWS_BEARER_TOKEN_BEDROCK`, the name AWS's own tooling reads.
+    #[serde(default)]
+    pub bedrock_api_key: Option<String>,
+
+    /// xAI API key, for Grok models billed to an xAI API balance. Env
+    /// fallback `XAI_API_KEY`.
+    #[serde(default)]
+    pub xai_api_key: Option<String>,
+
+    /// Meta Model API key, for Muse models. Env fallback `META_AI_API_KEY`.
+    /// Meta's own examples name the variable `MODEL_API_KEY`, which is too
+    /// generic to read safely, so Leviath does not.
+    #[serde(default)]
+    pub meta_api_key: Option<String>,
+
+    /// The AWS region whose Bedrock endpoints are called. Unset falls back
+    /// to `AWS_REGION`, then `AWS_DEFAULT_REGION`, then `us-east-1`. Part of
+    /// the address on every Bedrock host, so the one Bedrock setting a user
+    /// has to get right.
+    #[serde(default)]
+    pub bedrock_region: Option<String>,
+
     /// Host to reach Anthropic on, when it is not Anthropic's own.
     ///
     /// For an enterprise gateway or a self-hosted proxy that speaks the same
@@ -50,6 +79,68 @@ pub struct ProviderConfig {
     /// Host to reach OpenRouter on. See [`Self::anthropic_base_url`].
     #[serde(default)]
     pub openrouter_base_url: Option<String>,
+
+    /// Host to reach Meshy on. See [`Self::anthropic_base_url`].
+    #[serde(default)]
+    pub meshy_base_url: Option<String>,
+
+    /// Host to reach the Bedrock runtime on, replacing
+    /// `https://bedrock-runtime.<region>.amazonaws.com`. See
+    /// [`Self::anthropic_base_url`]. With this set the live model listing,
+    /// the price file and the token-count routes are not read: a gateway
+    /// that fronts inference rarely fronts the rest.
+    #[serde(default)]
+    pub bedrock_base_url: Option<String>,
+
+    /// Host to reach xAI on. See [`Self::anthropic_base_url`]. Also where a
+    /// Grok subscription's requests go, since the two share the API.
+    #[serde(default)]
+    pub xai_base_url: Option<String>,
+
+    /// Host to reach Meta's Model API on. See [`Self::anthropic_base_url`].
+    #[serde(default)]
+    pub meta_base_url: Option<String>,
+
+    /// Extra headers on every request Anthropic's provider makes to its
+    /// host: a gateway's own token, a tenant or cost-centre tag. Sent as
+    /// written, after the provider's own headers. Meant for a gateway named
+    /// in [`Self::anthropic_base_url`]; a value here is as often a credential
+    /// as not, so `Debug` prints the names alone.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub anthropic_headers: std::collections::BTreeMap<String, String>,
+
+    /// Extra headers for OpenAI's provider. See [`Self::anthropic_headers`].
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub openai_headers: std::collections::BTreeMap<String, String>,
+
+    /// Extra headers for Google's provider. See [`Self::anthropic_headers`].
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub google_headers: std::collections::BTreeMap<String, String>,
+
+    /// Extra headers for OpenRouter's provider. See [`Self::anthropic_headers`].
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub openrouter_headers: std::collections::BTreeMap<String, String>,
+
+    /// Extra headers for Meshy's provider, on its API calls and not on the
+    /// asset downloads, which go to signed URLs on another host. See
+    /// [`Self::anthropic_headers`].
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub meshy_headers: std::collections::BTreeMap<String, String>,
+
+    /// Extra headers for Bedrock's provider, on inference calls to the
+    /// runtime origin (the one [`Self::bedrock_base_url`] replaces) and not
+    /// on the AWS control-plane, price-file or count routes. See
+    /// [`Self::anthropic_headers`].
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub bedrock_headers: std::collections::BTreeMap<String, String>,
+
+    /// Extra headers for xAI's provider. See [`Self::anthropic_headers`].
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub xai_headers: std::collections::BTreeMap<String, String>,
+
+    /// Extra headers for Meta's provider. See [`Self::anthropic_headers`].
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub meta_headers: std::collections::BTreeMap<String, String>,
 
     /// Whether the Claude Code CLI transport is enabled.
     ///
@@ -76,11 +167,10 @@ pub struct ProviderConfig {
 
     /// Whether to offer Ollama.
     ///
-    /// Ollama needs no key and answers on a well-known local port, so it used
-    /// to be registered on every machine whether or not anybody asked. That
-    /// made a bare model name in a blueprint resolvable against whatever
-    /// happened to be running locally, which is a surprising place for a run
-    /// to end up.
+    /// Ollama needs no key and answers on a well-known local port, so it is
+    /// opt-in: registered on every machine, it would make a bare model name in
+    /// a blueprint resolvable against whatever happened to be running
+    /// locally, which is a surprising place for a run to end up.
     ///
     /// Kept separate from `ollama_base_url` because the two say different
     /// things: this is "I chose Ollama", and the URL is "and it is not at the
@@ -128,6 +218,27 @@ pub struct ProviderConfig {
     #[serde(default = "default_true")]
     pub codex_replay_reasoning: bool,
 
+    /// Whether to offer Grok billed to a subscription (SuperGrok, or X
+    /// Premium+ on a linked X account) rather than an xAI API balance.
+    ///
+    /// Opt-in for the reason Codex is: the credential is a browser sign-in,
+    /// and selecting it changes what gets billed. `lev setup` offers it, and
+    /// `lev auth login grok` does the sign-in.
+    #[serde(default)]
+    pub grok_enabled: bool,
+
+    /// Whether media parts (images, PDFs, audio, video) are uploaded to a
+    /// provider's own file storage once and referenced by id afterwards, on
+    /// the providers that have one.
+    ///
+    /// On by default: an upload is sent once rather than re-sent inline on
+    /// every turn, and a provider's file limit is far larger than what fits
+    /// inline. Off keeps every part inline, within each provider's inline
+    /// limit. [`Self::zero_retention`] turns uploads off regardless, since an
+    /// uploaded file is kept on the provider's servers until it is deleted.
+    #[serde(default = "default_true")]
+    pub file_uploads: bool,
+
     /// Prompt-cache lifetime for Anthropic: `"5m"` (default) or `"1h"`.
     ///
     /// The longer one costs more to write and needs a beta header, which is
@@ -170,6 +281,19 @@ pub struct ProviderConfig {
     /// failover target that needs a model to send (that is `fallback_order`).
     #[serde(default)]
     pub provider_order: Vec<String>,
+    /// Ask every provider for zero data retention, and refuse a stage whose
+    /// model cannot give it rather than send the request and hope. What each
+    /// provider keeps, and how the request reaches it (a per-request field,
+    /// an account setting, a contract), is `lev providers retention`.
+    #[serde(default)]
+    pub zero_retention: bool,
+    /// Providers this organisation holds a zero data retention agreement
+    /// with, by registry name (`openai`, `anthropic`, `google`). No API can
+    /// read such a contract, so it is declared here; with it, the provider
+    /// counts as keeping nothing. A model that retains regardless (Claude
+    /// Fable 5, Mythos 5) is not moved by it.
+    #[serde(default)]
+    pub zero_retention_agreements: Vec<String>,
 }
 
 /// Hand-written so the API keys can never be printed.
@@ -188,6 +312,12 @@ impl std::fmt::Debug for ProviderConfig {
             .field("anthropic_api_key", &redacted(&self.anthropic_api_key))
             .field("openai_api_key", &redacted(&self.openai_api_key))
             .field("google_api_key", &redacted(&self.google_api_key))
+            .field("meshy_api_key", &redacted(&self.meshy_api_key))
+            .field("bedrock_api_key", &redacted(&self.bedrock_api_key))
+            .field("xai_api_key", &redacted(&self.xai_api_key))
+            .field("meta_api_key", &redacted(&self.meta_api_key))
+            // A region is not a secret.
+            .field("bedrock_region", &self.bedrock_region)
             .field("claude_code_enabled", &self.claude_code_enabled)
             .field("claude_code_binary", &self.claude_code_binary)
             .field("claude_code_effort", &self.claude_code_effort)
@@ -198,8 +328,25 @@ impl std::fmt::Debug for ProviderConfig {
             .field("codex_reasoning_effort", &self.codex_reasoning_effort)
             .field("codex_verbosity", &self.codex_verbosity)
             .field("codex_replay_reasoning", &self.codex_replay_reasoning)
+            .field("grok_enabled", &self.grok_enabled)
+            .field("file_uploads", &self.file_uploads)
             .field("anthropic_cache_ttl", &self.anthropic_cache_ttl)
             .field("fallback_order", &self.fallback_order)
+            .field("zero_retention", &self.zero_retention)
+            .field("zero_retention_agreements", &self.zero_retention_agreements)
+            // A header value is a credential as often as not, so the names
+            // alone say what is configured.
+            .field("anthropic_headers", &header_names(&self.anthropic_headers))
+            .field("openai_headers", &header_names(&self.openai_headers))
+            .field("google_headers", &header_names(&self.google_headers))
+            .field(
+                "openrouter_headers",
+                &header_names(&self.openrouter_headers),
+            )
+            .field("meshy_headers", &header_names(&self.meshy_headers))
+            .field("bedrock_headers", &header_names(&self.bedrock_headers))
+            .field("xai_headers", &header_names(&self.xai_headers))
+            .field("meta_headers", &header_names(&self.meta_headers))
             .finish()
     }
 }
@@ -215,10 +362,27 @@ impl Default for ProviderConfig {
             anthropic_api_key: None,
             openai_api_key: None,
             google_api_key: None,
+            meshy_api_key: None,
+            bedrock_api_key: None,
+            xai_api_key: None,
+            meta_api_key: None,
+            bedrock_region: None,
             anthropic_base_url: None,
             openai_base_url: None,
             google_base_url: None,
             openrouter_base_url: None,
+            meshy_base_url: None,
+            bedrock_base_url: None,
+            xai_base_url: None,
+            meta_base_url: None,
+            anthropic_headers: std::collections::BTreeMap::new(),
+            openai_headers: std::collections::BTreeMap::new(),
+            google_headers: std::collections::BTreeMap::new(),
+            openrouter_headers: std::collections::BTreeMap::new(),
+            meshy_headers: std::collections::BTreeMap::new(),
+            bedrock_headers: std::collections::BTreeMap::new(),
+            xai_headers: std::collections::BTreeMap::new(),
+            meta_headers: std::collections::BTreeMap::new(),
             claude_code_enabled: false,
             claude_code_binary: None,
             claude_code_effort: None,
@@ -228,11 +392,21 @@ impl Default for ProviderConfig {
             codex_reasoning_effort: None,
             codex_verbosity: None,
             codex_replay_reasoning: default_true(),
+            grok_enabled: false,
+            file_uploads: default_true(),
             anthropic_cache_ttl: None,
             fallback_order: Vec::new(),
             provider_order: Vec::new(),
+            zero_retention: false,
+            zero_retention_agreements: Vec::new(),
         }
     }
+}
+
+/// The header names alone, for [`Debug`] output: a value is as often a
+/// credential as not.
+fn header_names(headers: &std::collections::BTreeMap<String, String>) -> Vec<&str> {
+    headers.keys().map(String::as_str).collect()
 }
 
 /// `"<set>"` or `"<unset>"` for an optional secret, for [`Debug`] output.
@@ -258,6 +432,10 @@ pub enum ModelProviderKind {
     /// A server speaking OpenAI's chat API, reached natively with no script:
     /// llama.cpp, vLLM, LM Studio, or a gateway.
     OpenaiCompatible,
+    /// OpenAI's own API (the Responses route) at another host, under a name
+    /// of its own: an Azure resource or an API gateway in front of OpenAI.
+    /// Several can sit side by side, each with its own key.
+    Openai,
 }
 
 impl ModelProviderKind {
@@ -266,6 +444,7 @@ impl ModelProviderKind {
         match self {
             Self::Script => "script",
             Self::OpenaiCompatible => "openai-compatible",
+            Self::Openai => "openai",
         }
     }
 
@@ -274,6 +453,7 @@ impl ModelProviderKind {
         match text {
             "script" => Some(Self::Script),
             "openai-compatible" => Some(Self::OpenaiCompatible),
+            "openai" => Some(Self::Openai),
             _ => None,
         }
     }
@@ -368,7 +548,15 @@ const ENDPOINT_KEYS: &[&str] = &[
     "serves",
     "headers",
     "models",
+    "retention",
+    "zero_retention_request",
+    "auth_header",
 ];
+
+/// The keys an endpoint entry reads off `extra`, where a `flatten` puts them:
+/// what the host keeps of its requests, which built-in provider's
+/// zero-retention request field it takes, and the header its key goes in.
+const ENDPOINT_EXTRA_KEYS: &[&str] = &["retention", "zero_retention_request", "auth_header"];
 
 impl ModelProviderConfig {
     /// The kind this entry is, with absent read as a script.
@@ -376,10 +564,27 @@ impl ModelProviderConfig {
         self.kind.unwrap_or_default()
     }
 
-    /// Whether this entry is an OpenAI-compatible endpoint rather than a
-    /// script.
+    /// Whether this entry is a host Leviath reaches natively (either
+    /// OpenAI-shaped kind) rather than a script.
     pub fn is_endpoint(&self) -> bool {
-        self.kind() == ModelProviderKind::OpenaiCompatible
+        self.kind() != ModelProviderKind::Script
+    }
+
+    /// Whether this entry is OpenAI's own API at a host of its own.
+    pub fn is_openai(&self) -> bool {
+        self.kind() == ModelProviderKind::Openai
+    }
+
+    /// The header the key goes in instead of `Authorization: Bearer`, when
+    /// the entry names one (`api-key` for an Azure key, or
+    /// `Ocp-Apim-Subscription-Key` for an API Management gateway).
+    pub fn auth_header(&self) -> Option<String> {
+        self.extra
+            .get("auth_header")
+            .and_then(toml::Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
     }
 
     /// What is wrong with this entry, if anything, named against `name`.
@@ -389,6 +594,31 @@ impl ModelProviderConfig {
     /// message should name the table to fix while the file is still in front
     /// of the person who wrote it.
     pub fn validate(&self, name: &str) -> anyhow::Result<()> {
+        let kind = self.kind().as_str();
+        if self.is_openai()
+            && self
+                .base_url
+                .as_deref()
+                .is_none_or(|url| url.trim().is_empty())
+        {
+            anyhow::bail!(
+                "[model_providers.{name}] has kind = \"openai\" but no base_url; set \
+                 base_url to the host's API root, such as \
+                 \"https://<resource>.openai.azure.com/openai/v1\""
+            );
+        }
+        if self.is_openai()
+            && self
+                .api_key
+                .as_deref()
+                .is_none_or(|key| key.trim().is_empty())
+        {
+            anyhow::bail!(
+                "[model_providers.{name}] has kind = \"openai\" but no api_key; set the \
+                 key the host issued (add auth_header = \"api-key\" when the host wants \
+                 it in that header rather than as a bearer token)"
+            );
+        }
         if self.is_endpoint()
             && self
                 .base_url
@@ -401,17 +631,30 @@ impl ModelProviderConfig {
                  \"http://localhost:8080/v1\""
             );
         }
+        if self.is_endpoint()
+            && self.extra.contains_key("auth_header")
+            && self.auth_header().is_none()
+        {
+            anyhow::bail!(
+                "[model_providers.{name}] auth_header must name a header, such as \"api-key\""
+            );
+        }
         // `extra` exists to reach a script's `initialize`. An endpoint has no
         // script, so a key landing there is one the endpoint will never read:
         // `modles` leaves it with no catalogue and `heaeders` sends nothing,
         // and both would otherwise load clean. `Config::unknown_config_keys`
         // cannot catch them either, because `flatten` writes them straight
         // back.
-        if self.is_endpoint() && !self.extra.is_empty() {
-            let mut keys: Vec<&str> = self.extra.keys().map(String::as_str).collect();
+        let mut keys: Vec<&str> = self
+            .extra
+            .keys()
+            .map(String::as_str)
+            .filter(|key| !ENDPOINT_EXTRA_KEYS.contains(key))
+            .collect();
+        if self.is_endpoint() && !keys.is_empty() {
             keys.sort_unstable();
             anyhow::bail!(
-                "[model_providers.{name}] has kind = \"openai-compatible\" and \
+                "[model_providers.{name}] has kind = \"{kind}\" and \
                  unknown key(s) {}; an endpoint reads only {}",
                 keys.join(", "),
                 ENDPOINT_KEYS.join(", ")

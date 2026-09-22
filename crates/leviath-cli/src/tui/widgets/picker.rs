@@ -18,7 +18,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use super::line_edit::{EditOutcome, LineEdit};
+use super::list_cursor;
 use super::popup::{centered, popup_frame};
+use crate::tui::text::{truncate, wrap_words};
 use crate::tui::theme::{C_ACCENT, C_ACTIVE, C_BORDER_FOCUS, C_DIM, C_MUTED, C_WARN, C_WHITE};
 
 /// Rows a page key moves.
@@ -61,6 +63,10 @@ pub(crate) struct Picker {
     pub(crate) cursor: usize,
     /// Multi-select: the chosen indices into `options`. `None` = one choice.
     pub(crate) multi: Option<BTreeSet<usize>>,
+    /// Where the options shown only to a search begin: those at or past this
+    /// index stay hidden until something is typed. `None` = every option is
+    /// always listed.
+    pub(crate) search_from: Option<usize>,
 }
 
 impl Picker {
@@ -79,7 +85,18 @@ impl Picker {
             options,
             cursor,
             multi: None,
+            search_from: None,
         }
+    }
+
+    /// Add options a search can find that the list does not show: a
+    /// category chooser that also finds any provider by its name or what it
+    /// does, once a word is typed. They are chosen by their index after the
+    /// listed options.
+    pub(crate) fn with_search_only(mut self, options: Vec<PickerOption>) -> Self {
+        self.search_from = Some(self.options.len());
+        self.options.extend(options);
+        self
     }
 
     /// The options matching the query, as indices into `options`.
@@ -90,8 +107,13 @@ impl Picker {
     pub(crate) fn matches(&self) -> Vec<usize> {
         let query = self.query.value().to_lowercase();
         let terms: Vec<&str> = query.split_whitespace().collect();
+        let listed = match terms.is_empty() {
+            true => self.search_from.unwrap_or(self.options.len()),
+            false => self.options.len(),
+        };
         self.options
             .iter()
+            .take(listed)
             .enumerate()
             .filter(|(_, option)| {
                 let haystack = format!("{} {}", option.value, option.detail).to_lowercase();
@@ -107,13 +129,8 @@ impl Picker {
     }
 
     /// Move within the filtered list, clamped to it.
-    ///
-    /// Clamping rather than wrapping: at eighty models, wrapping from the top
-    /// to the bottom looks like the list jumped rather than moved.
     pub(crate) fn move_cursor(&mut self, delta: isize) {
-        let count = self.matches().len();
-        let next = self.cursor as isize + delta;
-        self.cursor = next.clamp(0, count.saturating_sub(1) as isize) as usize;
+        self.cursor = list_cursor::move_cursor(self.cursor, delta, self.matches().len());
     }
 
     /// Whether an option is chosen (multi-select).
@@ -211,8 +228,8 @@ impl Picker {
     }
 
     /// Which option a click landed on, as an index into the filtered list.
-    /// Shares the layout with the drawing, so a click cannot resolve against
-    /// rows that were not on screen.
+    /// Shares the layout and the scroll window with the drawing, so a click
+    /// cannot resolve against rows that were not on screen.
     pub(crate) fn row_at(&self, area: Rect, row: u16) -> Option<usize> {
         let popup = centered(80, 88, area);
         // What `popup_frame` leaves after its border.
@@ -224,10 +241,18 @@ impl Picker {
         if row < list.y || row >= list.y + list.height {
             return None;
         }
-        let height = list.height as usize;
-        let offset = self.cursor.saturating_sub(height.saturating_sub(1));
-        let position = offset + (row - list.y) as usize;
-        (position < self.matches().len()).then_some(position)
+        let matches = self.matches();
+        let heights = self.row_heights(&matches, list.width);
+        let offset =
+            list_cursor::window_start_by_height(&heights, self.cursor, list.height as usize);
+        let mut line = (row - list.y) as usize;
+        for (position, tall) in heights.iter().enumerate().skip(offset) {
+            if line < *tall {
+                return Some(position);
+            }
+            line -= tall;
+        }
+        None
     }
 
     /// Draw the chooser over everything else.
@@ -274,43 +299,93 @@ impl Picker {
         }
 
         let height = chunks[2].height as usize;
-        // Keep the cursor in view without a stored offset: the list is rebuilt
-        // every frame anyway, so the window into it is arithmetic, not state.
-        let offset = self.cursor.saturating_sub(height.saturating_sub(1));
-        let rows: Vec<Line<'static>> = matches
-            .iter()
-            .enumerate()
-            .skip(offset)
-            .take(height)
-            .map(|(position, index)| {
-                let option = &self.options[*index];
-                let selected = position == self.cursor;
-                let mark = match &self.multi {
-                    Some(_) if self.is_chosen(*index) => "[x] ",
-                    Some(_) => "[ ] ",
-                    None => "",
-                };
-                Line::from(vec![
-                    Span::styled(
-                        if selected { "› " } else { "  " },
-                        Style::default().fg(C_ACCENT),
-                    ),
-                    Span::styled(mark, Style::default().fg(C_ACCENT)),
-                    Span::styled(
-                        format!("{:<38}", option.value),
-                        if selected {
-                            Style::default().fg(C_ACTIVE).add_modifier(Modifier::BOLD)
-                        } else {
-                            Style::default().fg(C_WHITE)
-                        },
-                    ),
-                    Span::styled(option.detail.clone(), Style::default().fg(C_DIM)),
-                ])
-            })
-            .collect();
+        let (value_w, note_w) = self.columns(&matches, chunks[2].width);
+        // The list is rebuilt every frame, so the window into it is
+        // arithmetic, not state. A note that wraps makes its row taller, and
+        // the window is counted in lines so the cursor's whole row is shown.
+        let heights = self.row_heights(&matches, chunks[2].width);
+        let offset = list_cursor::window_start_by_height(&heights, self.cursor, height);
+        let mut rows: Vec<Line<'static>> = Vec::new();
+        for (position, index) in matches.iter().enumerate().skip(offset) {
+            if rows.len() >= height {
+                break;
+            }
+            let option = &self.options[*index];
+            let selected = position == self.cursor;
+            let mark = match &self.multi {
+                Some(_) if self.is_chosen(*index) => "[x] ",
+                Some(_) => "[ ] ",
+                None => "",
+            };
+            let mut note = wrap_words(&option.detail, note_w).into_iter();
+            rows.push(Line::from(vec![
+                Span::styled(
+                    if selected { "› " } else { "  " },
+                    Style::default().fg(C_ACCENT),
+                ),
+                Span::styled(mark, Style::default().fg(C_ACCENT)),
+                Span::styled(
+                    format!("{:<value_w$}", truncate(&option.value, value_w - 2)),
+                    if selected {
+                        Style::default().fg(C_ACTIVE).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(C_WHITE)
+                    },
+                ),
+                Span::styled(note.next().unwrap_or_default(), Style::default().fg(C_DIM)),
+            ]));
+            // The rest of the note hangs under the note column.
+            let indent = " ".repeat(2 + mark.chars().count() + value_w);
+            for rest in note {
+                rows.push(Line::from(vec![
+                    Span::raw(indent.clone()),
+                    Span::styled(rest, Style::default().fg(C_DIM)),
+                ]));
+            }
+        }
+        rows.truncate(height);
         frame.render_widget(Paragraph::new(rows), chunks[2]);
     }
+
+    /// A row's columns at `width`: the value column, gap included, and the
+    /// room left for the note after the marker, any multi-select box, and
+    /// the value.
+    fn columns(&self, matches: &[usize], width: u16) -> (usize, usize) {
+        let value_w = self.value_column(matches, width);
+        let box_w = if self.multi.is_some() { 4 } else { 0 };
+        let note_w = (width as usize).saturating_sub(2 + box_w + value_w).max(1);
+        (value_w, note_w)
+    }
+
+    /// How many lines each matching row takes at `width`: one, plus one for
+    /// every extra row its note wraps onto. Drawing and hit-testing both ask
+    /// here, so a click resolves against the rows that were drawn.
+    fn row_heights(&self, matches: &[usize], width: u16) -> Vec<usize> {
+        let (_, note_w) = self.columns(matches, width);
+        matches
+            .iter()
+            .map(|index| wrap_words(&self.options[*index].detail, note_w).len())
+            .collect()
+    }
+
+    /// The value column's width for the rows on offer: the widest value
+    /// plus a gap, so a long name never runs into the note beside it, and
+    /// no wider than leaves the note some room. Measured over every match
+    /// rather than the rows in view, so the column holds still while the
+    /// list scrolls.
+    fn value_column(&self, matches: &[usize], width: u16) -> usize {
+        let widest = matches
+            .iter()
+            .map(|index| self.options[*index].value.chars().count())
+            .max()
+            .unwrap_or(0);
+        let room = (width as usize).saturating_sub(30).max(VALUE_MIN);
+        (widest + 2).clamp(VALUE_MIN, room)
+    }
 }
+
+/// The narrowest the value column gets, gap included.
+const VALUE_MIN: usize = 20;
 
 #[cfg(test)]
 mod tests {
@@ -352,6 +427,83 @@ mod tests {
             .iter()
             .map(|c| c.symbol().to_string())
             .collect()
+    }
+
+    /// A long value never runs into the note beside it: the column is as
+    /// wide as the widest value on offer plus a gap, and on a terminal too
+    /// narrow for that the value is cut with an ellipsis and the note still
+    /// starts after the gap.
+    #[test]
+    fn the_value_column_fits_the_widest_value() {
+        let long = "GitHub__add_reply_to_pull_request_comment";
+        let mut options = options();
+        options.push(PickerOption {
+            value: long.to_string(),
+            detail: "GitHub's tool, over MCP".to_string(),
+        });
+        let p = Picker::new("Tools", vec![], options, 0);
+        let roomy = rendered(&p, 120, 30);
+        assert!(
+            roomy.contains(&format!("{long}  GitHub's tool, over MCP")),
+            "{roomy}"
+        );
+        assert!(roomy.contains("alpha "), "{roomy}");
+        let tight = rendered(&p, 50, 30);
+        assert!(tight.contains("GitHub__add_reply…  GitHub's"), "{tight}");
+        assert!(!tight.contains(long), "{tight}");
+    }
+
+    /// A long note wraps under the note column instead of running off the
+    /// edge, the rows below move down to make room, a click on the wrapped
+    /// part lands on that option, and the window still reaches a cursor past
+    /// a tall row.
+    #[test]
+    fn a_long_note_wraps_and_its_rows_stay_clickable() {
+        let mut options = options();
+        options[1].detail = "vLLM, BionicGPT, a gateway, or any server that speaks the OpenAI \
+                             chat API: a name, a base URL, and a key or headers if it wants them"
+            .to_string();
+        let mut p = Picker::new("Providers", vec![], options, 0);
+        let area = Rect::new(0, 0, 60, 30);
+        let text = rendered(&p, 60, 30);
+        assert!(
+            text.contains("them"),
+            "the tail of the note is on screen:\n{text}"
+        );
+        let rows: Vec<u16> = (0..30).filter(|y| p.row_at(area, *y) == Some(1)).collect();
+        assert!(rows.len() >= 2, "beta takes more than one row: {rows:?}");
+        let last = rows[rows.len() - 1];
+        assert_eq!(
+            p.row_at(area, last + 1),
+            Some(2),
+            "gamma follows the wrapped note"
+        );
+        p.cursor = 3;
+        let short = rendered(&p, 60, 12);
+        assert!(short.contains("delta"), "{short}");
+        assert!(short.contains("gamma"), "{short}");
+        assert!(
+            !short.contains("alpha"),
+            "no room above the tall row:\n{short}"
+        );
+    }
+
+    /// Options for a search only stay out of the list until something is
+    /// typed, then are found by their value or their note like any other, and
+    /// chosen by their index after the listed ones.
+    #[test]
+    fn search_only_options_appear_once_something_is_typed() {
+        let extra = vec![PickerOption {
+            value: "Anthropic".into(),
+            detail: "Claude models".into(),
+        }];
+        let mut p = Picker::new("Pick", vec![], options(), 0).with_search_only(extra);
+        assert_eq!(p.matches(), [0, 1, 2, 3], "the list alone");
+        for c in "claude".chars() {
+            p.handle_key(&key(KeyCode::Char(c)));
+        }
+        assert_eq!(p.matches(), [4], "found by its note");
+        assert_eq!(p.handle_key(&key(KeyCode::Enter)), PickerOutcome::Chosen(4));
     }
 
     #[test]

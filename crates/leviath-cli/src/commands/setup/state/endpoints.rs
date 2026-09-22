@@ -5,7 +5,7 @@
 //! each, and a `[model_providers.<name>]` endpoint is neither: a machine can
 //! run two llama.cpp servers on two ports, and each needs a name, an address,
 //! maybe a key, maybe headers. So the pick-list rows for these are presets,
-//! and picking one adds an *entry* the credential screen then edits as a small
+//! and picking one adds an *entry* the setup modal then edits as a small
 //! form. Several entries can sit under one preset, and the screen offers add
 //! and remove beside the fields.
 //!
@@ -38,9 +38,11 @@ pub struct EndpointRow {
     pub outcome: Outcome,
     /// A check is in flight.
     pub checking: bool,
+    /// When `outcome` was learned, Unix seconds; `None` when it is `Skipped`.
+    pub checked_at: Option<i64>,
 }
 
-/// The rows one entry occupies on the credential screen, in order.
+/// The rows one entry occupies on the setup modal, in order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EndpointField {
     /// The table key.
@@ -114,7 +116,7 @@ impl EndpointField {
     }
 }
 
-/// Where the cursor sits on an endpoint preset's credential screen.
+/// Where the cursor sits on an endpoint preset's setup modal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EndpointCursor {
     /// On a field of the entry at this index into `Wizard::endpoints`.
@@ -181,6 +183,7 @@ impl EndpointRow {
             default_model: None,
             outcome: Outcome::Skipped,
             checking: false,
+            checked_at: None,
         }
     }
 
@@ -200,6 +203,30 @@ impl EndpointRow {
             default_model: None,
             outcome: Outcome::Skipped,
             checking: false,
+            checked_at: None,
+        }
+    }
+
+    /// The token a check of this entry is fingerprinted by, or `None` for a
+    /// server that wants none.
+    pub(crate) fn secret(&self) -> Option<&str> {
+        (!self.api_key.is_empty()).then_some(self.api_key.as_str())
+    }
+
+    /// Keep the default model in step with the listing: a pick the listing
+    /// no longer names is dropped, and the first id it does name is offered
+    /// when nothing was picked yet.
+    pub(crate) fn settle_default_model(&mut self) {
+        let choices = self.model_choices();
+        if self
+            .default_model
+            .as_ref()
+            .is_some_and(|m| !choices.contains(m))
+        {
+            self.default_model = None;
+        }
+        if self.default_model.is_none() {
+            self.default_model = choices.first().cloned();
         }
     }
 
@@ -219,7 +246,11 @@ impl EndpointRow {
     /// set by hand survives a pass through the wizard.
     fn to_config(&self, existing: Option<&ModelProviderConfig>) -> ModelProviderConfig {
         let mut entry = existing.cloned().unwrap_or_default();
-        entry.kind = Some(ModelProviderKind::OpenaiCompatible);
+        // An `openai` entry written by hand keeps its kind: the wizard edits
+        // the address, key and headers both kinds share.
+        if !entry.is_openai() {
+            entry.kind = Some(ModelProviderKind::OpenaiCompatible);
+        }
         entry.script = None;
         entry.base_url = Some(self.base_url.trim().to_string());
         entry.api_key = Some(self.api_key.trim().to_string()).filter(|k| !k.is_empty());
@@ -301,7 +332,7 @@ impl Wizard {
         self.endpoints.retain(|e| e.preset != preset);
     }
 
-    /// How many cursor rows the credential screen has for the preset at
+    /// How many cursor rows the setup modal has for the preset at
     /// provider row `index`: every entry's fields, then the add row.
     pub(crate) fn endpoint_row_count(&self, index: usize) -> usize {
         let preset = self.providers[index].provider.id;
@@ -399,6 +430,7 @@ impl Wizard {
             EndpointField::BaseUrl | EndpointField::ApiKey | EndpointField::Headers
         ) {
             row.outcome = Outcome::Skipped;
+            row.checked_at = None;
         }
     }
 
@@ -462,9 +494,9 @@ impl Wizard {
         }
     }
 
-    /// Route a verifier's reply to the entry it answers for. `true` when one
-    /// took it.
-    pub(super) fn settle_endpoint_reply(&mut self, reply: &VerifyReply) -> bool {
+    /// Route a verifier's reply to the entry it answers for, stamped `now`.
+    /// `true` when one took it.
+    pub(super) fn settle_endpoint_reply(&mut self, reply: &VerifyReply, now: i64) -> bool {
         let Some(row) = self
             .endpoints
             .iter_mut()
@@ -474,19 +506,8 @@ impl Wizard {
         };
         row.checking = false;
         row.outcome = reply.outcome.clone();
-        // A pick that the listing no longer names is dropped; the first id
-        // the listing does name is offered when nothing was picked yet.
-        let choices = row.model_choices();
-        if row
-            .default_model
-            .as_ref()
-            .is_some_and(|m| !choices.contains(m))
-        {
-            row.default_model = None;
-        }
-        if row.default_model.is_none() {
-            row.default_model = choices.first().cloned();
-        }
+        row.checked_at = Some(now);
+        row.settle_default_model();
         true
     }
 
@@ -532,6 +553,22 @@ impl Wizard {
 mod tests {
     use super::super::tests::test_wizard;
     use super::*;
+
+    /// An `openai` entry written by hand keeps its kind through a wizard pass;
+    /// anything else the wizard writes is an OpenAI-compatible endpoint.
+    #[test]
+    fn a_wizard_pass_keeps_an_openai_hosts_kind() {
+        let hand_written = ModelProviderConfig {
+            kind: Some(ModelProviderKind::Openai),
+            base_url: Some("https://east.openai.azure.com/openai/v1".to_string()),
+            api_key: Some("k".to_string()),
+            ..Default::default()
+        };
+        let row = EndpointRow::from_config("azure-east", &hand_written);
+        assert!(row.to_config(Some(&hand_written)).is_openai());
+        let fresh = row.to_config(None);
+        assert_eq!(fresh.kind, Some(ModelProviderKind::OpenaiCompatible));
+    }
 
     fn preset_index(wizard: &Wizard, id: &str) -> usize {
         wizard
@@ -635,7 +672,7 @@ mod tests {
         w.cursor = 16;
         assert_eq!(w.endpoint_cursor(llama), Some(EndpointCursor::Add));
         w.cursor = 17;
-        assert_eq!(w.endpoint_cursor(llama), None, "the continue button");
+        assert_eq!(w.endpoint_cursor(llama), None, "the modal's first button");
         assert_eq!(w.endpoint_cursor(99), None);
         assert!(w.is_endpoint_preset(llama));
         assert!(!w.is_endpoint_preset(0));
@@ -835,18 +872,20 @@ mod tests {
         w.request_endpoint_verification(4);
     }
 
-    /// The preset's credential screen has no action rows of its own (each
-    /// entry carries its buttons), and the chooser names an entry by its
-    /// preset and address.
+    /// The preset's setup modal has no action rows of its own (each entry
+    /// carries its buttons), so its card is exactly the entries' rows, and
+    /// the chooser names an entry by its preset and address.
     #[test]
     fn a_preset_has_no_detail_actions_and_the_chooser_names_its_entries() {
         let dir = tempfile::tempdir().unwrap();
         let mut w = test_wizard(dir.path());
         let llama = preset_index(&w, "llama-cpp");
         w.add_endpoint(llama);
-        w.enter(Step::ProviderDetail);
+        w.enter(Step::Providers);
+        w.open_provider_modal(llama);
         assert_eq!(w.detail_row(), Some(llama));
         assert!(w.detail_actions().is_empty());
+        assert_eq!(w.modal_card_rows(), w.endpoint_row_count(llama));
 
         assert_eq!(
             w.provider_detail("llama-cpp"),
@@ -957,7 +996,7 @@ mod tests {
         assert_eq!(providers, vec!["llama-cpp".to_string()]);
         assert_eq!(w.build_config().default_provider, "llama-cpp");
         assert_eq!(
-            w.build_config().default_model.as_deref(),
+            w.build_config().override_model.as_deref(),
             Some("qwen"),
             "the entry's pick becomes the default model"
         );

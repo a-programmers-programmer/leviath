@@ -208,7 +208,7 @@ jobs:
           echo "VERSION=$VERSION" >> $GITHUB_ENV
 
       - name: Publish prod release
-        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           # See beta.yml: tagging the promoted (older) commit needs a token
           # that may create refs with workflow-file drift; GITHUB_TOKEN cannot.
@@ -268,7 +268,7 @@ jobs:
         run: gh release delete latest --yes --cleanup-tag --repo ${{ github.repository }} || true
 
       - name: Publish latest channel release
-        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           # Same as the prod release above.
           token: ${{ secrets.RELEASE_TOKEN || github.token }}
@@ -335,11 +335,14 @@ jobs:
             exit 0
           fi
           # Dependency order: cargo publish verifies each crate against the
-          # registry, so dependencies must land before their dependents.
-          for c in leviath-net leviath-alloc \
-                   leviath-core leviath-sys leviath-agent-client leviath-mcp \
-                   leviath-package leviath-scripting leviath-telemetry \
-                   leviath-providers leviath-tools leviath-runtime \
+          # registry, so dependencies must land before their dependents. A
+          # dev-dependency counts too: cargo resolves it when packaging, so
+          # agent-client (which tests against tools) has to follow tools.
+          # The version check in CI refuses a list that breaks this.
+          for c in leviath-alloc leviath-core leviath-net leviath-sys \
+                   leviath-mcp leviath-package leviath-scripting \
+                   leviath-telemetry leviath-providers leviath-tools \
+                   leviath-agent-client leviath-runtime \
                    leviath leviath-cli; do
             if curl -fsS -A "leviath-ci (github.com/GEMISIS/leviath)" \
                  "https://crates.io/api/v1/crates/$c/$VERSION" >/dev/null 2>&1; then

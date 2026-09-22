@@ -257,11 +257,23 @@ pub fn title_chain(
     let mut chain: Vec<(String, String)> = Vec::new();
     let head = resolve_title_model(settings, run_model_label);
     for pair in head.into_iter().chain(stage_candidates.iter().cloned()) {
-        if !chain.contains(&pair) {
+        if !chain.contains(&pair) && writes_text(&pair.0, &pair.1) {
             chain.push(pair);
         }
     }
     chain
+}
+
+/// Whether a provider's model answers in text at all.
+///
+/// A run whose entry stage is a Meshy operation or an image model put that
+/// model at the head of the title chain, and the title call spent a failover
+/// step (and, for Meshy, a real job submission) learning it cannot write a
+/// sentence. The compiled tables know; a model they have never heard of is
+/// text-only by their own default, so an unknown pair stays in the chain.
+fn writes_text(provider: &str, model: &str) -> bool {
+    leviath_providers::mime_tables::builtin_mime(provider, model)
+        .produces(&leviath_core::mime::text_plain())
 }
 
 /// The provider's own "do not think about this one" switch.
@@ -287,6 +299,11 @@ fn no_thinking_extra(provider: &str) -> serde_json::Value {
         // top level. This is the provider that hands reasoning back as the
         // reply when the answer is empty, so it is the one that leaked.
         "openrouter" => serde_json::json!({ "reasoning": { "enabled": false } }),
+        // Claude's own switch, which the Bedrock provider passes through in
+        // `additionalModelRequestFields` for Claude and drops for every other
+        // vendor: on Bedrock the Claude 5 line thinks unless told not to, and
+        // the field is a validation error on a model that has no such switch.
+        "bedrock" => serde_json::json!({ "thinking": { "type": "disabled" } }),
         // Every model on the Codex route is a reasoning model, so a title
         // call left alone spends its whole 256-token budget thinking and
         // returns nothing. This asks for the least of it instead.
@@ -303,6 +320,10 @@ fn no_thinking_extra(provider: &str) -> serde_json::Value {
             "reasoning": { "effort": "low" },
             "text": { "verbosity": "low" }
         }),
+        // The same `low` on the other Responses routes, for the same reason.
+        // Muse Spark always reasons and refuses `none`; a Grok that picks its
+        // own depth has the field taken back off by its provider.
+        "xai" | "grok" | "meta" => serde_json::json!({ "reasoning": { "effort": "low" } }),
         _ => serde_json::Value::Null,
     }
 }
@@ -358,10 +379,20 @@ fn sanitize_title(raw: &str) -> String {
     // Compared in bytes, which is what the cap is in. Counting chars here and
     // cutting bytes afterwards lets a title of 80 CJK characters pass the check
     // and then be sliced mid-title.
+    //
+    // A model asked for a title often answers with a markdown heading, and
+    // `#` is not part of the name; nor are the quotes some wrap it in.
     stripped
         .lines()
         .map(strip_control_tokens)
-        .map(|l| l.trim_matches(['"', '\'', '`']).trim().to_string())
+        .map(|l| {
+            l.trim()
+                .trim_start_matches('#')
+                .trim()
+                .trim_matches(['"', '\'', '`'])
+                .trim()
+                .to_string()
+        })
         .filter(|l| !l.is_empty())
         .find(|l| l.len() <= TITLE_MAX_LEN && !is_degenerate(l) && !echoes_the_instruction(l))
         .unwrap_or_default()
@@ -581,10 +612,22 @@ pub(crate) fn dispatch_title(
             commands.entity(entity).remove::<PendingTitle>();
             continue;
         }
+        let mut refused = None;
         let picked = loop {
             let Some((provider_name, model)) = chain.0.first().cloned() else {
                 break None;
             };
+            // A title call carries the task, so a model zero retention
+            // refuses is passed over the way an unregistered one is.
+            if let Some(refusal) = providers.0.retention_refusal(&provider_name, &model) {
+                tracing::debug!(
+                    run_id = %meta.run_id,
+                    "title candidate refused: {refusal}"
+                );
+                refused = Some(refusal);
+                chain.0.remove(0);
+                continue;
+            }
             match providers.0.get(&provider_name) {
                 Some(provider) => break Some((provider_name, model, provider)),
                 None => {
@@ -600,7 +643,12 @@ pub(crate) fn dispatch_title(
         let Some((provider_name, model, provider)) = picked else {
             record_title_failure(
                 &mut meta,
-                "no configured provider could serve a title call".to_string(),
+                match refused {
+                    Some(refusal) => {
+                        format!("no title call was sent: the last candidate was {refusal}")
+                    }
+                    None => "no configured provider could serve a title call".to_string(),
+                },
             );
             commands.entity(entity).remove::<PendingTitle>();
             continue;
@@ -612,13 +660,19 @@ pub(crate) fn dispatch_title(
         // found a full pool does not cost the run a candidate.
         chain.0.remove(0);
 
+        // The title call carries the task, so the zero-retention fields ride
+        // it the way they ride a stage's own request.
+        let mut request = title_request(&meta.task, &provider_name, &model);
+        providers
+            .0
+            .apply_retention_knobs(&provider_name, &mut request.extra);
         stage.runtime.spawn(run_title_job(
             TitleJob {
                 entity,
                 provider,
                 provider_name: provider_name.clone(),
                 model: model.clone(),
-                request: title_request(&meta.task, &provider_name, &model),
+                request,
                 permit,
             },
             retry,
@@ -841,6 +895,7 @@ mod tests {
         ) -> leviath_providers::Result<leviath_providers::InferenceResponse> {
             match self.reply {
                 Ok(reply) => Ok(leviath_providers::InferenceResponse {
+                    parts: Vec::new(),
                     content: reply.to_string(),
                     tool_calls: vec![],
                     tokens_used: leviath_providers::TokenUsage {
@@ -887,7 +942,9 @@ mod tests {
             callback_secret: None,
             title: None,
             title_error: None,
+            blueprint_digest: None,
             unattended: false,
+            yolo_profile: None,
             read_paths: None,
             output_request: None,
             model_override: None,
@@ -1012,6 +1069,7 @@ mod tests {
     fn agent_state(status: crate::components::AgentStatus) -> AgentState {
         AgentState {
             agent_id: "a".to_string(),
+            current_visit: String::new(),
             current_stage: "s".to_string(),
             iteration: 0,
             status,
@@ -1186,6 +1244,7 @@ mod tests {
                 },
                 finish_reason: leviath_providers::FinishReason::Complete,
                 reasoning: None,
+                parts: Vec::new(),
             })
         }
         async fn count_tokens(&self, _t: &str, _m: &str) -> usize {
@@ -1292,6 +1351,7 @@ mod tests {
                 tokens_used: leviath_providers::TokenUsage::new(1, 0, 0, 1),
                 finish_reason: leviath_providers::FinishReason::Complete,
                 reasoning: None,
+                parts: Vec::new(),
             })
         }
         async fn count_tokens(&self, _t: &str, _m: &str) -> usize {
@@ -1565,6 +1625,25 @@ mod tests {
         );
     }
 
+    /// A model that makes files, not sentences, never enters the chain: a
+    /// mesh generator at the head of a run used to be asked for a title first.
+    #[test]
+    fn the_chain_skips_models_that_do_not_write_text() {
+        let stage = [
+            ("meshy".to_string(), "image-to-3d".to_string()),
+            ("anthropic".to_string(), "claude-x".to_string()),
+            ("nowhere".to_string(), "unheard-of".to_string()),
+        ];
+        assert_eq!(
+            title_chain(&config(None, None), Some("meshy/image-to-3d"), &stage),
+            vec![
+                ("anthropic".to_string(), "claude-x".to_string()),
+                ("nowhere".to_string(), "unheard-of".to_string()),
+            ],
+            "the run's own Meshy head and the Meshy candidate are skipped; an unknown pair is kept"
+        );
+    }
+
     /// The case `resolve_title_model` has to refuse on its own - a `[title]`
     /// provider different from the run's, with no `[title]` model - stops
     /// being a dead end, because each candidate carries its own model name.
@@ -1791,6 +1870,12 @@ mod tests {
             title_request("t", "openrouter", "deepseek/deepseek-r1").extra,
             serde_json::json!({ "reasoning": { "enabled": false } })
         );
+        // Claude on Bedrock thinks unless told not to; the provider keeps
+        // the field to Claude.
+        assert_eq!(
+            title_request("t", "bedrock", "us.anthropic.claude-sonnet-5").extra,
+            serde_json::json!({ "thinking": { "type": "disabled" } })
+        );
         // Anthropic only thinks when asked, and OpenAI never returns reasoning
         // text, so neither needs a switch and neither is sent one.
         assert_eq!(
@@ -1899,6 +1984,33 @@ mod tests {
             world.get::<RunMetadata>(e).unwrap().title_error.as_deref(),
             Some("no configured provider could serve a title call")
         );
+    }
+
+    /// A title call sends the task, so a candidate zero retention refuses is
+    /// passed over, and a run with nothing left says which model refused.
+    #[tokio::test]
+    async fn dispatch_passes_over_a_candidate_zero_retention_refuses() {
+        let (mut world, _title_rx) = build_world(Ok("t"), default_pools());
+        world.resource_mut::<Providers>().0.set_retention(
+            leviath_providers::retention::RetentionSettings {
+                zero_requested: true,
+                ..Default::default()
+            },
+        );
+        world.insert_resource(TitleSettings(config(None, None)));
+        let e = world
+            .spawn((
+                metadata(Some("mock/m")),
+                PendingTitle,
+                chain_of(&[("mock", "m")]),
+            ))
+            .id();
+        run_dispatch(&mut world);
+        assert!(world.get::<AwaitingTitle>(e).is_none());
+        let error = world.get::<RunMetadata>(e).unwrap().title_error.clone();
+        assert!(error.is_some_and(|e| e.starts_with(
+            "no title call was sent: the last candidate was mock/m, which does not run"
+        )));
     }
 
     /// The title call takes the operator's `[limits]` retry schedule, not a
@@ -2042,6 +2154,14 @@ mod tests {
             sanitize_title("\n\n  'Tidy: workspace'  \n"),
             "Tidy: workspace"
         );
+        // A model that answers with a heading has still named the run.
+        assert_eq!(
+            sanitize_title("# Playdate Crank: Hardware and SDK Mechanics"),
+            "Playdate Crank: Hardware and SDK Mechanics"
+        );
+        assert_eq!(sanitize_title("## \"Retry Backoff\""), "Retry Backoff");
+        // A line that is only markers is no title at all.
+        assert_eq!(sanitize_title("###\n"), "");
         assert_eq!(sanitize_title("   \n\t\n"), "");
         // One long line and nothing shorter behind it: no title here.
         let long = "word ".repeat(40);
@@ -2378,5 +2498,16 @@ mod tests {
             .expect("totals");
         assert_eq!(totals.prompt_tokens, 0);
         assert_eq!(totals.completion_tokens, 0);
+    }
+
+    #[test]
+    fn the_responses_routes_title_with_a_low_effort() {
+        for provider in ["xai", "grok", "meta"] {
+            assert_eq!(
+                title_request("t", provider, "m").extra,
+                serde_json::json!({ "reasoning": { "effort": "low" } }),
+                "{provider}"
+            );
+        }
     }
 }

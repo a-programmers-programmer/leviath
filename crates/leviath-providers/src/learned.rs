@@ -19,14 +19,19 @@
 use crate::capabilities::{LimitsSource, ModelCapabilities};
 use crate::pricing::ModelPricing;
 use crate::provider::ModelInfo;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 /// One model as its provider's listing described it.
 ///
 /// See the module doc for what `None` means. Not `Eq` because a rate is an
-/// `f64`.
-#[derive(Debug, Clone, Default, PartialEq)]
+/// `f64`. `Serialize`/`Deserialize` so a primed catalogue can be written to a
+/// shared on-disk cache and read back by a process that did not prime it;
+/// `#[serde(default)]` so a field this build added is a missing key, not a
+/// parse error, when it reads a cache an older build wrote.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct LearnedModel {
     /// The name the provider shows people, when it publishes one.
     pub display_name: Option<String>,
@@ -51,6 +56,11 @@ pub struct LearnedModel {
     pub released: Option<i64>,
     /// When the provider will withdraw it, as the date string it published.
     pub retires: Option<String>,
+    /// Mime type patterns the listing says the model accepts. `None` when
+    /// the listing has no such field, as with every field here.
+    pub input_types: Option<Vec<String>>,
+    /// Mime type patterns the listing says the model can hand back.
+    pub output_types: Option<Vec<String>>,
 }
 
 impl LearnedModel {
@@ -76,6 +86,17 @@ impl LearnedModel {
             ..base
         }
     }
+
+    /// `base` with the mime lists this record names replaced.
+    pub fn apply_mime(
+        &self,
+        base: crate::capabilities::ModelMime,
+    ) -> crate::capabilities::ModelMime {
+        crate::capabilities::ModelMime {
+            input: self.input_types.clone().unwrap_or(base.input),
+            output: self.output_types.clone().unwrap_or(base.output),
+        }
+    }
 }
 
 /// One provider's primed catalogue.
@@ -92,6 +113,15 @@ impl LearnedModels {
     /// Replace the whole catalogue with what a listing just said.
     pub fn replace(&self, models: HashMap<String, LearnedModel>) {
         *leviath_core::sync::lock(&self.0) = models;
+    }
+
+    /// A copy of the whole catalogue, for writing to the shared cache. Sorted
+    /// into a `BTreeMap` so two saves of the same data produce the same bytes.
+    pub fn snapshot(&self) -> std::collections::BTreeMap<String, LearnedModel> {
+        leviath_core::sync::lock(&self.0)
+            .iter()
+            .map(|(id, m)| (id.clone(), m.clone()))
+            .collect()
     }
 
     /// What the listing said about `id`, if it mentioned it.
@@ -139,6 +169,18 @@ impl LearnedModels {
     pub fn corrected(&self, id: &str, base: ModelCapabilities) -> ModelCapabilities {
         match self.get(id) {
             Some(learned) => learned.apply_to(base),
+            None => base,
+        }
+    }
+
+    /// `base` mime lists corrected by what the listing said about `id`.
+    pub fn mime_corrected(
+        &self,
+        id: &str,
+        base: crate::capabilities::ModelMime,
+    ) -> crate::capabilities::ModelMime {
+        match self.get(id) {
+            Some(learned) => learned.apply_mime(base),
             None => base,
         }
     }
@@ -355,6 +397,14 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_copies_the_whole_catalogue_sorted() {
+        let snap = store().snapshot();
+        let keys: Vec<&str> = snap.keys().map(String::as_str).collect();
+        assert_eq!(keys, ["claude-sonnet-5", "openai/gpt-5.5"]);
+        assert_eq!(snap["openai/gpt-5.5"].max_context_tokens, Some(1_050_000));
+    }
+
+    #[test]
     fn a_key_finds_its_id_whole_or_by_last_segment() {
         let models = store();
         assert_eq!(
@@ -465,5 +515,47 @@ mod tests {
             let seconds = unix_seconds_from_rfc3339(&format!("{text}T00:00:00Z")).unwrap();
             assert_eq!(civil_date(seconds), text);
         }
+    }
+}
+
+#[cfg(test)]
+mod mime_tests {
+    use super::*;
+    use crate::capabilities::ModelMime;
+
+    #[test]
+    fn a_record_replaces_only_the_mime_lists_it_names() {
+        let base = ModelMime::new(&["text/*"], &["text/*"]);
+        assert_eq!(LearnedModel::default().apply_mime(base.clone()), base);
+        let input = LearnedModel {
+            input_types: Some(vec!["text/*".into(), "image/*".into()]),
+            ..Default::default()
+        };
+        let merged = input.apply_mime(base.clone());
+        assert_eq!(merged.input, vec!["text/*", "image/*"]);
+        assert_eq!(merged.output, base.output);
+        let output = LearnedModel {
+            output_types: Some(vec!["image/*".into()]),
+            ..Default::default()
+        };
+        assert_eq!(output.apply_mime(base.clone()).output, vec!["image/*"]);
+    }
+
+    #[test]
+    fn the_store_corrects_a_listed_id_and_leaves_the_rest() {
+        let store = LearnedModels::default();
+        store.replace(HashMap::from([(
+            "seer".to_string(),
+            LearnedModel {
+                input_types: Some(vec!["text/*".into(), "video/*".into()]),
+                ..Default::default()
+            },
+        )]));
+        let base = ModelMime::text_only();
+        assert_eq!(
+            store.mime_corrected("seer", base.clone()).input,
+            vec!["text/*", "video/*"]
+        );
+        assert_eq!(store.mime_corrected("blind", base.clone()), base);
     }
 }

@@ -83,17 +83,21 @@ pub(crate) use transition_choice::{
 pub(crate) use transition_choice::{build_transition_prompt, match_transition_choice};
 mod tool_stages;
 pub(crate) use tool_stages::{
-    poll_dynamic_tool_refresh, refresh_advertised_tools, sync_tool_stages,
+    poll_dynamic_tool_refresh, refresh_advertised_tools, rescan_before_dispatch, sync_tool_stages,
 };
 mod messaging;
 pub(crate) use messaging::{MessageIntake, deliver_messages};
+mod journal_health;
+pub(crate) use journal_health::{PersistLaneHealth, fail_runs_with_unwritable_journals};
 mod persist;
 pub use persist::PersistWatermark;
 #[cfg(test)]
 pub(crate) use persist::{
     BROADCAST_LOG_LINE_MAX_BYTES, PERSIST_HEARTBEAT_SECS, reconcile_stage_ledger,
 };
-pub(crate) use persist::{PersistenceStage, dispatch_persistence, reflect_interaction_status};
+pub(crate) use persist::{
+    PersistenceStage, dispatch_persistence, journal_interactions, reflect_interaction_status,
+};
 mod compaction;
 pub(crate) use compaction::{
     AwaitingCompaction, CompactionResults, PendingEdgeCompact, apply_edge_transform,
@@ -116,13 +120,22 @@ pub(crate) use tools::{
     AwaitingTools, ContextToolResults, ToolServiceRes, ToolStage, ToolsNeedRefresh,
     call_had_no_effect, dispatch_tools, merge_in_call_order, one_line,
 };
-pub use tools::{DynamicTools, ToolProgress, ToolService, noop_progress};
+pub use tools::{DynamicTools, RescanBeforeDispatch, ToolProgress, ToolService, noop_progress};
 #[cfg(test)]
-pub(crate) use tools::{barrier_then, cut_off_arguments_refusal, invalid_args_refusal};
+pub(crate) use tools::{barrier_then, invalid_args_refusal};
+mod cut_off;
+pub(crate) use cut_off::{
+    MAX_CUT_OFF_NUDGES, cut_off_arguments_refusal, cut_off_nudge, cut_off_stage_error,
+};
+mod park;
+mod part_routing;
 mod response;
 pub use response::StageLedger;
 #[cfg(test)]
-pub(crate) use response::{GlobalNudge, MAX_CUT_OFF_NUDGES, edited_path, to_inference_result};
+pub(crate) use response::{
+    GlobalNudge, MAX_NO_IMAGE_NUDGES, edited_path, no_media_nudge, stage_expected_media,
+    to_inference_result,
+};
 pub(crate) use response::{
     InferenceResults, ProcessResponse, ReadyForTools, ReadyForTransition, ResolveTransition,
     StageIoBuffer, StageOutcome, StageProgress, collect_inference, handle_empty_response,
@@ -131,15 +144,18 @@ pub(crate) use response::{
 mod inference;
 #[cfg(test)]
 pub(crate) use inference::{
-    BATCH_TOOL_HINT, WINDOWS_SHELL_HINT, build_request, hint_blocks, shell_guidance_for,
+    BATCH_TOOL_HINT, WINDOWS_SHELL_HINT, build_request, effective_parameters, hint_blocks,
+    shell_guidance_for, source_context_digest, tool_catalog_version,
 };
+pub use inference::{CaptureModelInput, MODEL_INPUT_ASSEMBLY_VERSION};
 pub(crate) use inference::{
     InFlightWork, abort_terminal_work, dispatch_inference, retry_policy_for, track_in_flight,
 };
 mod resolve;
 pub use resolve::{
-    ModelDefaults, ToolCatalog, ToolOwners, bare_default_model, expand_connector_grants,
-    filter_tools_for_stage, model_key, providers_tried, resolve_stage_model, resolve_stages,
+    HeadSource, ModelDefaults, ToolCatalog, ToolOwners, bare_user_model, expand_connector_grants,
+    filter_tools_for_stage, head_source, model_key, providers_tried, resolve_stage_model,
+    resolve_stages, tool_source,
 };
 mod stall;
 pub use stall::{DEFAULT_STALL_TIMEOUT_SECS, PausedForSetup, StallTimeout};

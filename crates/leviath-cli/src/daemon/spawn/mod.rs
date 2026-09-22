@@ -11,7 +11,7 @@
 //! whole path is synchronous - which lets it run straight from the host's
 //! control loop.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex as StdMutex};
 
@@ -172,6 +172,9 @@ fn load_blueprint(
     let mut blueprint = leviath_core::manifest::parse_manifest(&content)
         .map_err(|e| format!("parse manifest: {e}{}", stale()))?;
     blueprint
+        .resolve_region_content_schemas(path)
+        .map_err(|e| format!("invalid blueprint: {e}{}", stale()))?;
+    blueprint
         .validate()
         .map_err(|e| format!("invalid blueprint: {e}{}", stale()))?;
     // What `lev validate` would have said, in the daemon log. Nothing here
@@ -206,6 +209,54 @@ fn load_blueprint(
     Ok((content, blueprint))
 }
 
+/// The registry this run types its bytes by: the world's rows (the
+/// operator's, kept current by the config reload) with the blueprint's own
+/// `[mime_types]` layered on top, and the blueprint's checks compiled
+/// beside its other scripts. A world without a registry (a test's) starts
+/// from the compiled defaults.
+///
+/// Cannot fail here: the manifest parser layered these rows once already,
+/// and a row that layers over nothing layers over anything, since one row
+/// never constrains another; `checks` is keyed by the registry's own keys.
+fn run_mime_registry(
+    world: &World,
+    blueprint: &Blueprint,
+    checks: BTreeMap<String, Arc<dyn leviath_core::mime::MimeCheck>>,
+) -> leviath_runtime::blob_store::RunMimeRegistry {
+    let base = world
+        .get_resource::<leviath_runtime::blob_store::MimeRegistryHandle>()
+        .map(|r| r.0.clone())
+        .unwrap_or_default();
+    leviath_runtime::blob_store::RunMimeRegistry::new(&base, blueprint.mime_types.clone(), checks)
+        .expect("the manifest parser accepted these rows")
+}
+
+/// The run's blob store as the tools see it: the world's store and the
+/// run's registry, keyed by this run, under the operator's size ceiling.
+fn tool_mime(
+    world: &World,
+    run_id: &str,
+    registry: &leviath_runtime::blob_store::RunMimeRegistry,
+) -> leviath_tools::ToolMime {
+    let store = world
+        .get_resource::<leviath_runtime::blob_store::BlobStoreHandle>()
+        .map(|s| s.0.clone())
+        .unwrap_or_else(|| Arc::new(leviath_core::mime::MemoryBlobStore::new()));
+    let registry = registry.cell();
+    let max_part_bytes = world
+        .get_resource::<leviath_runtime::blob_store::MimeLimits>()
+        .map_or(
+            leviath_runtime::blob_store::MimeLimits::default().max_part_bytes,
+            |l| l.max_part_bytes,
+        );
+    leviath_tools::ToolMime {
+        store,
+        registry,
+        run_id: run_id.to_string(),
+        max_part_bytes,
+    }
+}
+
 /// Everything phase 7 attaches that is not already on the entity.
 ///
 /// A struct because these are one thing - the durable record of a run - rather
@@ -213,6 +264,9 @@ fn load_blueprint(
 /// which four are collections is a transposition waiting to happen.
 struct RunRecordParts {
     agent_name: String,
+    /// The SHA-256 of the manifest text this run is executing, which is also
+    /// the identity of the snapshot written into its run directory.
+    blueprint_digest: Option<String>,
     model_label: Option<String>,
     num_stages: usize,
     read_path_counts: Option<leviath_core::run_meta::ReadPathGrantCounts>,
@@ -231,6 +285,17 @@ struct RunRecordParts {
     tool_sensitivities: Option<HashMap<String, leviath_core::TaintLevel>>,
     security: leviath_core::taint::SecurityConfig,
     mcp_overrides: std::collections::HashMap<String, leviath_core::policy::McpToolOverride>,
+    /// The yolo profile's answer to the two spawn-time markers: whether
+    /// stage-boundary checkpoints approve themselves, and whether the taint
+    /// gate does. Both false for an attended run.
+    auto_checkpoints: bool,
+    auto_gate: bool,
+    /// The profile's name when `--yolo=<name>` named one.
+    yolo_profile: Option<String>,
+    /// Whether this run writes the exact request it sends the model into its
+    /// journal. Either the machine asked for every run, or this spawn asked for
+    /// this one.
+    capture_model_input: bool,
 }
 
 /// Record the run on its entity: metadata, counters, and the markers that
@@ -257,7 +322,9 @@ fn attach_run_record(
         callback_secret: args.callback_secret.clone(),
         title: None,
         title_error: None,
+        blueprint_digest: parts.blueprint_digest,
         unattended: args.yolo,
+        yolo_profile: parts.yolo_profile,
         read_paths: parts.read_path_counts,
         output_request: args.output.clone(),
         model_override: args.model.clone(),
@@ -302,10 +369,25 @@ fn attach_run_record(
             });
         // `--yolo` means run unattended, so a blueprint's stage-boundary
         // checkpoints are approved rather than parked on a deps.hub nobody is
-        // watching. (`.then_some(..).into_iter()` keeps the non-yolo path
+        // watching - unless the yolo profile keeps them (`checkpoints =
+        // "ask"`). (`.then_some(..).into_iter()` keeps the non-yolo path
         // branch-free, matching the taint-gate marker below.)
-        args.yolo
+        parts
+            .auto_checkpoints
             .then_some(leviath_runtime::components::InteractionAutoApprove)
+            .into_iter()
+            .for_each(|marker| {
+                entity_mut.insert(marker);
+            });
+        // The operator asked for this run's prompts to be written down, machine-
+        // wide or for this run alone. Absent on every other run, which is what
+        // keeps a prompt - and the file contents, command output and credentials
+        // inside it - out of a journal nobody asked to hold them.
+        // (`.then_some(..).into_iter()` keeps the ordinary path branch-free,
+        // matching the checkpoint marker above.)
+        parts
+            .capture_model_input
+            .then_some(leviath_runtime::pipeline::CaptureModelInput)
             .into_iter()
             .for_each(|marker| {
                 entity_mut.insert(marker);
@@ -329,9 +411,10 @@ fn attach_run_record(
                     leviath_runtime::pipeline::ToolSensitivities(sensitivities),
                 ));
                 // `--yolo` means run unattended: waive taint-gate prompts (the
-                // tool-policy wildcard below doesn't cover them), so a headless run
-                // never blocks on a gate no one can answer.
-                if args.yolo {
+                // tool policy doesn't cover them), so a headless run never
+                // blocks on a gate no one can answer - unless the profile keeps
+                // them (`gate = "ask"`).
+                if parts.auto_gate {
                     entity_mut.insert(leviath_runtime::components::GateAutoApprove);
                 }
                 // `Option`'s iterator enables tracking without a dead "no window" arm
@@ -465,11 +548,39 @@ fn build_agent_inner(
 ) -> Result<Entity, String> {
     // 0. Everything that can be judged from the request alone.
     check_spawn_request(args)?;
+    // The yolo profile, read from `yolo.toml` as it stands now: `None` for an
+    // attended run, the built-in default for bare `--yolo`. A name the file
+    // does not have fails the spawn here, before anything is on disk but the
+    // placeholder - the person asked for a specific set of rules.
+    let profile = crate::yolo::resolve_for_spawn(args.yolo, args.yolo_profile.as_deref())
+        .map_err(|e| e.to_string())?;
+    // Whether the human tools are cut and auto-answered: yolo, under a
+    // profile that does not keep the model's questions for a person.
+    let unattended_tools = profile.as_ref().is_some_and(|p| p.spec.questions.is_auto());
+    let yolo_profile_name = args
+        .yolo
+        .then(|| args.yolo_profile.clone())
+        .flatten()
+        .filter(|name| !name.is_empty());
 
-    // 1. Load the blueprint (the client resolves the manifest path). Mutable
-    // because step 2d writes each stage's global tool grants into it before the
-    // runtime resolves the stages from it.
-    let (content, mut blueprint) = load_blueprint(args, deps.config)?;
+    // 1. Load the blueprint (the client resolves the manifest path).
+    let (content, blueprint) = load_blueprint(args, deps.config)?;
+
+    // 1b. Fail fast if a required dependency is not satisfied, before any
+    // billed inference. Every spawn - `lev run`, the serve API, sub-agents and
+    // fan-out - passes through here, so this is the one place that gate lives.
+    if let Some(msg) = crate::dependencies::evaluate(
+        &blueprint.dependencies,
+        &deps.config.mcp_servers,
+        Path::new(&args.blueprint_path)
+            .parent()
+            .unwrap_or(Path::new(".")),
+        &crate::dependencies::SystemProbe,
+    )
+    .blocking_message()
+    {
+        return Err(msg);
+    }
 
     // 2a. Entry stage + per-stage sandbox resolution. Each stage's effective
     // sandbox cascades stage → agent → global (`resolve_sandbox`); building the
@@ -526,9 +637,23 @@ fn build_agent_inner(
     // that a live run is up but blind to paths its author designed it around.
     let read_path_counts =
         read_path_grant_counts(&blueprint, deps.config, std::path::Path::new(&args.workdir));
+    // The run's mime registry, before the tools are built over it: the
+    // blueprint's checks are compiled here, with the same fence its other
+    // scripts get, and a broken one is a spawn error.
+    let mime_checks = resolve_mime_checks(&blueprint, &args.blueprint_path)?;
+    let run_registry = run_mime_registry(world, &blueprint, mime_checks);
+    let mime = Arc::new(tool_mime(world, &args.run_id, &run_registry));
+    // The blueprint's own `tools/`, which is where `install_self_tool` writes
+    // and the first directory discovery scans. Derived from the manifest this
+    // run was spawned from, so an agent can only ever arm itself.
+    let agent_tools_dir = std::path::Path::new(&args.blueprint_path)
+        .parent()
+        .map(|dir| dir.join("tools"));
     let tool_ctx = leviath_tools::ToolContext::new(std::path::PathBuf::from(&args.workdir))
         .with_read_paths(read_path_policy)
-        .with_shell_env(shell_env_policy(deps.config));
+        .with_shell_env(shell_env_policy(deps.config))
+        .with_agent_tools_dir(agent_tools_dir)
+        .with_mime(mime.clone());
     let mut builtins = leviath_tools::BuiltinTools::new(tool_ctx);
     if let Some(mgr) = &sandbox {
         builtins =
@@ -550,7 +675,7 @@ fn build_agent_inner(
     all_tool_defs.extend(leviath_tools::BuiltinTools::subagent_tool_defs());
     all_tool_defs.extend(deps.mcp_tool_defs.iter().cloned());
     // The non-script defs (built-in + sub-agent + MCP), captured before script
-    // defs are appended - a `dynamic_tools` agent re-filters against these plus a
+    // defs are appended - a rescanning agent re-filters against these plus a
     // fresh script scan on each mid-run refresh.
     let static_tool_defs = all_tool_defs.clone();
 
@@ -561,11 +686,12 @@ fn build_agent_inner(
     // classification see them. A script tool whose name collides with a built-in,
     // sub-agent, or MCP tool is ignored (the existing tool wins), so it never
     // shadows a core tool.
-    // A `dynamic_tools` agent also scans its run workdir's `tools/`, so a tool it
+    // An agent that rescans also scans its run workdir's `tools/`, so a tool it
     // writes mid-run (into a workdir it can reach) is discoverable on re-scan.
-    let dynamic_tools = blueprint.dynamic_tools;
-    let workdir_tools_dir =
-        dynamic_tools.then(|| std::path::PathBuf::from(&args.workdir).join("tools"));
+    let tool_rescan = blueprint.tool_rescan;
+    let workdir_tools_dir = tool_rescan
+        .rescans()
+        .then(|| std::path::PathBuf::from(&args.workdir).join("tools"));
     let (script_tools, script_tool_names, script_defs) = discover_script_tools(
         &args.blueprint_path,
         &builtin_names,
@@ -573,29 +699,6 @@ fn build_agent_inner(
         workdir_tools_dir.clone(),
     );
     all_tool_defs.extend(script_defs);
-
-    // 2d. Global tool grants. `available_tools` is exact-match, so a tool an
-    // earlier run installed into `~/.leviath/tools/` is invisible to a stage
-    // that does not name it; a stage with `available_global_tools` asks for
-    // every such tool. The expansion is written into the blueprint itself,
-    // before stage resolution, because that is where the runtime reads each
-    // stage's grant list from - and the `stage_available` snapshot taken
-    // below inherits it, so a `dynamic_tools` refresh re-filters against the
-    // same expanded list. Only scripts discovered from the global directory
-    // count (see `global_tool_names`): a workdir or agent-dir script that
-    // shadows a global name is never granted this way.
-    let global_tools_dir = leviath_core::tools_dir();
-    let global_names = global_tool_names(
-        &script_tools,
-        &script_tool_names,
-        global_tools_dir.as_deref(),
-    );
-    for stage in &mut blueprint.stages {
-        if stage.available_global_tools {
-            stage.available_tools =
-                expand_global_grants(&stage.available_tools, true, &global_names);
-        }
-    }
 
     // 3. Resolve stages against the world's providers.
     let stages = {
@@ -612,7 +715,7 @@ fn build_agent_inner(
                 defs: &all_tool_defs,
                 owners: deps.mcp_tool_owners,
             },
-            args.yolo,
+            unattended_tools,
             args.output.as_ref(),
         )?
     };
@@ -650,7 +753,7 @@ fn build_agent_inner(
     // the manifest's top-level block would be silently ignored.
     let agent_perms = blueprint.agent_tool_permissions();
     // Each stage's Layer-1 allowlist, captured before the blueprint moves - a
-    // `dynamic_tools` agent re-filters against these on refresh.
+    // rescanning agent re-filters against these on refresh.
     //
     // Connector grants are expanded here rather than left for the refresh to
     // redo, so the refresh filters against exactly the list spawn resolved.
@@ -675,14 +778,6 @@ fn build_agent_inner(
         .iter()
         .map(|s| s.required_tools.clone())
         .collect();
-    // And which stages hold a global grant, so a refresh can extend the list
-    // with a tool installed *during* the run - the snapshot above only knows
-    // the global inventory as it stood at spawn.
-    let stage_global: Vec<bool> = blueprint
-        .stages
-        .iter()
-        .map(|s| s.available_global_tools)
-        .collect();
     // The same list as a lookup set, canonicalised, for the tool state: an
     // interaction for a kept tool has to reach a real person rather than the
     // auto-answering backend, and dispatch tests one name at a time.
@@ -692,6 +787,23 @@ fn build_agent_inner(
             names
                 .iter()
                 .map(|n| leviath_tools::canonical_tool_name(n).to_string())
+                .collect()
+        })
+        .collect();
+    // What each stage lets each tool be handed, canonicalised the same way,
+    // so a limit written against an alias still meets the call.
+    let stage_tool_accepts_by_index: Vec<HashMap<String, Vec<String>>> = blueprint
+        .stages
+        .iter()
+        .map(|s| {
+            s.tool_accepts
+                .iter()
+                .map(|(tool, list)| {
+                    (
+                        leviath_tools::canonical_tool_name(tool).to_string(),
+                        list.clone(),
+                    )
+                })
                 .collect()
         })
         .collect();
@@ -712,15 +824,17 @@ fn build_agent_inner(
     // `seed = { tools = [...] }` needs them: a seeded call answers to the
     // same policy a mid-run call does, and a seeded *script* tool needs the
     // host it would run under. Everything they read is already bound.
-    // Launch overrides: `--yolo` allows every tool (`*` wildcard); `--allow X`
-    // allows tool `X` outright.
+    // Launch overrides: `--allow X` allows tool `X` outright. `--yolo` is a
+    // profile (`profile` above) rather than an override, applied after the
+    // config layers by `crate::yolo::apply_profile`; bare `--yolo` is the
+    // profile that allows everything the config does not deny.
     let mut launch_overrides: HashMap<String, crate::config::ToolPolicy> = HashMap::new();
-    if args.yolo {
-        launch_overrides.insert("*".to_string(), crate::config::ToolPolicy::Allow);
-    }
     for tool in &args.allow {
         launch_overrides.insert(tool.clone(), crate::config::ToolPolicy::Allow);
     }
+    let workdir_path = std::path::PathBuf::from(&args.workdir);
+    // The files no run may change, for the seeds now and the tool lane after.
+    let protected = crate::tools::permission_files(deps.config);
     // Rhai script-tool host (Layer 3): resolve `[tool_script_permissions]` once,
     // with `read_file`/`shell` `inherit` deferring to the agent's own resolved
     // policy for that built-in (evaluated against the entry stage).
@@ -742,7 +856,7 @@ fn build_agent_inner(
     let script_allow = crate::daemon::script_host::resolve_script_permissions(
         &effective_script_perms,
         &|builtin| {
-            crate::tools::resolve_policy(
+            let configured = crate::tools::resolve_policy(
                 builtin,
                 true,
                 &launch_overrides,
@@ -750,6 +864,17 @@ fn build_agent_inner(
                 &agent_perms,
                 &agent_scoped_perms,
                 deps.config.security.allow_blueprint_permissions,
+            );
+            // A script's `inherit` answers to the profile as the tool lane
+            // does, by name: there is no call here to read arguments from.
+            crate::yolo::apply_profile(
+                profile.as_deref(),
+                builtin,
+                &serde_json::Value::Null,
+                configured,
+                crate::tools::launch_allows(&launch_overrides, builtin),
+                crate::yolo::ToolKind::Builtin,
+                &workdir_path,
             )
         },
     );
@@ -759,12 +884,15 @@ fn build_agent_inner(
     let writes = Arc::new(crate::daemon::tool_service::WriteBudget::new(
         deps.config.limits.write_limits(),
     ));
+    let offered_parts = Arc::new(std::sync::Mutex::new(Vec::new()));
     let script_host: Arc<dyn leviath_scripting::ScriptHost> = Arc::new(
         crate::daemon::script_host::DaemonScriptHost::new(
             script_allow,
             std::path::PathBuf::from(&args.workdir),
         )
         .with_write_budget(writes.clone())
+        // The run's parts, by name, and somewhere to put new ones.
+        .with_mime(mime.clone(), offered_parts.clone())
         // Route a script `shell()` through the agent's per-stage sandbox (so a
         // script can't escape the isolation the stage declared) and cap it at the
         // configured wall-clock timeout.
@@ -814,6 +942,10 @@ fn build_agent_inner(
         let seed_agent = agent_perms.clone();
         let seed_global = agent_scoped_perms.clone();
         let seed_may_loosen = deps.config.security.allow_blueprint_permissions;
+        let seed_profile = profile.clone();
+        let seed_workdir = workdir_path.clone();
+        let seed_builtins = builtin_names.clone();
+        let seed_scripts = script_tool_names.clone();
         let tool_policy = crate::daemon::seed_tool::SeedToolPolicy::new(
             crate::daemon::seed_tool::production_runner(
                 crate::daemon::seed_tool::SeedToolContext {
@@ -823,17 +955,37 @@ fn build_agent_inner(
                     script_host: script_host.clone(),
                     mcp: deps.shared_mcp.clone(),
                     writes: writes.clone(),
+                    protected: protected.clone(),
                 },
-                Arc::new(move |name: &str, is_builtin: bool| {
-                    crate::daemon::seed_tool::SeedToolPermissions {
-                        launch: &seed_launch,
-                        stage: &seed_stage,
-                        agent: &seed_agent,
-                        global: &seed_global,
-                        may_loosen: seed_may_loosen,
-                    }
-                    .resolve(name, is_builtin)
-                }),
+                Arc::new(
+                    move |name: &str, is_builtin: bool, arguments: &serde_json::Value| {
+                        let configured = crate::daemon::seed_tool::SeedToolPermissions {
+                            launch: &seed_launch,
+                            stage: &seed_stage,
+                            agent: &seed_agent,
+                            global: &seed_global,
+                            may_loosen: seed_may_loosen,
+                        }
+                        .resolve(name, is_builtin);
+                        // The profile has the same say over a seed as over a
+                        // mid-run call. Under bare `--yolo` that is what lets a
+                        // seeded `shell` run at all: a seed refuses `ask`, and the
+                        // profile is what turns it into `allow`.
+                        crate::yolo::apply_profile(
+                            seed_profile.as_deref(),
+                            name,
+                            arguments,
+                            configured,
+                            crate::tools::launch_allows(&seed_launch, name),
+                            crate::yolo::ToolKind::classify(
+                                name,
+                                seed_builtins.contains(name),
+                                seed_scripts.contains(name),
+                            ),
+                            &seed_workdir,
+                        )
+                    },
+                ),
             ),
         );
         resolve_seeds(
@@ -881,6 +1033,7 @@ fn build_agent_inner(
             agent_id: args.run_id.clone(),
             blueprint,
             seeds,
+            parts: args.parts.clone(),
             stages,
             global_hints: leviath_core::config::PromptHints {
                 batch_tool: deps.config.batch_tool_hint,
@@ -888,6 +1041,7 @@ fn build_agent_inner(
             },
             global_nudge: deps.config.nudge.clone(),
             region_scripts,
+            mime_registry: Some(run_registry),
         },
     )?;
 
@@ -910,6 +1064,7 @@ fn build_agent_inner(
         &deps,
         RunRecordParts {
             agent_name: agent_name.clone(),
+            blueprint_digest: Some(leviath_core::mime::store::sha256_hex(content.as_bytes())),
             model_label: model_label.clone(),
             num_stages,
             read_path_counts,
@@ -941,6 +1096,13 @@ fn build_agent_inner(
             tool_sensitivities,
             security: security.clone(),
             mcp_overrides,
+            auto_checkpoints: profile
+                .as_ref()
+                .is_some_and(|p| p.spec.checkpoints.is_auto()),
+            auto_gate: profile.as_ref().is_some_and(|p| p.spec.gate.is_auto()),
+            yolo_profile: yolo_profile_name.clone(),
+            capture_model_input: deps.config.observability.capture_model_input
+                || args.capture_model_input,
         },
     );
 
@@ -952,24 +1114,37 @@ fn build_agent_inner(
         max_depth: max_child_depth,
         no_seed_commands: args.no_seed_commands,
         unattended: args.yolo,
+        yolo_profile: yolo_profile_name.clone(),
         model_override: args.model.clone(),
+        offered_parts: offered_parts.clone(),
+        mime: Some(mime.clone()),
     };
-    // Build the dynamic-tools re-resolution context and tag the entity
-    // `DynamicTools` so the runtime polls it for mid-run re-scans.
-    let dynamic = dynamic_tools.then(|| {
+    // Build the re-resolution context and tag the entity `DynamicTools` so the
+    // runtime polls it for mid-run re-scans, plus `RescanBeforeDispatch` when
+    // the blueprint asks for a look before every batch as well.
+    let dynamic = tool_rescan.rescans().then(|| {
         world
             .entity_mut(entity)
             .insert(leviath_runtime::pipeline::DynamicTools);
+        if tool_rescan.before_dispatch() {
+            world
+                .entity_mut(entity)
+                .insert(leviath_runtime::pipeline::RescanBeforeDispatch);
+        }
+        let scan_dirs = script_scan_dirs(&args.blueprint_path, workdir_tools_dir);
+        // Stamped as spawn found them, so the first batch of a `before_dispatch`
+        // run does not re-scan directories it has just read.
+        let stamp = std::sync::Mutex::new(crate::daemon::tool_service::stamp_scan_dirs(&scan_dirs));
         Arc::new(crate::daemon::tool_service::DynamicToolCtx {
-            scan_dirs: script_scan_dirs(&args.blueprint_path, workdir_tools_dir),
+            scan_dirs,
             reserved_names: reserved_tool_names(&builtin_names, deps.mcp_tool_defs),
             static_defs: static_tool_defs,
+            mcp_owners: deps.mcp_tool_owners.clone(),
             stage_available,
             stage_required,
-            stage_global,
-            tools_dir: global_tools_dir,
-            unattended: args.yolo,
+            unattended: unattended_tools,
             dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            stamp,
         })
     });
     let state = build_tool_state(ToolStateParts {
@@ -984,6 +1159,7 @@ fn build_agent_inner(
         entry_index,
         stage_perms_by_index,
         stage_required_by_index,
+        stage_tool_accepts_by_index,
         agent_perms,
         agent_name: &agent_name,
         launch_overrides,
@@ -992,8 +1168,12 @@ fn build_agent_inner(
         script_tools,
         script_tool_names,
         script_host,
+        offered_parts,
         dynamic,
-        unattended: args.yolo,
+        unattended: unattended_tools,
+        yolo: profile,
+        yolo_profile: yolo_profile_name,
+        protected,
         blueprint_safe: blueprint_safe.as_ref(),
         blueprint_read_paths: blueprint_read_paths.as_ref(),
         workdir: std::path::PathBuf::from(&args.workdir),
@@ -1129,13 +1309,15 @@ system = { kind = "pinned", max_tokens = 1000 }
     fn model_defaults_carries_the_fallback_chain_from_config() {
         let mut config = Config {
             default_provider: "openrouter".to_string(),
-            default_model: Some("deepseek".to_string()),
+            override_model: Some("deepseek".to_string()),
+            fallback_model: Some("flash".to_string()),
             ..Default::default()
         };
         config.providers.fallback_order = vec!["anthropic/claude-sonnet-5".to_string()];
         let defaults = model_defaults(&config);
         assert_eq!(defaults.provider, "openrouter");
-        assert_eq!(defaults.model.as_deref(), Some("deepseek"));
+        assert_eq!(defaults.override_model.as_deref(), Some("deepseek"));
+        assert_eq!(defaults.fallback_model.as_deref(), Some("flash"));
         assert_eq!(defaults.fallback_order.len(), 1);
         assert_eq!(defaults.fallback_order[0].provider, "anthropic");
     }
@@ -1194,68 +1376,6 @@ system = { kind = "pinned", max_tokens = 1000 }
             def_names.sort_unstable();
             assert_eq!(def_names, vec!["echo", "net_tool"]);
         });
-    }
-
-    /// A global grant expands to the tools whose *file* is in the global
-    /// directory and that survived discovery: a workdir script shadowing a
-    /// global name is not one, a reserved name that discovery dropped is not
-    /// one, and the result is sorted. With no global directory there is nothing
-    /// to grant.
-    #[test]
-    fn global_tool_names_are_the_surviving_tools_from_the_global_dir_only() {
-        let workdir = tempfile::tempdir().unwrap();
-        let global = tempfile::tempdir().unwrap();
-        let workdir_tools = workdir.path().join("tools");
-        std::fs::create_dir(&workdir_tools).unwrap();
-        // `echo` exists in both places; the workdir copy wins the scan.
-        std::fs::write(workdir_tools.join("echo.rhai"), "// @tool echo\n\"repo\"").unwrap();
-        std::fs::write(global.path().join("echo.rhai"), "// @tool echo\n\"global\"").unwrap();
-        std::fs::write(global.path().join("zed.rhai"), "// @tool zed\n1").unwrap();
-        std::fs::write(global.path().join("alpha.rhai"), "// @tool alpha\n1").unwrap();
-        // Compiled, but a reserved name discovery would have dropped.
-        std::fs::write(
-            global.path().join("read_file.rhai"),
-            "// @tool read_file\n1",
-        )
-        .unwrap();
-        let (set, _skipped) = leviath_scripting::ScriptToolSet::discover(&[
-            workdir_tools,
-            global.path().to_path_buf(),
-        ]);
-        let surviving: HashSet<String> = ["echo", "zed", "alpha"]
-            .into_iter()
-            .map(str::to_string)
-            .collect();
-
-        assert_eq!(
-            global_tool_names(&set, &surviving, Some(global.path())),
-            vec!["alpha".to_string(), "zed".to_string()]
-        );
-        // A name discovery did not keep is not granted even from the global dir.
-        let fewer: HashSet<String> = ["zed".to_string()].into_iter().collect();
-        assert_eq!(
-            global_tool_names(&set, &fewer, Some(global.path())),
-            vec!["zed".to_string()]
-        );
-        assert!(global_tool_names(&set, &surviving, None).is_empty());
-    }
-
-    /// The grant list keeps the blueprint's order, appends what is global and
-    /// new, names nothing twice, and is untouched for a stage without the flag.
-    #[test]
-    fn expand_global_grants_appends_without_duplicates_only_when_allowed() {
-        let available = vec!["read_file".to_string(), "echo".to_string()];
-        let global = vec!["alpha".to_string(), "echo".to_string()];
-        assert_eq!(
-            expand_global_grants(&available, true, &global),
-            vec![
-                "read_file".to_string(),
-                "echo".to_string(),
-                "alpha".to_string()
-            ]
-        );
-        assert_eq!(expand_global_grants(&available, false, &global), available);
-        assert_eq!(expand_global_grants(&[], true, &[]), Vec::<String>::new());
     }
 
     #[test]
@@ -1380,11 +1500,15 @@ system = { kind = "pinned", max_tokens = 1000 }
             callback_url: None,
             callback_secret: None,
             yolo: false,
+            yolo_profile: None,
             no_seed_commands: false,
             allow: Vec::new(),
             max_depth: None,
             parent_run_id: None,
+            worker_stage: None,
             output: None,
+            parts: Vec::new(),
+            capture_model_input: false,
         }
     }
 
@@ -1724,6 +1848,80 @@ system = { kind = "pinned", max_tokens = 1000 }
         assert!(err.contains("hooks/brain.rhai"), "got: {err}");
     }
 
+    /// A blueprint's mime check that cannot be loaded stops the spawn, the
+    /// way its other scripts do, before any tokens are spent.
+    #[tokio::test]
+    async fn build_agent_fails_fast_on_a_mime_check_it_cannot_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("agent.leviath");
+        std::fs::write(
+            &manifest,
+            "[agent]\nname = \"v\"\nversion = \"0.1.0\"\ndescription = \"d\"\n\n\
+             [stages.main]\nmodel = { provider = \"anthropic\", model = \"m\" }\n\n\
+             [mime_types.\"application/x-acme-scene\"]\ncheck = \"checks/gone.rhai\"\n",
+        )
+        .unwrap();
+        let (mut world, cli) = test_world();
+        let hub = InteractionHub::new();
+        let mcp = Arc::new(Mutex::new(leviath_mcp::ToolExecutor::new()));
+        let args = spawn_args(&manifest.to_string_lossy());
+        let err = build_agent(
+            world.world_mut(),
+            SpawnDeps {
+                tool_service: cli.as_ref(),
+                config: &Config::default(),
+                shared_mcp: mcp,
+                mcp_tool_defs: &[],
+                mcp_tool_owners: &Default::default(),
+                hub: &hub,
+                now_secs: 100,
+                subagent_tx: sub_tx(),
+            },
+            &args,
+        )
+        .unwrap_err();
+        assert!(err.contains("cannot read mime check"), "got: {err}");
+        assert!(err.contains("gone.rhai"), "got: {err}");
+    }
+
+    /// A required dependency that is not satisfied fails the spawn before any
+    /// tokens are spent, with a message pointing at `lev deps`.
+    #[tokio::test]
+    async fn build_agent_fails_fast_on_an_unmet_dependency() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("agent.leviath");
+        std::fs::write(
+            &manifest,
+            "[agent]\nname = \"v\"\nversion = \"0.1.0\"\ndescription = \"d\"\n\n\
+             [stages.main]\nmodel = { provider = \"anthropic\", model = \"m\" }\n\n\
+             [[dependencies]]\nname = \"key\"\nkind = \"env\"\n\
+             var = \"LEVIATH_DEPS_SPAWN_UNSET_XYZ\"\n",
+        )
+        .unwrap();
+        let (mut world, cli) = test_world();
+        let hub = InteractionHub::new();
+        let mcp = Arc::new(Mutex::new(leviath_mcp::ToolExecutor::new()));
+        let args = spawn_args(&manifest.to_string_lossy());
+        let err = build_agent(
+            world.world_mut(),
+            SpawnDeps {
+                tool_service: cli.as_ref(),
+                config: &Config::default(),
+                shared_mcp: mcp,
+                mcp_tool_defs: &[],
+                mcp_tool_owners: &Default::default(),
+                hub: &hub,
+                now_secs: 100,
+                subagent_tx: sub_tx(),
+            },
+            &args,
+        )
+        .unwrap_err();
+        assert!(err.contains("dependencies are not satisfied"), "got: {err}");
+        assert!(err.contains("LEVIATH_DEPS_SPAWN_UNSET_XYZ"), "got: {err}");
+        assert!(err.contains("lev deps"), "got: {err}");
+    }
+
     /// The run id becomes a directory name and everything a run writes lands
     /// under it. The persistence lane joins it to the runs directory without
     /// checking, so the check belongs at the boundary that accepts the request.
@@ -1731,6 +1929,98 @@ system = { kind = "pinned", max_tokens = 1000 }
     /// The blueprint path here points at nothing, which is the point: the error
     /// must be about the run id, proving the guard runs before anything is read
     /// off disk.
+    #[test]
+    fn tool_mime_reads_the_worlds_store_or_falls_back_to_memory() {
+        let bare = World::new();
+        let bp = validator_blueprint(None, None);
+        let registry = run_mime_registry(&bare, &bp, BTreeMap::new());
+        let m = tool_mime(&bare, "run-x", &registry);
+        assert_eq!(m.run_id, "run-x");
+        assert_eq!(
+            m.max_part_bytes,
+            leviath_runtime::blob_store::MimeLimits::default().max_part_bytes
+        );
+        let mut world = World::new();
+        world.insert_resource(leviath_runtime::blob_store::BlobStoreHandle(Arc::new(
+            leviath_core::mime::MemoryBlobStore::new(),
+        )));
+        world.insert_resource(leviath_runtime::blob_store::MimeRegistryHandle::default());
+        world.insert_resource(leviath_runtime::blob_store::MimeLimits {
+            max_part_bytes: 7,
+            ..Default::default()
+        });
+        assert_eq!(tool_mime(&world, "r", &registry).max_part_bytes, 7);
+        // The tools read the run's registry through the cell the runtime
+        // swaps a reload into, so the two never disagree about a type.
+        let obj = leviath_core::mime::MimeType::parse("model/obj").unwrap();
+        assert_eq!(m.name_for("a", &obj), "a.obj");
+        let rows: toml::Table = toml::from_str("[\"model/obj\"]\nextensions = [\"o\"]\n").unwrap();
+        registry
+            .rebuild(
+                &leviath_core::mime::MimeRegistry::builtin()
+                    .layered(&rows, "e")
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(m.name_for("a", &obj), "a.o");
+    }
+
+    /// A blueprint's `[mime_types]` checks are compiled beside its other
+    /// scripts, fenced to its directory, and refuse bytes on the run.
+    #[test]
+    fn resolve_mime_checks_compiles_the_rows_scripts() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("agent.leviath");
+        std::fs::create_dir_all(dir.path().join("checks")).unwrap();
+        std::fs::write(
+            dir.path().join("checks/scene.rhai"),
+            "fn check(bytes, mime_type) { if bytes.len() < 4 { return \"too short\"; } () }",
+        )
+        .unwrap();
+        let mut bp = validator_blueprint(None, None);
+        bp.mime_types = toml::from_str(
+            "[\"application/x-acme-scene\"]\nfamily = \"model\"\ncheck = \"checks/scene.rhai\"\n\
+             [\"model/obj\"]\ntext = true\n",
+        )
+        .unwrap();
+        let checks = resolve_mime_checks(&bp, &manifest.to_string_lossy()).expect("compiles");
+        assert_eq!(checks.len(), 1);
+        let scene = leviath_core::mime::MimeType::parse("application/x-acme-scene").unwrap();
+        assert_eq!(
+            checks["application/x-acme-scene"].check(&scene, b"ab"),
+            Err("too short".to_string())
+        );
+        // On the run: the store refuses what the check refuses.
+        let registry = run_mime_registry(&World::new(), &bp, checks);
+        let mime = tool_mime(&World::new(), "run-c", &registry);
+        let short = leviath_core::mime::Blob::new(scene.clone(), b"ab".to_vec()).named("a.scene");
+        let err = mime.store(short).unwrap_err();
+        assert!(err.contains("too short"), "{err}");
+        let fine = leviath_core::mime::Blob::new(scene, b"ACME1".to_vec()).named("b.scene");
+        assert!(mime.store(fine).is_ok());
+
+        // Missing, escaping and broken scripts are each named.
+        bp.mime_types = toml::from_str("[\"x/y\"]\ncheck = \"checks/gone.rhai\"\n").unwrap();
+        let err = resolve_mime_checks(&bp, &manifest.to_string_lossy()).unwrap_err();
+        assert!(err.contains("cannot read mime check"), "{err}");
+        bp.mime_types = toml::from_str("[\"x/y\"]\ncheck = \"../escape.rhai\"\n").unwrap();
+        let err = resolve_mime_checks(&bp, &manifest.to_string_lossy()).unwrap_err();
+        assert!(
+            err.contains("mime check '../escape.rhai' resolves outside"),
+            "{err}"
+        );
+        std::fs::write(dir.path().join("checks/broken.rhai"), "fn check(a) { () }").unwrap();
+        bp.mime_types = toml::from_str("[\"x/y\"]\ncheck = \"checks/broken.rhai\"\n").unwrap();
+        let err = resolve_mime_checks(&bp, &manifest.to_string_lossy()).unwrap_err();
+        assert!(
+            err.contains("mime check for x/y failed to compile"),
+            "{err}"
+        );
+        bp.mime_types = toml::from_str("[png]\ncheck = \"checks/scene.rhai\"\n").unwrap();
+        let err = resolve_mime_checks(&bp, &manifest.to_string_lossy()).unwrap_err();
+        assert!(err.starts_with("[mime_types]:"), "{err}");
+    }
+
     #[tokio::test]
     async fn build_agent_rejects_a_run_id_that_is_not_a_directory_name() {
         for bad in ["../escape", "a/b", "..", ".", ""] {
@@ -1887,155 +2177,6 @@ system = { kind = "pinned", max_tokens = 1000 }
             chrono::DateTime::parse_from_rfc3339(v["utc"].as_str().expect("utc")).is_ok(),
             "{json}"
         );
-    }
-
-    /// A stage with `available_global_tools` is offered a tool installed in the
-    /// global directory that its `available_tools` never named - at spawn, in
-    /// the resolved stage the runtime reads, not only on a later refresh - and a
-    /// stage without the flag is not. The `dynamic_tools` snapshot the refresh
-    /// path filters against inherits the same expansion.
-    #[tokio::test]
-    async fn build_agent_grants_global_tools_to_a_stage_that_opted_in() {
-        let home = tempfile::tempdir().unwrap();
-        let global = home.path().join(".leviath").join("tools");
-        std::fs::create_dir_all(&global).unwrap();
-        std::fs::write(
-            global.join("echo.rhai"),
-            "// @tool echo\n// @description say it back\nparams.x",
-        )
-        .unwrap();
-        temp_env::async_with_vars(
-            [("LEVIATH_HOME", Some(home.path().to_str().unwrap()))],
-            async {
-                let dir = tempfile::tempdir().unwrap();
-                let manifest = dir.path().join("agent.leviath");
-                std::fs::write(
-                    &manifest,
-                    "[agent]\nname = \"global\"\nversion = \"0.1.0\"\ndescription = \"d\"\n\
-                     dynamic_tools = true\n\n\
-                     [stages.main]\nmodel = { provider = \"anthropic\", model = \"m\" }\n\
-                     available_tools = [\"read_file\"]\navailable_global_tools = true\n\n\
-                     [stages.plain]\nmodel = { provider = \"anthropic\", model = \"m\" }\n\
-                     available_tools = [\"read_file\"]\n",
-                )
-                .unwrap();
-                let (mut world, cli) = test_world();
-                let hub = InteractionHub::new();
-                let mcp = Arc::new(Mutex::new(leviath_mcp::ToolExecutor::new()));
-                let mut args = spawn_args(&manifest.to_string_lossy());
-                args.workdir = dir.path().to_string_lossy().to_string();
-                let entity = build_agent(
-                    world.world_mut(),
-                    SpawnDeps {
-                        tool_service: cli.as_ref(),
-                        config: &Config::default(),
-                        shared_mcp: mcp,
-                        mcp_tool_defs: &[],
-                        mcp_tool_owners: &Default::default(),
-                        hub: &hub,
-                        now_secs: 100,
-                        subagent_tx: sub_tx(),
-                    },
-                    &args,
-                )
-                .expect("spawn succeeds");
-
-                // The entry stage's resolved tools, as the runtime will offer them.
-                let mut offered: Vec<String> = world
-                    .world()
-                    .get::<leviath_runtime::pipeline::StageInference>(entity)
-                    .expect("the entry stage is resolved")
-                    .tools
-                    .iter()
-                    .map(|t| t.name.clone())
-                    .collect();
-                offered.sort_unstable();
-                assert_eq!(offered, vec!["echo".to_string(), "read_file".to_string()]);
-
-                // The refresh snapshot carries the expansion for the opted-in
-                // stage only.
-                let state = cli.state_for(entity).expect("registered");
-                let dynamic = state.dynamic.as_ref().expect("dynamic_tools agent");
-                assert_eq!(
-                    dynamic.stage_available,
-                    vec![
-                        vec!["read_file".to_string(), "echo".to_string()],
-                        vec!["read_file".to_string()],
-                    ]
-                );
-                assert_eq!(dynamic.stage_global, vec![true, false]);
-                assert_eq!(dynamic.tools_dir.as_deref(), Some(global.as_path()));
-            },
-        )
-        .await;
-    }
-
-    /// The global grant is decided by where a script lives, not by its name: a
-    /// `dynamic_tools` run whose workdir ships `tools/echo.rhai` under the same
-    /// name as a global `echo` has the workdir copy win discovery, and that copy
-    /// is repository content the grant must not advertise. The genuinely global
-    /// `lint` still is.
-    #[tokio::test]
-    async fn build_agent_does_not_grant_a_workdir_script_shadowing_a_global_tool() {
-        let home = tempfile::tempdir().unwrap();
-        let global = home.path().join(".leviath").join("tools");
-        std::fs::create_dir_all(&global).unwrap();
-        std::fs::write(global.join("echo.rhai"), "// @tool echo\n\"global\"").unwrap();
-        std::fs::write(global.join("lint.rhai"), "// @tool lint\n\"ok\"").unwrap();
-        temp_env::async_with_vars(
-            [("LEVIATH_HOME", Some(home.path().to_str().unwrap()))],
-            async {
-                let dir = tempfile::tempdir().unwrap();
-                let workdir_tools = dir.path().join("tools");
-                std::fs::create_dir(&workdir_tools).unwrap();
-                std::fs::write(workdir_tools.join("echo.rhai"), "// @tool echo\n\"repo\"").unwrap();
-                let manifest = dir.path().join("agent.leviath");
-                std::fs::write(
-                    &manifest,
-                    "[agent]\nname = \"shadowed\"\nversion = \"0.1.0\"\ndescription = \"d\"\n\
-                     dynamic_tools = true\n\n\
-                     [stages.main]\nmodel = { provider = \"anthropic\", model = \"m\" }\n\
-                     available_tools = [\"read_file\"]\navailable_global_tools = true\n",
-                )
-                .unwrap();
-                let (mut world, cli) = test_world();
-                let hub = InteractionHub::new();
-                let mcp = Arc::new(Mutex::new(leviath_mcp::ToolExecutor::new()));
-                let mut args = spawn_args(&manifest.to_string_lossy());
-                args.workdir = dir.path().to_string_lossy().to_string();
-                let entity = build_agent(
-                    world.world_mut(),
-                    SpawnDeps {
-                        tool_service: cli.as_ref(),
-                        config: &Config::default(),
-                        shared_mcp: mcp,
-                        mcp_tool_defs: &[],
-                        mcp_tool_owners: &Default::default(),
-                        hub: &hub,
-                        now_secs: 100,
-                        subagent_tx: sub_tx(),
-                    },
-                    &args,
-                )
-                .expect("spawn succeeds");
-
-                let mut offered: Vec<String> = world
-                    .world()
-                    .get::<leviath_runtime::pipeline::StageInference>(entity)
-                    .expect("the entry stage is resolved")
-                    .tools
-                    .iter()
-                    .map(|t| t.name.clone())
-                    .collect();
-                offered.sort_unstable();
-                assert_eq!(offered, vec!["lint".to_string(), "read_file".to_string()]);
-                // The shadowing copy was discovered (it would answer an explicit
-                // `available_tools` entry); it simply earned no global grant.
-                let state = cli.state_for(entity).expect("registered");
-                assert!(state.script_tool_names.lock().unwrap().contains("echo"));
-            },
-        )
-        .await;
     }
 
     #[tokio::test]
@@ -2725,7 +2866,8 @@ system = { kind = "pinned", max_tokens = 1000 }
             "[agent]\nname = \"asks\"\nversion = \"0.1.0\"\ndescription = \"d\"\n\n\
              [stages.main]\nmodel = { provider = \"anthropic\", model = \"m\" }\n\
              available_tools = [\"read_file\", \"ask_user_text\"]\n\
-             required_tools = [\"ask_user_text\"]\n",
+             required_tools = [\"ask_user_text\"]\n\
+             [stages.main.tool_accepts]\nread_file = [\"text/*\"]\n",
         )
         .unwrap();
         let (mut world, cli) = test_world();
@@ -2756,6 +2898,12 @@ system = { kind = "pinned", max_tokens = 1000 }
                 .contains("ask_user_text")
         );
         assert_eq!(state.stage_required_by_index.len(), 1);
+        // And what the stage lets each tool be handed, by canonical name.
+        assert_eq!(
+            state.stage_tool_accepts.lock().unwrap().get("read_file"),
+            Some(&vec!["text/*".to_string()])
+        );
+        assert_eq!(state.stage_tool_accepts_by_index.len(), 1);
     }
 
     #[tokio::test]
@@ -2793,6 +2941,59 @@ system = { kind = "pinned", max_tokens = 1000 }
                 .is_none()
         );
         assert!(!cli.take(entity).expect("tool state registered").unattended);
+    }
+
+    /// Capture is off for a plain run, on when the machine asked for every run,
+    /// and on when one spawn asked for itself. Off by default is the safety
+    /// property, so the absence is asserted as hard as the presence.
+    #[tokio::test]
+    async fn the_capture_marker_lands_only_when_the_machine_or_the_spawn_asks() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("agent.leviath");
+        std::fs::write(
+            &manifest,
+            "[agent]\nname = \"plain\"\nversion = \"0.1.0\"\ndescription = \"d\"\n\n\
+             [stages.main]\nmodel = { provider = \"anthropic\", model = \"m\" }\n",
+        )
+        .unwrap();
+        let path = manifest.to_string_lossy().to_string();
+        let captured = |config: &Config, args: &SpawnArgs| {
+            let (mut world, cli) = test_world();
+            let hub = InteractionHub::new();
+            let mcp = Arc::new(Mutex::new(leviath_mcp::ToolExecutor::new()));
+            let entity = build_agent(
+                world.world_mut(),
+                SpawnDeps {
+                    tool_service: cli.as_ref(),
+                    config,
+                    shared_mcp: mcp,
+                    mcp_tool_defs: &[],
+                    mcp_tool_owners: &Default::default(),
+                    hub: &hub,
+                    now_secs: 100,
+                    subagent_tx: sub_tx(),
+                },
+                args,
+            )
+            .expect("spawn succeeds");
+            world
+                .world()
+                .get::<leviath_runtime::pipeline::CaptureModelInput>(entity)
+                .is_some()
+        };
+
+        let plain = Config::default();
+        assert!(!captured(&plain, &spawn_args(&path)));
+
+        let mut machine_wide = Config::default();
+        machine_wide.observability.capture_model_input = true;
+        assert!(captured(&machine_wide, &spawn_args(&path)));
+
+        let asked = SpawnArgs {
+            capture_model_input: true,
+            ..spawn_args(&path)
+        };
+        assert!(captured(&plain, &asked));
     }
 
     #[tokio::test]
@@ -2939,11 +3140,78 @@ system = { kind = "pinned", max_tokens = 1000 }
         assert!(!out[0].1.contains("no tool state"));
     }
 
+    /// Each `tool_rescan` value tags the agent with what that value turns on,
+    /// and nothing more.
+    ///
+    /// The markers are what the runtime queries, so a value that tagged too
+    /// little would leave a run doing less than its blueprint asked for, and one
+    /// that tagged too much would make every batch of an ordinary run pay for a
+    /// mode it never asked for.
+    #[tokio::test]
+    async fn build_agent_tags_an_agent_with_the_rescan_it_asked_for() {
+        use leviath_core::blueprint::ToolRescan;
+        use leviath_runtime::pipeline::{DynamicTools, RescanBeforeDispatch};
+
+        for (value, polls, before_dispatch) in [
+            (ToolRescan::AtSpawn, false, false),
+            (ToolRescan::AfterWrites, true, false),
+            (ToolRescan::BeforeDispatch, true, true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let manifest = dir.path().join("agent.leviath");
+            std::fs::write(
+                &manifest,
+                coder_manifest().replace(
+                    "[agent]",
+                    &format!("[agent]\ntool_rescan = \"{}\"", value.wire()),
+                ),
+            )
+            .unwrap();
+
+            let (mut world, cli) = test_world();
+            let hub = InteractionHub::new();
+            let mcp = Arc::new(Mutex::new(leviath_mcp::ToolExecutor::new()));
+            let entity = build_agent(
+                world.world_mut(),
+                SpawnDeps {
+                    tool_service: cli.as_ref(),
+                    config: &Config::default(),
+                    shared_mcp: mcp,
+                    mcp_tool_defs: &[],
+                    mcp_tool_owners: &Default::default(),
+                    hub: &hub,
+                    now_secs: 100,
+                    subagent_tx: sub_tx(),
+                },
+                &spawn_args(&manifest.to_string_lossy()),
+            )
+            .expect("spawn succeeds");
+
+            let word = value.wire();
+            assert_eq!(
+                world.world().get::<DynamicTools>(entity).is_some(),
+                polls,
+                "{word}: whether the runtime polls it between turns"
+            );
+            assert_eq!(
+                world.world().get::<RescanBeforeDispatch>(entity).is_some(),
+                before_dispatch,
+                "{word}: whether it looks again before each batch"
+            );
+            // And the re-resolution context exists exactly when it is used.
+            assert_eq!(
+                leviath_runtime::pipeline::ToolService::refresh_tools(cli.as_ref(), entity, 0)
+                    .is_some(),
+                polls,
+                "{word}: whether there is anything to refresh with"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn build_agent_tags_dynamic_tools_agent() {
-        // A blueprint opting into dynamic_tools gets the DynamicTools marker so the
-        // runtime polls it for mid-run re-scans; the agent's tool state carries the
-        // re-resolution context (exercised via refresh_tools).
+        // The flag `tool_rescan` grew out of still reads as `after_writes`, so a
+        // blueprint carrying it is polled between turns as it always was.
         let dir = tempfile::tempdir().unwrap();
         let manifest = dir.path().join("agent.leviath");
         std::fs::write(
@@ -3918,11 +4186,15 @@ conversation = {{ kind = "sliding_window", max_items = 20, max_tokens = 10000 }}
             callback_url: None,
             callback_secret: None,
             yolo: false,
+            yolo_profile: None,
             no_seed_commands: false,
             allow: Vec::new(),
             max_depth: None,
             parent_run_id: None,
+            worker_stage: None,
             output: None,
+            parts: Vec::new(),
+            capture_model_input: false,
         }
     }
 
@@ -4011,6 +4283,59 @@ criteria = { kind = "pinned", max_tokens = 2000, seed = "input" }"#,
         )
         .unwrap_err();
         assert!(err.contains("spec"), "got: {err}");
+    }
+
+    /// A fan-out worker of the same blueprint is not asked for the caller's
+    /// required inputs: its work item is its input, and the parent already met
+    /// the caller's contract. The region is left empty rather than refused.
+    #[test]
+    fn resolve_seeds_a_worker_is_not_held_to_the_callers_required_inputs() {
+        let bp =
+            bp(r#"spec = { kind = "pinned", max_tokens = 2000, seed = "input", required = true }"#);
+        let mut args = args_with("Work item id: a\nContext: {}", HashMap::new(), "/tmp");
+        args.worker_stage = Some("review_one".to_string());
+        let seeds = resolve_seeds(
+            &bp,
+            &args,
+            "/tmp",
+            &seed_policy(),
+            &no_seed_tools(),
+            &no_read_paths(),
+        )
+        .unwrap();
+        assert!(!seeds.contains_key("spec"));
+    }
+
+    #[test]
+    fn resolve_seeds_required_caller_input_is_satisfied_by_a_part() {
+        let bp =
+            bp(r#"spec = { kind = "pinned", max_tokens = 2000, seed = "input", required = true }"#);
+        let mut args = args_with("t", HashMap::new(), "/tmp");
+        args.parts =
+            vec![leviath_core::mime::InboundPart::from_bytes("m.png", vec![1]).in_region("spec")];
+        let seeds = resolve_seeds(
+            &bp,
+            &args,
+            "/tmp",
+            &seed_policy(),
+            &no_seed_tools(),
+            &no_read_paths(),
+        )
+        .unwrap();
+        assert!(!seeds.contains_key("spec"));
+        // A part bound elsewhere does not satisfy it.
+        args.parts[0].region = Some("other".to_string());
+        assert!(
+            resolve_seeds(
+                &bp,
+                &args,
+                "/tmp",
+                &seed_policy(),
+                &no_seed_tools(),
+                &no_read_paths(),
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -5294,5 +5619,191 @@ conversation = {{ kind = "sliding_window", max_items = 20, max_tokens = 10000 }}
                 "{name} tells the user to pass --task but declares no region to hold one"
             );
         }
+    }
+
+    const PROFILES_TOML: &str = "[careful]\ndefault = \"ask\"\nquestions = \"ask\"\n\
+        checkpoints = \"ask\"\ngate = \"ask\"\n\n[loose]\ndefault = \"allow\"\n";
+
+    /// A profile that keeps the human mechanisms leaves every marker off: the
+    /// run is still yolo (its tool calls answer to the profile), but a
+    /// checkpoint opens, the gate asks, and the model's questions are offered.
+    /// One that keeps nothing is bare `--yolo` with a name on it.
+    #[tokio::test]
+    async fn build_agent_under_a_profile_keeps_what_the_profile_keeps() {
+        crate::config::with_isolated_config_path_async("spawn_profile_keeps", |cfg| async move {
+            std::fs::write(cfg.join("yolo.toml"), PROFILES_TOML).unwrap();
+            for (name, auto) in [("careful", false), ("loose", true)] {
+                let dir = tempfile::tempdir().unwrap();
+                let manifest = dir.path().join("agent.leviath");
+                std::fs::write(
+                    &manifest,
+                    "[agent]\nname = \"sec\"\nversion = \"0.1.0\"\ndescription = \"d\"\n\n\
+                     [security]\ntaint_tracking = true\n\n\
+                     [stages.main]\nmodel = { provider = \"anthropic\", model = \"m\" }\n",
+                )
+                .unwrap();
+                let (mut world, cli) = test_world();
+                let hub = InteractionHub::new();
+                let mut args = spawn_args(&manifest.to_string_lossy());
+                args.yolo = true;
+                args.yolo_profile = Some(name.to_string());
+                let entity = build_agent(
+                    world.world_mut(),
+                    SpawnDeps {
+                        tool_service: cli.as_ref(),
+                        config: &Config::default(),
+                        shared_mcp: Arc::new(Mutex::new(leviath_mcp::ToolExecutor::new())),
+                        mcp_tool_defs: &[],
+                        mcp_tool_owners: &Default::default(),
+                        hub: &hub,
+                        now_secs: 100,
+                        subagent_tx: sub_tx(),
+                    },
+                    &args,
+                )
+                .expect("spawn succeeds");
+                assert_eq!(
+                    world
+                        .world()
+                        .get::<leviath_runtime::components::GateAutoApprove>(entity)
+                        .is_some(),
+                    auto,
+                    "{name}: gate marker"
+                );
+                assert_eq!(
+                    world
+                        .world()
+                        .get::<leviath_runtime::components::InteractionAutoApprove>(entity)
+                        .is_some(),
+                    auto,
+                    "{name}: checkpoint marker"
+                );
+                let meta = world
+                    .world()
+                    .get::<RunMetadata>(entity)
+                    .expect("run metadata attached");
+                assert!(meta.unattended, "{name}: still a yolo run");
+                assert_eq!(meta.yolo_profile.as_deref(), Some(name));
+                let state = cli.take(entity).expect("tool state registered");
+                assert_eq!(state.unattended, auto, "{name}: questions routing");
+                let profile = state.yolo.get();
+                assert_eq!(
+                    profile.as_ref().as_ref().map(|p| p.name.as_str()),
+                    Some(name)
+                );
+                let handle = state.subagent.as_ref().expect("a sub-agent handle");
+                assert!(handle.unattended);
+                assert_eq!(handle.yolo_profile.as_deref(), Some(name));
+            }
+        })
+        .await;
+    }
+
+    /// A name the file does not have stops the spawn and lists what it does
+    /// have. Without `yolo`, a stray name is not even looked up.
+    #[tokio::test]
+    async fn build_agent_refuses_a_profile_the_file_does_not_have() {
+        crate::config::with_isolated_config_path_async("spawn_profile_unknown", |cfg| async move {
+            std::fs::write(cfg.join("yolo.toml"), PROFILES_TOML).unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let manifest = dir.path().join("agent.leviath");
+            std::fs::write(
+                &manifest,
+                "[agent]\nname = \"a\"\nversion = \"0.1.0\"\ndescription = \"d\"\n\n\
+                 [stages.main]\nmodel = { provider = \"anthropic\", model = \"m\" }\n",
+            )
+            .unwrap();
+            let (mut world, cli) = test_world();
+            let config = Config::default();
+            let hub = InteractionHub::new();
+            let owners = Default::default();
+            let deps = || SpawnDeps {
+                tool_service: cli.as_ref(),
+                config: &config,
+                shared_mcp: Arc::new(Mutex::new(leviath_mcp::ToolExecutor::new())),
+                mcp_tool_defs: &[],
+                mcp_tool_owners: &owners,
+                hub: &hub,
+                now_secs: 100,
+                subagent_tx: sub_tx(),
+            };
+            let mut args = spawn_args(&manifest.to_string_lossy());
+            args.yolo = true;
+            args.yolo_profile = Some("nope".to_string());
+            let err = build_agent(world.world_mut(), deps(), &args).expect_err("unknown profile");
+            assert!(err.contains("no yolo profile named \"nope\""), "{err}");
+            assert!(err.contains("careful, loose"), "{err}");
+
+            std::fs::remove_file(cfg.join("yolo.toml")).unwrap();
+            args.yolo = false;
+            let entity = build_agent(world.world_mut(), deps(), &args)
+                .expect("an attended run ignores the name");
+            let meta = world.world().get::<RunMetadata>(entity).expect("metadata");
+            assert!(!meta.unattended);
+            assert!(meta.yolo_profile.is_none());
+            assert!(cli.take(entity).expect("state").yolo.get().is_none());
+        })
+        .await;
+    }
+
+    /// A seed answers to the profile as a mid-run call does. Bare `--yolo`
+    /// is what lets a seeded `shell` run at all - a seed refuses `ask` - and a
+    /// profile whose default asks leaves the region empty rather than running
+    /// it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tool_seed_answers_to_the_yolo_profile() {
+        crate::config::with_isolated_config_path_async("spawn_profile_seed", |cfg| async move {
+            std::fs::write(cfg.join("yolo.toml"), PROFILES_TOML).unwrap();
+            for (profile, expect_ran) in [(None, true), (Some("careful"), false), (Some("loose"), true)] {
+                let dir = tempfile::tempdir().unwrap();
+                let manifest = dir.path().join("agent.leviath");
+                std::fs::write(
+                    &manifest,
+                    "[agent]\nname = \"seeded\"\nversion = \"0.1.0\"\ndescription = \"d\"\n\n\
+                     [stages.main]\nmodel = { provider = \"anthropic\", model = \"m\" }\n\n\
+                     [context.regions]\n\
+                     task = { kind = \"pinned\", max_tokens = 4000, seed = \"task_input\" }\n\
+                     environment = { kind = \"pinned\", max_tokens = 1000, \
+                     seed = { tools = [{ name = \"shell\", args = { command = \"echo seeded\" } }] } }\n",
+                )
+                .unwrap();
+                let (mut world, cli) = test_world();
+                let mut args = spawn_args(&manifest.to_string_lossy());
+                args.workdir = dir.path().to_string_lossy().to_string();
+                args.yolo = true;
+                args.yolo_profile = profile.map(str::to_string);
+                let entity = build_agent(
+                    world.world_mut(),
+                    SpawnDeps {
+                        tool_service: cli.as_ref(),
+                        config: &Config::default(),
+                        shared_mcp: Arc::new(Mutex::new(leviath_mcp::ToolExecutor::new())),
+                        mcp_tool_defs: &[],
+                        mcp_tool_owners: &Default::default(),
+                        hub: &InteractionHub::new(),
+                        now_secs: 100,
+                        subagent_tx: sub_tx(),
+                    },
+                    &args,
+                )
+                .expect("spawn succeeds");
+                let window = world
+                    .world()
+                    .get::<leviath_runtime::components::ContextWindow>(entity)
+                    .expect("the agent has a window");
+                let content: String = window
+                    .regions
+                    .iter()
+                    .find(|r| r.name == "environment")
+                    .expect("the seeded region exists")
+                    .content
+                    .iter()
+                    .map(|e| e.content.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert_eq!(content.contains("seeded"), expect_ran, "{profile:?}: {content}");
+            }
+        })
+        .await;
     }
 }

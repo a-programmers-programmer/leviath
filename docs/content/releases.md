@@ -3,7 +3,7 @@ title: Releases and channels
 description: How the alpha, beta, and stable channels work, and why stable ships the byte-for-byte alpha build.
 group: Guides
 group_order: 4
-order: 6
+order: 7
 ---
 
 # Releases and channels
@@ -80,7 +80,7 @@ scoop install leviath            # or leviath-beta, leviath-alpha
 ```
 
 **Cargo** installs the released crates.io version, which tracks the stable
-channel: each stable deploy publishes any crate version not yet on crates.io,
+channel. Each stable deploy publishes any crate version not yet on crates.io,
 from the same commit the binaries were built at.
 
 ```bash
@@ -121,7 +121,7 @@ platform's own resolver and NSS configuration, which is what you want on a machi
 ## Verifying a download
 
 Every release carries a `SHA256SUMS` file generated at build time and
-re-verified at each promotion, and builds are attested with GitHub's build
+re-verified at each promotion. Builds are attested with GitHub's build
 provenance:
 
 ```bash

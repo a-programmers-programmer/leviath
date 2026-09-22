@@ -1,6 +1,7 @@
 //! Anthropic Claude provider implementation.
 
 mod catalog;
+mod files;
 mod stream;
 
 use crate::capabilities::{Match, Row};
@@ -295,6 +296,10 @@ pub struct AnthropicProvider {
     /// Cache TTL for prompt caching breakpoints.
     cache_ttl: CacheTtl,
 
+    /// The operator's extra headers, sent after the provider's own on every
+    /// request to `base_url`: a gateway's token, a tenant tag.
+    extra_headers: Vec<(String, String)>,
+
     /// What `GET /v1/models` said, filled by [`Provider::prime_capabilities`].
     ///
     /// Empty until primed, and empty for good if the endpoint could not be
@@ -412,6 +417,7 @@ impl AnthropicProvider {
             capability_overrides: HashMap::new(),
             cache_ttl: CacheTtl::default(),
             learned: Default::default(),
+            extra_headers: Vec::new(),
         }
     }
 
@@ -430,12 +436,20 @@ impl AnthropicProvider {
             capability_overrides: overrides,
             cache_ttl: CacheTtl::default(),
             learned: Default::default(),
+            extra_headers: Vec::new(),
         }
     }
 
     /// Return built-in capabilities for a model based on its name pattern.
     fn builtin_capabilities(&self, model: &str) -> ModelCapabilities {
         table_capabilities(model)
+    }
+
+    /// Extra headers on every request to the host, after the provider's own:
+    /// what a gateway named in `with_base_url` wants of its own.
+    pub fn with_headers(mut self, headers: Vec<(String, String)>) -> Self {
+        self.extra_headers = headers;
+        self
     }
 
     /// Point this provider at a different host.
@@ -486,7 +500,7 @@ impl AnthropicProvider {
     /// how the debug-http log drifted - it hardcoded three headers and silently
     /// omitted `anthropic-beta`, so under `--features debug-http` a 1h-cache
     /// request logged something the wire never carried.
-    fn header_pairs(&self) -> Vec<(&'static str, String)> {
+    fn header_pairs(&self) -> Vec<(&str, String)> {
         let mut headers = vec![
             ("x-api-key", self.api_key.clone()),
             ("anthropic-version", "2023-06-01".to_string()),
@@ -498,7 +512,7 @@ impl AnthropicProvider {
                 "extended-cache-ttl-2025-04-11".to_string(),
             ));
         }
-        headers
+        crate::provider::with_extra_header_pairs(headers, &self.extra_headers)
     }
 
     /// Call Anthropic's exact `/messages/count_tokens` endpoint for `text`.
@@ -542,6 +556,24 @@ impl AnthropicProvider {
 
     /// Build the request body for the Anthropic API.
     fn build_request_body(&self, request: &InferenceRequest) -> serde_json::Value {
+        // A message's content as the API takes it: a string for plain text,
+        // else the blocks, with each stored part written as Anthropic's own
+        // `image` or `document` block and every other block as it serialises.
+        fn anthropic_content(content: &crate::MessageContent) -> serde_json::Value {
+            match content {
+                crate::MessageContent::Text(text) => serde_json::Value::String(text.clone()),
+                crate::MessageContent::Blocks(blocks) => serde_json::Value::Array(
+                    blocks
+                        .iter()
+                        .map(|block| {
+                            crate::mime::anthropic_block(block).unwrap_or_else(|| {
+                                serde_json::to_value(block).unwrap_or(serde_json::Value::Null)
+                            })
+                        })
+                        .collect(),
+                ),
+            }
+        }
         // Anthropic allows at most 4 `cache_control` blocks per request, counted
         // across BOTH system blocks and message content. System blocks get first
         // claim on that budget (they're the most stable, most valuable prefix to
@@ -632,7 +664,7 @@ impl AnthropicProvider {
                         // time.
                         let mut message = serde_json::json!({
                             "role": msg.role,
-                            "content": msg.content,
+                            "content": anthropic_content(&msg.content),
                         });
                         // Nothing to mark leaves the message unannotated; it
                         // is still sent.
@@ -648,7 +680,7 @@ impl AnthropicProvider {
             } else {
                 messages.push(serde_json::json!({
                     "role": msg.role,
-                    "content": msg.content,
+                    "content": anthropic_content(&msg.content),
                 }));
             }
         }
@@ -796,6 +828,7 @@ impl AnthropicProvider {
             ),
             finish_reason: Self::parse_stop_reason(stop_reason),
             reasoning: None,
+            parts: Vec::new(),
         })
     }
 }
@@ -905,6 +938,22 @@ impl Provider for AnthropicProvider {
         "anthropic"
     }
 
+    fn media_limits(&self, _model: &str) -> crate::files::MediaLimits {
+        crate::files::provider_limits("anthropic")
+    }
+
+    async fn upload_file(
+        &self,
+        upload: &crate::files::FileUpload,
+    ) -> Result<crate::files::RemoteFile> {
+        self.upload(upload, &crate::files::provider_limits("anthropic"))
+            .await
+    }
+
+    async fn delete_file(&self, file: &crate::files::RemoteFile) -> Result<()> {
+        self.delete(file).await
+    }
+
     fn serves_model(&self, model_key: &str) -> Option<String> {
         // Anthropic's models are named `claude-*`. See the note on the Gemini
         // provider for why the capability table is the wrong thing to ask.
@@ -922,6 +971,10 @@ impl Provider for AnthropicProvider {
             .or_else(|| crate::pricing::published_rates("anthropic", model))
     }
 
+    fn learned_models(&self) -> Option<&crate::learned::LearnedModels> {
+        Some(&self.learned)
+    }
+
     fn capabilities(&self, model: &str) -> ModelCapabilities {
         // Three answers, narrowest first: what the user wrote, what the API
         // says, what this build was compiled with.
@@ -933,6 +986,17 @@ impl Provider for AnthropicProvider {
             Some(o) => o.apply_to(base),
             None => base,
         }
+    }
+
+    fn mime(&self, model: &str) -> crate::capabilities::ModelMime {
+        let base = self
+            .learned
+            .mime_corrected(model, crate::mime_tables::anthropic(model));
+        let mime = match self.capability_overrides.get(model) {
+            Some(o) => o.apply_mime(base),
+            None => base,
+        };
+        crate::mime::WireShape::Anthropic.carried(mime)
     }
 
     /// Every id the listing named, once primed.
@@ -1005,10 +1069,13 @@ impl AnthropicProvider {
     /// One page of the listing, as the endpoint answers it.
     async fn fetch_models_page(&self, url: String) -> Result<serde_json::Value> {
         let response = crate::provider::apply_request_timeout(
-            self.client
-                .get(url)
-                .header("x-api-key", &self.api_key)
-                .header("anthropic-version", "2023-06-01"),
+            crate::provider::with_extra_headers(
+                self.client
+                    .get(url)
+                    .header("x-api-key", &self.api_key)
+                    .header("anthropic-version", "2023-06-01"),
+                &self.extra_headers,
+            ),
             Some(crate::provider::SIDE_CALL_TIMEOUT_SECS),
         )
         .send()
@@ -1043,6 +1110,9 @@ impl AnthropicProvider {
 }
 
 #[cfg(test)]
+mod mime_tests;
+
+#[cfg(test)]
 mod tests {
     // The SSE parser lives in `stream`, and its tests stayed here beside the
     // request-building ones they share fixtures with.
@@ -1067,6 +1137,7 @@ mod tests {
             overrides,
             None,
         );
+        assert!(provider.learned_models().is_some());
 
         // Configured: the operator's number, not the table's.
         let configured = provider.pricing("claude-opus-5").expect("configured");
@@ -2167,6 +2238,7 @@ mod tests {
             capability_overrides: HashMap::new(),
             cache_ttl: CacheTtl::default(),
             learned: Default::default(),
+            extra_headers: Vec::new(),
         }
     }
 
@@ -2208,6 +2280,7 @@ mod tests {
             capability_overrides: HashMap::new(),
             cache_ttl: CacheTtl::default(),
             learned: Default::default(),
+            extra_headers: Vec::new(),
         };
         let tokens = provider.count_tokens("anything", "claude-sonnet-4-6").await;
         assert_eq!(tokens, 42);
@@ -2237,6 +2310,7 @@ mod tests {
             capability_overrides: HashMap::new(),
             cache_ttl: CacheTtl::default(),
             learned: Default::default(),
+            extra_headers: Vec::new(),
         };
         assert_eq!(provider.count_tokens("first", "claude-sonnet-4-6").await, 7);
         let held = tokio::time::timeout(
@@ -2262,6 +2336,7 @@ mod tests {
             capability_overrides: HashMap::new(),
             cache_ttl: CacheTtl::default(),
             learned: Default::default(),
+            extra_headers: Vec::new(),
         };
         let tokens = provider.count_tokens("1234567", "claude-sonnet-4-6").await;
         assert_eq!(tokens, 2);
@@ -2279,6 +2354,7 @@ mod tests {
             capability_overrides: HashMap::new(),
             cache_ttl: CacheTtl::default(),
             learned: Default::default(),
+            extra_headers: Vec::new(),
         };
         let tokens = provider.count_tokens("1234567", "claude-sonnet-4-6").await;
         assert_eq!(tokens, 2);
@@ -2296,6 +2372,7 @@ mod tests {
             capability_overrides: HashMap::new(),
             cache_ttl: CacheTtl::default(),
             learned: Default::default(),
+            extra_headers: Vec::new(),
         };
         let tokens = provider.count_tokens("1234567", "claude-sonnet-4-6").await;
         assert_eq!(tokens, 2);
@@ -2942,6 +3019,7 @@ mod tests {
             capability_overrides: HashMap::new(),
             cache_ttl: CacheTtl::default(),
             learned: Default::default(),
+            extra_headers: Vec::new(),
         };
         let request = InferenceRequest {
             system: vec![],
@@ -2978,6 +3056,7 @@ mod tests {
             capability_overrides: HashMap::new(),
             cache_ttl: CacheTtl::default(),
             learned: Default::default(),
+            extra_headers: Vec::new(),
         };
         let request = InferenceRequest {
             system: vec![],
@@ -3007,6 +3086,7 @@ mod tests {
             capability_overrides: HashMap::new(),
             cache_ttl: CacheTtl::default(),
             learned: Default::default(),
+            extra_headers: Vec::new(),
         };
         let result = provider.list_models().await;
         assert!(result.is_err());
@@ -3210,6 +3290,25 @@ mod tests {
             extra: serde_json::Value::Null,
             request_timeout_secs: None,
         }
+    }
+
+    /// The operator's extra headers reach the wire on an inference, after
+    /// the provider's own.
+    #[tokio::test]
+    async fn extra_headers_ride_every_request() {
+        let body = br#"{"content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#;
+        let (url, seen) = leviath_testkit::spawn_mock_recorder(200, "OK", body.to_vec()).await;
+        let provider = provider_with_url(url)
+            .with_headers(vec![("X-Gateway-Token".to_string(), "t-1".to_string())]);
+        provider.infer(&simple_request()).await.unwrap();
+        let request = leviath_core::sync::lock(&seen)[0].to_ascii_lowercase();
+        assert!(request.contains("x-gateway-token: t-1"), "{request}");
+        let own = request.find("x-api-key").expect("the key is sent");
+        let extra = request.find("x-gateway-token").expect("the extra is sent");
+        assert!(
+            own < extra,
+            "the provider's own header comes first: {request}"
+        );
     }
 
     #[tokio::test]
@@ -3572,6 +3671,7 @@ mod tests {
             capability_overrides: HashMap::new(),
             cache_ttl: CacheTtl::Ephemeral1h,
             learned: Default::default(),
+            extra_headers: Vec::new(),
         };
         assert_eq!(
             provider.cache_control_value(),

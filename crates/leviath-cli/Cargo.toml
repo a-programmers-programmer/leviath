@@ -37,7 +37,7 @@ mimalloc-allocator = ["dep:mimalloc", "dep:leviath-alloc", "leviath-alloc/mimall
 # table on purpose: only the composition-root binary should pick an allocator,
 # never a library crate.
 mimalloc = { version = "0.1", optional = true }
-leviath-alloc = { path = "../leviath-alloc", version = "0.5.8", optional = true }
+leviath-alloc = { path = "../leviath-alloc", version = "0.6.3", optional = true }
 leviath-core = { workspace = true }
 # The outbound-request policy (SSRF checks + the shared client).
 leviath-net = { workspace = true }
@@ -54,6 +54,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 toml_edit = { workspace = true }
+# `lev rage`: the token-shaped patterns its scrubber replaces.
+regex = { workspace = true }
+# `lev rage`: the bundle it writes.
+zip = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
@@ -67,6 +71,7 @@ crossterm = { workspace = true }
 ratatui = { workspace = true }
 unicode-width = { workspace = true }
 futures-util = { workspace = true }
+tokio-stream = { workspace = true }
 dotenvy = { workspace = true }
 leviath-tools = { workspace = true }
 leviath-sys = { workspace = true }
@@ -74,6 +79,8 @@ async-trait = { workspace = true }
 pulldown-cmark = { workspace = true }
 ratatui-textarea = { workspace = true }
 rataflow = { workspace = true }
+async-graphql = { workspace = true }
+async-graphql-axum = { workspace = true }
 axum = { workspace = true }
 axum-server = { workspace = true }
 tower-http = { workspace = true }

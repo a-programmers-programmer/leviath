@@ -26,6 +26,9 @@ pub struct ProviderRegistry {
     /// Lazy, hot-reloading resolver for `.rhai` script providers. Shared across
     /// registry clones (one compile cache daemon-wide).
     script_layer: Option<Arc<ScriptProviderLayer>>,
+    /// The operator's data retention settings, laid over what each provider
+    /// documents or reads. See [`Self::retention`].
+    retention: leviath_providers::retention::RetentionSettings,
 }
 
 impl ProviderRegistry {
@@ -38,6 +41,121 @@ impl ProviderRegistry {
     pub fn with_script_layer(mut self, layer: Arc<ScriptProviderLayer>) -> Self {
         self.script_layer = Some(layer);
         self
+    }
+
+    /// The data retention settings from `config.toml`: whether zero
+    /// retention is asked for, which providers the organisation holds an
+    /// agreement with, and the per-model and per-provider declarations.
+    pub fn with_retention(
+        mut self,
+        settings: leviath_providers::retention::RetentionSettings,
+    ) -> Self {
+        self.retention = settings;
+        self
+    }
+
+    /// Replace the settings in place: what the daemon's housekeeper does
+    /// when `config.toml` changes under a running daemon.
+    pub fn set_retention(&mut self, settings: leviath_providers::retention::RetentionSettings) {
+        self.retention = settings;
+    }
+
+    /// The settings [`Self::with_retention`] installed.
+    pub fn retention_settings(&self) -> &leviath_providers::retention::RetentionSettings {
+        &self.retention
+    }
+
+    /// [`Self::retention`] with the caller's settings rather than the
+    /// registry's own: the spawn gate reads them off the config it was
+    /// handed, which is the live one, while the registry's copy follows on
+    /// the next housekeeping pass.
+    pub fn retention_with(
+        &self,
+        settings: &leviath_providers::retention::RetentionSettings,
+        provider: &str,
+        model: &str,
+    ) -> leviath_providers::retention::RetentionPolicy {
+        let base = self
+            .get(provider)
+            .and_then(|p| p.live_retention(model))
+            .unwrap_or_else(|| leviath_providers::retention::builtin(provider, model));
+        leviath_providers::retention::resolve(base, provider, model, settings)
+    }
+
+    /// Why `provider`/`model` may not be called, when zero data retention is
+    /// asked for in `settings` and the model keeps something; `None` when it
+    /// may.
+    ///
+    /// Worded to follow the model's name ("openai/gpt-5.5, which does not
+    /// ..."), so the spawn gate and every inference lane refuse in the same
+    /// words, each with its own lead-in.
+    pub fn retention_refusal_with(
+        &self,
+        settings: &leviath_providers::retention::RetentionSettings,
+        provider: &str,
+        model: &str,
+    ) -> Option<String> {
+        if !settings.zero_requested {
+            return None;
+        }
+        let policy = self.retention_with(settings, provider, model);
+        (!policy.is_zero()).then(|| {
+            format!(
+                "{provider}/{model}, which does not run with zero data retention \
+                 (retention {}: {}). `[providers] zero_retention` is on: name a model \
+                 that keeps nothing, declare the agreement in \
+                 `zero_retention_agreements` if you hold one, or turn the setting off.",
+                policy.retention.describe(),
+                policy.note,
+            )
+        })
+    }
+
+    /// [`Self::retention_refusal_with`] with the registry's own settings: what
+    /// an inference lane checks just before it sends, so a switch turned on
+    /// under a running daemon holds for the calls that follow.
+    pub fn retention_refusal(&self, provider: &str, model: &str) -> Option<String> {
+        self.retention_refusal_with(&self.retention, provider, model)
+    }
+
+    /// What `provider` keeps of `model`'s requests, with the operator's
+    /// settings applied: what the provider read from its account if it
+    /// could, else the compiled-in table for the name it is registered
+    /// under (a script provider or an endpoint answers by its own name),
+    /// then a declaration, an agreement, or the request for zero retention
+    /// on top. Answers for a provider that is not registered too, from the
+    /// table alone, so a listing can describe one that is merely known.
+    pub fn retention(
+        &self,
+        provider: &str,
+        model: &str,
+    ) -> leviath_providers::retention::RetentionPolicy {
+        self.retention_with(&self.retention, provider, model)
+    }
+
+    /// Ask every native provider to read again what it answers
+    /// [`Provider::live_retention`] from, in turn. A daemon calls this
+    /// when zero retention is switched on under it, so an account mode
+    /// `lev providers retention` just set is what the next spawn is judged
+    /// by rather than what the daemon read when it started.
+    pub async fn refresh_retention(&self) {
+        // One after another: a handful of providers, of which one or two
+        // read anything, each a short side call.
+        for provider in self.providers.values() {
+            provider.refresh_retention().await;
+        }
+    }
+
+    /// Merge the per-request zero-retention fields for `provider` into a
+    /// request's extra parameters, when zero retention is asked for. A
+    /// provider without such fields is left alone.
+    pub fn apply_retention_knobs(&self, provider: &str, extra: &mut serde_json::Value) {
+        if self.retention.zero_requested {
+            // An endpoint that declared which built-in's fields it takes
+            // (`zero_retention_request`) is sent that provider's.
+            let knobs = self.retention.knob_provider(provider);
+            leviath_providers::retention::apply_request_knobs(knobs, extra);
+        }
     }
 
     /// Register a provider by name.
@@ -107,7 +225,16 @@ impl ProviderRegistry {
     /// costs a compile of a script that is about to be used anyway, and it is
     /// what lets that provider answer [`Provider::serves_model`] and so win an
     /// open route.
-    pub async fn prime_capabilities(&self, timeout: std::time::Duration, also: &[&str]) {
+    ///
+    /// Answers the providers whose listing failed, each with the error in the
+    /// words [`leviath_providers::ProviderError::describe`] gives it, so a
+    /// caller can record the failure where `lev setup` will see it. A timeout
+    /// is not among them: it says nothing about the credential.
+    pub async fn prime_capabilities(
+        &self,
+        timeout: std::time::Duration,
+        also: &[&str],
+    ) -> Vec<(String, String)> {
         let mut targets: Vec<(String, Arc<dyn Provider>)> = self
             .providers
             .iter()
@@ -148,6 +275,7 @@ impl ProviderRegistry {
         // is its own network call, and a listing command or a daemon start
         // that waited for five of them in turn paid five timeouts in the
         // worst case where one would do.
+        let mut failures = Vec::new();
         let mut in_flight = tokio::task::JoinSet::new();
         for (name, provider) in targets {
             in_flight.spawn(async move {
@@ -167,13 +295,16 @@ impl ProviderRegistry {
             };
             match outcome {
                 Ok(Ok(())) => {}
-                Ok(Err(e)) => tracing::warn!(
-                    provider = %name,
-                    error = %e,
-                    "could not read this provider's model list, so model sizes \
-                     come from the table compiled into this build; a model it \
-                     does not name gets a conservative window"
-                ),
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        provider = %name,
+                        error = %e,
+                        "could not read this provider's model list, so model sizes \
+                         come from the table compiled into this build; a model it \
+                         does not name gets a conservative window"
+                    );
+                    failures.push((name, e.describe()));
+                }
                 Err(_) => tracing::warn!(
                     provider = %name,
                     timeout_secs = timeout.as_secs(),
@@ -182,6 +313,102 @@ impl ProviderRegistry {
                 ),
             }
         }
+        failures.sort();
+        failures
+    }
+
+    /// Write every native provider's primed catalogue to the shared capability
+    /// cache at `path`, stamped `now` (Unix seconds). Called by the daemon after
+    /// a successful prime so short-lived processes read the same numbers. A
+    /// provider that keeps no learned store (a script provider) contributes
+    /// nothing; a cache that could not be written is a warning, never fatal.
+    ///
+    /// A primed listing is also a successful check, so each provider that
+    /// primed gets a [`ProviderCheck`](leviath_providers::ProviderCheck)
+    /// stamped `now`, carrying its entry in `fingerprints` (provider name to
+    /// credential fingerprint, made by the caller), which is what lets
+    /// `lev setup` open on a provider the daemon has already proved works. The file is added to, not replaced:
+    /// checks other surfaces recorded, and providers this registry does not
+    /// hold, stay as they were.
+    ///
+    /// `path` is an `Option` so a caller whose home did not resolve (the cache
+    /// path is unknown) passes `None` and this no-ops, keeping the caller
+    /// branch-free rather than each guarding an untestable `None`.
+    ///
+    /// `failures` are the providers whose prime failed, as
+    /// [`Self::prime_capabilities`] answered them: each is recorded as a
+    /// failed check with that message, so `lev setup` shows the error the
+    /// daemon hit instead of a provider that looks unchecked.
+    pub fn save_capability_cache(
+        &self,
+        path: Option<&std::path::Path>,
+        now: i64,
+        fingerprints: &HashMap<String, String>,
+        failures: &[(String, String)],
+    ) {
+        let Some(path) = path else {
+            return;
+        };
+        let mut cache = leviath_providers::CapabilityCache::load_or_new(path, now);
+        for (name, message) in failures {
+            cache.record_check(
+                name,
+                leviath_providers::ProviderCheck {
+                    checked_at: now,
+                    credential: fingerprints.get(name).cloned(),
+                    outcome: leviath_providers::CheckOutcome::Failed {
+                        message: message.clone(),
+                    },
+                },
+            );
+        }
+        for (name, provider) in &self.providers {
+            if let Some(learned) = provider.learned_models() {
+                let snapshot = learned.snapshot();
+                if !snapshot.is_empty() {
+                    cache.record_check(
+                        name,
+                        leviath_providers::ProviderCheck {
+                            checked_at: now,
+                            credential: fingerprints.get(name).cloned(),
+                            outcome: leviath_providers::CheckOutcome::Reachable {
+                                models: snapshot.len(),
+                            },
+                        },
+                    );
+                    cache.set(name, snapshot);
+                }
+            }
+        }
+        if let Err(e) = cache.save(path) {
+            tracing::warn!(error = %e, "could not write the model-capability cache");
+        }
+    }
+
+    /// Fill each native provider's learned store from the cache at `path`, for
+    /// the providers it holds an entry for, and report whether anything loaded.
+    ///
+    /// Lets a freshly built registry answer a model's real limits without its own
+    /// network prime, as long as some process (the daemon) has primed and written
+    /// the cache. A missing file, or one written by another format version,
+    /// loads nothing and returns false: the registry then primes over the
+    /// network or answers from the compiled table. The cache's age is not
+    /// checked; a listing learned last month is still closer than the table.
+    pub fn load_capability_cache(&self, path: &std::path::Path) -> bool {
+        let Some(cache) = leviath_providers::CapabilityCache::load(path) else {
+            return false;
+        };
+        let mut loaded = false;
+        for (name, provider) in &self.providers {
+            let Some(learned) = provider.learned_models() else {
+                continue;
+            };
+            if let Some(models) = cache.get(name) {
+                learned.replace(models.clone().into_iter().collect());
+                loaded = true;
+            }
+        }
+        loaded
     }
 
     /// Get every model a run is about to use ready, before it starts.
@@ -375,6 +602,11 @@ mod tests {
         catalog: Option<Vec<String>>,
         /// What it says about refusing anything outside that catalogue.
         refusal: Option<String>,
+        /// The learned store the capability cache reads and fills.
+        learned: leviath_providers::LearnedModels,
+        /// When true, [`Provider::learned_models`] returns `None`, standing in
+        /// for a provider (a script provider) that keeps no learned store.
+        no_store: bool,
     }
 
     impl StubProvider {
@@ -385,7 +617,38 @@ mod tests {
                 warmed: Arc::new(std::sync::Mutex::new(Vec::new())),
                 catalog: None,
                 refusal: None,
+                learned: leviath_providers::LearnedModels::default(),
+                no_store: false,
             }
+        }
+
+        /// A stub that keeps no learned store, like a script provider.
+        fn storeless() -> Self {
+            Self {
+                no_store: true,
+                ..Self::new(PrimeOutcome::Ok)
+            }
+        }
+
+        /// A stub whose learned store already holds `models` (id → context
+        /// window), as if it had primed.
+        fn with_learned(models: &[(&str, usize)]) -> Self {
+            let stub = Self::new(PrimeOutcome::Ok);
+            stub.learned.replace(
+                models
+                    .iter()
+                    .map(|(id, ctx)| {
+                        (
+                            (*id).to_string(),
+                            leviath_providers::LearnedModel {
+                                max_context_tokens: Some(*ctx),
+                                ..Default::default()
+                            },
+                        )
+                    })
+                    .collect(),
+            );
+            stub
         }
 
         /// The same stub, publishing a complete catalogue.
@@ -461,6 +724,10 @@ mod tests {
             self.catalog.clone()
         }
 
+        fn learned_models(&self) -> Option<&leviath_providers::LearnedModels> {
+            (!self.no_store).then_some(&self.learned)
+        }
+
         fn refusal_reason(&self, _model_key: &str) -> Option<String> {
             self.refusal.clone()
         }
@@ -468,6 +735,91 @@ mod tests {
 
     /// A provider gets to explain a refusal, and one with nothing to add is
     /// silent rather than inventing a sentence.
+    /// A retention answer is keyed by the name a provider is registered
+    /// under, not the name it calls itself: a stub registered as `openai`
+    /// answers with OpenAI's documented policy, and the operator's settings
+    /// sit on top. The per-request knobs go out only when zero retention was
+    /// asked for.
+    #[test]
+    fn retention_is_answered_by_registry_name_with_settings_on_top() {
+        use leviath_providers::retention::{Retention, RetentionSettings, Source};
+        let mut registry = ProviderRegistry::new();
+        registry.register(
+            "openai".to_string(),
+            Arc::new(StubProvider::new(PrimeOutcome::Ok)),
+        );
+        let documented = registry.retention("openai", "gpt-5.5");
+        assert_eq!(documented.retention, Retention::Days(30));
+        assert_eq!(documented.source, Source::Builtin);
+        // Unregistered is still described, from the table.
+        assert!(registry.retention("ollama", "qwen3.5:9b").is_zero());
+        let mut extra = serde_json::Value::Null;
+        registry.apply_retention_knobs("openai", &mut extra);
+        assert!(extra.is_null(), "nothing asked for, nothing sent");
+
+        let settings = RetentionSettings {
+            zero_requested: true,
+            agreements: vec!["openai".to_string()],
+            ..Default::default()
+        };
+        let mut registry = registry.with_retention(settings.clone());
+        assert_eq!(registry.retention_settings(), &settings);
+        // Replaced in place, the way the housekeeper does it, and answered
+        // with a caller's settings, the way the spawn gate does it.
+        registry.set_retention(RetentionSettings::default());
+        assert!(!registry.retention("openai", "gpt-5.5").is_zero());
+        assert!(
+            registry
+                .retention_with(&settings, "openai", "gpt-5.5")
+                .is_zero()
+        );
+        registry.set_retention(settings.clone());
+        let declared = registry.retention("openai", "gpt-5.5");
+        assert!(declared.is_zero());
+        assert_eq!(declared.source, Source::Declared);
+        registry.apply_retention_knobs("openai", &mut extra);
+        assert_eq!(extra, serde_json::json!({ "store": false }));
+
+        // An endpoint that declared whose fields it takes is sent them; one
+        // that did not is sent nothing, since the table has none for it.
+        registry.set_retention(RetentionSettings {
+            zero_requested: true,
+            request_knob_aliases: HashMap::from([("azure".to_string(), "openai".to_string())]),
+            ..Default::default()
+        });
+        let mut azure = serde_json::Value::Null;
+        registry.apply_retention_knobs("azure", &mut azure);
+        assert_eq!(azure, serde_json::json!({ "store": false }));
+        let mut plain = serde_json::Value::Null;
+        registry.apply_retention_knobs("gw", &mut plain);
+        assert!(plain.is_null());
+    }
+
+    /// The refusal every lane shares: nothing when zero retention is off or
+    /// the model keeps nothing, and otherwise the model named with why.
+    #[test]
+    fn a_retention_refusal_names_the_model_and_the_way_out() {
+        let mut registry = ProviderRegistry::new();
+        registry.register(
+            "openai".to_string(),
+            Arc::new(StubProvider::new(PrimeOutcome::Ok)),
+        );
+        assert_eq!(registry.retention_refusal("openai", "gpt-5.5"), None);
+        let registry = registry.with_retention(leviath_providers::retention::RetentionSettings {
+            zero_requested: true,
+            ..Default::default()
+        });
+        let refusal = registry
+            .retention_refusal("openai", "gpt-5.5")
+            .expect("OpenAI keeps an abuse log");
+        assert!(
+            refusal.starts_with("openai/gpt-5.5, which does not run with zero data retention"),
+            "{refusal}"
+        );
+        assert!(refusal.contains("zero_retention_agreements"), "{refusal}");
+        assert_eq!(registry.retention_refusal("ollama", "qwen3.5:9b"), None);
+    }
+
     #[test]
     fn refusal_reason_comes_from_the_provider_or_not_at_all() {
         let mut reg = ProviderRegistry::new();
@@ -669,6 +1021,32 @@ mod tests {
 
         assert_eq!(fails.warmed.lock().expect("not poisoned").len(), 1);
         assert_eq!(hangs.warmed.lock().expect("not poisoned").len(), 1);
+    }
+
+    /// A failed listing comes back named, in the words setup shows; one that
+    /// only ran out of time does not, since it says nothing about the key.
+    #[tokio::test]
+    async fn priming_answers_the_providers_whose_listing_failed() {
+        let mut reg = ProviderRegistry::new();
+        reg.register(
+            "fails".to_string(),
+            Arc::new(StubProvider::new(PrimeOutcome::Fails)),
+        );
+        reg.register(
+            "hangs".to_string(),
+            Arc::new(StubProvider::new(PrimeOutcome::Hangs)),
+        );
+        reg.register(
+            "ok".to_string(),
+            Arc::new(StubProvider::new(PrimeOutcome::Ok)),
+        );
+        let failures = reg
+            .prime_capabilities(std::time::Duration::from_millis(100), &[])
+            .await;
+        assert_eq!(
+            failures,
+            vec![("fails".to_string(), "API error: no".to_string())]
+        );
     }
 
     #[tokio::test]
@@ -980,6 +1358,26 @@ mod tests {
             .await;
     }
 
+    /// A refresh asks every registered provider in turn; a provider that
+    /// reads no setting has nothing to do, and the registry's answer for it
+    /// is the table's before and after.
+    #[tokio::test]
+    async fn a_refresh_asks_every_registered_provider() {
+        let mut registry = ProviderRegistry::new();
+        registry.register(
+            "openai".to_string(),
+            Arc::new(StubProvider::new(PrimeOutcome::Ok)),
+        );
+        registry.register(
+            "ollama".to_string(),
+            Arc::new(StubProvider::new(PrimeOutcome::Ok)),
+        );
+        let before = registry.retention("openai", "gpt-5.5");
+        registry.refresh_retention().await;
+        assert_eq!(registry.retention("openai", "gpt-5.5"), before);
+        assert!(registry.retention("ollama", "q").is_zero());
+    }
+
     #[tokio::test]
     async fn stub_provider_methods_are_exercised() {
         let p = StubProvider::new(PrimeOutcome::Ok);
@@ -998,5 +1396,145 @@ mod tests {
             request_timeout_secs: None,
         };
         assert!(p.infer(&request).await.is_err());
+    }
+
+    #[test]
+    fn the_capability_cache_round_trips_and_skips_every_other_shape() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("caps").join("model_capabilities.json");
+
+        // A primed registry with all three provider shapes:
+        let mut primed = ProviderRegistry::new();
+        // one that learned a real window (cached),
+        primed.register(
+            "learned".to_string(),
+            Arc::new(StubProvider::with_learned(&[("big-model", 200_000)])),
+        );
+        // one with a store that primed nothing (empty snapshot, not cached),
+        primed.register(
+            "empty".to_string(),
+            Arc::new(StubProvider::new(PrimeOutcome::Ok)),
+        );
+        // and one with no store at all (a script provider; skipped).
+        primed.register("storeless".to_string(), Arc::new(StubProvider::storeless()));
+        // A check another surface recorded earlier survives the daemon's save.
+        let mut earlier = leviath_providers::CapabilityCache::new(500);
+        earlier.record_check(
+            "elsewhere",
+            leviath_providers::ProviderCheck {
+                checked_at: 500,
+                credential: None,
+                outcome: leviath_providers::CheckOutcome::Failed {
+                    message: "rejected".to_string(),
+                },
+            },
+        );
+        earlier.save(&path).expect("the earlier cache writes");
+        let fingerprints = HashMap::from([("learned".to_string(), "abcd1234abcd1234".to_string())]);
+        primed.save_capability_cache(
+            Some(&path),
+            1_000,
+            &fingerprints,
+            &[(
+                "broken".to_string(),
+                "[dns-failure] no such host".to_string(),
+            )],
+        );
+
+        // The prime is recorded as a check, with the credential it used.
+        let written = leviath_providers::CapabilityCache::load(&path).expect("written");
+        let check = written
+            .check("learned")
+            .expect("a primed provider is checked");
+        assert_eq!(check.checked_at, 1_000);
+        assert_eq!(check.credential.as_deref(), Some("abcd1234abcd1234"));
+        assert_eq!(
+            check.outcome,
+            leviath_providers::CheckOutcome::Reachable { models: 1 }
+        );
+        assert!(
+            written.check("empty").is_none(),
+            "a provider that primed nothing is not a passed check"
+        );
+        assert_eq!(
+            written
+                .check("broken")
+                .expect("a failed prime is recorded")
+                .outcome,
+            leviath_providers::CheckOutcome::Failed {
+                message: "[dns-failure] no such host".to_string()
+            }
+        );
+        assert_eq!(
+            written.check("elsewhere").expect("kept").checked_at,
+            500,
+            "another surface's check survives"
+        );
+
+        // A fresh registry reads it back.
+        let mut fresh = ProviderRegistry::new();
+        // this one is in the cache, so it is filled,
+        fresh.register(
+            "learned".to_string(),
+            Arc::new(StubProvider::new(PrimeOutcome::Ok)),
+        );
+        // this one has a store but no cache entry, so it is left alone,
+        fresh.register(
+            "unknown".to_string(),
+            Arc::new(StubProvider::new(PrimeOutcome::Ok)),
+        );
+        // and this one has no store, so it is skipped.
+        fresh.register("storeless".to_string(), Arc::new(StubProvider::storeless()));
+        assert!(
+            fresh
+                .get("learned")
+                .unwrap()
+                .learned_models()
+                .unwrap()
+                .is_empty(),
+            "nothing learned before the cache is loaded"
+        );
+        assert!(fresh.load_capability_cache(&path));
+        assert_eq!(
+            fresh
+                .get("learned")
+                .unwrap()
+                .learned_models()
+                .unwrap()
+                .get("big-model")
+                .unwrap()
+                .max_context_tokens,
+            Some(200_000),
+        );
+        assert!(
+            fresh
+                .get("unknown")
+                .unwrap()
+                .learned_models()
+                .unwrap()
+                .is_empty(),
+            "a provider with no cache entry is left as it was"
+        );
+
+        // A missing (or stale-versioned) cache loads nothing and says so.
+        assert!(!fresh.load_capability_cache(&dir.path().join("nope.json")));
+    }
+
+    #[test]
+    fn saving_the_cache_where_it_cannot_be_written_warns_but_does_not_panic() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A file where a directory would have to be makes the write fail.
+        let file = dir.path().join("in-the-way");
+        std::fs::write(&file, "x").expect("write the blocker");
+        let unwritable = file.join("sub").join("model_capabilities.json");
+        let mut reg = ProviderRegistry::new();
+        reg.register(
+            "stub".to_string(),
+            Arc::new(StubProvider::with_learned(&[("m", 1)])),
+        );
+        // The failure is logged, not propagated: a cache is a convenience.
+        reg.save_capability_cache(Some(&unwritable), 1, &HashMap::new(), &[]);
+        // No path (home did not resolve) is a silent no-op, not a panic.
+        reg.save_capability_cache(None, 1, &HashMap::new(), &[]);
     }
 }

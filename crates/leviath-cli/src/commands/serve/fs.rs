@@ -39,25 +39,39 @@ pub(super) async fn list_dirs(
     State(state): State<AppState>,
     Query(query): Query<DirsQuery>,
 ) -> Result<Json<DirsResp>, ApiError> {
+    dir_listing(&state, query.path.as_deref(), query.hidden)
+        .map(Json)
+        .map_err(|e| super::core::error::as_api_error(&e))
+}
+
+/// The directories under `path`, for a file picker.
+///
+/// Confined to `--workdir-root` when the operator set one. That fence is why
+/// `parent` is null at the root rather than leading above it, and why a symlink
+/// child pointing outside is left out: offering it would be offering a workdir
+/// the spawn path refuses.
+pub(super) fn dir_listing(
+    state: &AppState,
+    path: Option<&str>,
+    hidden: bool,
+) -> Result<DirsResp, super::core::error::ServeError> {
+    use super::core::error::ServeError;
+
     let root = state.limits.workdir_root.as_deref();
     let cwd = known_dir_or_fs_root(std::env::current_dir().ok());
 
-    let listed = match &query.path {
+    let listed = match path {
         Some(p) => {
             let requested = PathBuf::from(p);
             if !requested.is_absolute() {
-                return Err(err(
-                    StatusCode::BAD_REQUEST,
-                    "path must be absolute".to_string(),
-                ));
+                return Err(ServeError::BadRequest("path must be absolute".to_string()));
             }
             if let Some(root) = root
                 && !leviath_core::resolves_within(&requested, root)
             {
-                return Err(err(
-                    StatusCode::FORBIDDEN,
-                    format!("path '{p}' is outside the configured --workdir-root"),
-                ));
+                return Err(ServeError::Forbidden(format!(
+                    "path '{p}' is outside the configured --workdir-root"
+                )));
             }
             requested
         }
@@ -71,30 +85,26 @@ pub(super) async fn list_dirs(
 
     match std::fs::metadata(&listed) {
         Ok(m) if !m.is_dir() => {
-            return Err(err(
-                StatusCode::BAD_REQUEST,
-                format!("'{}' is a file, not a directory", listed.display()),
-            ));
+            return Err(ServeError::BadRequest(format!(
+                "'{}' is a file, not a directory",
+                listed.display()
+            )));
         }
         Ok(_) => {}
         Err(_) => {
-            return Err(err(
-                StatusCode::NOT_FOUND,
-                format!("directory '{}' not found", listed.display()),
-            ));
+            return Err(ServeError::NotFound(format!(
+                "directory '{}' not found",
+                listed.display()
+            )));
         }
     }
 
-    let entries = std::fs::read_dir(&listed).map_err(|e| {
-        err(
-            StatusCode::NOT_FOUND,
-            format!("could not read '{}': {e}", listed.display()),
-        )
-    })?;
+    let entries = std::fs::read_dir(&listed)
+        .map_err(|e| ServeError::NotFound(format!("could not read '{}': {e}", listed.display())))?;
     let mut dirs = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        if !query.hidden && name.starts_with('.') {
+        if !hidden && name.starts_with('.') {
             continue;
         }
         let path = entry.path();
@@ -128,7 +138,7 @@ pub(super) async fn list_dirs(
         false => listed.parent().map(|p| p.to_string_lossy().into_owned()),
     };
 
-    Ok(Json(DirsResp {
+    Ok(DirsResp {
         path: listed.to_string_lossy().into_owned(),
         parent,
         home: known_dir_or_fs_root(dirs::home_dir())
@@ -137,7 +147,7 @@ pub(super) async fn list_dirs(
         cwd: cwd.to_string_lossy().into_owned(),
         root: root.map(|r| r.to_string_lossy().into_owned()),
         dirs,
-    }))
+    })
 }
 
 /// `POST /api/fs/dirs`: create one empty directory inside a directory the
@@ -156,47 +166,58 @@ pub(super) async fn create_dir(
     State(state): State<AppState>,
     Json(req): Json<MkdirReq>,
 ) -> Result<(StatusCode, Json<MkdirResp>), ApiError> {
-    let parent = PathBuf::from(&req.path);
+    made(&state, &req.path, &req.name)
+        .map(|made| (StatusCode::CREATED, Json(made)))
+        .map_err(|e| super::core::error::as_api_error(&e))
+}
+
+/// Make one directory under an existing one, for whichever surface asked.
+///
+/// A picker needs the three refusals told apart: a path outside the fence, a
+/// parent that is not there, and a name already taken are three different things
+/// to show somebody.
+pub(super) fn made(
+    state: &AppState,
+    path: &str,
+    name: &str,
+) -> Result<MkdirResp, super::core::error::ServeError> {
+    use super::core::error::ServeError;
+
+    let parent = PathBuf::from(path);
     if !parent.is_absolute() {
-        return Err(err(
-            StatusCode::BAD_REQUEST,
-            "path must be absolute".to_string(),
-        ));
+        return Err(ServeError::BadRequest("path must be absolute".to_string()));
     }
     if let Some(root) = state.limits.workdir_root.as_deref()
         && !leviath_core::resolves_within(&parent, root)
     {
-        return Err(err(
-            StatusCode::FORBIDDEN,
-            format!(
-                "path '{}' is outside the configured --workdir-root",
-                req.path
-            ),
-        ));
+        return Err(ServeError::Forbidden(format!(
+            "path '{}' is outside the configured --workdir-root",
+            path
+        )));
     }
     match std::fs::metadata(&parent) {
         Ok(m) if !m.is_dir() => {
-            return Err(err(
-                StatusCode::BAD_REQUEST,
-                format!("'{}' is a file, not a directory", parent.display()),
-            ));
+            return Err(ServeError::BadRequest(format!(
+                "'{}' is a file, not a directory",
+                parent.display()
+            )));
         }
         Ok(_) => {}
         Err(_) => {
-            return Err(err(
-                StatusCode::NOT_FOUND,
-                format!("directory '{}' not found", parent.display()),
-            ));
+            return Err(ServeError::NotFound(format!(
+                "directory '{}' not found",
+                parent.display()
+            )));
         }
     }
-    if !is_one_segment(&req.name) {
-        return Err(err(
-            StatusCode::BAD_REQUEST,
-            format!("name '{}' must be a single directory name", req.name),
-        ));
+    if !is_one_segment(name) {
+        return Err(ServeError::BadRequest(format!(
+            "name '{}' must be a single directory name",
+            name
+        )));
     }
 
-    let target = parent.join(&req.name);
+    let target = parent.join(name);
     // `create_dir` already fails on an existing path, but its error does not
     // say *which* failure it was, and "already there" is the one a picker has
     // to render differently from "the machine said no".
@@ -205,25 +226,19 @@ pub(super) async fn create_dir(
     // name too. `exists` follows the link, finds nothing, and would send this
     // to `create_dir` for an `EEXIST` reported as a 500.
     if target.symlink_metadata().is_ok() {
-        return Err(err(
-            StatusCode::CONFLICT,
-            format!("'{}' already exists", target.display()),
-        ));
+        return Err(ServeError::Conflict(format!(
+            "'{}' already exists",
+            target.display()
+        )));
     }
     std::fs::create_dir(&target).map_err(|e| {
-        err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("could not create '{}': {e}", target.display()),
-        )
+        ServeError::Internal(format!("could not create '{}': {e}", target.display()))
     })?;
 
-    Ok((
-        StatusCode::CREATED,
-        Json(MkdirResp {
-            path: target.to_string_lossy().into_owned(),
-            parent: parent.to_string_lossy().into_owned(),
-        }),
-    ))
+    Ok(MkdirResp {
+        path: target.to_string_lossy().into_owned(),
+        parent: parent.to_string_lossy().into_owned(),
+    })
 }
 
 /// Whether `name` is one ordinary directory name rather than a path.
@@ -282,6 +297,8 @@ mod tests {
     fn app_with_root(workdir_root: Option<PathBuf>) -> Router {
         let (tx, _) = broadcast::channel(64);
         let state = AppState {
+            caches: Default::default(),
+            signer: Default::default(),
             update_check: Default::default(),
             update_jobs: Default::default(),
             config: crate::commands::serve::testutil::fixed_config(Config::default()),

@@ -218,6 +218,8 @@ mod tests {
     fn test_state() -> AppState {
         let (tx, _) = broadcast::channel(64);
         AppState {
+            caches: Default::default(),
+            signer: Default::default(),
             update_check: Default::default(),
             update_jobs: Default::default(),
             config: crate::commands::serve::testutil::fixed_config(Config::default()),
@@ -666,6 +668,8 @@ mod tests {
         daemon.client.list().await.expect("served, and introduced");
         let (tx, _) = broadcast::channel(64);
         let state = AppState {
+            caches: Default::default(),
+            signer: Default::default(),
             update_check: Default::default(),
             update_jobs: Default::default(),
             config: crate::commands::serve::testutil::fixed_config(Config::default()),
@@ -758,12 +762,14 @@ mod tests {
                 iteration: 1,
             },
             ServerEvent::ToolCallStarted {
+                execution_id: "x1".to_string(),
                 agent_id: "a".to_string(),
                 run_id: "run-match".to_string(),
                 call_id: "c1".to_string(),
                 tool: "read_file".to_string(),
             },
             ServerEvent::ToolCallFinished {
+                execution_id: "x1".to_string(),
                 agent_id: "a".to_string(),
                 run_id: "run-match".to_string(),
                 call_id: "c1".to_string(),
@@ -829,6 +835,8 @@ mod tests {
         // `handle_ws` without needing to fabricate the error directly.
         let (tx, _) = broadcast::channel::<ServerEvent>(2);
         let state = AppState {
+            caches: Default::default(),
+            signer: Default::default(),
             update_check: Default::default(),
             update_jobs: Default::default(),
             config: crate::commands::serve::testutil::fixed_config(Config::default()),
@@ -959,6 +967,8 @@ mod tests {
     async fn handle_ws_breaks_on_closed_channel_via_server_shutdown() {
         let (tx, _) = broadcast::channel::<ServerEvent>(16);
         let state = AppState {
+            caches: Default::default(),
+            signer: Default::default(),
             update_check: Default::default(),
             update_jobs: Default::default(),
             config: crate::commands::serve::testutil::fixed_config(Config::default()),

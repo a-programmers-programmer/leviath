@@ -32,7 +32,8 @@ where you look up the exact name, type, and default. The same contract ships mac
 
 ```toml
 default_provider     = "anthropic"   # provider used when a blueprint names none
-default_model        = "claude-sonnet-4-5"   # bare model id on default_provider, no "anthropic/" prefix
+override_model       = "claude-sonnet-4-5"   # every stage starts on this; unset lets each blueprint decide
+fallback_model       = "claude-haiku-4-5"    # only for a stage none of whose own models is configured
 agent_paths          = ["~/projects/my-agents"]   # extra directories scanned for blueprints
 openrouter_api_key   = "sk-or-..."   # env fallback: OPENROUTER_API_KEY
 ollama_base_url      = "http://localhost:11434"   # env fallback: OLLAMA_HOST
@@ -41,22 +42,48 @@ taint_tracking       = false         # global master switch, see below
 batch_tool_hint      = true          # global master switch, see below
 shell_hint           = true          # global master switch, see below
 update_check         = true          # ask whether a newer release exists
+load_dotenv          = false         # read ./.env from the directory lev runs in
 ```
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `default_provider` | string | `"anthropic"` | |
-| `default_model` | string | unset | A bare model id on `default_provider`, not `provider/model`. A leading `<default_provider>/` is dropped and named at load, so `"ollama/qwen3.8:latest"` under `default_provider = "ollama"` still works. Unset is usually the better state; over the API, `PUT /api/config` with `"default_model": null` writes it away. See [which entry a stage starts on](/docs/providers#which-entry-a-stage-starts-on) |
+| `override_model` | string | unset | One model every stage that allows a user default starts on, ahead of the models its blueprint names |
+| `fallback_model` | string | unset | The model a stage falls back to when none of the models it names is configured here |
 | `agent_paths` | array of paths | `[]` | Searched in addition to `~/.leviath/agents` |
 | `openrouter_api_key` | string | unset | Falls back to `OPENROUTER_API_KEY` |
-| `ollama_base_url` | string | unset | Falls back to `OLLAMA_HOST`, then `http://localhost:11434`. Setting it also counts as choosing Ollama, so an install that configured it before `[providers] ollama_enabled` existed keeps working |
+| `ollama_base_url` | string | unset | Falls back to `OLLAMA_HOST`, then `http://localhost:11434` |
 | `request_timeout_secs` | integer | unset | Unset means the 15 minute ceiling. A stage's `[stages.<name>.model] request_timeout_secs` wins for that stage |
 | `taint_tracking` | bool | `false` | Turns on [taint tracking](/docs/security) for every agent. With it off, an agent can still opt in itself |
 | `batch_tool_hint` | bool | `true` | Adds a short hint telling the model it may batch independent tool calls |
 | `shell_hint` | bool | `true` | Adds a short hint describing the shell a stage will get. Only says anything on Windows today |
-| `update_check` | bool | `true` | Lets this copy ask whether a newer release exists on its own channel, at most once an hour. Set `false` on an air-gapped machine, or anywhere an outbound request nobody asked for is the problem. Off, `lev update` still says how to update and [`GET /api/update`](/docs/api#asking-how-to-upgrade) still answers; both report `null` for whether anything newer exists |
+| `update_check` | bool | `true` | Lets this copy ask whether a newer release exists on its own channel, at most once an hour |
+| `load_dotenv` | bool | `false` | Reads a `.env` file from the directory `lev` runs in |
 
 All three of those cascade: a stage setting beats an agent setting, which beats this file.
+
+`override_model` and `fallback_model` both take a bare model id on `default_provider`, not
+`provider/model`. A leading `<default_provider>/` is dropped and named at load, so
+`"ollama/qwen3.8:latest"` under `default_provider = "ollama"` still works.
+
+Leaving `override_model` unset is usually the better state. Over the API, `PUT /api/config` with
+`"override_model": null` writes it away. It was called `default_model` before 0.6. See
+[which entry a stage starts on](/docs/providers#which-entry-a-stage-starts-on).
+
+`fallback_model` is tried after every model a stage names, and before `[providers] fallback_order`.
+It never moves a stage off a model its blueprint names. A `default_model` from before 0.6 loads as
+this, with a notice, and `lev update` rewrites the key.
+
+Setting `ollama_base_url` also counts as choosing Ollama, so an install that configured it before
+`[providers] ollama_enabled` existed keeps working.
+
+Set `update_check` to `false` on an air-gapped machine, or anywhere an outbound request nobody
+asked for is the problem. Off, `lev update` still says how to update and
+[`GET /api/update`](/docs/api#asking-how-to-upgrade) still answers. Both report `null` for whether
+anything newer exists.
+
+`load_dotenv` is off unless you turn it on, because the directory `lev` runs in is often a
+repository someone else wrote. See [environment variables](#environment-variables).
 
 ### System-prompt hints
 
@@ -92,10 +119,18 @@ the file empty in CI.
 anthropic_api_key   = "sk-ant-..."   # env fallback: ANTHROPIC_API_KEY
 openai_api_key      = "sk-..."       # env fallback: OPENAI_API_KEY
 google_api_key      = "..."          # env fallback: GOOGLE_API_KEY
+xai_api_key         = "xai-..."      # env fallback: XAI_API_KEY
+meta_api_key        = "..."          # env fallback: META_AI_API_KEY
+bedrock_api_key     = "ABSK..."      # env fallback: AWS_BEARER_TOKEN_BEDROCK (a Bedrock API key)
+bedrock_region      = "us-east-1"    # env fallback: AWS_REGION, then AWS_DEFAULT_REGION
 anthropic_base_url  = "https://gw.corp/v1"   # env fallback: ANTHROPIC_BASE_URL
 openai_base_url     = "https://gw.corp/v1"   # env fallback: OPENAI_BASE_URL
-google_base_url     = "https://gw.corp/v1"   # env fallback: GOOGLE_BASE_URL
+google_base_url     = "https://gw.corp/v1beta"   # env fallback: GOOGLE_BASE_URL (the native API root)
+xai_base_url        = "https://gw.corp/v1"   # env fallback: XAI_BASE_URL
+meta_base_url       = "https://gw.corp/v1"   # env fallback: META_AI_BASE_URL
 openrouter_base_url = "https://gw.corp/v1"   # env fallback: OPENROUTER_BASE_URL
+bedrock_base_url    = "https://gw.corp/bedrock"   # env fallback: BEDROCK_BASE_URL
+anthropic_headers   = { X-Gateway-Token = "..." }  # extra headers for that gateway (see below)
 claude_code_enabled = false          # opt in to the Claude Code CLI transport
 claude_code_binary  = "/usr/local/bin/claude"   # unset resolves `claude` on PATH
 claude_code_effort  = "medium"       # low | medium | high | xhigh | max
@@ -104,21 +139,38 @@ codex_enabled          = false      # bill inference to a ChatGPT subscription
 codex_reasoning_effort = "medium"   # low | medium | high | xhigh (see below)
 codex_verbosity        = "medium"   # low | medium | high
 codex_replay_reasoning = true       # replay each turn's reasoning on the next request
+grok_enabled           = false      # bill Grok to a SuperGrok or X Premium+ subscription
 anthropic_cache_ttl = "5m"           # 5m (default) | 1h
 fallback_order      = ["anthropic/claude-sonnet-5", "openai/gpt-5.6-mini"]
 provider_order      = ["codex", "openrouter", "openai"]   # a bare name's route preference
+zero_retention      = false          # ask every provider for zero data retention (see below)
+zero_retention_agreements = []       # providers you hold a zero data retention contract with
+file_uploads        = true           # upload large parts to provider file storage (see below)
 ```
 
-`ollama_enabled` turns Ollama on. It is opt-in like every other provider: it needs no key and
+`file_uploads` lets a provider with a Files API (Anthropic, OpenAI, Google, xAI, Grok and Meta)
+take a large image, PDF, video or recording once and have later requests name it by id. Set it
+to `false` to send every part inline instead. Zero data retention turns uploads off whatever this
+says. See [Files and size limits](/docs/mime#files-and-size-limits).
+
+`zero_retention` asks every provider for zero data retention and refuses, at spawn, a stage whose
+model cannot give it. What each provider keeps, how the request reaches it, and which models
+retain regardless is the subject of [data retention](/docs/providers#data-retention).
+`lev providers retention` prints it for this install, and `lev providers retention set zero`
+writes the switch. `zero_retention_agreements` names the providers (`openai`, `anthropic`,
+`google`, `xai`) your organisation holds a zero data retention contract with. No API can read such
+a contract, so it is declared here, and a declared provider counts as keeping nothing.
+
+`ollama_enabled` turns Ollama on. It is opt-in like every other provider. It needs no key and
 answers on a well-known local port, which used to be reason enough to register it on every
-machine - and that made a bare model name in a blueprint resolvable against whatever happened to
+machine. That made a bare model name in a blueprint resolvable against whatever happened to
 be running locally. Setting `ollama_base_url` counts as choosing it too.
 
 `codex_reasoning_effort` takes `none`, `minimal`, `low`, `medium`, `high` or `xhigh`, but **the
 route decides per model which of those it accepts**, and rejects the rest outright. `gpt-5.5`
 answers `400` to `minimal` and lists its own set as `none, low, medium, high, xhigh`; a model that
 must reason rejects `none`. `low` and above are accepted everywhere seen so far. Leviath cannot
-check this at save time - the answer differs per model and is only known by asking - so a value
+check this at save time, because the answer differs per model and is only known by asking. A value
 one of your models refuses shows up as a failed call rather than a rejected config.
 
 `anthropic_cache_ttl` is how long a cached prompt prefix survives. The default `5m` is free; `1h`
@@ -137,15 +189,35 @@ family. Setting `anthropic_base_url` alone sends Anthropic traffic through the g
 OpenAI going straight out, which is the arrangement most of these deployments actually have.
 
 Each falls back to an environment variable, so a machine behind a gateway needs no config file at
-all - the gateway is a property of the host rather than of the checkout.
+all. The gateway is a property of the host rather than of the checkout.
 
 A gateway serving model IDs the vendor never published (`internal-model-1`, say) also needs those
 IDs described, or nothing knows their context window. That is
 `[model_capabilities.<model_id>]` below, which works the same way for a gateway as for anything
 else.
 
+A gateway that wants something of its own on each request, a token in a second header or a
+tenant or cost-centre tag, gets it from `<provider>_headers`. That is a table of header names to
+values, sent as written after the provider's own headers on every request the provider makes to
+that host. `anthropic_headers`, `openai_headers`, `google_headers`, `openrouter_headers`,
+`meshy_headers` and `bedrock_headers` exist. Two hosts are left out on purpose: Meshy's asset
+downloads go to signed URLs on another host, and Bedrock's control-plane, price-file and
+token-count routes go to AWS itself, so neither is sent them. A value here is as often a credential
+as not, so it is kept out of logs the way the keys are.
+
+```toml
+[providers]
+anthropic_base_url = "https://llm-gateway.corp.example/anthropic"
+anthropic_api_key  = "gateway-placeholder"      # the gateway holds the real key
+anthropic_headers  = { X-Gateway-Token = "...", X-Cost-Centre = "research" }
+```
+
 `HTTP_PROXY` and `HTTPS_PROXY` are honoured independently of this, so a gateway that is itself
 behind a proxy needs nothing extra here.
+
+`bedrock_base_url` replaces the Bedrock runtime origin only. With it set, the live model listing,
+the price file and the token-count routes are not read, and `lev models list` shows this build's
+table for Bedrock; see [AWS Bedrock](/docs/providers#aws-bedrock).
 
 `claude_code_enabled` is off unless you turn it on. See
 [Providers](/docs/providers#claude-code-transport) for the terms note that goes with it.
@@ -158,18 +230,20 @@ It is read per run, so a change takes effect on the next `lev run` with no resta
 
 ### Provider preference order
 
-`provider_order` decides which provider serves a **bare** model name - one a blueprint lists with no
-provider - when more than one you have configured serves it. Entries are plain provider names, best
-first. It generalizes `default_provider` from a single front-runner into a full ordering; leave it
-empty and `default_provider` alone decides, exactly as before.
+`provider_order` decides which providers may serve a **bare** model name, one a blueprint lists
+with no provider. It also sets the order when more than one of them serves it. Entries are plain
+provider names, best first. It generalizes `default_provider` from a single front-runner into a
+full ordering; leave it empty and `default_provider` alone serves bare names.
 
-Naming a provider here is also how you route a bare name onto a subscription transport. A ChatGPT
-(Codex) or Claude subscription is normally reachable only by an explicit `codex/...` or being your
-sole `default_provider`, so that enabling it never silently moves billing. Listing it in
-`provider_order` is the deliberate opt-in: put `codex` first and a stage that names `gpt-5.6-sol`
-with no provider runs on your plan, ahead of an OpenAI key that also serves that name. A provider
-you did not list stays at its old priority, and a subscription you did not list stays excluded from
-bare names.
+The list is the whole answer: a configured provider that is not in it never serves a bare name,
+however many models it carries. It is still reachable by an explicit `provider/model` in a
+blueprint or a `fallback_order` entry, and a stage that pins it while it is not configured is
+refused at spawn rather than quietly moved elsewhere. So configuring a key never silently moves a
+bare-named stage, and what it bills, onto a provider nobody listed; that holds for a ChatGPT
+(Codex) subscription as much as for an API key. Put `codex` first and a stage that names
+`gpt-5.6-sol` with no provider runs on your plan, ahead of an OpenAI key that also serves the
+name. Leave it out and only a `codex/...` pin reaches it. `lev setup`'s priority modal is where
+a provider is taken in or out of the list.
 
 It shapes routes, not models: a blueprint that chose a different model per stage keeps each stage's
 model, the same way `default_provider` does. `lev doctor` flags an entry naming a provider that is
@@ -220,7 +294,7 @@ cerebras = 1                     # every model this provider serves, together
 | `finished_retention_secs` | `300` | How long a finished run stays in [`lev ps`](/docs/cli#runs-that-have-finished). See below |
 | `wedge_timeout_secs` | `0` (off) | Fail a run nothing can reach any more. See below |
 | `provider_failures_before_open` | `3` | Failures in a row before a provider is pulled. See below |
-| `provider_circuit_cooldown_secs` | `300` | How long a pulled provider waits before one request tests it. A success restores it, a failure restarts the wait |
+| `provider_circuit_cooldown_secs` | `300` | How long a pulled provider waits before one request tests it. See below |
 | `interaction_timeout_secs` | unset | Bound how long a prompt waits for a person. Unset waits until answered. See below |
 | `inference_retry_attempts` | `4` | Tries per inference, the first included. See below |
 | `inference_retry_base_ms` | `1000` | First retry wait for an ordinary blip, doubling each retry. See below |
@@ -242,7 +316,7 @@ Some of these need more than a table cell.
 the chunks are folded back into one finished turn before anything reads it, because half a sentence
 is not something a run can act on. What it changes is the connection. A buffered call sends nothing
 back until the model has finished thinking, so a long turn is a socket that has been silent for
-minutes, and a NAT, a VPN or a corporate proxy takes a silent socket for a dead one and closes it -
+minutes. A NAT, a VPN or a corporate proxy takes a silent socket for a dead one and closes it,
 failing a request that was going perfectly well. Set it to `false` if a provider's stream
 misbehaves; a provider that does not offer streaming for the model in hand is called the old way
 regardless.
@@ -256,7 +330,7 @@ max_agents_per_run = 20
 
 A run's price is very nearly its headcount. Measured across four finished research
 runs, cost per agent stayed between $5.37 and $9.05 while the count ranged from 10
-to 42, so the bill followed the headcount and nothing bounded the headcount:
+to 42. The bill followed the headcount, and nothing bounded the headcount.
 `max_child_depth` bounds how deep the sub-agent tree goes, and a fan-out stage's
 `max_items` bounds a single split, but the total was whatever each generation of
 workers thought was worth spawning.
@@ -297,7 +371,7 @@ prices come from and when they are a reconstruction rather than the invoice.
 
 **`max_concurrent_inferences_by_model`** and **`max_concurrent_inferences_by_provider`** are the
 two ways to say "not this one". The first replaces the global cap for one model id. The second adds
-a *separate*, coarser pool in front of it, bounding every model one provider serves together - a
+a *separate*, coarser pool in front of it, bounding every model one provider serves together. A
 request needs a slot in both, and holds both until it finishes:
 
 ```toml
@@ -314,8 +388,8 @@ one and is not applied per provider as well. See
 [inference pools](/docs/engine#inference-pools), and note that this bounds *concurrency* while
 [`[rate_limits.<provider>]`](#rate_limitsprovider) bounds *rate*.
 
-`0` is not a way to say "no limit" in any of the three, and not a way to disable a provider either:
-a pool of nothing would park every request on it for the life of the daemon, and waiting for a full
+`0` is not a way to say "no limit" in any of the three, and not a way to disable a provider either.
+A pool of nothing would park every request on it for the life of the daemon, and waiting for a full
 pool is ordinary backpressure that is never failed or reported. A `0` is therefore read as `1` and
 said so in the log. To lift a limit, delete the key.
 
@@ -339,10 +413,13 @@ or a rejected key, before that provider is taken out of service for every run. T
 because a single payment error can be one oversized request. `0` disables it and leaves per-run
 failover to cope alone.
 
+After the cooldown, one request tests the provider: a success restores it, and a failure restarts
+the wait.
+
 A provider that answered the connection and then went quiet gets four times that budget, so the
-default pulls it after twelve rather than three. The two failures do not mean the same thing:
-nothing listening on the port is a fact about the provider, and the next request fails identically,
-while a timeout is usually a fact about one request - a large prompt against a busy server. Three
+default pulls it after twelve rather than three. The two failures do not mean the same thing.
+Nothing listening on the port is a fact about the provider, and the next request fails identically.
+A timeout is usually a fact about one request, such as a large prompt against a busy server. Three
 slow calls in a row is an ordinary afternoon on a big run, and pulling a working provider there
 takes it away from every other run for the whole cooldown. Twelve rather than never, because a
 provider that accepts connections and answers nothing is still one no run should be sent to. The
@@ -355,12 +432,12 @@ over-long request fails on the first answer, because the second would be the sam
 
 There are three schedules, and only the blip one is configurable. An ordinary blip waits
 `inference_retry_base_ms` and doubles, so the default four attempts are 1s, 2s, 4s. A **capacity**
-refusal - a 429, or Anthropic's 529 "overloaded" - waits 15s, 30s, then 60s per further attempt
-instead, because an overload window lasts minutes and a second of waiting only buys another refusal.
-A call that **reached the provider** and then went quiet - a timeout, or an answer that stopped
-part-way - starts at 5s and doubles, so the same four attempts cover about thirty-five seconds:
-that failure usually means the network moved underneath the run, and a wifi handover or a VPN
-reconnecting outlasts seven seconds every time. A name that does not resolve or a port that refuses
+refusal, a 429 or Anthropic's 529 "overloaded", waits 15s, 30s, then 60s per further attempt
+instead. An overload window lasts minutes, and a second of waiting only buys another refusal.
+A call that **reached the provider** and then went quiet, such as a timeout or an answer that
+stopped part-way, starts at 5s and doubles. The same four attempts then cover about thirty-five
+seconds. That failure usually means the network moved underneath the run, and a wifi handover or a
+VPN reconnecting outlasts seven seconds every time. A name that does not resolve or a port that refuses
 keeps the fast schedule, since that answer is instant and identical however long you wait. When the
 provider sends a `Retry-After`, that answer wins over all of them, capped at a minute.
 
@@ -371,7 +448,7 @@ still bounded by its stage's `request_timeout_secs`, so a run can never wait ind
 
 **`interaction_timeout_secs`** bounds how long a prompt waits on a person: `ask_user_*`, tool
 approvals, taint gates, and interaction points. Leave it unset and the run waits for you until you
-answer, whether that is in ten minutes or on Monday; nothing else in the daemon fails, reaps, or
+answer, whether that is in ten minutes or on Monday. Nothing else in the daemon fails, reaps, or
 marks stuck a run that is waiting on a person, and only cancelling it ends the wait. Set a number
 and a prompt nobody answered in that many seconds is resolved so the run can continue. An expiry
 *denies* an approval and tells the model no answer came. It never counts as consent. `0` is read as
@@ -413,6 +490,7 @@ allow_env_vars             = ["MY_PROVIDER_KEY"]
 allow_blueprint_read_paths = false
 allow_blueprint_safe_commands = false
 allow_blueprint_permissions   = false
+lock_permission_files      = true    # a run may not write config.toml, yolo.toml, mime_types.toml, or the script dirs
 shell_env                  = "filtered"   # filtered | strict | custom | inherit
 shell_env_withhold         = []          # names withheld under shell_env = "custom"
 read_paths                 = ["~/.leviath/runs", "glob:~/design-docs/**"]
@@ -428,12 +506,23 @@ credential_store           = "file"   # file | keychain
 | `allow_blueprint_read_paths` | `false` | Honors every blueprint's `[read_paths]` as written. Prefer a per-agent grant for anything you did not author |
 | `allow_blueprint_safe_commands` | `false` | Honors every blueprint's `[safe_commands]` as written. Off, an installed agent cannot pre-approve its own shell |
 | `allow_blueprint_permissions` | `false` | Honors every blueprint's `[tool_permissions]`, even above the built-in default. See below |
+| `lock_permission_files` | `true` | Refuses any tool call that would write the files that decide what agents may do. See below |
 | `shell_env` | `"filtered"` | Which of the daemon's environment variables a shell command inherits. See below |
 | `shell_env_withhold` | `[]` | The names `shell_env = "custom"` withholds. Ignored under every other mode |
 | `read_paths` | `[]` | Machine-wide read grants, which apply only where a blueprint declares the path too. See below |
 | `credential_store` | `"file"` | `keychain` moves secrets to the OS credential store. Run `lev auth migrate` after changing it |
 
-Five of those need more than a table cell.
+Six of those need more than a table cell.
+
+**`lock_permission_files`** keeps a run's tools out of `config.toml`, `yolo.toml`, `mime_types.toml`, the taint
+gate's `policy.toml` and `rules/`, and the `providers/` and `tools/` script directories. Those are
+where permissions are granted and where code every later run executes lives, so an agent that
+could write them from inside a run could widen what its next spawn is allowed to do. With the lock
+on, `write_file`, `edit_file`, and a `shell` line that names one of them are refused before any
+policy is consulted, `--yolo` or not; a seed at spawn is held to the same rule. A shell line is
+refused for reads too, because the shell does not say which a program does; `read_file` and
+`list_dir` are untouched. This closes the tool surfaces, not every way to the disk: a
+[sandbox](/docs/containers) is the boundary for an agent you do not trust.
 
 **`allowed_workdirs`** silences the confirm prompt for everything under a listed path. Left empty,
 `lev run` asks only about the alarming cases: a home directory, or a filesystem root.
@@ -468,6 +557,7 @@ switches a limit off. See [Limits](/docs/api#limits) for what a client sees.
 [serve]
 max_concurrent_requests = 64   # in flight at once; the next is answered 503
 request_timeout_secs    = 30   # per request; over it the client gets 408
+max_upload_bytes        = 33554432   # one request body; bounds a multipart upload
 ```
 
 The websocket routes are outside both limits. Neither is a ceiling on the runs behind the API:
@@ -567,7 +657,7 @@ allow_blueprint = true          # honour this agent's own [safe_commands]
 |---|---|---|
 | `defaults` | `true` | The shipped read-only verb list. See below |
 | `tools` | `[]` | Tools that never prompt whatever their arguments. Built-in names, or MCP names as advertised (`server__tool`) |
-| `shell` | `[]` | A program, optionally with the subcommand that narrows it. `git status`, never `git` or `cargo test --lib`. Also `env:NAME`, below |
+| `shell` | `[]` | A program, optionally with the subcommand that narrows it. Also `env:NAME`, below |
 | `allow_blueprint` | `false` | Per-agent only. Honour that agent's own `[safe_commands]` block |
 
 An entry on the `defaults` list has to clear one bar: under any flag, it must not be able to write a
@@ -575,6 +665,9 @@ file, run another program, or open a connection. That is why `find`, `sed`, `awk
 `env` and `cargo` are absent from it. It is also why `uniq` (it writes its second operand), `tree`
 (`-o`) and `rg` (`--pre` runs a command) were taken off. Add any of them back by name if you want
 them unprompted.
+
+A `shell` entry is a program, optionally with the subcommand that narrows it: write `git status`,
+never `git` or `cargo test --lib`.
 
 A shell entry covers the program it names with any arguments, so `cat` covers `cat notes.md`. It
 does not cover a line that also runs something else: `cat notes.md && curl evil` still asks, because
@@ -648,7 +741,8 @@ env_var    = "inherit"
 Every field defaults to `inherit`. For `shell`, `read_file`, and `write_file`, that defers to the
 agent's own permission for the equivalent built-in and permits the call only when it resolves to
 `allow`. For `http_get`, `http_post`, and `env_var`, which have no built-in equivalent, `inherit`
-permits the call; the tool itself is still gated by the other three layers. See
+permits the call; the tool itself is still gated by the other three layers. `read_file` also
+covers `read_file_bytes`, and `http_get` covers `http_get_bytes`. See
 [Rhai tools](/docs/rhai-tools).
 
 ## `[sandbox]`
@@ -664,7 +758,7 @@ image          = "debian:bookworm-slim"
 engine         = "docker"      # docker | podman | nerdctl | finch; auto-detected when unset
 network        = true
 mounts         = ["/opt/toolchain:ro"]
-persist        = false
+keep_warm      = false         # keep one container warm across the stages of a run
 on_unavailable = "error"       # error | warn
 ```
 
@@ -676,7 +770,7 @@ by the sandbox. Details in [Security and sandboxing](/docs/security#sandboxes).
 ## `[rate_limits.<provider>]`
 
 Client-side limits enforced before every call, for the built-in providers (`anthropic`, `openai`,
-`google`, `openrouter`).
+`google`, `openrouter`, `bedrock`).
 
 ```toml
 [rate_limits.anthropic]
@@ -693,9 +787,9 @@ entry to leave it. A `0` on either key means no limit on that side:
 `tokens_per_minute = 0` only the request window.
 
 A throttle is visible, not silent. The first time a run waits on the token
-window the daemon logs a `warn` naming the limit, `lev doctor` (and
+window, the daemon logs a `warn` naming the limit. `lev doctor` (and
 `GET /api/doctor`) flags a `tokens_per_minute` low enough to throttle almost
-every call, and both point at the same fix: raise it, or set `0`. This matters
+every call. Both point at the same fix: raise it, or set `0`. This matters
 because the limit was parsed but not enforced in older versions, so a value set
 back then now shapes a run for the first time.
 
@@ -711,7 +805,7 @@ config to read at all, so nothing can be applied.
 
 Leviath never falls back to defaults there, and never stops. **The last version of the file that
 loaded stays in force**, so runs in flight keep going and new ones still start. What changes is that
-your edits are not being read - and that is the part that used to be silent, which is what made a
+your edits are not being read. That is the part that used to be silent, which is what made a
 single typo cost an afternoon.
 
 Every surface now says so, and each one clears itself when the file parses again. Nothing has to be
@@ -719,19 +813,23 @@ restarted:
 
 | Where | What you see |
 |---|---|
-| `lev run` | One line before the run starts: the file, where in it the problem is, and that this run is on the last config that loaded |
+| `lev run` | One line before the run starts: the file, and where in it the problem is |
 | `lev ps` | The same fact under the run table |
 | `lev doctor` | The `config` check fails, with the line and column, or with the key |
 | `lev dash` | A warning across the top of the screen for as long as the file is broken |
-| `lev validate` | A warning that the model and read-path checks were skipped; the blueprint is still checked. A file that *does* load gets the same scrutiny `lev doctor` gives it: stale keys and script providers whose file is missing are warned about on the way past |
+| `lev validate` | A warning that the model and read-path checks were skipped; the blueprint is still checked |
 | `GET /api/config` | A `config_error` object, and a `config_health` frame on `/ws`. See [the API reference](/docs/api#when-the-config-file-will-not-load) |
+
+The `lev run` line also says that this run is on the last config that loaded. A file that *does*
+load gets the same scrutiny `lev doctor` gives it: stale keys and script providers whose file is
+missing are warned about on the way past.
 
 Two kinds of problem are reported differently, because they are found differently:
 
 - A **syntax error**, or a value of the wrong type for its key, has a place in the file: it is
   reported with a line and a column.
-- A **refused value** parsed fine and was then turned down - an `openai-compatible` gateway with no
-  `base_url`, an `[[mcp_servers]]` entry with neither a `command` nor a `url`. There is no position
+- A **refused value** parsed fine and was then turned down: an `openai-compatible` gateway with no
+  `base_url`, or an `[[mcp_servers]]` entry with neither a `command` nor a `url`. There is no position
   to point at, so it is reported with the dotted key it is about, such as `model_providers.local`.
 
 The file is read once per save. A broken file nobody has touched since costs one `stat`, not a
@@ -781,6 +879,9 @@ provider already reports for that model, so the common case is one line:
 max_context_tokens = 1048576
 ```
 
+The quotes are TOML's, needed for any id with a `/`, a `.` or a `:` in it, which every Bedrock id
+has: `[model_capabilities."us.amazon.nova-pro-v1:0"]`.
+
 A misspelled key is refused at load rather than ignored, so a typo cannot look like a working
 override. The full set, when you do want to state all of it:
 
@@ -792,10 +893,30 @@ supports_tools       = true
 supports_system_prompt = true
 max_context_tokens   = 32768
 max_output_tokens    = 4096
+input_types          = ["text/*", "image/*"]   # what it takes in a request
+output_types         = ["text/*"]              # what it can hand back
+retention            = "zero"                  # what the provider keeps of its requests
 ```
+
+`retention` replaces what Leviath believes the provider keeps of this model's requests: `zero`,
+`30d` (any number of days), `indefinite` or `unknown`. It is per model, for one whose policy
+differs from its provider's or one the compiled-in table has never heard of, and it wins over
+everything else `lev providers retention` knows.
+
+`input_types` and `output_types` are mime type patterns, and they replace the provider's
+list rather than adding to it, so name `text/*` too. They are how a local vision model gets
+sent an image instead of a one-line stand-in for it. [More than text](/docs/mime) explains what a
+model does with each type.
+
+`supports_tools = false` is more than "do not offer tools": such a model's provider refuses any
+request that carries a function call, the history included. A stage on that model gets whatever
+tools ran earlier in the run as prose: what was called, what came back. It is advertised no
+tool at all, whatever the stage grants, and the run log notes the tools it left out. That is what
+lets an image model sit in a graph beside stages that use tools.
 
 `lev models show <model>` prints the values a run will actually use, with any correction already
 applied, and says whether they came from the provider's own listing or this build's table.
+
 `GET /api/models` carries the same numbers plus a `limits_source` of `api`, `builtin` or
 `override`, so a client can tell a figure the provider reported from one this build matched off the
 model's name. The two are not worth the same and they look identical once printed.
@@ -814,15 +935,18 @@ Three sources, narrowest first:
 
    | provider | reads | learns | cannot learn |
    |---|---|---|---|
-   | OpenRouter | `/models` | both limits, whether the model takes a temperature and tools (`supported_parameters`), the price per token, whether the upstream bills a cache write (the signal for explicit cache markers), the release date | nothing it lists; a few entries carry no `supported_parameters` |
+   | OpenRouter | `/models` | both limits, temperature and tools, the price per token, cache-write billing, the release date | nothing it lists; a few entries carry no `supported_parameters` |
    | Anthropic | `/v1/models`, every page | `max_input_tokens`, `max_tokens`, the display name, the release date | temperature: the listing has no such field, so the table says which models refuse one |
    | OpenAI | `/v1/models` | the model ids, release and retirement dates | sizes, temperature and tools: the listing describes none of them |
    | Google | `/v1beta/models`, every page | both limits, whether the model samples (`maxTemperature`); models without `generateContent` are dropped | tools, price, dates. Needs the native base URL; an OpenAI-compat one has no such listing |
    | Ollama | `/api/ps`, then `/api/show` | the served window (see below), whether the model calls tools (`capabilities`) | temperature: every local model takes one |
 
+   OpenRouter reports temperature and tool support under `supported_parameters`, and whether the
+   upstream bills a cache write, which is the signal for explicit cache markers.
+
    Once a provider's listing has been read it is also the complete list of what that provider
-   serves, so `lev validate` refuses a model it does not carry (Ollama is the exception: `/api/tags`
-   is what has been pulled, not what Ollama can serve).
+   serves, so `lev validate` refuses a model it does not carry. Ollama is the exception: `/api/tags`
+   is what has been pulled, not what Ollama can serve.
 
 3. The table compiled into this build, matched against the model's name, and for an OpenRouter model
    it does not name, a conservative 128,000 tokens.
@@ -831,9 +955,9 @@ Ollama is asked twice because the two endpoints answer different questions. `/ap
 window the runner **actually allocated** for a model it currently has loaded, which is the only
 figure that is an observation rather than an inference, so it is taken as final. For anything not
 loaded, `/api/show` gives the `num_ctx` the model's Modelfile pins. Its `model_info` also carries the
-architecture's maximum, and that is deliberately *not* used: it is what the weights allow rather than
-what the server will serve, and on a model whose Modelfile pins 32 768 against a 262 144 architecture
-it would replace one overestimate with a much larger one.
+architecture's maximum, and that is deliberately *not* used. It is what the weights allow rather
+than what the server will serve. On a model whose Modelfile pins 32 768 against a 262 144
+architecture, it would replace one overestimate with a much larger one.
 
 So a warm Ollama model reports its true window and a cold one that pins no `num_ctx` still falls back
 to the compiled table. Calling a model once is enough to make it warm.
@@ -856,6 +980,47 @@ the line that fixes it.
 > table names, so Leviath warns once per model when it falls back to a conservative window and tells
 > you the line to add here.
 
+## `[mime]`
+
+Ceilings on the parts [More than text](/docs/mime) describes: the images, audio, video,
+documents and 3D models that move through regions, tools and outputs. Defaults shown.
+
+```toml
+[mime]
+# max_part_bytes = 33554432             # one part, at every ingress; unset, see below
+inline_text_bytes = 1048576             # text kept inside the entry before it is stored by hash
+max_media_bytes_per_request = 20971520  # stored media one request carries, where a provider names no limit (20 MiB)
+provider_file_ttl_secs = 86400          # how long an upload lives in a provider's file storage (a day)
+overwrite_artifacts = false             # let a produced artifact replace a different file at its path
+```
+
+A part over `max_part_bytes` is refused where it arrives, whether that is an upload, a tool
+result or a model reply. Left unset, it is the largest part a configured provider takes, by
+upload or inline (1 GiB with Meta, 500 MiB with Anthropic), or 32 MiB when none names a limit.
+`lev mime list` prints the value in force and where it came from. `provider_file_ttl_secs` is
+the lifetime asked for on each upload, clamped to what the provider takes. Text longer than `inline_text_bytes` is stored by hash like any other
+part and read back as text when a request is built. `max_media_bytes_per_request` is a backstop
+for the vendor request-size limits a token budget cannot see. An image's token estimate is the
+same whatever its byte size, so a request can sit inside its context window and still be
+megabytes of media on the wire. Past it, the oldest stored parts are sent as their stand-ins
+instead, with a warning in the run's log.
+
+`overwrite_artifacts` is about a file a run made that never touched disk, like an image a model
+drew or a mesh a provider built. When the run hands it back as an artifact, it is written into
+the working directory under the name it was given. If a different file is already there, maybe
+yours or a previous run's answer, it is left alone by default and the new one is written beside
+it as `<stem>-<sha8>.<ext>`. The answer records that path. Set this to `true` to replace the
+file instead. A blueprint can decide for itself with
+[`overwrite_artifacts`](/docs/outputs#large-results) in its output table, and that wins over this.
+
+<a id="mime_typestypesubtype"></a>
+
+## `[mime_types."type/subtype"]`
+
+Rows added to the mime registry. They belong in [`mime_types.toml`](#mime_typestoml) beside
+this file, which is where `lev mime init` puts them; a table here still loads, and the file's
+rows layer over it. The row keys are the same in both places.
+
 <a id="model_providersname"></a>
 
 ## `[model_providers.<name>]`
@@ -871,13 +1036,17 @@ described in [its own section](#openai-compatible-endpoints) below.
 script   = "groq"        # defaults to <name>.rhai
 api_key  = "..."
 base_url = "https://api.groq.com/openai/v1"
+retention = "zero"       # what this host keeps of its requests, if you know
 
 [model_providers.groq.rate_limit]
 requests_per_minute = 30
 tokens_per_minute   = 100000
 ```
 
-Any other key you add is forwarded verbatim to the script's `initialize(config)`.
+Any other key you add is forwarded verbatim to the script's `initialize(config)`. `retention` is
+forwarded too, and Leviath reads it as well. Leviath knows nothing about a custom host's data
+retention, so `zero`, `30d`, `indefinite` or `unknown` here is what `lev providers retention`
+and the `zero_retention` switch go by for it.
 
 `serves` is the one key that is not forwarded: it names the models this provider answers for, so a
 blueprint entry naming one of them with no provider can resolve here.
@@ -901,7 +1070,7 @@ entry, or straight into the file.
 
 ```toml
 default_provider = "llama-cpp"
-default_model    = "qwen3-8b"
+override_model   = "qwen3-8b"
 
 [providers]
 anthropic_api_key = "sk-ant-..."
@@ -915,6 +1084,15 @@ kind     = "openai-compatible"
 base_url = "http://192.168.1.20:8080/v1"
 api_key  = "..."                   # optional; sent as a bearer token
 headers  = { "X-Org" = "research" }  # optional; extra headers on every request
+
+[model_providers.azure]
+kind        = "openai-compatible"
+base_url    = "https://my-resource.openai.azure.com/openai/v1"
+api_key     = "..."
+auth_header = "api-key"              # Azure takes the key in this header, not as a bearer token
+serves      = ["gpt-5.5"]
+retention   = "zero"                 # only with Azure's abuse-monitoring exemption approved
+zero_retention_request = "openai"    # send store = false when zero_retention is on
 ```
 
 This is three providers: two llama.cpp servers under their own names, and Anthropic. A blueprint
@@ -922,15 +1100,31 @@ reaches a model on one of them as `llama-cpp/qwen3-8b` or `llama-cpp-big/llama-3
 `default_provider` above sends every stage that allows a user default to the first. `base_url` is
 required and includes the path prefix the server expects, usually `/v1`. Each entry may also carry
 `rate_limit` and `serves`, which mean what they mean for a script provider. An endpoint entry refuses
-to load with a key it does not read (a script entry forwards such keys to its `initialize`, an
-endpoint has nowhere to send them), so a misspelled `models` or `headers` is an error naming the
-entry rather than a catalogue or header that quietly never arrives.
+to load with a key it does not read. A script entry forwards such keys to its `initialize`, while
+an endpoint has nowhere to send them. So a misspelled `models` or `headers` is an error naming the
+entry, rather than a catalogue or header that quietly never arrives.
 
-Streaming and tool calls are on. Each request carries the temperature the stage asks for, and a
-server that refuses one is asked again without it and remembered for the rest of the process.
+The fourth entry above is Azure OpenAI, whose `/openai/v1/` surface speaks OpenAI's chat API and
+takes its key in an `api-key` header. `auth_header` names the header `api_key` goes in, in place of
+`Authorization: Bearer`; leave it out for a server that takes a bearer token. To reach Azure through
+OpenAI's Responses API instead, with file uploads and reasoning replay, use
+[`kind = "openai"`](#openai-at-another-host). Two keys on an endpoint are about
+[data retention](/docs/data-retention). `retention` says what the host keeps, which Leviath
+cannot know for a custom host. Azure keeps prompts up to 30 days for abuse monitoring unless the
+exemption is approved for your subscription, so write `zero` only then.
+`zero_retention_request` names the built-in provider whose per-request zero-retention fields this
+host takes when `[providers] zero_retention` is on: `openai` sends `store = false`, `openrouter`
+the `provider.zdr` routing fields. Without it an endpoint is sent neither, because Leviath cannot
+tell an Azure deployment from a llama.cpp server that would reject the field.
+
+Streaming and tool calls are on. Each request carries the temperature the stage asks for and its
+output cap as `max_tokens`. A server that refuses the temperature is asked again without it. One
+that refuses `max_tokens` and asks for `max_completion_tokens`, which is how OpenAI's reasoning
+models answer, is asked again with the cap under that name. Either way the model is remembered for
+the rest of the process, so later requests start in the shape it takes.
 
 **Detection.** At start-up Leviath asks each endpoint `GET /models` and uses the ids it lists,
-with no filtering: `lev models list --provider llama-cpp` and `GET /api/models` show them, and the
+with no filtering. `lev models list --provider llama-cpp` and `GET /api/models` show them, and the
 wizard offers them as the default model. A server that refuses the route or does not answer falls
 back to the ids named in `models`:
 
@@ -945,8 +1139,10 @@ models   = ["mixtral-8x22b", "llama-3-70b"]
 With neither a listing nor a `models` list the provider does not say what it serves, and a
 blueprint that pins a model on it is sent through rather than refused.
 
-**Windows and cost.** A `/models` listing says nothing reliable about context windows, so an
-endpoint's models are assumed to hold 128 000 tokens until a
+**Windows and cost.** A `/models` listing says nothing reliable about context windows. A model
+served under a vendor's own id (`gpt-5.5`, or `openai/gpt-5.5` through a gateway) is sized from
+that vendor's table, the same as the native provider sizes it. Any other id, such as an Azure
+deployment you named yourself, is assumed to hold 128 000 tokens until a
 [`[model_capabilities]`](#model_capabilitiesmodel_id) entry names the real figure; `lev models
 show <model>` reports which it is. Token counts are the local estimate, and cost is reported as
 unknown unless the same entry sets a price.
@@ -956,16 +1152,47 @@ going through this kind, because Leviath reads a model's context window and tool
 Ollama's `/api/show`, which the OpenAI-style shim does not report. Pointing an
 `openai-compatible` entry at Ollama works, but loses that.
 
+## OpenAI at another host
+
+`[providers] openai_base_url` points the built-in `openai` provider at one other host. When you
+have more than one, such as two Azure resources behind different API Management gateways with
+different keys, give each its own `[model_providers.<name>]` entry with `kind = "openai"`. Each is
+OpenAI's own provider, speaking the Responses API, under the name you give it:
+
+```toml
+[model_providers.azure-east]
+kind        = "openai"
+base_url    = "https://east-resource.openai.azure.com/openai/v1"
+api_key     = "..."
+auth_header = "api-key"
+
+[model_providers.azure-west]
+kind     = "openai"
+base_url = "https://west-gateway.azure-api.net/openai/v1"
+api_key  = "..."
+auth_header = "Ocp-Apim-Subscription-Key"
+serves   = ["prod-gpt55"]               # a deployment name, so a bare model name can route here
+```
+
+A blueprint reaches them as `azure-east/gpt-5.5` and `azure-west/prod-gpt55`. `base_url` and
+`api_key` are required. `auth_header` names the header the key goes in; without it the key is sent
+as a bearer token, which Azure's `/openai/v1/` surface also accepts. `headers`, `rate_limit`,
+`serves`, `retention` and `zero_retention_request` mean what they mean on an
+[OpenAI-compatible entry](#openai-compatible-endpoints), and `models` routes the same way `serves`
+does. A model is sized from OpenAI's table by its id, so a deployment you named yourself needs a
+[`[model_capabilities]`](#model_capabilitiesmodel_id) entry. Azure keeps prompts for abuse
+monitoring unless your subscription has the exemption, so write `retention = "zero"` only then.
+
 ## `[[mcp_servers]]`
 
 [MCP](/docs/mcp) tool servers. `lev mcp add` writes these for you.
 
 ```toml
 [[mcp_servers]]
-name      = "github"
+name      = "tracker"
 transport = "http"        # stdio | http; inferred from command/url when omitted
 url       = "https://api.example.com/mcp"
-headers   = { Authorization = "Bearer ${GITHUB_TOKEN}" }
+headers   = { Authorization = "Bearer ${TRACKER_TOKEN}" }
 
 [[mcp_servers]]
 name      = "local-fs"
@@ -976,6 +1203,12 @@ env       = { LOG_LEVEL = "debug" }
 ```
 
 Values in `headers` and `env` may use `${VAR}` to pull from the environment.
+
+`name` must be letters, digits, `_` or `-`, and no two entries may share one. The name goes into
+every one of that server's tool names as `<server>__<tool>`, and a model provider refuses a tool
+name with anything else in it. A name Leviath cannot use is refused when the config loads rather
+than rewritten, since rewriting `my.tools` to `my_tools` would collide with a server actually
+called `my_tools`. See [naming a server](/docs/mcp#naming-a-server).
 
 ## `[nudge]`
 
@@ -1031,19 +1264,39 @@ enabled      = true
 exporter     = "otlp"    # otlp | stdout | none
 endpoint     = "http://localhost:4318"
 service_name = "leviath"
+log_file_max_bytes = 5242880   # daemon.log and each serve-<name>.log; 0 never rolls
+capture_model_input = false    # write each run's exact prompts into its journal
 ```
 
 `endpoint` falls back to `OTEL_EXPORTER_OTLP_ENDPOINT`, then `http://localhost:4318`. Leviath
 exports OTLP over **HTTP/protobuf**, so a collector's gRPC port (4317) will not work.
 `service_name` falls back to `OTEL_SERVICE_NAME`, then `"leviath"`.
 
+`log_file_max_bytes` sizes every log file Leviath writes for itself: the daemon's
+`~/.leviath/daemon.log` and each server's `~/.leviath/serve-<name>.log`. When a file reaches the
+cap it is renamed to `<name>.1`, replacing the previous one, and a fresh file starts. The default
+is 5 MiB, so no process holds more than about 10 MiB of its own output. Set `0` to let the files
+grow without limit. The daemon applies a change on the next run, with no restart; a server reads
+the cap when it starts. See [the daemon page](/docs/daemon#where-it-logs) for what the files hold.
+
+`capture_model_input` writes the exact request every run sends the model into that run's journal,
+once per provider attempt. **Off by default, and read the warning before you change that.** A
+captured request is the whole prompt: file contents a tool read, command output, the task somebody
+typed, and any credential that passed through them. There is no size cap, so a captured run's
+journal grows by roughly the context size per attempt. The setting is read at spawn, so it applies
+to runs started after the change. To capture a single run, ask at spawn instead. See
+[capturing what went to the model](/docs/observability#capturing-what-went-to-the-model).
+
 ## Environment variables
 
-Leviath reads a `.env` file from the working directory unless `LEVIATH_SKIP_DOTENV` is set. Only
-that one file, never a walk up the tree, and a variable you have already exported always wins.
+Leviath can read provider keys from a `.env` file in the directory you run `lev` in. It does not
+unless you ask: set `load_dotenv = true` at the top of `config.toml` (the **Load ./.env** switch on
+the advanced screen of `lev setup`), or run one command with `LEVIATH_LOAD_DOTENV=1`.
+`LEVIATH_SKIP_DOTENV` turns it off whatever the other two say. Only that one file is read, never a
+walk up the tree, and a variable you have already exported always wins.
 
-A cloned repository *is* the working directory, so its `.env` is content somebody else wrote.
-Credentials from it load normally, which is what the feature is for. The handful of names that
+It is off by default because a cloned repository *is* the working directory, so its `.env` is
+content somebody else wrote. With it on, credentials from it load normally. The handful of names that
 decide where configuration comes from, or what gets executed, are ignored instead, with a warning
 naming them. That covers the `LEVIATH_` namespace, `PATH`, `SHELL`, `EDITOR`, `VISUAL`, and the
 `LD_*` and `DYLD_*` loader variables. It also covers the interpreter and tool hook variables that
@@ -1057,7 +1310,8 @@ Export those yourself if you meant them.
 |---|---|
 | `LEVIATH_HOME` | Redirects the whole data root. Every home-relative path honors it, so an isolated test or a second install works |
 | `LEVIATH_CONFIG_PATH` | Path to an exact config file, bypassing the default location |
-| `LEVIATH_SKIP_DOTENV` | Set to skip `.env` loading |
+| `LEVIATH_LOAD_DOTENV` | `1` or `true` reads `./.env` for this command, as `load_dotenv = true` does |
+| `LEVIATH_SKIP_DOTENV` | Set to skip `.env` loading, whatever `load_dotenv` says |
 | `LEVIATH_RUNS_DIR` | Overrides where run directories are written |
 | `LEVIATH_API_TOKEN` | Bearer token for `lev serve`. The server refuses to start without one |
 | `LEVIATH_CONTROL_TIMEOUT_SECS` | Deadline for one control-socket request |
@@ -1082,6 +1336,8 @@ Everything persistent sits under the data root, `<home>/.leviath`, which `LEVIAT
 | Path | Holds |
 |---|---|
 | `config.toml` | This file, created `0600` |
+| `yolo.toml` | The named profiles behind `lev run --yolo=<name>`. See [below](#yolotoml) |
+| `mime_types.toml` | Your rows in the mime registry: what a type is. See [below](#mime_typestoml) |
 | `mcp-auth.json` | MCP OAuth tokens, created `0600` |
 | `runs/` | One directory per run: `meta.json`, `context.json`, `stages.json`, the `run.lvr` journal, per-stage logs |
 | `agents/` | Blueprints installed by `lev add` |
@@ -1124,14 +1380,78 @@ meets a record kind it does not know steps over it and keeps going. That is what
 Leviath write records an older one can still read around, and it is why the version below does not
 move when a kind is added.
 
-**The version marks a change to the framing** - the preamble, the length prefix, or the payload
-encoding - not to the record set. A build refuses an archive whose version is higher than it
+**The version marks a change to the framing**, meaning the preamble, the length prefix, or the
+payload encoding. It does not mark a change to the record set. A build refuses an archive whose
+version is higher than it
 understands, rather than reading it: at that point it cannot find the record boundaries, so it
 would not fail cleanly, it would produce nonsense. An older version reads normally.
 
 **A torn tail is tolerated.** A crash mid-append leaves a partial final frame, and readers stop
-there and keep everything before it - so an interrupted run still recovers to its last intact
+there and keep everything before it. An interrupted run still recovers to its last intact
 point.
+
+<a id="mime_typestoml"></a>
+
+## `mime_types.toml`
+
+Your rows in the mime registry, which says what each [mime type](/docs/mime) is, live in
+`mime_types.toml` beside `config.toml` (so under the data root, and wherever
+`LEVIATH_CONFIG_PATH` points when that is set). A key is a `type/subtype` or a `type/*`
+pattern; name only what you change, and every other field resolves from the built-in table (the
+exact type, then `type/*`, then `*/*`). `lev mime init` writes this example to start from, and the
+[live copy](/schema/mime_types.example.toml) is the one the tests check. `lev mime add` and
+`lev mime remove` edit rows in place, and `lev mime list` prints the table the file makes with
+each row's source. An edit reaches the next run at once and every run already under way within
+the daemon's housekeeping interval of thirty seconds, with nothing restarted.
+
+```toml
+["model/obj"]
+extensions = ["obj"]
+text = true                      # UTF-8 under the hood: may reach a text model as text
+
+["application/x-acme-scene"]
+family = "model"
+extensions = ["scene"]
+magic = "41434D45"
+tokens = { per_byte = 0.1 }
+stand_in = "[{type} {size}] {name}"
+```
+
+| Key | Meaning |
+|---|---|
+| `family` | What providers key their encoders on: `text`, `image`, `audio`, `video`, `document`, `model`, `binary`, or a name of your own |
+| `text` | The bytes are UTF-8 and may travel inline and reach any text model as text |
+| `tokens` | Exactly one of the five counting rules listed under this table |
+| `extensions` | Extensions, without the dot, that imply this type |
+| `magic` | A hex prefix that identifies the bytes |
+| `stand_in` | What a consumer that cannot take the type sees; `{type}` `{name}` `{size}` `{dims}` `{duration}` `{pages}` |
+| `check` | A [Rhai script](/docs/rhai-mime-checks), relative to this file's directory, that refuses bytes which are not what they claim |
+
+`tokens` takes exactly one of `{ per_byte = 0.25 }`, `{ per_pixel = 750, max = 1600 }`,
+`{ per_second = 32 }`, `{ per_page = 2000 }` or `{ fixed = 1000 }`. A page rule counts a PDF's
+pages from the file. When it cannot, because every page sits inside a compressed object stream, a
+page is assumed every 64 KiB.
+
+A `check` script's `check(bytes, mime_type)` function is what turns the bytes down. An empty `""`
+lifts a check a broader row put on the type.
+
+A misspelled key inside a row is refused, and a `check` that cannot be read or compiled is refused
+with its row named. A file that will not load is skipped by the daemon and reported by
+`lev doctor`, named by path. A `[mime_types]` block cut out of an
+older `config.toml` loads as it was, wrapper and all. A run's tools may not write the file
+(`lock_permission_files`), since what a file is typed as decides what a model is shown.
+
+## `yolo.toml`
+
+The named profiles behind `lev run --yolo=<name>` live in `yolo.toml`, beside `config.toml`,
+and follow `LEVIATH_CONFIG_PATH` when that is set. Each table is a name you can pass, and says
+which tool calls run unprompted, which still raise the ordinary approval prompt, and which are
+refused. `lev yolo init` writes an example to start from.
+
+With `[security] lock_permission_files` on (the default), no run's tools may write this file.
+
+See [yolo profiles](/docs/yolo) for every field and how a verdict is reached, or
+[write your first yolo profile](/docs/first-yolo-profile) for a walkthrough.
 
 ## `policy.toml`
 
@@ -1150,11 +1470,26 @@ tool             = "http_post"
 to               = ["https://hooks.internal/*"]
 max_sensitivity  = "internal"   # public | internal | private
 
-[mcp_overrides."github.create_issue"]
+[mcp_overrides.tracker.tools.create_issue]
 sensitivity = "internal"
 direction   = "outbound"
 clearance   = "internal"
 ```
+
+`[mcp_overrides]` reclassifies one [MCP](/docs/mcp) tool for the taint gate. Name the server, then
+`tools`, then the tool, each as its own key. A dot inside either name needs no special handling
+that way: `[mcp_overrides."my.tools".tools."find.all"]` is read as the server `my.tools` and the
+tool `find.all`.
+
+Leviath stores the override under the name the tool is advertised to the model as, which is
+`<server>__<tool>` with every character a provider refuses rewritten. That is the name the gate
+looks up, so `my.tools` and `find.all` above are classified as `my_tools__find_all`. `lev policy
+add` writes that flat name directly, and both spellings are read.
+
+> [!NOTE]
+> The advertised name is always exactly `<server>__<tool>`, so you can write an override before the
+> server has ever connected. `lev policy list` prints the name each override landed on, and
+> `lev policy test <tool>` says how one is classified.
 
 Scripted rules live as `.rhai` files in a `rules/` directory beside `policy.toml`, so
 `~/Library/Application Support/leviath/rules/` on macOS and `~/.config/leviath/rules/` on Linux. See

@@ -13,63 +13,1973 @@ same list.
 
 ## Unreleased
 
-### Added
-
-- An experimental bundled `oracle` blueprint for repository work. It uses
-  tool-free JSON decisions, deterministic reader/coder/verifier fan-out, and a
-  workspace kernel with bounded orders, receipts, snapshots, and path-scoped
-  compare-and-swap patches. See [the Oracle workflow design](docs/design/oracle-workflow.md).
-- `lev mcp serve` turns Leviath into an MCP server over stdio, so a host agent
-  (Claude Code, Grok, Codex, Gemini, Hermes) delegates a task with a tool call
-  instead of hunting for the `lev` binary. The `run` tool starts an agent and
-  waits for its final output; `wait`, `status`, `result`, `cancel`, `message`,
-  and `respond` steer a run the host already started; `list_runs` merges the
-  daemon's view with the runs on disk; `list_agents`, `list_tools`, and
-  `install_tool` answer without a daemon. A host timeout or cancellation only
-  stops the waiting, never the run.
-  `--attended` makes host-started runs ask before effectful tool calls (they
-  run unattended by default); `--allow`, `--default-agent`, and `--workdir`
-  set the defaults every call inherits.
-- `lev integrate <host>` registers that server in Claude Code, Grok, Codex,
-  Gemini, or Hermes (`all` covers every host installed under your home). It
-  merges into the host's existing configuration rather than replacing it,
-  installs a skill that tells the host when to reach for Leviath, and installs
-  or updates the bundled agents. `--project` writes project-scoped
-  configuration where the host has one; `--print` shows what would be written
-  and writes nothing.
-- A bundled `orchestrator` agent, the one a host reaches for by default: it
-  plans, fans the work out to `coder` workers, verifies the result, and ends
-  by deciding which repeatable steps deserve a Rhai tool.
-- `install_tool`, a built-in that compiles a Rhai tool script and installs it
-  into `~/.leviath/tools` so every future run can call it. It refuses a script
-  that does not compile, lacks `// @tool` or `// @description`, or collides
-  with an existing tool name, and stamps each file with a provenance line,
-  which `lev tools` prints under the tool (a file without one was not
-  installed this way). It asks before running by default;
-  `--yolo` waives the prompt.
-- `available_global_tools = true` on a stage advertises every tool installed
-  in `~/.leviath/tools` to that stage on top of its `available_tools`.
-  Without it an installed tool is offered only to a blueprint that names it,
-  so nothing a run installed was ever used by the next one. `lev validate`
-  marks such stages with `(global tools)`.
-- `lev run --wait` stays attached until the run finishes and prints its final
-  output the way `lev result` does, or one JSON object with `--json`, and
-  exits non-zero when the run ends in error or is cancelled.
-
 ### Changed
 
-- The bundled `coder` agent's `implement` and `review` stages set
-  `available_global_tools = true`, so the worker that performs the mechanical
-  steps is offered the tools earlier runs installed.
+- **Breaking, GraphQL only.** The schema filters by shape. One set of scalar
+  filters - `StringFilter` (`eq`, `ne`, `in`, `notIn`, `contains`,
+  `startsWith`, `endsWith`), `IntFilter`, `DecimalFilter` and `TimestampFilter`
+  (`eq`, `ne`, `in`, `notIn`, `lt`, `lte`, `gt`, `gte`), and `BooleanFilter`
+  (`eq`, `ne`) - is now what every filter input in the schema is built from, so
+  a predicate nobody thought to add a field for is one you can write today.
+  `RunFilter` gains `and`, `or` and `not` over filters of its own type, plus
+  `title`, `task`, `blueprintName`, `yoloProfileName`, `unattended`,
+  `startedAt`, `updatedAt`, `ageSecs`, `workingSecs`, `costUsd`, `waitReason`
+  and `waitReasonIn`. Every field set in one filter object has to hold, and a
+  field the run has no value for satisfies nothing - wrap it in `not` to find
+  those runs.
+
+  Four things move, and a client has to be edited:
+  - `runs(ids:)` is now `runs(filter: { ids: })`, so an exact-id fetch composes
+    with the rest of the predicate instead of excluding it. Named on the filter
+    the request passes, it still says which runs to read and still reports the
+    ones it cannot find in `missing`.
+  - `topLevelOnly` and `subAgentsOnly` are gone, replaced by
+    `scope: ALL | TOP_LEVEL | SUB_AGENTS`. They were two booleans for one
+    three-way choice, and setting both was a contradiction the server had to
+    refuse.
+  - `parent` and `descendantOf` are `ID` rather than `String`, and setting two
+    parentage fields at once is no longer refused: they intersect, like every
+    other pair of fields on one filter object.
+  - `filter.since` is gone. `startedAt` and `updatedAt` take a whole
+    `TimestampFilter`, so polling is `updatedAt: { gte: <serverTime> }` and
+    every window either side of it is expressible too. `GET /api/runs?since=`
+    is unchanged.
+
+  `query`, `queryIn`, `sort` and `ascending` describe the listing rather than a
+  run, so they stay on the filter the request passes and are refused inside
+  `and`, `or` or `not` rather than quietly ignored.
+
+- **Breaking, GraphQL only.** `blueprints` takes a `BlueprintFilter` and pages
+  by cursor. `blueprints(query:, exact:, skip:)` becomes
+  `blueprints(filter: { query:, names:, name:, version:, description:, and:,
+  or:, not: }, first:, after:)`. The offset `skip` is gone: a blueprint
+  installed or removed mid-walk shifted every later page, and the cursor names
+  where you got to instead. `endCursor` is now an opaque token like every other
+  cursor in this API rather than the blueprint's name, and it is minted only
+  when another page follows. A name in `names` that is not installed still
+  lands in `missing` rather than failing the request.
+
+  The REST run listing is untouched: its query parameters, its filters and its
+  cursors are exactly what they were.
+
+- **Breaking, GraphQL clients:** `BlueprintInput` is a pure reference to an
+  installed blueprint - `{ name: String!, digest: String }` - and
+  `validateBlueprint` takes the manifest as arguments of its own:
+  `validateBlueprint(content: String!, name: String)`. A query that sent
+  `blueprint: { content: "..." }` to it becomes `content: "..."`, and a `name`
+  beside it still scopes the check to that installed blueprint's directory so
+  its scripts resolve. `spawnRun`, `scripts`, `tools` and the run filter keep
+  taking `blueprint:`, and what they send is unchanged: a `name`, plus a
+  `digest` to pin the revision. The field is required now, so a reference that
+  names nothing is refused by the schema rather than by the server. The REST
+  routes are untouched: `POST /api/blueprints/validate` takes the same body and
+  answers the same shape.
+
+- `callback_secret` without a `callback_url` is refused rather than accepted and
+  dropped. The secret signs the callback body, so a request that sends one and
+  no URL is asking for a signed callback that can never fire, and accepting it
+  left somebody believing they had set one up while the credential went nowhere.
+  Both `POST /api/agents` and `spawnRun` refuse it, since they are one spawn
+  underneath; the refusal names the missing field and never echoes the secret.
+
+- A lifecycle mutation answers with the run as the act left it. The daemon
+  applies a pause, resume or cancel to its world before it answers and writes
+  the record a moment later, so the answer now waits for the act to show in the
+  record: `pauseRun` reads `PAUSED`, `cancelRun` reads `CANCELLED`, and
+  `resumeRun` reads whatever the run went back to doing. A run slow to write its
+  record is answered with the record as it stands rather than held any longer.
+
+### Added
+
+- A stage records what it actually ran on. Each entry in the stage ledger gains
+  `models`, the provider and model pairs that stage ran an inference against, in
+  the order it first reached each. A list rather than one value because a stage
+  that fails over runs on more than one: the first entry is where it started, the
+  last is where it ended up, and one entry means it never moved. It is on the
+  GraphQL `StageRecord` as `models { provider model }`, on
+  `GET /api/agents/{id}/stages` as `models`, and announced as
+  `runs.stages.models`.
+
+  A pair is recorded where a call is billed rather than where a stage picks its
+  model, so choosing a model is not running on one. A stage the run never
+  entered, a stage whose first call has not come back, and a stage whose only
+  provider could not be reached all answer null rather than an empty list. So
+  does every stage of a run that finished before this, and none of them is
+  filled in from the run's own `model`, which is the entry stage's resolution
+  and wrong for every stage after it.
+
+  `RunFilter` gains `stageProvider` and `stageModel`, each a `StringFilter`, and
+  a run matches when any one of its stages ran on something the filter accepts.
+  They compose inside `and`, `or` and `not` like every other field, and they are
+  answered from the run's own record, so filtering ten thousand runs by model
+  opens no more files than listing them does.
+
+- `lev respond` takes the start of a request id, not only the whole thing. An
+  id names the run that raised the question, so it runs to forty-odd characters
+  and a person answering a prompt was retyping all of them; the run's own id is
+  usually enough. The start has to fit exactly one open interaction. One that
+  fits two is refused with both listed and nothing answered, because an answer
+  sent to the wrong run approves work nobody looked at. An id given in full
+  always answers that interaction, even where longer ids begin with it, and one
+  that fits nothing reports `no such open interaction` as before. Matching is
+  from the start of the id only: the tail is the part two runs are most likely
+  to share. The CLI alone reads a short id - a program sends back the id it was
+  handed, so `POST /api/agents/{id}/interaction` and `answerInteraction` are
+  unchanged.
+
+- A run can be asked to journal the exact request it sent the model, once per
+  provider attempt. **Off by default**, because a captured request is the whole
+  prompt: it holds whatever the run's context held, including file contents a
+  tool read, command output, and anything somebody pasted, and a run directory is
+  a plain file. Turn it on for a machine with `[observability]
+  capture_model_input`, or for one run with `capture_model_input` on
+  `POST /api/agents` and `captureModelInput` on `spawnRun`. There is no size
+  cap, deliberately: every call re-sends the window, so a captured run's journal
+  grows by roughly the context size per attempt, and a truncated prompt that
+  reads like a whole one would be worse than a large file. Each entry says
+  whether the body is there, was never taken, was scrubbed or aged out, so a
+  reader can tell "never captured" from "captured and gone". The parameters that
+  were really in force after resolution, an identifier for the tool set the model
+  was offered, the version of the assembly that built the request, and a
+  fingerprint of the window it came from are recorded whether capture is on or
+  off. Read it all back on `InferenceAttempt.modelInput`. There is no mapping
+  from context regions to places in the request, because assembly keeps none and
+  an inferred one would not be evidence.
+
+- `node(id:)` over GraphQL fetches anything with a globally unique id from that
+  id alone: a run, one revision of a blueprint, a registered script, a
+  configured MCP server, a yolo profile, an update job or an export. Each of the
+  seven implements the new `Node` interface, so an id that arrived with no type
+  attached, from a webhook payload or a pasted link, is one request rather than a
+  guess at which field to ask. The three that are keyed by a name carry the kind
+  in the id (`mcpServer:docs`, `yoloProfile:careful`, `script:tool@coder:redact`)
+  and a script's carries the blueprint it belongs to, because a name alone is
+  unique only within its own kind. An id that names nothing answers null rather
+  than failing: a deleted run, an expired export and a typo are the same answer.
+  `Model` is deliberately not a `Node`, because a model id is the provider's own
+  and two providers can both serve `gpt-5.5`.
+
+- A context change is recorded as the transaction it is. One write to one region
+  is the smallest thing that happens and rarely the whole of what happened: a
+  compaction summarises one region and empties another, a stage edge clears four,
+  a resume rebuilds every region there is. Each of those is now one record,
+  carrying every region it touched with that region's contents digested before
+  and after and its token count either side, and naming the window's revision
+  before and after the whole transaction. The cause vocabulary is unchanged. A
+  change also names the tool execution that committed it, where one was being
+  handled - a `context_*` or `todo_*` tool, a mime tool, a submission - and names
+  none for the writes that happen outside any call. `contextChanges` serves all of
+  it, with the journal position of each record.
+
+- A context window has a revision: a content address of what it holds, derived
+  from every region's contents and budgets. It is the same value a change record
+  carries either side of itself, so a change joins to the windows it moved
+  between, and `contextSnapshot(revision:)` reads one back. That read is
+  immutable by construction. A revision is derived from content and the journal is
+  append-only, so it resolves to exactly the content it was minted from - no later
+  write can change what a revision means, and asking for one can never come back
+  with what the run holds now.
+
+- A tool execution says what it is connected to. `visit` is the stay in a stage it
+  belongs to, which is the key to correlate on: a stage entered three times has
+  one index, and the iteration restarts on every entry. `requestedBy` is the trip
+  to the provider whose answer asked for the call, which no client could work out
+  for itself - a failover means the answer came from a provider the attempt before
+  it did not go to. `contextChanges` is what the call committed to the window, and
+  is independent of how the call ended: one that succeeded may have committed
+  nothing, and one that failed may have committed something first.
+  `producedArtifacts` is the files it produced, read from the journal as it
+  produced them rather than from the run's answer, which keeps only the latest
+  submission's files and says nothing about which call made them. Each is null or
+  empty where the journal did not record the connection, never a guess.
+
+- A stay in a stage has an id minted when the run enters it, and a trip to a
+  provider has one minted before its request goes out. Both were identified by
+  position until now, which nothing outside the file they sit in could rely on: the
+  per-stage visit list keeps the earliest 128 stays, so the hundred and
+  twenty-ninth visit took the first one's identity, and an attempt's number
+  restarts at every call.
+
+- A batch of calls the dispatcher answers without the tool lane - context tools,
+  refusals, gate denials - is journaled like any other, so a run's `executions`
+  are every call the model made rather than only the ones something ran
+  asynchronously. Such a batch is never a *pending* batch: a resume re-issues it
+  rather than replaying it, because a replay lands recorded results in the
+  conversation without redoing a context tool's write.
+
+- The journal records why a context window changed, not only what it then held.
+  Every write that can name its cause records one beside the snapshot: a region
+  seeded at spawn or on stage entry, a message delivered into the run, the
+  model's own reply, a routed tool result, a part the model produced, a
+  compacting region summarising itself, a stage-edge transform, a `context_*` or
+  `todo_*` tool the model called, a region or stage hook, a fan-out worker, an
+  interaction point, a resume rebuilding the window, and the runtime's own
+  bookkeeping. Each entry names the region, the cause, the entries that arrived
+  and left, and how its token count moved, so a window that lost its plan no
+  longer reads the same whether a compaction took it, a transform cleared it, or
+  the model released it. No content is written: the snapshot recorded beside it
+  already carries the window. `fold` hands them back as `context_changes`.
+
+- The journal records one entry per trip to a provider, so a retried call and a
+  first-time success no longer read the same. Each entry says which attempt it
+  was, which provider and model it went to, whether it succeeded, how the failure
+  was classified, how long the attempt took and how long the run slept before it,
+  beside a hundred-byte digest of the request. Two attempts carrying the same
+  digest are the same request sent twice, which is the question a retry raises;
+  no request or response body is written. A move to another provider is its own
+  entry, naming what it left and what it took, so a run that changed model no
+  longer looks like one that was always configured that way. `fold` hands both
+  back as `attempts` and `failovers`.
+
+- `lev serve` answers GraphQL at `POST /graphql`, beside its REST routes. One
+  request names exactly the fields it wants, at any depth, and a field nobody
+  selected is never read from disk: a fleet view that costs a listing plus one
+  request per waiting run over REST is a single request here. It is not a layer
+  over the REST routes. Both surfaces call the same code inside the server, so
+  the two cannot drift, and the same bearer token, request cap and deadline
+  apply. This release serves the run listing, with its filters, keyset paging
+  and search, and the pause, resume and cancel mutations, which answer with the
+  run as it is afterwards. Failures carry `extensions.code`, so a client
+  branches on a word rather than on message text. Queries are bounded by depth,
+  complexity and page size before any of them runs. The schema is published as
+  `leviath.graphql` beside the OpenAPI spec, generated from the server's own
+  types and held to them by a test. See [the GraphQL
+  docs](https://leviath.dev/docs/graphql).
+
+- Blueprint writes over GraphQL (`createBlueprint`, `updateBlueprint`,
+  `deleteBlueprint`), the four checks that write nothing as queries beside them
+  (`validateBlueprint`, `validateScript`, `validateConfigKey`,
+  `testYoloProfile`), and the first of the admin mutations
+  (`addMcpServer`, `removeMcpServer`, `putMimeRow`, `deleteMimeRow`) behind
+  `--allow-admin`. Without that flag they are invisible to introspection and
+  refused with `FORBIDDEN`, which is the closest a single built schema comes to
+  the REST side's unmounted route. Creating a blueprint whose name is already
+  installed now answers `409` rather than replacing it silently, on both
+  surfaces.
+
+- `deleteRuns` over GraphQL, taking exactly one of `ids` or `before`, and
+  reporting partial success rather than refusing a sweep because one run in it is
+  still going. The checks behind it moved into the service layer with the rest,
+  so a sub-agent's refusal now keeps its own kind (missing stays missing, live
+  stays a conflict) instead of being flattened on the way out.
+
+- The machine's own state over GraphQL: `config` (with every secret left out),
+  `doctor`, `mcpServers`, `yoloProfiles`, `mime`, `scripts` and `directories`.
+  Each REST handler behind these was split so both surfaces run the same read,
+  rather than one of them growing a second copy of the walk.
+
+- Short-lived signed links on the byte routes, so a browser can show a run's
+  files. The three byte routes now also accept an `exp`/`sig` pair in place of
+  the bearer token, which is what an `<img src>` or a download link needs: a
+  header cannot be set on either, and the alternative a client writes without
+  this (fetch with the token, hold the bytes, mint a blob URL) is real work. A
+  link opens one path, lasts five minutes, and opens byte routes only; the
+  signing key is random per server process and never written down, so a restart
+  invalidates every link it handed out. GraphQL mints them: `blobs`, `artifacts`
+  and `fileUrl` on a run.
+
+- The GraphQL write side: `spawnRun`, `sendMessage` and `answerInteraction`,
+  each answering with the run as it is afterwards, plus `openInteractions`, the
+  approval inbox. Answers take exactly one variant, decided by the request's own
+  kind, so there is no combination to get wrong; `feedback` is refused beside an
+  approval, because it is what the model reads instead of the call; and a second
+  answer to one request reads as `accepted: false` rather than as an error, since
+  two people clicking one prompt is ordinary. The spawn refusals are the
+  server's own decisions (`--workdir-root`, `--no-remote-yolo`, the outbound URL
+  policy), and both surfaces now make them in one place.
+
+- Live frames over GraphQL, at `GET /ws/graphql`. A subscription names the frame
+  types it wants and the runs it is about, and both filters are applied on the
+  server, before a frame is serialized: a console watching one run of five
+  thousand is handed one run's frames rather than the fleet's.
+  `includeDescendants` adds the sub-agents of those runs as they spawn, so a
+  fan-out needs no re-subscribe. A subscription that falls behind now receives an
+  `EventsDropped` frame saying how many frames it missed; `/ws` skips a slow
+  listener silently, which reads exactly like a quiet run.
+
+- Exporting the run store, as one file. `bulkExportRuns` over GraphQL starts a
+  job and answers immediately, however large the store is; `bulkExport(id:)`
+  polls it, and hands back a signed link to `GET /api/exports/{id}` once the
+  file is written. The body is JSONL, one run per line, written a run at a time
+  and never held whole in memory, so a reader can start on it before the writer
+  has finished. The filter is the run listing's own, and `fields` narrows each
+  row to the names it uses, with an unknown name refused rather than dropped:
+  a column quietly missing from an export is discovered downstream, by somebody
+  who did not ask for it. A file and its job record are kept for an hour and
+  removed together, so neither outlives the other.
+
+- The whole manifest over GraphQL, field by field. A stage carries its model
+  block, its tool routing and permissions, its checkpoints, its output shape, its
+  hooks, its fan-out and the edges out of it with their conditions, transforms and
+  gates; a blueprint carries its dependencies, the mime rows it ships, its
+  sandbox, its summarizer, its file tracking and what it would like to run
+  unasked; a region carries its budget, its policies and what seeds it. A setting
+  the author left out reads as null rather than as its default, and
+  `Stage.effective` is the resolved answer beside it: the batch hint, the shell
+  hint, the nudge, the sandbox and taint tracking, each resolved stage over
+  blueprint over this machine's config. Two revisions of one blueprint are two
+  ids, so "what did this run execute" and "what is installed now" stay separate
+  questions.
+
+- A run's files, one file's text and its context history over GraphQL, beside
+  the run they belong to: `files` answers either what the run recorded changing
+  or what is in its working directory now, a level at a time; `fileContent` reads
+  a window of text and says where the next one starts; `contextHistory` pages the
+  window's own history, newest first on request. Also `parent`, `currentStage`
+  and `interaction` on a run, so "what is this waiting for" and "where did this
+  come from" are fields rather than requests. The REST routes behind these were
+  split so both surfaces run one implementation, which is also how the GraphQL
+  listing gained the containment check the read path already had: a relative
+  directory resolves against the run's working directory, and one that walks out
+  of it is refused rather than followed.
+
+- The machine's own state and the acts that change it, over GraphQL: `daemon`,
+  `update` and `updateJob(id:)` as fields, and, behind `--allow-admin`,
+  `updateConfig`, `putScript`, `deleteScript`, `runDoctorLive`, `makeDirectory`
+  and `startUpdate` as mutations. `updateConfig` carries the REST route's three
+  states per setting (absent leaves it, `null` clears it, a value sets it) rather
+  than flattening them, and `putMimeRow` now takes the whole row, including its
+  token rule and magic bytes, which until now were REST-only.
+
+- The rest of the admin surface over GraphQL: `providerSignIn`,
+  `providerSignOut` and `checkProvider` for a subscription's stored sign-in,
+  `testMcpServer` and `loginMcpServer` for a server, `probeModels` for an
+  OpenAI-compatible endpoint, and `putYoloProfiles` for the profiles file. Each
+  goes through the same code its REST route goes through, which meant lifting six
+  more handlers into the service layer; asking for a sign-in that is already
+  waiting now answers with that sign-in's URL rather than only refusing, on both
+  surfaces, because the URL is what a client needs either way.
+
+- Three more ways to narrow a run listing, on both surfaces: a whole subtree
+  (`descendant_of=` / `descendantOf`), sub-agents only (`parent=sub` /
+  `subAgentsOnly`), and one blueprint's runs (`blueprint=`). A subtree is walked
+  once from the index's own parent map rather than a pass per level, so a fan-out
+  that fanned out again is still one traversal. Setting two of the tree filters at
+  once is refused rather than resolved one way. Also `acceptsMessages`, `blobUrl`
+  and `artifactUrl` on a run, `path` on an artifact, `active` on a stage visit, and
+  `adminEnabled` on the config, so a settings screen can tell whether a save will
+  be allowed before it offers one.
+
+- The three checks that answer without changing anything, over GraphQL:
+  `validateConfigKey` for a key's format, `validateScript` for whether a script
+  compiles, and `testYoloProfile` for what a profile would do with one call. None
+  is behind `--allow-admin`, because none of them dials anything or writes
+  anything, and a form that checks as somebody types should not need the flag.
+
+- What a run did, over GraphQL: `Run.executions` pages over the run's journal,
+  so it holds the attempts a context window no longer shows. A call a gate
+  refused, one that failed and was reissued, one a restart cut off: each carries
+  its own id, its outcome, the stage and iteration it belonged to, and the byte
+  position of the record that dispatched it. Results are a field of their own,
+  read one record at a time, because a single result can be a whole file. Each
+  call is typed by its tool, so a `ShellCall` has a command where a
+  `ReadFileCall` has a path, and every call also carries the arguments exactly
+  as the model sent them. A call whose arguments do not fit its tool comes back
+  untyped with a reason rather than tidied. The same typed call answers what a
+  person is being asked to approve, which used to name the tool without saying
+  what it would run. Announced as `graphql.executions`.
+
+- What a run asked, over GraphQL: `Run.interactions` pages over the same
+  journal, and is the only record that a run stopped and asked a person
+  something at all. Once a tool has read the answer, a granted call reads no
+  differently from one no policy ever stopped, and the scope a person chose
+  (this call, this stage, the rest of the run) is otherwise gone the moment
+  it does. Each entry carries its kind, the tool an approval was for, the
+  prompt and stage, and a typed settlement: whether it was answered, timed
+  out, or cancelled, with the approval, choice, text and feedback filled in
+  only when it was answered. The settlement's widest approval scope is
+  spelled `RUN` here, where the REST journal writes `session` for the same
+  thing. Announced as `graphql.interactions`.
+
+- What a run's provider calls took, over GraphQL: `Run.inferences` pages the
+  attempt records in its journal, one entry per trip to a provider. Each carries
+  the provider and model asked, which attempt it was, how it ended, what the
+  retry loop did next, how long the attempt took and how long the run slept
+  before it, beside the digest that says whether two attempts sent the same
+  request. The move to another provider is a nullable field on the attempt it
+  followed rather than a listing of its own: the journal records it a tick later,
+  from the tick loop that decided it, and pairing them here saves every client
+  the join. Announced as `graphql.inferences`.
+
+- Why a run's regions changed, over GraphQL: `Run.contextChanges` pages the
+  change records in its journal, naming the region, the cause, the entries that
+  arrived and left, and how the region's token count moved. `Run.contextHistory`
+  goes on serving the window snapshots, and both fields now say which of the two
+  they are: a region that lost its plan looks identical in a snapshot whether a
+  compaction took it, a transform cleared it, or the model deleted it. Announced
+  as `graphql.context_changes`.
 
 ### Fixed
 
-- `lev validate <name>` accepts an installed agent's name, as `lev run <name>`
-  always has, instead of failing with "No agent.leviath found at <name>". The
-  install's own `tools/` are reported, and a stale installed copy of a bundled
-  agent is still named when it fails to load. A name is looked up only in the
-  install tree, never in the current directory, so a typo run from inside an
-  agent directory stays an error.
+- An answer to a question could reach the wrong run. Two runs in one daemon
+  asking about the same tool call raised the same request id, because the id was
+  the provider's tool-call id with a word in front of it and nothing about the
+  run. The daemon holds every run's open questions in one place keyed by that id,
+  so the second question replaced the first: the first run was handed the neutral
+  answer, which a tool approval and a taint gate both read as not-approved, and
+  the person who then answered what they were looking at answered the second run
+  instead. Nothing was written down either way, so a run that had quietly been
+  refused looked like one somebody refused.
+
+  A request id now leads with the run that raised it, the way an interaction
+  point's already did, so two runs cannot produce one id whatever their provider
+  names its calls. Ids are longer; they were always opaque, and `lev respond`,
+  the REST and GraphQL answer routes, the dashboard and the ACP bridge all echo
+  the one they were given.
+
+  Behind that, two ways a provider could hand out a colliding call id in the
+  first place are closed. `claude-code` minted `cc_call_1`, `cc_call_2` from a
+  counter on the provider object, and a provider-credential edit rebuilds that
+  object while the runs already going keep asking, so two of them handed out the
+  same ids; it now mints from the same process-wide source `ollama` uses, which
+  survives both a second provider and a restart. A Gemini reply with the id
+  missing, and a Rhai provider script that names no call, used to leave the id
+  empty, which pairs with every result and answers every prompt; both now get a
+  minted one.
+
+  Two questions meeting under one id is now refused rather than resolved
+  silently: the question already open is the one kept, because somebody may be
+  reading it, the arriving one is answered neutrally, the daemon logs an error,
+  and the journal records the refusal as its own settlement (`REFUSED` over
+  GraphQL) rather than as a denial nobody made.
+
+### Changed
+
+- Six GraphQL booleans read as booleans. `BlueprintMimeRow.text`,
+  `MimeRow.text` and the `text` field of the `MimeRowInput` a `putMimeRow`
+  takes are now `isText`; `SandboxConfig.network` is now `allowNetwork`;
+  `FileEntry.outsideWorkdir` is now `isOutsideWorkdir`; and
+  `UpdateBlueprintEntry.changes` is now `hasChanges`. Each answers the same
+  yes or no it always did, so updating a client is a rename in the selection
+  set and, for `putMimeRow`, in the row you send. The REST routes are
+  untouched: `GET /api/mime` still answers `text`, a sandbox block in a
+  manifest is still written `network = true`, `GET /api/runs/:id/files` still
+  answers `outside_workdir`, and `GET /api/update` still answers `changes`.
+
+- The GraphQL API names a run a run. `spawnAgent` is now `spawnRun`, and
+  `pauseAgent`, `resumeAgent` and `cancelAgent` are now `pauseRun`, `resumeRun`
+  and `cancelRun`. They answer with a `RunPayload`, which is what `AgentPayload`
+  is now called, and `spawnRun` takes a `SpawnRunInput`, which is what
+  `SpawnAgentInput` is now called. `Run.agentName` is now `Run.blueprintName`,
+  since it holds the installed blueprint's name.
+
+  The argument that scopes a read to one blueprint is now `blueprint:` rather
+  than `agent:`, on `scripts`, `tools`, `validateBlueprint`, `putScript` and
+  `deleteScript`. The field that names that blueprint is now `blueprint` on both
+  `Script` and `ScriptTool`. The tool inventory agrees with it: the
+  `ToolOrigin` value for a `.rhai` script in one blueprint's own `tools/` is now
+  `BLUEPRINT_SCRIPT` rather than `AGENT_SCRIPT`.
+
+  The self-update job names the files it installs. `startUpdate`'s `agents:`
+  argument is now `blueprints:`, `update.agents` is now `update.blueprints`,
+  `UpdateAgentEntry` is now `UpdateBlueprintEntry`, and `UpdateStep.AGENTS` is
+  now `UpdateStep.BLUEPRINTS`. `POST /api/update` still takes an `agents` flag
+  and still records a step spelled `agents`, so a REST client needs no change.
+
+  Field, type and enum descriptions throughout the schema now say blueprint for
+  the files and run for the execution, wherever they said agent for one of the
+  two. The wording is all a reader sees; nothing a client selects moved with it.
+
+  In the live frames, `AgentSpawned`, `AgentStatusChanged`, `AgentSpend` and
+  `AgentCompleted` are now `RunSpawned`, `RunStatusChanged`, `RunSpend` and
+  `RunCompleted`. The `RunEventType` values that select them are now
+  `RUN_SPAWNED`, `RUN_STATUS_CHANGED`, `RUN_SPEND` and `RUN_COMPLETED`.
+
+  A blueprint is what an author writes, a run is one execution of it, and an
+  agent id is the live handle in the world that a run outlives. So `agentId` is
+  untouched, on every one of those frames included: it is that handle, and
+  nothing else names it. The REST routes, their JSON and the `/ws` frames are
+  unchanged, `agent_status` and its siblings included.
+
+- The `id` field on `Run`, `Blueprint`, `UpdateJob` and `BulkExport` is `ID!`
+  rather than `String!`, which is what implementing `Node` takes. The value is
+  the same string it always was, so nothing on the wire moves; a generated
+  client sees the id type it would see for any other id.
+
+- `submit_output`'s recorded `artifacts` are typed. The tool takes a bare path or
+  an object with a name and a type, and each entry now comes back as whichever of
+  the two the model wrote, rather than as raw JSON a client had to sniff. A
+  fan-out item's `context` stays raw JSON, and its description says why: the shape
+  is a contract between one blueprint's own stages.
+
+- Descriptions on the GraphQL fields where what they leave out mattered. `logs`
+  says that empty covers a stage that has written nothing and a stage that is not
+  there. `fileUrl`, `blobUrl` and `artifactUrl` say they mint a link without
+  looking for what it names, so a 404 comes from following it. `probeModels` says
+  what becomes of the key it is handed. A region seed's tool arguments say why
+  they have no fixed shape. `metadata` says it is for a caller's own labels rather
+  than a typed extension point, and the spawn input's `yolo` and `noSeedCommands`
+  each say that null is `false` rather than a third state. `callbackSecret` says
+  it is ignored without a `callbackUrl`, since there is no webhook to sign.
+
+- A run whose journal cannot be written is failed instead of carried on. The
+  daemon retries the append; if the second attempt fails too, the run ends with
+  an error naming the file that could not be written. Until now every
+  persistence failure was a log line and nothing else, so a run went on calling
+  tools and spending money while the record of what it did was being dropped -
+  and anyone reading that record afterwards saw a run that had never done any of
+  it.
+
+  **A deleted run is not a failure.** Removing a run (the dashboard's `d`,
+  `DELETE /api/runs/{id}`, `rm -rf`) makes every later write for it a no-op on
+  purpose, and that is still silent: the daemon tells the two apart by looking
+  for the run's directory, not by the error it got. Only a genuine write failure
+  - a full disk, a read-only mount, a permission - ends a run.
+
+- The daemon counts what its persistence lane writes and loses, and says so.
+  `lev doctor` runs a `journal` check that fails when anything has been lost,
+  naming the run and the file; `lev ps` prints a line under the table for the
+  same; and `POST /graphql`'s new `journal` field carries the counters, so a
+  console can show it. A daemon whose journal has been failing for an hour used
+  to answer every request and report every lane as idle.
+
+- **GraphQL:** a region or a stage a manifest names is served as the object it
+  names, rather than as a string. `TransitionEdge.target` is the `Stage` the edge
+  leads to; `TransitionGate.requireRegions`, `TransformConfig.carry`, `compact`
+  and `clear`, `StageContext.regions`, `hide` and `reset`,
+  `ToolRouting.defaultRegion`, `ToolRouteOverride.region`, `OutputRoute.region`,
+  `FileTrackingConfig.region`, `Region.sourceRegion`, `FanOut.resultsRegion`,
+  `FanOut.workerStage`, `FanOut.mergeStage`, `InteractionPoint.documentRegion`
+  and the gate's `region`, `requireRegionUpdated`, `requireNoOpenItems` and
+  `requireRegionEntries.region` all resolve now.
+
+  Each one keeps the name beside it, because a name can resolve to nothing: read
+  `targetName`, `regionName`, `requireRegionNames`, `carryNames`, `hideNames` and
+  their siblings for what the author wrote. A resolved field is null and its name
+  field is set where the blueprint declares no such region or stage, which
+  happens for a reference a later edit broke, and for the four regions the
+  runtime always carries (`conversation`, `tool_results`, `final_output`,
+  `stage_instructions`) when no layout declares them. A region also says which
+  stage declared it, through `Region.declaredByStage`, which is null for one the
+  blueprint declares run-wide.
+
+  A tool stays a name on every one of these, and each field's description says
+  why: a manifest names MCP server tools, group tokens such as `@builtin`, and
+  tools a machine does not have, none of which the `Tool` interface describes.
+  Read `tools` for what this machine offers. `ToolPermissionRule.policy` is
+  non-null, and a word the manifest parser would refuse reads as `ASK`, which is
+  what the dispatcher makes of it.
+
+  To migrate: add `{ name }` under each field listed above, or switch to the
+  `…Name` field beside it where a bare string is what your client wants.
+
+- **GraphQL:** a blueprint argument is a `BlueprintInput` rather than a name, and
+  a region argument is a `RegionInput`. `spawnRun(input:)` takes
+  `blueprint: { name: "coder" }`, `RunFilter` and `bulkExportRuns` take
+  `blueprint: { name: "coder" }`, `tools` and `scripts` take
+  a `BlueprintInput` on `blueprint:`, and `validateBlueprint` takes
+  `blueprint: { content: "<manifest>" }` in place of a `manifest:` argument.
+  `sendMessage(targetRegion:)` and `SpawnRunInput.regions[].region` take
+  `{ name: "plan" }`.
+
+  A `BlueprintInput` may also carry a `digest`, which is the revision the caller
+  believes is installed. A digest that does not match answers `CONFLICT` naming
+  both, and a digest on a name nothing is installed under answers `NOT_FOUND`, so
+  a blueprint edited under a client is loud rather than silent. Without a digest
+  nothing is read on the way in, and the behaviour is exactly what it was.
+
+- `Tool` is an interface over `BuiltinTool`, `SubagentTool` and `ScriptTool`. A
+  script always has a file and a built-in never does, so the file, the owning
+  blueprint and the declared capabilities are fields on the one that has them
+  rather than nulls on all three. Every entry now also carries the tool's description
+  and the JSON Schema of its arguments, on both surfaces: the inventory had them
+  and dropped them, so a picker showing what a tool takes had to compile the
+  script itself.
+
+- `install_tool` is two tools, because it only ever did the wide one.
+  `install_self_tool` writes into the calling blueprint's own `tools/`, where
+  only that blueprint's runs see it; `install_global_tool` writes into
+  `~/.leviath/tools/`, where every agent on the machine that asks for script
+  tools does. The old name still works and still means the wide one, so nothing
+  that grants or calls it changes.
+
+  One agent learning something armed every agent with it, and the name said
+  nothing about that. Neither half falls back to the other: an agent with no
+  blueprint directory to write to is told so rather than quietly installing
+  machine-wide, which is the mistake the split exists to make impossible.
+
+- A blueprint says when its runs look for tools again, with a third answer that
+  did not exist: `[agent] tool_rescan` takes `at_spawn` (the default),
+  `after_writes`, or the new `before_dispatch`, which looks at the scanned
+  directories before each batch of tool calls as well as before each turn.
+
+  What that catches is a tool nobody told the daemon about. `after_writes` fires
+  on a flag the agent's own `write_file`, `edit_file` or `install_tool` sets, so
+  a tool written by a shell command, by a script tool, or by a sub-agent sharing
+  the workdir stayed invisible for the whole run. `before_dispatch` looks at the
+  directories instead of waiting to be told, and notices a tool that was edited
+  or removed as well. The check is a `stat` per scanned directory per batch, and
+  re-reads only what changed. `dynamic_tools = true` is the older spelling of
+  `after_writes` and still reads as it, so no blueprint has to change.
+
+- `addMcpServer` takes the `headers` the REST route has always taken. An HTTP
+  MCP server that authenticates with an `Authorization` header could be added
+  over REST and not over GraphQL, so adding one there produced a server that
+  could never answer. Three more fields the REST side already served are served
+  here too: a config error's `since`, and which tool credentials the daemon can
+  see, by name, on both the daemon status and the link frame.
+
+- Names on the GraphQL surface say what they answer. `Run.toolCalls` is
+  `toolCallCount`, because it is a number and the calls themselves are
+  `executions`. `Run.logs(tail:)` is `tailBytes`, which is what it counts.
+  `StageVisit.active` is `inProgress`, so it stops sharing a name with the two
+  `active` fields that are clocks. `Script.source` is `foundAt`, leaving
+  "source" to mean one thing.
+
+  Seven fields that carried a word now carry a value: a tool's `origin`, an MCP
+  server's `transport` and `auth`, an update job's `status` and each step's
+  `step` and `status`, a context region's `kind`, and what a yolo profile does
+  with tools, questions, checkpoints and the gate. The REST routes still carry
+  exactly the words they always did. An MCP server also answers `configError`
+  now: `transport: INVALID` said a server was broken and nothing about why,
+  which left reading the config by hand as the only way to find out.
+
+- `lev update` and `POST /api/update` grew a fourth step, `keys`, which
+  respells renamed blueprint keys in the blueprints you wrote. The bundled ones
+  are replaced wholesale by the step before it, so they need nothing.
+
+- Three settings are spelled the way they behave. `[sandbox] persist` is
+  `keep_warm`: it keeps one container warm across a run's stages, and the
+  container is torn down when the run ends either way, so `persist` promised a
+  lifetime it never gave. `[stages.<stage>.tool_routing] persist` is
+  `keep_results`: it decides whether a tool's result stays in the region it was
+  routed to or goes to `scratch`, which has nothing to do with surviving a stage
+  change. A custom region's `persistent` is `pinned`: it means the region is not
+  evicted during the run, not that anything outlives it. The same `[sandbox]`
+  key in `config.toml` was renamed with it, as was the GraphQL field on each
+  (`keepWarm`, `keepResults`, `pinned`) and the `pinned` entry a Rhai
+  `region_custom` returns.
+
+  **Nothing has to change.** Every old name is still read, and reads exactly as
+  it did, so a blueprint or config written before this runs untouched. What is
+  new is being told: `lev validate` notes each old key with what the setting
+  actually does, and `lev update` now offers to respell them in your own
+  blueprints and in `config.toml`, listing every line first and writing nothing
+  without a yes. The rewrite replaces the key and nothing else, so comments,
+  spacing and key order survive it. Written both ways in one table, the current
+  name wins and `lev validate` says the old line is dead.
+
+- A tool execution is told apart from the tool call it was carrying out. The
+  provider's call id was the only identity a completed call had, and a provider
+  may reuse one across a retry or a reissue, so two attempts at one call could
+  not be told apart afterwards. Each attempt now gets an id minted here at
+  dispatch, and the provider's id travels beside it as correlation. A stage visit
+  gets an id the same way, having been identified by its position in a capped
+  list: the hundred and twenty-ninth visit took the first one's identity, and
+  everything recorded against it moved with it. Old journals stay readable and
+  carry no ids rather than invented ones.
+
+- A run resumed after a crash records what it gave up on. A call with no
+  journaled result is one nobody saw the end of, and the resume lands a stand-in
+  and carries on rather than re-running it. The journal said nothing about that
+  until now, so a batch cut off mid-flight read exactly like one that never
+  started. Each such attempt is now recorded as indeterminate, which is a state
+  and not a missing value: a completion that never arrived is not evidence of
+  success.
+
+- The persistence lane says what became of an append. A tool batch waits for its
+  journal record before running, and that wait used to end in a bare signal, so a
+  failed write was invisible at the point it mattered. The answer now says the
+  record landed and at which byte position, or that this world keeps no journal,
+  or that the write failed. Only the last is a problem, and it is now said out
+  loud.
+
+- A run keeps its own copy of the blueprint it executed. Spawn writes the
+  manifest into the run's directory and records its SHA-256 as
+  `blueprint_digest`, so "what did this run execute" stays answerable after the
+  installed file is edited or deleted, and a daemon restart resumes a run on the
+  manifest it started with rather than on whatever the file says by then. Only
+  the manifest is frozen: scripts it names are still read from the installed
+  agent directory. Runs recorded before this carry no copy and no digest, and
+  fall back to the installed file exactly as before.
+
+- A run that has already finished now answers `409` to pause, resume and
+  cancel, on both surfaces, rather than `404`. "Not found" about a run sitting
+  in the listing reads as a wrong run id, and sent people looking for a run
+  that was right there. The message names the state the run finished in.
+
+## 0.6.3 - 2026-09-19
+
+### Changed
+
+- The performance probes and the live-test harness (`harness.sh`,
+  `mock.py`, `daemon_drive.py`, `dash_pty.py` and the rest of
+  `perf-tools/`) moved to
+  [leviath-benchmarks](https://github.com/GEMISIS/leviath-benchmarks)
+  under `perf/`, with their baselines. `CONTRIBUTING.md` shows how to run
+  them against a local build. `codeql_summary.py` stays here, in
+  `scripts/`.
+- The **What is Leviath?** page opens on a table of six words: blueprint,
+  stage, transition, run, region, and agent. A blueprint is the files you
+  write (`agent.leviath` and the tools and scripts beside it), a run is one
+  execution of it, and a region is part of a run's memory. The glossary
+  says the same.
+
+### Fixed
+
+- `lev dash` stays quick with thousands of runs. The runs directory is read
+  on a thread of its own, so the dashboard draws and takes keys at once
+  (the list says "Loading runs…" for the moment before its first read), and
+  a key or a scroll never waits on the disk. Scrolling or moving the mouse
+  quickly no longer leaves the list scrolling on by itself after you stop.
+  On 5,000 runs the list shows in about 120 ms, down from 1.3 seconds, a key
+  answers in about 10 ms, down from 160 ms, and a fast trackpad scroll
+  settles in about 15 ms, down from 21 seconds. A finished run's page no
+  longer re-reads its whole history once a second.
+
+## 0.6.2 - 2026-09-18
+
+### Changed
+
+- Leviath no longer reads a `.env` file from the working directory unless
+  you ask: set `load_dotenv = true` in `config.toml` (the **Load ./.env**
+  switch on `lev setup`'s advanced screen), or run one command with
+  `LEVIATH_LOAD_DOTENV=1`. The directory `lev` runs in is often a repository
+  someone else wrote. If your keys live in a `.env`, turn the switch on.
+- `lev models list` prints, under the table, each provider it could not
+  list and why, and exits with an error when not one of them answered.
+  `--json` rows from such a provider carry `listing_error`. `lev setup`,
+  `lev models list` and `lev doctor` print a provider failure in the same
+  words, with the transport's own cause (`dns error: failed to lookup
+  address`) rather than "unreachable - check your network".
+- A run paused because its provider did not answer says which way:
+  `paused: provider unreachable`, `provider timed out` or `provider failed`,
+  with blockers `provider_unreachable`, `provider_timed_out` and
+  `provider_failed` on the API. Before, every one of these, a slow call and a
+  server error included, read `paused: needs providers`. `lev ps` lists what
+  happened to each paused run under the table, and the watchdog's pause
+  names the provider's last error.
+- `gpt-5.5`, `gpt-5.4` and `gpt-5.4-pro` are sized at 922,000 tokens, the
+  budget prompt and reply share on the Responses API, as `gpt-5.6` already
+  was. `gpt-5.4` had been sized with the 272,000-token family.
+
+- The OpenAI provider calls OpenAI's Responses API instead of Chat
+  Completions, with `store: false` on every request. A stage's
+  `reasoning_effort` and `response_format` parameters are translated to
+  `reasoning.effort` and `text.format`, and a reasoning model's chain of
+  thought is replayed on the next turn. OpenRouter, Ollama and
+  OpenAI-compatible endpoints still use Chat Completions.
+- The Google provider calls Gemini's Interactions API instead of the
+  OpenAI-compatible endpoint, with `store: false`. Video now reaches Gemini
+  models. `google_base_url` names the native API root
+  (`.../v1beta`); a URL ending in `/openai` is read as the root above it,
+  and a gateway that speaks only the compatible API moves to an
+  `openai-compatible` endpoint entry.
+- `[mime] max_part_bytes`, left unset, is the largest part a configured
+  provider takes (1 GiB with Meta, 500 MiB with Anthropic) rather than a
+  fixed 32 MiB. A value you set still wins.
+- A stored part the model takes is held to its provider's documented inline
+  limits; a part over one reaches the model as its stand-in with the
+  reason, rather than a refused request.
+- The setup wizard's cards read Google, Meshy, OpenAI Codex and Ollama,
+  with what each is in its description.
+- A stage that should produce video or audio and gets only text is nudged
+  to try again, as an image stage already was.
+- `lev serve` answers The Lair's connect-time requests from memory. Every
+  run listing reads through one parse cache over the runs directory, filled
+  at start-up and read off the async runtime, so a page of fifty costs a
+  stat per live run rather than a parse of every run on the machine; the
+  tree routes walk a parent map built once instead of re-scanning the list
+  at every level. `GET /api/models` answers from a catalogue built once per
+  config and refreshed behind a stale answer, with the providers asked side
+  by side and each given five seconds; only the first request for a config
+  waits, and that wait is bounded. On a machine with about a thousand runs
+  the console's connect burst went from about 0.9 s to about 4 ms, and
+  `/api/models` from about 1 s to under a millisecond once warm.
+- `lev serve` compresses a body over a kilobyte for a client that accepts
+  gzip or brotli, and its CORS answer lets a browser keep a preflight for
+  an hour rather than asking again about every request.
+- `lev daemon install` points the supervisor's stdout and stderr capture at
+  `daemon.stdio.log` rather than `daemon.log`, which the daemon now writes
+  and caps itself. Run `lev daemon install` again to pick that up. A daemon
+  whose stderr is not a terminal no longer copies its log there.
+- `lev setup` sets a provider up in a modal rather than on a screen per
+  provider. The Providers screen lists the providers this install has;
+  **Add a provider** asks how it is reached, what it makes, and which one,
+  then opens the provider's card with three ways out: **Verify and use**,
+  **Skip verification and use**, **Cancel**. Enter on a listed provider
+  reopens its card and `d` removes it, clearing its key when you finish.
+  The wizard will not continue past that screen, or finish, with no
+  provider configured. Configuring a provider no longer puts it in the
+  provider priority on its own: the reorder modal takes a configured
+  provider in or out with Space, keeping at least one. The quit dialog
+  lists the choices that would be discarded.
+- A bare model name is served only by providers in `provider_order` (or
+  by `default_provider` alone when the order is empty). A configured
+  provider left out of the list is never chosen for a bare name and stays
+  reachable by an explicit `provider/model` or a `fallback_order` entry;
+  before, every configured provider could serve a bare name, ranked behind
+  the listed ones. The rule that kept a subscription transport off bare
+  names unless listed now applies to every provider, so that special case
+  is gone. `lev validate` and its `no-reachable-provider` lint judge open
+  entries the same way.
+- `PUT /api/config` takes `null` for `anthropic_key`, `openai_key`,
+  `google_key`, `openrouter_key` and `bedrock_key` to clear a key, taking
+  the provider out of the install the way the wizard's remove does; an
+  empty string is a 400.
+
+### Added
+
+- Yolo profiles have documentation of their own. [Write your first yolo
+  profile](https://leviath.dev/docs/first-yolo-profile) walks one profile from
+  `lev yolo init` to a run, and [Yolo
+  profiles](https://leviath.dev/docs/yolo) is the reference: every field, the
+  order a verdict is decided in, the shell rules, and what a profile can never
+  loosen. They were previously a section inside the `config.toml` reference.
+- `read_file_bytes(path)` for Rhai tools: a workdir file's exact bytes as a
+  blob, ready for `write_part`. A picture a shell command rendered, or a
+  design someone dropped in the workdir, can now become a part without
+  going through base64 text, which the 900 KB shell output cap cut short.
+  Gated and confined like `read_file`, and refused past
+  `[mime] max_part_bytes` before the file is read.
+- `[model_providers.<name>] kind = "openai"`: OpenAI's own provider, on the
+  Responses API, at a host of its own under the name you give it. Several
+  sit side by side, each with its own `base_url` and `api_key`, so two Azure
+  resources behind different gateways work at once.
+- `auth_header` on an `openai` or `openai-compatible` entry sends the key in
+  that header (`api-key`, `Ocp-Apim-Subscription-Key`) instead of as a bearer
+  token.
+
+- `write_file` takes an optional `append`. Set to `true`, the content goes
+  on the end of the file, which is created if missing. A file too large for
+  one reply can now be written in parts, and file tracking keeps the parts
+  together under the one path.
+
+- OpenAI's image (`gpt-image-2` and the rest), video (`sora-2`,
+  `sora-2-pro`), speech (`gpt-4o-mini-tts`, `tts-1`) and transcription
+  (`whisper-1`, `gpt-4o-transcribe`) models run as stages that hand back
+  images, videos, audio and transcripts.
+- Google's image models (`gemini-3.1-flash-image`, `nano-banana-pro-preview`),
+  Veo 3.1 video, Gemini speech (as WAV) and Lyria music run the same way.
+- AWS Bedrock's Stability image models (Stable Image Core and Ultra, SD3.5
+  Large and the editing tools) and Nova Canvas run the same way.
+- Unit prices for media models (per image, second of video, hour of audio,
+  million characters or music clip) are read from LiteLLM by
+  `cargo xtask prices`; a hand-written row still wins, and is kept only
+  where LiteLLM has no price. `gpt-4o-mini-tts` is priced by the length of
+  the audio it returns, read from the file.
+- `lev setup` files a provider under every kind it makes (text and images,
+  video, speech and audio, 3D models), and typing at "Add a provider" finds
+  one by its name or what it does.
+- A new tutorial, [Build an advanced agent](/docs/advanced-agent), builds an
+  agent that turns an idea into concept art and a short film on an OpenAI
+  key. The mime page is now called "More than text".
+- **xAI** as a provider (`XAI_API_KEY`), with its model list, windows,
+  aliases and prices read live, the cost each call reports recorded as its
+  cost, and the image (`grok-imagine-image`), video (`grok-imagine-video`),
+  text to speech (`grok-tts`) and speech to text (`grok-stt`) models run as
+  stages that produce parts.
+- **Grok** as a subscription provider: sign in with a browser
+  (`lev auth login grok`) and bill Grok to a SuperGrok or X Premium+ plan.
+  Signing out revokes the session at xAI.
+- **Meta** as a provider (`META_AI_API_KEY`): Muse Spark, its contributor
+  models (flagged, and refused under zero data retention, since Meta trains
+  on them), Muse Image and Muse Voice Transcribe.
+- Large images, PDFs, video and audio upload once to the provider's own
+  file storage (Anthropic, OpenAI, Google, xAI, Grok, Meta) and are named by
+  id on later turns, retries and stages. Nothing uploads under zero data
+  retention or with `[providers] file_uploads = false` (a Defaults row in
+  `lev setup`, `--file-uploads`, and a `PUT /api/config` key). A run deletes
+  its uploads when it finishes or is deleted; each also expires after
+  `[mime] provider_file_ttl_secs`.
+- Subscription quota: `lev auth status` and `lev providers quota` show how
+  much of a Codex or Grok plan is used and when each window resets, `lev
+  doctor` warns when a limit is reached, and `GET /api/providers?quota=true`
+  carries the reports. The accounts are asked side by side and each is given
+  its own bound, so one that will not answer costs one wait rather than one
+  per subscription. The daemon keeps the reading for a minute, fifteen
+  seconds when an account could not be read, so a providers page can ask
+  every time it opens: `X-Leviath-Quota-Age` and `X-Leviath-Quota-Complete`
+  say what you got, and `?refresh=1` reads the accounts again. Announced as
+  the `providers.quota` capability.
+- A model that bills long prompts at a higher rate is billed that way, and
+  shown: a `+` beside its price in `lev models list`, both rates in `lev
+  models show`, and a `long-context-price` note from `lev validate`. Model
+  choice does not change.
+- `lev models list` marks with `!` a model whose retention conflicts with
+  your settings, and takes `--produces <MIME_TYPE>`. Media models show a
+  unit price (`0.05/s`, `0.01/img`).
+- `lev mime list` prints the part ceiling in force, whether uploads are on,
+  and each configured provider's limits.
+- `cargo xtask prices` covers Meta and xAI, reads LiteLLM's long-context
+  tiers, keeps hand-written unit prices for media models and reports one not
+  checked in 90 days, and reports window drift for xAI and Meta.
+- `GET /api/models` carries `X-Leviath-Catalog-Age` and
+  `X-Leviath-Catalog-Complete`, takes `?refresh=1` to ask the providers
+  again, and announces the `models.cached` capability.
+- `perf-tools/serve_latency.py --burst` times the console's connect-time
+  requests fired at once, and `--accept-encoding` records compressed sizes.
+- `lev rage` packs the logs and settings a bug report needs into one zip,
+  with every key removed: `lev doctor --offline`, the daemon's state and
+  log, the config file with its keys taken out, every installed blueprint,
+  and, for a run, its metadata, stages, context, journal, media and
+  blueprint. A small screen asks what the problem was about (`--about`)
+  and which run (`--run`) or blueprint (`--agent`); `--note` adds your
+  words, `--output` names the zip, `--no-blobs` leaves media out, and
+  `--non-interactive` skips the screen. Nothing is uploaded. The zip keeps
+  the task text, the model's replies, tool output and file contents, and
+  says so before you share it. The new Reporting issues guide has the rest.
+- The daemon writes its own log to `~/.leviath/daemon.log`, however it was
+  started; before, a daemon `lev run` started for you logged nowhere. The
+  file is capped at `[observability] log_file_max_bytes` (5 MiB by
+  default, `0` never rolls) with one rolled `daemon.log.1`, and a changed
+  cap applies on the next run without a restart.
+- `lev serve` writes its own log too, `~/.leviath/serve-<name>.log`, one
+  per server: `--name` names it, and the port does when no name is given,
+  so two servers side by side keep separate logs and a restart on the same
+  port keeps rolling the same one. The same cap applies, read when the
+  server starts. `lev rage` packs every serve log into a bug report.
+- A **What is Leviath?** page opens the docs, before Getting Started: the
+  problem a long agent run has, what a blueprint, regions, the daemon and
+  the journal do about it, what Leviath is not, and who it is for. Written
+  in plain words for someone who runs a coding agent and has never opened a
+  framework's docs.
+
+- `[providers] <provider>_headers` (`anthropic_headers`, `openai_headers`,
+  `google_headers`, `openrouter_headers`, `meshy_headers`, `bedrock_headers`):
+  extra headers sent after the provider's own on every request to its host,
+  for a gateway named in `<provider>_base_url` that wants a token or a tag of
+  its own. Meshy's asset downloads and Bedrock's AWS-only routes are not sent
+  them. Kept out of logs the way the keys are.
+- `zero_retention_request` on a `[model_providers.<name>]` endpoint names
+  the built-in provider whose per-request zero-retention fields the host
+  takes (`openai` sends `store = false`, `openrouter` the `provider.zdr`
+  routing fields), so an Azure OpenAI deployment or an OpenAI-shaped gateway
+  is sent them with the switch on. The data retention page shows both.
+- Which models can give zero data retention is now read per model where a
+  provider publishes it. Bedrock's model listing says which data retention
+  modes each model may be served under, and a model it never offers under
+  `none` (every OpenAI model on Bedrock, Claude Fable 5) is refused up front
+  under `[providers] zero_retention` rather than reported unavailable by
+  Bedrock mid-run; an account set to `inherit` is read as serving each model
+  under that model's own default, where it was read as zero. OpenRouter's
+  `GET /endpoints/zdr` list is read the same way, so a model with no
+  zero-retention endpoint is refused before the request goes out.
+- `lev validate` reports it before a run does: `retention-not-zero` (error)
+  for a stage whose model would be refused under the switch, and
+  `retention-fallback-dropped` (warning) for a fallback that failover would
+  skip, each with the provider's reason.
+- The setup wizard's Defaults screen has a **Zero data retention (ZDR)**
+  switch whose help spells out what it does, with an agreement row for each
+  chosen provider that settles retention by contract (Anthropic, OpenAI,
+  Google). Headless: `lev setup --zero-retention true` and
+  `--zero-retention-agreements anthropic,openai`.
+
+### Fixed
+
+- An MCP tool's name is now always exactly `<server>__<tool>`, with nothing
+  appended. A tool whose advertised name was already taken used to be renamed
+  with a `_2` suffix, which no blueprint, `[mcp_overrides]` key or grant could
+  have predicted and which changed with the order servers happened to connect
+  in. The name can now be read straight off `config.toml` and written down
+  before the server has ever been reached. A name that genuinely collides is
+  refused, and the daemon log says which two names ran into each other.
+- An `[[mcp_servers]]` name must be letters, digits, `_` or `-`, and no two
+  entries may share one. Both are refused when the config loads, by
+  `lev doctor`, `lev mcp add` and `POST /api/mcp/servers`. The name is used
+  verbatim in every one of that server's tool names, and a model provider
+  refuses a tool name containing anything else. Leviath no longer rewrites the
+  offending character, because `my.tools` and `my_tools` would both become the
+  prefix `my_tools` and then two servers would claim one set of tool names. A
+  dot and an underscore are different characters. A server name imported by
+  `lev setup` from another tool's config is still adjusted to fit, and the
+  wizard shows the name it will write.
+- `[mcp_overrides]` in `policy.toml` now applies. It sets an MCP tool's
+  sensitivity, direction and clearance for the taint gate, and it had never
+  reached a tool in any spelling: the loader keyed overrides by
+  `<server>.<tool>` while the gate looks them up by the name the tool is
+  dispatched under, `<server>__<tool>`. An override was parsed, stored, and
+  never read, so a call you believed you had restricted was gated on the
+  tool's default classification. Write it as
+  `[mcp_overrides.<server>.tools.<tool>]`, where a dotted server or tool name
+  needs no escaping; the flat `[mcp_overrides.<server>__<tool>]` that
+  `lev policy add` writes is also read, so editing an allowlist rule no longer
+  drops every override in the file. `lev policy list` prints the name each
+  override landed on.
+- A run that hands back a file a model or provider made (a mesh, an image)
+  hands back its own file, not one an earlier run of the same agent left in
+  the working directory under the same name. The run's part is looked for
+  before the disk, and a different file already at that path is left alone:
+  the part is written beside it as `<stem>-<sha8>.<ext>`, and that is the path
+  the answer records. Set `overwrite_artifacts = true` in the blueprint's
+  output table, or in `[mime]` in `config.toml`, to replace the file instead.
+- An OpenAI-compatible endpoint can talk to OpenAI's reasoning models. They
+  refuse `max_tokens` with `400 unsupported_parameter`; the request is sent
+  again with the cap as `max_completion_tokens`, and the model is remembered.
+- An OpenAI-compatible endpoint serving a vendor's model under its own id
+  (Azure's `gpt-5.5`) is sized from that vendor's table, not the 128,000-token
+  guess for a model nothing knows.
+- Zero data retention refuses every call to a model that keeps something,
+  not only a stage's at spawn: the run's title call, compaction and content
+  summaries, the routing call at a stage boundary, `lev test` and the
+  `lev doctor` probe. A blueprint whose compaction model keeps something is
+  refused at spawn, and turning the switch on under a running daemon holds
+  from the next call. The routing call now carries the zero-retention request
+  fields too.
+- `lev doctor` reports a provider whose listing failed as a failed inference
+  check with the error, not "lists no model to probe with".
+- A provider whose model list the daemon could not read is recorded as a
+  failed check with the error, so `lev setup` opens on it.
+- A media stage whose prompt sits in a pinned region (the task) was sent
+  "Begin." as its prompt, so an image or 3D model made something unrelated.
+  The runtime's placeholder turn is no longer read as the prompt.
+- A stage on an image or video model no longer warns that its tools are not
+  advertised when the only tool is `submit_output`.
+- A streamed reply that reached Leviath in one read no longer ends as "the
+  stream ended before the model said it had finished". The reader stopped at
+  the first event it had nothing to pass on and waited for bytes that had
+  already arrived, so a short, fast reply lost its ending and the run paused.
+- A tool call cut off by the output cap no longer kills the run on the
+  next request. The call was refused, but its half-written arguments stayed
+  in the conversation as plain text, and every later request sent them that
+  way. Anthropic answers `400 tool_use.input: Input should be an object`, and
+  Ollama refuses it too. A 400 is never retried or failed over, so the run
+  ended in an error, and a paused run resumed or recovered after a daemon
+  restart hit the same wall. Requests now carry those arguments as
+  `{"_raw": "..."}` beside the refusal the model already got, which is what
+  Bedrock requests already did.
+
+- A model whose tool call keeps getting cut off is told how to fix the
+  call instead of just what went wrong. The refusal says the limit is
+  raised for the next reply, how to split this tool's call (`write_file`
+  with `"append": true`, smaller `edit_file` changes), and, from the second
+  cut-off in a row, not to resend it and how many tries are left. A fourth
+  cut-off tool call in a row is a stage error: it takes the stage's `error`
+  edge, or fails the run when there is none. Before, such a model was paid
+  in full for every attempt until `max_iterations` stopped it, and the run
+  could then report complete with the work undone. Only cut-offs in a row
+  count, so replies that are not cut off never add to it, however many tool
+  calls they make.
+
+- `lev setup` no longer shows every configured provider as "not checked
+  yet". What a provider said the last time anything asked it is recorded in
+  `~/.leviath/model_capabilities.json`, beside its model list: by the daemon
+  when it reads the model lists at start-up, by `lev models` for each
+  provider it lists live, and by the wizard's own checks. The wizard opens on
+  that record, with its models and "checked 2 hours ago", as long as it was
+  made with the key the config holds now. The file stores an HMAC of the
+  key under a random per-install key kept in
+  `~/.leviath/provider-check.key`, never the key, and `lev rage` never packs
+  that file.
+
+- `lev doctor` no longer fails its `resolve` check with "resolved to
+  'anthropic', which is not configured" on an install whose only provider
+  is something else and whose config sets no `override_model` or
+  `fallback_model`. That placeholder was the resolver's last resort for a
+  stage naming no model, not a finding about the config. The check now
+  passes on the first configured provider in `provider_order` (or
+  `default_provider`), the inference and daemon checks that used to be
+  skipped run with a model picked from that provider's catalogue, and the
+  inference line names which. With nothing in the preference configured
+  the check fails loudly, naming the provider the config asked for and
+  what is registered. `GET /api/doctor` reports the same.
+
+- The mkcert recipe on the API page prefixes both mkcert commands with
+  `TRUST_STORES=system,nss`, and the page and the troubleshooting guide
+  explain the `keytool -list` / `Keystore file does not exist` stop that
+  mkcert 1.4.4 hits, on install and on issue alike, when `JAVA_HOME` names
+  a directory with a `keytool` but no `lib/security/cacerts`, as the
+  Homebrew openjdk keg does. The Lair never needs the Java trust store.
+
+- `lev setup` no longer runs a long label into its value: the label column
+  on the Defaults and Limits screens, the name column on the Agents and MCP
+  screens, and the value column of the priority reorder are each as wide as
+  their widest entry plus a gap. The chooser wraps a long note under its
+  column instead of cutting it at the edge, and a click on the wrapped part
+  still lands on that row. A window too narrow for the step trail shows
+  "Step n of 7: Title" in the header instead of a trail cut at the border.
+
+- The `lev setup` provider window no longer moves the Providers screen
+  under it. The screen kept drawing its highlight and viewport from the
+  cursor the window was steering, so every arrow press in the window also
+  walked the list behind it.
+
+- An OpenAI-compatible endpoint entry carrying `retention` refused to load
+  as having an unknown key, though the docs said to write it there.
+- Under `[providers] zero_retention`, the run-title call and compaction
+  summaries went out without the per-request zero-retention fields, though
+  both carry the run's own text; they now ride those calls the way they
+  ride a stage's request.
+- A running daemon judged a spawn under `[providers] zero_retention` by the
+  Bedrock account mode it read when it started, so `lev providers retention
+  set zero` (which sets the mode to `none`) was followed by a refusal
+  naming the old mode until the daemon restarted. While the switch is on
+  the daemon now reads the mode again before every spawn.
+- `lev providers retention` names the Bedrock models never served under
+  mode `none`, and any unavailable to the account as things stand with
+  Bedrock's reason (a mode the model is not served under, a missing access
+  grant), so a refusal is explained before a run meets it.
+- Under `[providers] zero_retention`, a fallback that keeps something is
+  dropped from a stage's failover list at spawn, with a line in the stage's
+  log; only the model the stage starts on was checked before, so a failover
+  could reach a model the switch should have kept the request from.
+
+## 0.6.1 - 2026-09-15
+
+### Added
+
+- Data retention is a thing a provider answers, and zero retention a thing
+  you can ask for. `lev providers retention` says what each configured
+  provider keeps of a request and how that is controlled: a per-request
+  field (OpenRouter), an account setting Leviath reads and writes (Bedrock,
+  `GET`/`PUT /data-retention`), or an agreement no API can read (OpenAI,
+  Anthropic, Google), with the models that retain regardless (Claude Fable 5
+  and Mythos 5) called out. `[providers] zero_retention = true` (or
+  `lev providers retention set zero`) sends OpenAI `store = false`, routes
+  OpenRouter only to zero-retention endpoints, sets Bedrock's account mode to
+  `none`, and refuses at spawn a stage whose model still keeps something.
+  `zero_retention_agreements` declares the contracts you hold; `retention` on
+  a `[model_capabilities]` or `[model_providers]` entry answers for one model
+  or one custom host; `lev models show` prints a model's own answer.
+
+## 0.6.0 - 2026-09-14
+
+### Added
+
+- AWS Bedrock is a built-in provider. Set `AWS_BEARER_TOKEN_BEDROCK` (a
+  Bedrock API key, not an AWS access key) or choose it in `lev setup`
+  (`--bedrock-key`, `--bedrock-region`, and a region picker on the Defaults
+  screen), and name models by their inference-profile id:
+  `bedrock/us.anthropic.claude-sonnet-5`. Requests go over Converse and
+  ConverseStream, so streaming, tools, images and PDFs work; Claude's
+  extended thinking and Nova 2's reasoning pass through a stage's parameters,
+  and a Claude's signed reasoning is replayed on the next turn. Token counts
+  are exact where Bedrock counts them (its CountTokens, or Anthropic's route
+  on `bedrock-mantle` for the newest Claude). Each model's context window and
+  output cap come from AWS's model cards, kept current by the new
+  `cargo xtask bedrock-windows` and its weekly workflow, and prices from
+  AWS's public price list at start-up, with the Marketplace-billed Claude
+  models priced from Anthropic's rates. The region follows `AWS_REGION`, then
+  `AWS_DEFAULT_REGION`, then `us-east-1`; `bedrock_base_url` points inference
+  at a gateway. `GET /api/config` reports `has_bedrock_key` and
+  `bedrock_region`, and `PUT /api/config` takes `bedrock_key` and
+  `bedrock_region`. (#844)
+
+- Rhai tools can fetch a file: `http_get_bytes(url [, headers])` returns the
+  declared `mime_type` and the raw `bytes`, ready for `write_part`, under the
+  same permission as `http_get`. The bundled `web_fetch` uses it: a URL that
+  answers with an image, a sound or a PDF is stored as a part of the run and
+  attached to the tool result instead of coming back as a refusal, so a model
+  that takes the type sees the file. (researcher, deep-researcher,
+  wide-researcher and data-analyst bumped.) (#842)
+
+- The Gemini provider's offline listing (what `lev models list` and the
+  picker show before a live listing is read) names the 2.5 models, including
+  `gemini-2.5-flash-image`, beside the 3.x ones. (#842)
+
+- A fan-out worker's files travel up with its answer. Each artifact a worker
+  hands back is stored again under the parent's run and rides on the merge
+  report's entry as a part named `<item>/<artifact>`, so a merge stage whose
+  model takes images or meshes sees the files themselves rather than each
+  worker's description of them. A file the store lost or one over the part
+  ceiling is left out with a warning. (#841)
+
+- `AgentWorld::artifact_bytes` reads one of a run's artifacts back from its
+  blob store, so an embedder that has the name, type and hash from `result`
+  no longer needs to know where the world keeps its files. (#841)
+
+- The Meshy provider lists its six operations, so a configured key shows them
+  on `GET /api/models` and `lev models list` like any other provider's models. (#841)
+
+- `GET /api/agents/{id}/artifacts/{name}` serves one file a run handed back,
+  by the name its answer lists, from the blob store by hash first and the
+  working directory second (capability `runs.artifacts`). A client had the
+  name, type and hash from the result and no route that took any of them: a
+  file a model made and nothing wrote to disk was unreachable over HTTP.
+  `files/raw?path=` now falls back to the same store for a path the answer
+  lists as an artifact, and an Agent Client Protocol host's `resource_link`
+  points at the stored file when the working directory has no copy. (#841)
+
+- A sub-agent's files reach its parent. `wait_for_agent` and `check_agent`
+  list the child's artifacts under its answer and hand them up as parts of
+  the tool result, stored again under the parent's run and named
+  `<child>/<artifact>`, so a parent whose model takes the type sees the
+  file itself. (#841)
+
+- A new lint, `output-stage-cannot-answer`: an output stage whose models
+  cannot call tools (an image model, a 3D generator) can never reach
+  `submit_output`, so unless it declares an artifact and routes the produced
+  part the run ends with nothing after re-submitting the job up to six times.
+  Said at validate time, as an error. (#841)
+
+- A transition gate can require a count: `require_region_entries = { region =
+  "views", at_least = 4 }` holds the stage and re-runs it with the gate's
+  message until the region holds that many entries. It is what lets a stage
+  whose model cannot call tools - an image model, which returns however many
+  pictures it likes per reply - draw until its set is complete, and it makes
+  "build from four views" a rule the runtime keeps rather than a wish in a
+  prompt. The bundled `sprite-to-3d` uses it on its drawing stage and on the
+  edge into the build. (#840)
+
+- An output stage whose model makes a file - a 3D generator, an image model -
+  can hand that file back as the run's answer with no `submit_output` call and
+  no text turn. Route the produced part into a region with `output_routing` and
+  declare it under `[[stages.<name>.output.artifacts]]`; when the routed parts
+  satisfy the declared artifacts, the run records them as its final output
+  directly. Only the stage's own `output_routing` targets are searched, so an
+  input part in another region is never mistaken for a produced one, and a stage
+  whose model returned only text still falls back to the `submit_output` nudge.
+  This lets a pure "bytes in, bytes out" pipeline run with no text provider at
+  all: the bundled `image-to-model` and `model-to-animated-model` are now single
+  Meshy stages that need only `MESHY_API_KEY`, and `text-to-image-to-model` no
+  longer needs a text model for its final step. (#836)
+
+- The Meshy provider gains three more operations: `text-to-3d` (a text prompt to
+  a textured mesh, a preview task then a refine task), `retexture` (a mesh plus a
+  text style to a re-textured mesh), and `animate` (a mesh to an animated mesh -
+  it rigs the model, looks the requested action up in Meshy's animation library,
+  and applies it). Each runs its phases under one `request_timeout_secs`, and its
+  text prompt or action comes from a visible region's text. (#833)
+
+- Meshy is a first-class provider for generative 3D. A stage selects it with
+  `provider = "meshy"` and one of `image-to-3d`, `multi-image-to-3d` or `rig`:
+  the stage's visible image or mesh parts go in, and it submits a Meshy REST
+  job, polls it to completion under the stage's `request_timeout_secs`, and
+  hands back the produced `.glb` (and, for a generation, its preview render) as
+  a stored part the run stores and routes like any other. `MESHY_API_KEY` is now
+  a provider credential (`[providers] meshy_api_key`, a `MESHY_API_KEY` env
+  fallback, and a `lev setup` entry) rather than a bundled agent's MCP secret.
+  A reply whose whole output is a produced part now ends its stage instead of
+  being nudged to call a tool it does not have. (#832)
+
+- Blueprints can declare what has to be in place before they run, as a top-level
+  `[[dependencies]]` array: an MCP server with the env secrets it needs, an
+  environment variable, a program on `PATH`, or a condition a Rhai script
+  decides. An unmet required dependency fails the spawn before any model is
+  billed. `lev deps list` shows what an agent needs, `lev deps check` says
+  whether this machine has it and exits non-zero when it does not, and
+  `lev deps install` sets it up after asking: it writes an MCP server's
+  non-secret settings into your config and allowlists the secret it needs, so a
+  `${VAR}` in the server's headers or a stdio server's env is filled from your
+  environment at connect time rather than written to a file; or it runs a
+  declared shell command or Rhai install script.
+  `lev validate` lists each declared dependency and whether this machine has it,
+  and `GET /api/blueprints/{name}` carries them as `dependencies` (announced by
+  the `blueprints.dependencies` capability). A bundled `sprite-to-3d` agent
+  turns a sprite sheet into a rigged, game-ready model with Meshy and declares
+  the Meshy dependency (#827).
+
+### Fixed
+
+- The bundled reviewer's parallel review never ran: a fan-out worker is
+  spawned with its work item as its task, and the reviewer declared no region
+  to hold one, so every `review_worker` was refused at spawn and the deep
+  review quietly covered for all of them. The reviewer (0.2.7) now has a
+  `task` region, `lev validate` reports the shape as
+  `fanout-worker-task-unheld` for any blueprint that repeats it, and a worker
+  of its own blueprint is no longer asked for the caller inputs the parent
+  was started with (the reviewer's required `--diff`), since its share of
+  them travels in the work item. `lev run reviewer --diff @x.patch` still
+  needs no task: a blueprint whose task region is optional is not asked for
+  one when a region or an attachment was handed in.
+- `web_fetch` failed on nearly every non-text file it was handed (an image, a
+  PDF) with "Size of array/BLOB too large": the script engine's array ceiling
+  of ten thousand elements applies to blobs too, so the bytes `http_get_bytes`
+  fetched never reached the script. The ceiling is now the same 32 MiB the
+  host caps a fetched body at.
+- A PDF was billed half a token per byte, so a 2 MB brochure counted as over
+  a million tokens and a stage that handed it to a model that reads PDFs died
+  on the context limit. A document is now billed by its pages, with the new
+  `per_page` token rule (`{ per_page = 2000 }` for `application/pdf`; also
+  `lev mime add --tokens per_page=N` and `PUT /api/mime`): the page count is
+  read off the file, a stand-in says `12 pages`, and a file whose pages cannot
+  be counted is taken as a page per 64 KiB.
+- A sprite-to-3d run whose mesh Meshy refused to rig ("Pose estimation
+  failed": a waving arm, a prop merged into the body, a non-humanoid shape)
+  ended with an error and no output after the build had succeeded. The
+  bundled agent (0.3.2) now finalizes the unrigged model with the refusal on
+  record, and the Meshy provider's error says what the refusal means and what
+  usually fixes it (an upright A-pose character with limbs apart, built from
+  several views) instead of reading as a malformed request.
+- A run title that came back as a markdown heading kept its `#`; the marker is
+  stripped like the quotes around a title are.
+- `lev run --help` said the bundled coder's plan approval holds an unattended
+  run for a person; it resolves as approved, and the help now says so.
+
+- A produced part the run could not keep (over `[mime] max_part_bytes`, or a
+  world with no store) vanished into a line in the reply and nothing else; the
+  stage log and the daemon log now say what was dropped and why, so a stage
+  left with nothing to hand back reads as a ceiling rather than a model that
+  made nothing. (#841)
+
+- `mime-unseen` fired on every stage of a media pipeline, since a drawing
+  stage cannot see the mesh region and the build stage cannot see the images:
+  that is the runtime handing each model its stand-ins, as designed. It is
+  now information when a stage's models see some of what it takes, and a
+  warning only when they see none of it. (#841)
+
+- `unbounded-percentage-budget` measured every percentage region against the
+  Meshy provider's 64-million-token "window", which is the ceiling its REST
+  call takes a mesh under, not a context window. A model that does not write
+  text no longer counts toward the widest declared window. (#841)
+
+- `lev blobs` and `GET /api/agents/{id}/blobs` reported a stored part's
+  native token estimate (2.4 million for a 9 MB mesh) as its `tokens`; the
+  figure is now what the region charges it, its stand-in. (#841)
+
+- The title call no longer tries a model that does not write text. A run whose
+  entry stage is a Meshy operation or an image model put that model at the
+  head of the title chain and spent a failover step (for Meshy, a real job
+  submission) learning it cannot write a sentence. (#841)
+
+- A stage whose name carries a hyphen could never be chosen by the router: the
+  routing reply was split on every non-word character, so `generate-more`
+  became `generate` and `more`, matched no edge, and the run advanced along
+  the first edge declared instead - silently, and on every decision. A hyphen
+  now stays part of the word, the way an underscore always did. (#840)
+
+- A stage that showed a model pictures starved every stage after it of output.
+  The window's prompt calibration compared the provider's bill with the
+  window's estimate, but the window charges a stored part its one-line
+  stand-in while a model that takes the bytes is billed the image's real cost;
+  the gap was learned as a permanent "shortfall", and a later text-only stage
+  was then budgeted as if its prompt filled the window - replies capped near
+  zero, a `submit_output` cut off mid-argument three times, the run failed. The
+  cost of the parts a request sends as bytes is now known at dispatch and comes
+  off the bill before the comparison. (#839)
+
+- The parts a reply produced landed in their routed region as one entry, so a
+  stage that had to drop one bad render among nine could only drop all nine -
+  and kept a stock photo in the set a mesh was built from rather than do that.
+  Each routed part is now its own entry, keyed by the part's name, so
+  `context_delete` and `context_read` can name it the way `context_list` shows
+  it. (#839)
+
+- `context_read` with a `key` on any region other than a hashmap returned the
+  whole region; it now returns the named entry, or `[not found]`, and takes an
+  `index` for an unkeyed entry the way `context_delete` does. (#839)
+
+- The bundled `sprite-to-3d` reference stages judge likeness, not just parts. A
+  render could carry every accessory and still be the wrong character: the prep
+  stage now checks its anchor view against the art for face, expression,
+  proportions and outfit before drawing the views that must match it; the
+  critique stage logs a wrong likeness or a changed garment as a serious item;
+  assess-coverage builds only from four usable views (the builder symmetrises
+  what it cannot see) and cannot leave without writing the build hints; long
+  hair, tails and capes are drawn clear of the body so the builder does not
+  fuse them to it; and the verify stage rejects a model missing a one-sided
+  signature part the source shows. (#840)
+
+- The bundled `sprite-to-3d` filter stage is told what the builder actually
+  uses - the first four images in its region, in listing order - and keeps at
+  most four, with the iteration room to prune a busy pass one render at a
+  time. A model the verify stage rejects goes back through the reference loop
+  (draw, filter, critique) rather than straight to a rebuild: the builder only
+  sees the reference views, so a rebuild from the same four with the same
+  settings returned the same model, twice, at ultra-mode cost. (#839)
+
+- A run could not be started with an attachment over about 6 MB: the daemon's
+  control socket capped a request at 8 MiB, a spawn carries its attached files
+  as base64 on that one request, and a 7 MB mesh - an ordinary Meshy output -
+  was cut mid-line and refused as `invalid request: EOF while parsing a string`,
+  from `lev run --attach` and from the API's multipart upload alike (which had
+  accepted the file). The cap is now 64 MiB, enough for a file at the
+  `[mime] max_part_bytes` ceiling, and a request that still exceeds it is
+  refused with a message that names the limit. (#837)
+
+- A Meshy stage whose prompt or animation action lived in a pinned region (the
+  `task` region a caller fills) never saw it: the operations read only message
+  text, and a pinned region renders into the system prompt. So the bundled
+  `model-to-animated-model` applied its default walk whatever action the task
+  named, and a `text-to-3d` or `retexture` fed from a pinned region refused for
+  want of a prompt. With no message text the operations now read the stage's
+  pinned regions (never the runtime's own instruction block), and `animate`
+  takes an `action` parameter beside `texture_prompt` for a stage that wants to
+  pin the clip. (#837)
+
+### Changed
+
+- The default ceiling on stored media carried in one model request is now 20 MiB
+  rather than 64 MiB. Several vendors reject a request whose image content
+  exceeds about 30 MB, and 64 MiB sat above that, so a request heavy with images
+  hit the vendor's hard error instead of the runtime's own backstop; at 20 MiB
+  the oldest media becomes stand-ins before the vendor limit is reached. Raise it
+  in `[mime]` for a provider that allows more (#400).
+- A stage that produces an image now notices when the model replies with text
+  and no image, which usually means the image generation failed or was refused.
+  It sends the model's own words back so the retry is informed, and after a few
+  such replies it lets the stage end rather than looping. The reply's text
+  often carries the reason, so it is no longer lost (#400).
+- An image a model draws is now named after its own content,
+  `image-<sha>.png`, rather than its position in the reply. Two images drawn in
+  different turns no longer collide on `image-1.png`, so a later stage can point
+  at one exactly to keep it or drop it, and byte-identical images share the one
+  name the run's blob store already dedupes them to (#400).
+- The bundled `sprite-to-3d` agent now draws a front T-pose and matching back
+  and side views, keeps the best of each and drops the rest, builds one model
+  from all the views with Meshy (symmetry off, so an arm cannon survives), and
+  checks the result against the views before finishing, rebuilding a bounded
+  number of times if it drifted (#400).
+- The dashboard stage graph reads more clearly. A stage that can end the run
+  shows a `⏹` in its box's top-right corner instead of a `can end` badge on the
+  crowded detail row; the row now names what the stage takes and hands back as
+  `in text · <types> · out text · <types>`, with text always shown; and a box
+  grows to fit its own in/out on a left-to-right graph, so a stage with several
+  types is wider without widening every other box (top-to-bottom and wrapped
+  graphs keep a uniform width) (#400).
+- `--yolo` takes an optional profile, `--yolo=<name>`, on `lev run` and
+  `lev agent-client`. The equals sign is required, so `lev run --yolo coder`
+  keeps meaning "run coder, plain yolo". The bare flag is unchanged.
+- `default_model` is two settings now, named for what they do. `override_model`
+  is what `default_model` was: while set, every stage that allows a user
+  default starts on it, ahead of the models its blueprint names. `fallback_model`
+  is new and is what the old name promised: tried after every model a stage
+  names and before `[providers] fallback_order`, so it carries a stage none
+  of whose own models is configured here and never moves a stage off a model
+  its blueprint chose. Unset is the valid default for both. A config written
+  before this loads its `default_model` as `fallback_model`, which is a change
+  of behaviour for that install: stages go back to their blueprint models. The
+  load says so, `lev doctor` warns, and `lev update` rewrites the key with the
+  user watching; setting `override_model` restores the old behaviour (#795).
+- A run says when one of those settings moved a stage off the model its
+  blueprint named: one `[model] stage 'fix' starts on openrouter/deepseek-v4-flash
+  (override_model); blueprint asked for openrouter/deepseek-v4-pro` line per
+  stage in the run's log at spawn, so it reaches `lev run` output, the
+  dashboard and the journal. A stage that starts on its own first choice says
+  nothing. `lev validate` prints `override_model` and `fallback_model` beside
+  `default_provider`.
+- `GET /api/config` reports `override_model` and `fallback_model` in place of
+  `default_model`, both always present and `null` when unset; `PUT
+  /api/config` takes both with the same three states (absent, `null`, a
+  string) and the same empty-string refusal. `default_model` is gone from the
+  API. `lev setup --default-model` is `--override-model`, with
+  `--fallback-model` beside it. In the wizard both settings sit on the
+  advanced tuning screen, as Override model and Fallback model, so the main
+  screen asks only for providers and their order. The embedding builder's `default_model(provider, model)` is
+  `override_model(provider, model)`, `default_provider(provider)` sets the
+  provider alone, `fallback_model(model)` is the new setting, and the old
+  `fallback_model(provider, model)` that appended to the failover chain is
+  `fallback_route(provider, model)`.
+
+### Added
+
+- A stage can route the parts a model produces to regions of their own, by mime
+  type. `[stages.<name>.output_routing]` maps a mime pattern to a region
+  (`"image/*" = "artwork"`); a reply that mixes text and other parts is split
+  part by part, each part going to the most specific matching pattern's region,
+  and the text and any unmatched part staying in `conversation`. The point is to
+  hand a produced file (a picture from an image model, a document a generator
+  returns) to a later stage or the user instead of leaving it in the transcript,
+  so unlike `tool_routing` the target need only be a region the blueprint
+  declares. It is mime types throughout, so the same table routes audio, video
+  or any registered type (#400).
+- A stage can empty regions when it is entered, for a clean slate.
+  `[stages.<name>.context] reset = ["conversation"]` clears the named regions on
+  entry (the content is gone, not merely hidden), so a stage starts with only
+  what its visible regions hold. Unlike `hide`, `reset` may name `conversation`
+  (#400).
+- `submit_output` can name a file the run produced but never wrote to disk (a
+  picture from an image model, which lives in the run's store) as an artifact.
+  When the path is not a workdir file, the name, then a sha256 prefix, is
+  resolved against the run's produced parts, and a match is written to that path
+  before it is recorded, so the user and any later stage get a real file (#400).
+- A run's file listing types each entry. `GET /api/agents/{id}/files` entries
+  carry a `mime_type`, resolved by the run's registry from the file's name, so
+  a console can decide whether to render a file, or offer it to a region that
+  `accepts` a type, without a request per row or a guess of its own. Typed by
+  extension only (not sniffed) and empty for a directory; `.../files/raw` still
+  sniffs the bytes when an exact answer is needed. Announced as
+  `runs.files.mime_type` (#812).
+- Named yolo profiles. `lev run --yolo=<name>` runs under a profile from
+  `yolo.toml` beside `config.toml`, which says which tool calls run unprompted,
+  which still go through the ordinary approval prompt, and which are refused,
+  per tool (names, globs, `@groups`) and per shell command (word globs, with
+  `args` scoped to paths that resolve inside a tree), and whether the model's
+  questions, the stage checkpoints and the taint gate still reach a person. A
+  profile never lifts a configured deny. The file is read at spawn and when a
+  run resumes, so edits need no daemon restart; a child, a fan-out worker and a
+  restarted run inherit the name. `lev yolo list|show|test|init` reads and
+  tries the file, and `GET /api/yolo`, `GET /api/yolo/{name}`,
+  `POST /api/yolo/test` and the admin-only `PUT /api/yolo` do the same over
+  HTTP. `POST /api/agents` takes `yolo_profile`, which `--no-remote-yolo`
+  refuses with `yolo`.
+- `[security] lock_permission_files`, on by default: a run's `write_file`,
+  `edit_file` and `shell` calls that name `config.toml`, `yolo.toml`, the taint
+  policy and its rules, or the `providers/` and `tools/` script directories are
+  refused before any policy is consulted, `--yolo` or not, and a seed at spawn
+  is held to the same rule. An agent could otherwise widen what its next spawn
+  is allowed to do from inside a run.
+- Typed mime parts. A region entry, a tool result, a user message, a model
+  reply and a final output are each a list of parts, and a part is one piece
+  of content with a mime type: a paragraph, a PNG, a WAV clip, an MP4, a PDF,
+  an OBJ model. Text is a part like any other; its bytes travel inside the
+  entry, while any other part is stored once under `<run>/blobs/<sha256>` and
+  referenced by hash everywhere else, so the journal and `context.json` never
+  grow by a file's size. What a type *is* comes from a mime registry rather
+  than from code: the compiled defaults, then `[mime_types]` in the config,
+  each row naming a family, whether the bytes are text, a token rule,
+  extensions, a magic prefix and a stand-in template, and `[mime]` sets the
+  size ceilings. `lev doctor` reports a row that will not load. A region says
+  what it takes with `accepts = ["text/*", "image/png"]` and is bounded by its
+  token budget; a region with a `schema` takes text only. A snapshot or journal
+  written before this reads back unchanged, since a plain string is still how a
+  text-only entry is written (#400).
+- Every model says what it takes and what it can hand back, as mime type
+  patterns. The built-in tables know that Claude reads images and PDFs, that
+  Gemini also takes audio and video, which OpenAI models see, hear or draw,
+  and which Ollama builds are vision models; OpenRouter's listing corrects
+  that from its `architecture` block and Ollama's `/api/show` from its
+  `capabilities`; `[model_capabilities.<id>] input_types / output_types`
+  correct both, and a Rhai provider declares `// @input_types` and
+  `// @output_types`. For the vendors whose APIs report nothing per model,
+  the precise lists live in a compiled table refreshed from OpenRouter's
+  catalogue by `cargo xtask modalities`, as `cargo xtask prices` refreshes
+  list prices, so a model that takes images but not PDFs is described as
+  such rather than by a whole-vendor guess. `lev models` shows a `MIME`
+  column and takes `--accepts image/png`, `lev models show` prints both
+  lists, and `GET /api/models` carries `input_types` and `output_types`
+  (#400).
+- A stored part reaches the model. Assembly emits a mime block per stored
+  part beside a one-line stand-in that names it, and the inference lane
+  fills the bytes in right before the request goes out: as the vendor's own
+  image, audio or document block when the model's input types cover the
+  part, as text when the registry says the bytes are text (a `model/obj`
+  file goes to any text model as text), and as the stand-in alone
+  otherwise. A region that renders into the system prompt has its stored
+  parts lifted into one leading user message, so the prefix still caches.
+  Anthropic gets `image` and `document` blocks, the OpenAI-shaped providers
+  `image_url`, `input_audio` and `file` parts, Codex `input_image` and
+  `input_file`, and a Rhai provider the neutral `mime` block with the
+  base64 in `data`; the Claude Code transport and every lane that does not
+  hydrate send the stand-in. The journal and `context.json` never hold
+  base64. `[mime] max_media_bytes_per_request` caps the bytes of stored media
+  one request carries, oldest sent as stand-ins first, a backstop for the
+  vendor request-size limits a token budget cannot see (#400).
+- Stages declare typed inputs and outputs. `[stages.<name>.input] accepts`
+  states what a stage takes as parts (else the union of its visible regions'
+  `accepts`), and `as_text` names types whose parts reach the model as text
+  whatever it takes; a stage listing several models is resolved onto the one
+  that can see what it takes. `[[stages.<name>.output.artifacts]]` declares
+  the files a stage hands back by `name`, `type`, `required` and
+  `description`, and `submit_output` takes each as a path or as
+  `{ name, path, type }`: every file must exist inside the working
+  directory, a required one that is missing or a declared one of the wrong
+  type is refused back to the model, and each accepted file is typed,
+  hashed, stored as a part of the run and mirrored into `final_output`.
+  `artifacts` on the answer, in `meta.json`, on `GET /api/agents/{id}/result`
+  and on the completion webhook is now a list of `{ name, path, mime_type,
+  size, sha256 }` rather than paths; an answer recorded before this reads
+  back with each path's file name and an unknown type. `lev result` lists
+  them with their types and hashes, `lev validate` prints what each stage
+  takes and hands back and warns `mime-unseen` when a stage's models cannot
+  see a type its regions take (#400).
+- Rhai scripts handle parts. A script tool reads a stored part's bytes with
+  `read_part(name)` (by file name or hash prefix), stores new bytes with
+  `write_part(bytes [, type [, name]])`, sees what the run holds with
+  `list_parts()` and `find_part(name)`, and returns `#{ content, parts }`
+  to hand parts back on its result; `// @accepts` and `// @produces`
+  declare the types it takes and makes, which `lev tools` shows. The parts
+  a tool can name are the ones in the agent's context when the batch was
+  dispatched plus what the batch wrote. A custom region's `entries[i]`
+  carries `parts`, and a stage hook's `ctx.parts` lists each region's
+  stored parts (#400).
+- A tool result is text plus any stored parts the tool produced, all the
+  way through: the tool lane, the routed region entry, the journal's
+  `ToolCallDone` record (a plain string when it is text alone, so every
+  journal written before this reads back unchanged) and the crash-resume
+  replay. `read_file` on a file that is not text stores it as a typed part
+  rather than failing, an MCP server's `image`, `audio` and blob-carrying
+  `resource` blocks are decoded and stored beside its text, and a
+  `resource_link` is described with its URI and type. Two context tools
+  move bytes the other way: `context_attach` puts a workdir file into a
+  region as a part, with a caption and a key so a newer version replaces
+  the older, and `context_export` writes a stored part back into the
+  workdir by file name or hash prefix (#400).
+- Files reach a run over HTTP. `POST /api/agents` and `POST
+  /api/agents/{id}/message` take `multipart/form-data` (a `request` field
+  of JSON plus file fields named `part` or `part:<region>`), a JSON `parts`
+  list naming files inside the run's working directory, and `@path` tokens
+  in the task, a region's text or a message, resolved inside the working
+  directory. `GET /api/agents/{id}/blobs` lists the stored parts a run
+  holds and `/blobs/{sha256}` serves one under its own content type, `GET
+  /api/agents/{id}/files/raw?path=` serves a workdir file the same way, and
+  `GET /api/mime` lists the effective mime registry. Both byte routes
+  advertise `Accept-Ranges: bytes` and answer a single `Range` request with
+  `206 Partial Content` and a `Content-Range`, so a client can scrub or
+  resume. `[serve] max_upload_bytes` (32 MiB by default) bounds a request
+  body and is reported under `limits`. Announced as `spawn.parts`, `messages.parts`,
+  `runs.blobs`, `runs.files.raw`, `runs.result.artifacts` and
+  `mime.registry` (#400).
+- The mime registry can be written over HTTP, not only read. `PUT /api/mime`
+  adds a row to `mime_types.toml` beside the config, or sets the fields sent
+  on the one already there, and `DELETE /api/mime?mime_type=` takes one out -
+  the same file and the same validation `lev mime add` and `lev mime remove`
+  use, so a console can create the custom type a region, a stage input or a
+  declared artifact names without handing the operator a block of TOML to
+  paste. Both need `--allow-admin` and are announced as `mime.write` (#814).
+- Files reach a run from the command line. `lev run --attach
+  path[:region][:type][:text]` puts a file in a region as a typed part, a
+  `--<region> @file` whose bytes are not text attaches instead of seeding,
+  and a `@path` inside the task or a region's text attaches that file to
+  the same entry while the text keeps the name. `lev msg --attach` and a
+  `@path` in a message do the same for a running agent, with the files
+  landing beside the words as one entry. The control socket's spawn and
+  message requests carry `parts` (base64 on the wire), the daemon stores
+  each one under the run's `blobs/` and writes the reference into the
+  region, and a region that refuses the part's type or is over `[mime]
+  max_part_bytes` refuses the spawn by name, or drops the part from a
+  message and keeps the text (#400).
+- Files come back out from the command line. `lev result --artifact <name>`
+  streams one produced file to stdout, `--out <dir>` writes every produced
+  file (or the named one) into a directory, and `--open <name>` hands one
+  to the operating system; the bytes come from the run's store when the
+  answer recorded a hash, else from the working directory. `lev blobs
+  <run>` lists every stored part a run holds with its type, size, shape,
+  tokens, hash and regions, and `lev blobs <run> <name-or-hash>` fetches
+  one to stdout, `--out` a path, or `--open`. `lev mime list` prints the
+  effective mime registry with each row's source and `lev mime check
+  <file>` says what a file resolves to and how a model would see it. `lev
+  context --full` shows each stored part as its own row (#400).
+- A text answer to a question carries files. `lev respond --attach` and a
+  `@path` in the answer, a `@path` in a reply typed on the dashboard, and
+  `parts` or a multipart upload on `POST /api/agents/{id}/interaction` all
+  put typed parts on the answer; the run stores them and writes them beside
+  the words in the tool result, so the model reads the file where the
+  answer mentions it. A choice or an approval refuses files. The dashboard
+  shows an unfolded entry's stored parts as rows of their own in the
+  Context view, opens one with the operating system on `v` and writes it
+  into the run's working directory on `w`, lists the files a run produced
+  under its answer in the Final view, and attaches the files a task names
+  with `@path` when a run starts from the new-run screen, counting them on
+  the task box as you type. The new-run screen's Inputs pane gives a file
+  region a picker of the working directory, filtered to the types the region
+  accepts, so a file reaches a region by being chosen rather than named and
+  never with an `@`; a region takes as many files as its token budget allows,
+  added and removed in the picker. How many that is comes from the budget, not a
+  fixed count: the row and the picker name the budget (`≤117k tok`, the region's
+  share of the entry model's context window), each candidate shows its own token
+  cost, and a file that would overflow the budget is refused with the reason.
+  The run is stopped with a named error rather than started with a region that
+  cannot hold what it was given (#400).
+- The stage graph shows the mime a stage takes beyond text (`◧ image/*
+  audio/wav`, from its regions' `accepts` or its `[input] accepts`) and the
+  files it declares it hands back (`▤ video/mp4`), in the explorer, the
+  new-run preview, the agent editor and `lev validate --graph` alike. A path
+  whose file the next stage's regions cannot take carries `!` on its label,
+  and the explorer's caption names the type that would cross as a stand-in
+  (#400).
+- The operator's mime rows live in `mime_types.toml` beside `config.toml`,
+  the way yolo profiles live in `yolo.toml`: a key per type with the same
+  fields as before, layered over the compiled defaults and over a
+  `[mime_types]` table in the config, which still loads. `lev mime init`
+  writes a commented example, `lev mime list` names the file as a row's
+  source, `lev doctor` names it when it will not load, and
+  `lock_permission_files` keeps a run's tools out of it. An edit reaches
+  the next run without a restart (#400).
+- Every run types its bytes by its own copy of the mime registry: the
+  operator's rows with the blueprint's own `[mime_types]` layered on top,
+  built at spawn and read by the tools, the request builder and the message
+  path alike. A blueprint's rows reach that agent's runs only, are checked
+  when the manifest is parsed (a misspelled field fails `lev validate` and
+  the spawn), and travel with the agent (#400).
+- An edit to `mime_types.toml` or to `[mime_types]` in the config reaches
+  runs already under way, not only the next one. The daemon re-reads both on
+  its own timer, every thirty seconds, and rebuilds every live run's registry
+  over the new rows; a new run reads them as it spawns (#400).
+- A mime row may name a `check`: a Rhai script beside the file that names
+  it whose `check(bytes, mime_type)` refuses bytes that are not what they
+  claim. It runs once, where bytes are stored, so an upload, a tool result, a
+  `read_file`, a model's reply and a `submit_output` artifact are all refused
+  with the reason when they fail it; a check that cannot run refuses too. The
+  operator's checks are compiled when the registry is built and reported by
+  `lev doctor` when they will not load; a blueprint's at spawn, fenced to the
+  blueprint's directory like its other scripts. Nothing checks the bytes of a
+  type whose row names no check, as before (#400).
+- `lev mime add <type>` writes a row into `mime_types.toml` from flags
+  (`--family`, `--text`, `--tokens`, `--extensions`, `--magic`, `--stand-in`,
+  `--check`) and sets the fields given on a row that is there; `lev mime
+  remove <type>` takes one out; `lev mime show <type>` prints one type as
+  the registry resolves it. The file is checked before it is written. `lev
+  mime list` gains a check column and `lev mime check <file>` runs the
+  type's check over the file and prints the verdict. `lev mime init` says
+  in its help that it is optional (#400).
+- `mime_check` is a sixth `kind` on the scripts routes (`GET /api/scripts`,
+  `GET/PUT/DELETE /api/scripts/mime_check/{name}`, `POST
+  /api/scripts/validate`): the operator's checks are listed and addressed
+  relative to the config's directory, a blueprint's beside the agent with
+  `?agent=`. `scripts.mime_checks` in `capabilities` says so. `lev validate`
+  prints the rows a blueprint adds, the dashboard's type chooser offers them,
+  and a new `mime-type-overrides-builtin` lint warns when a blueprint row
+  changes the family or the text flag of a built-in type (#400).
+- `[stages.<name>.tool_accepts]`: what each tool may be handed at a stage,
+  as `tool = ["image/*"]`. A stored part outside the list is out of that
+  tool's reach there: `spawn_agent`'s `parts` refuses it by name, a script's
+  `list_parts` leaves it out and its `read_part` names the limit, and
+  `context_export` refuses it the same way. Inline text is never hidden.
+  `lev validate` prints each stage's limits and warns
+  (`tool-accepts-ungranted`) about a limit on a tool the stage does not
+  grant (#400).
+- The dashboard's new-run screen has an Inputs box: one slot per region the
+  blueprint takes from the caller beyond the task. A file typed there is
+  attached to that region as a typed part, the way `lev run --pictures
+  @photo.png` is, and text seeds it, so a picture no longer has to ride in
+  the task region to reach an agent from the dashboard. `Tab` from the
+  agent list stops there when the agent has such regions (#400).
+- The dashboard's agent editor is laid out around what moves through a
+  stage. Its tabs are *Behaviour*, *Inputs & outputs* (the regions the
+  stage reads and what each takes, what it takes beyond them and reads as
+  text, the answer's format, the files it hands back), *Models & tools*
+  (the chain, the tools, and what each tool may be handed at the stage)
+  and *Context & tools*. A region, a declared file and a loop's path open
+  in a window over the editor instead of replacing the inspector, and every
+  mime type field is one chooser of the families, every type the registry
+  knows and a typed `type/subtype`. The keys round-trip the way the
+  runtime reads them, and the graph beside the inspector wears the badges
+  as you edit (#400).
+- `lev agent-client` advertises `image` and `audio` prompt capabilities. An
+  image or audio block's bytes, and a `resource` block's `blob`, become
+  parts on the task region (or on the message, on a later prompt), a prompt
+  that is only files gets a line naming them, and a `resource_link` is
+  named in the text: one whose `file://` URI points inside the session's
+  working directory is read there and rides along as a part, marked as
+  attached, and any other is marked as not fetched. The files a run produced
+  follow its answer as `resource_link` blocks with a `file://` URI into the
+  session's working directory. Embedders get the same: `SpawnSpec::attach`,
+  `AgentWorld::send_message_with`, `InteractionResponse::with_parts`, and
+  `artifacts` on the answer (#400).
+- Mime a model produces comes back as parts. An OpenAI-shaped provider
+  reads data URIs off the reply (OpenRouter's `images` list, `image_url`
+  items in a content array, streamed or not) and a Rhai provider returns
+  them under `parts`; the runtime stores each one and writes it beside the
+  reply's text on the assistant turn, named as the provider named it, so
+  the next request, `lev blobs`, the dashboard and the API all see it. What
+  the run cannot keep is described in the reply instead. `perf-tools/mock.py`
+  draws a PNG with `LV_MOCK_IMAGE=1` (#400).
+- `spawn_agent` takes `parts`: stored parts of the parent run, by name or
+  sha256 prefix, read from the parent's store and put on the child's task
+  region as typed parts, delivered as the parent's were. A name that matches
+  nothing, or bytes the store has lost, refuses the spawn by name. A
+  compaction that replaces entries carrying stored parts with a text summary
+  names the parts it dropped in the run log; the bytes stay in the store
+  (#400).
+- The bundled `reviewer` (0.2.5) takes screenshots: a `screenshots` region
+  accepting `image/*`, filled with `--attach shot.png:screenshots` or a
+  `@path` in `--criteria`, that the scan and deep-review stages read as the
+  caller's evidence of intent or breakage (#400).
+- A renamed-key table (`config/renamed.rs`) that every surface reads: the
+  loader respells an old key in the file text before parsing, so a type
+  error still points at its line; the unread-key warning does not report it;
+  `lev doctor` warns with the same notice; and `lev update` lists it under a
+  `renamed-keys` migration and rewrites the file. The next rename is one
+  entry in that table. `Migration::apply` now receives the raw document too,
+  so a migration can quote a key that serde no longer reads.
+
+- The agent editor's *Inputs & outputs* tab reads as inputs and outputs:
+  an *Input types* row (the stage's own, or what its regions take, with the
+  regions listed under it), *Sent as text*, an *Output type* picked from
+  the plain shapes and the mime registry rather than typed, and one
+  *Output file* row per declared file. A fan-out's worker is picked from
+  the agent's other stages or the installed agents instead of typed, with
+  an *another…* row for an agent that is not installed here (#400).
+- The agent editor's tools chooser offers MCP servers. Every `[[mcp_servers]]`
+  in the config, and in the agent's own manifest, is a row that grants the
+  server whole (`available_connectors`), and each server is asked for its
+  tools when the Agents screen opens, so its tools appear one by one under
+  their `server__tool` names as the answers land; a server that could not
+  be asked says why on its row. A stage's tools row shows both (#400).
+
+### Removed
+
+- The opt-in Azure Artifact Signing step on the alpha build, along with the
+  `id-token` grant that existed only for it. It was never configured, so every
+  `lev.exe` to date shipped unsigned and nothing changes for users. The version
+  resource in `lev.exe` stays. Should signing ever be wanted, the SignPath
+  Foundation route in CONTRIBUTING is the one to add.
+
+### Fixed
+
+- An OpenRouter model that refuses the temperature parameter outright no longer
+  fails the run. A reasoning or image model reached through OpenRouter can reject
+  temperature with "Unsupported parameter: 'temperature' is not supported with
+  this model" (the catalogue lists temperature for it anyway, since that
+  describes the gateway, not the backend). Two gaps let this fail a run: the
+  retry that drops temperature and resends only recognised "does not support" (a
+  refused value), not this "is not supported"/"unsupported" wording (the
+  parameter refused); and the retry lived only on the buffered path, so an image
+  model reached by streaming never got it. Both are fixed - the wording is
+  recognised, and buffered and streaming share one retry helper - so the request
+  is resent without temperature and the model is remembered, and the rest of the
+  run omits it up front (#400).
+- A model that hands back the same file twice in one reply is stored once. Some
+  image gateways (gemini-3-pro-image) return several byte-identical copies of a
+  picture in a single call; the store is content-addressed, so the copies were
+  already one file on disk, but each was kept as its own part and sent back to
+  the next stage. Byte-identical produced parts are now de-duplicated, keeping
+  the first. Parts that merely look alike but differ in any byte are untouched
+  (#400).
+- An image a stage drew reached the next stage, and an image-output model drew
+  the subject it was asked for. Two faults in how typed media crossed a stage
+  boundary made an image agent draw the wrong picture and then describe a
+  different one:
+  - `google/gemini-2.5-flash-image` ignores the system prompt and generates
+    from its user turn, but a stage's prompt lands in the system blocks with a
+    bare `Begin.` user nudge - the convention that makes a text model act - so
+    the model drew the nudge: "draw a rabbit" came back as a generic "start of
+    a journey" landscape. A model that does not read the system prompt now has
+    it folded into the first user turn, so the model generates the asked
+    subject. Whether a model reads the system prompt is the existing
+    `supports_system_prompt` capability (settable per model in
+    `[model_capabilities]`); no catalogue distinguishes the image model that
+    ignores it from the one that honours it, so that one is a compiled one-off.
+  - A model-produced image rode the assistant turn that made it, and a provider
+    refuses or ignores an image inside an assistant turn (Anthropic answers
+    `400: 'image' blocks are not permitted within assistant turns`), so the
+    next stage never saw it and described the task text instead of the picture.
+    A produced image is now lifted into a following user turn, where the next
+    stage's model actually sees it.
+- A run's `modified_files` missed a file a `shell` command created. Only a
+  modifying tool that names a `path` (`write_file`, `edit_file`) was recorded,
+  so an agent whose whole job was to draw a chart or build an artifact with a
+  script left "what it changed" empty or naming only the scaffolding, while
+  "browse the folder" found the file plainly. Now a batch that ran a `shell`
+  call that landed scans the working directory for files modified since the run
+  began (hidden entries skipped, bounded in breadth and depth) and folds them
+  into the list. The scan adds to the list without touching
+  `modified_file_count`, which counts modifying tool *calls* - a shell is not
+  one - so a run that only shelled still reports its outputs on
+  `GET /api/agents/{id}/files?source=modified` without double-counting a file a
+  second shell call re-touched (#816).
+- The agent editor's inspector wrapped its tab strip at its usual width,
+  which cut the last tab in two and drew every row one line below where
+  the mouse map had it, so a click landed on the row under the pointer.
+  The strip shortens its titles when the full ones do not fit, labels are
+  cut to their column, and the body is never wrapped. The inspector is
+  wider, `Tab`/`Shift-Tab` walk a stage's tabs (the arrows change a row in
+  place, as they do on every other panel, and `Esc` goes back to the
+  graph), a live row's label is no longer drawn in the dim colour that
+  meant "cannot be edited", a chooser keeps a long name clear of the
+  note beside it, a button row is its label with nothing in front of it,
+  and a stage's *Move up / down in the file* buttons are gone (the paths
+  decide the flow, so the order in the file changed nothing) (#400).
+- Starting a run from the dashboard that named a file with `@path` in the task
+  attached that file twice: the screen resolved it against its working
+  directory and the daemon resolved the same token again. A spawn now drops an
+  exact repeat (same region, name and bytes), so the model sees the picture
+  once. A file attached to two regions, or two different files, is unaffected
+  (#400).
+- `lev validate` warns (`blueprint-permission-clamped`) when a stage sets a
+  granted tool more permissively than its built-in default, which a downloaded
+  blueprint cannot do on its own: the runtime clamps `shell = "allow"` or
+  `write_file = "allow"` back to its default, so the tool still asks. The line
+  looked like a decision and silenced `implicit-shell-policy` without doing
+  anything; the warning names how to make it stick, or to drop it (#400).
+- A Rhai provider ships the mime types its models are built for, with a
+  `// @mime_type <type> family=... [text=...] [extensions=...] [magic=...]`
+  annotation, repeatable. The rows layer into every run's registry under the
+  built-in table, so a run that resolves onto the provider knows the type,
+  and the operator's config and a blueprint still win over it. `lev mime list`
+  shows each with a `provider:<name>` source (#400).
+- A model that cannot call tools (an image model such as Nano Banana, whose
+  listing says `supports_tools = false`) was sent every tool call and result
+  an earlier stage had left in the shared conversation, and its provider
+  refused the request outright ("Function calling is not enabled for this
+  model"), so a generate stage that a review stage looped back to died on
+  its second visit. Such a model now gets that history as prose, what was
+  called and what came back, and is advertised no tool whatever the stage
+  granted (the run log says so), so an image model can sit inside an
+  iterating graph (#400).
+- The test suite's blueprint route tests wrote their `test-bp-*` blueprints
+  into the developer's real `~/.leviath/agents`, and one that failed before
+  its own clean-up left them there. They run in a temp dir of their own now,
+  through the same kind of test-only path override the MCP routes use.
+- The crates.io publish on a stable release stopped at `leviath-alloc`. An
+  August hygiene commit marked the crate `publish = false` while the prod
+  workflow's publish loop still named it and `leviath-cli`'s default allocator
+  feature still pinned it by version, so the 0.5.8 release published
+  `leviath-net` and then retried a refused publish for thirty minutes before
+  giving up, leaving every other crate at 0.5.5 on the registry. The crate is
+  publishable again (it had shipped there through 0.5.5 already), and
+  `cargo xtask version --check` now reads each member's manifest and refuses
+  a `publish = false` crate that the publish loop names or that another
+  manifest pins by version.
+- The publish loop's order was also wrong for the current dependency graph:
+  `leviath-agent-client` sat before `leviath-tools`, which it tests against,
+  and cargo resolves dev-dependencies when packaging, so the publish would
+  have failed there next. The loop is reordered, and the same check now
+  reads every member's dependencies and refuses a list that names a crate
+  before one it depends on. The rest of 0.5.8 was published by hand from the
+  tag in that order.
+- `lev add` on a bundle file installs the blueprint under the name its
+  `agent.leviath` declares. It used the file's stem, and `lev pack` names its
+  output `<name>-<version>.leviath-bundle`, so installing a packed `coder`
+  put `coder-1.2.0` on disk: `lev list` and the API showed `coder`, because
+  they read the manifest, while `lev run coder`, `lev validate coder` and
+  `lev remove coder` looked for a directory that was not there. The file's
+  stem is now only the fallback for a bundle whose manifest declares no name,
+  and a manifest name that is not a plain directory name is refused the same
+  way a directory install refuses it. An install made before this fix keeps
+  its old directory; `lev remove <name>-<version>` clears it.
+
+## 0.5.9 - 2026-09-02
+
+### Added
+
+- `[providers] provider_order`, an ordered list of provider names, best
+  first, that decides which configured provider serves a blueprint model
+  named without one. It generalizes `default_provider` into a full ordering;
+  left empty, resolution is exactly what it was. Naming a subscription
+  transport (Codex, Claude Code) in the order is the deliberate opt-in that
+  lets a plan win a bare model name at the priority it is listed. Every
+  surface that writes config learned it: `GET /api/config` reports the
+  order and `PUT` replaces it, `lev doctor` flags an entry naming no
+  configured provider, and the config and OpenAPI schemas describe it.
+- `lev providers`, which lists the configured providers with the current
+  order, and `lev providers order <name>...` / `--clear` to set or drop it
+  from the command line. An unknown name is refused with the known list
+  rather than persisted as a silent no-op.
+- The setup wizard's Defaults screen replaces the single "Default provider"
+  chooser with a "Provider priority" list arranged in a drag-to-reorder
+  modal (drag a row by its grip, or move it with Shift+arrows or K/J); the
+  head of the order is written as `default_provider`.
+- `install_tool`, a built-in that persists a Rhai tool to `~/.leviath/tools`
+  so every future run can use it. Nothing an agent could do reached that
+  directory before. It compiles the script first and refuses a reserved or
+  malformed name, a `@tool` directive that disagrees with the name, an empty
+  `@description`, an oversized source, an existing script without
+  `overwrite`, a symlinked destination, or a `<name>.toml` sibling whose
+  `[tool]` name differs. The written file leads with a provenance line
+  naming who installed it and when. Like `write_file` and `shell` it
+  defaults to `ask`.
+- Tool groups in `available_tools`. An entry that starts with `@` grants a
+  whole kind of tool rather than one: `@builtin` (every compiled-in tool),
+  `@subagent`, `@scripts` (every Rhai tool, the agent's own and the global
+  ones), `@mcp` (every tool every connected server advertises) and `@all`.
+  Groups and names mix, so "every built-in plus these two scripts" is
+  `["@builtin", "summarize", "cite"]` and "everything" is `["@all"]`. A group
+  is resolved when the stage runs, so a script or MCP server added later is
+  offered without editing the manifest, and it grants visibility only: every
+  tool it reaches still goes through `tool_permissions`, the taint gate and
+  the approval prompts. `submit_output` and `fan_out` are never granted by a
+  group. `lev validate` refuses an entry that looks like a group and names
+  none, checks `required_tools` against what the groups reach on this
+  install (`required-tool-not-granted`), and reports an autonomous stage
+  granting `@builtin` once for the group rather than once per blocking tool.
+  The dashboard's tool chooser leads with the five groups and labels each
+  tool by where it comes from, and `GET /api/tools` carries the same
+  `groups` list for other clients.
+
+### Changed
+
+- `lev --help` groups the commands under Setup and configuration,
+  Blueprints, Running agents, Inspecting runs, and Servers instead of one
+  flat list of thirty. Every command is still `lev <command>`; only the help
+  reads differently.
+
+### Fixed
+
+- The dashboard's task editor, response box, deny-with-feedback prompt and
+  in-place document edit all submit on Ctrl+S. Ctrl+Enter reaches a program
+  only under the kitty keyboard protocol; elsewhere it arrives as a plain
+  Enter, and some macOS terminals swallow it or open a context menu on it,
+  which left the keyboard no way to start a run. Ctrl+Enter still works
+  where it arrives, and the hint bars name ^S.
+- The provider-priority modal accepts K and J to move a row. Apple Terminal
+  and others strip Shift from an arrow key before it reaches the
+  application, so Shift+Up/Down was the only keyboard reorder and it was
+  unreachable there.
+- The `install_tool` summary and the Rhai tools page pointed at an
+  `available_global_tools` stage key that does not exist. Both now say
+  `@scripts`, which does what that key claimed to.
 
 ## 0.5.8 - 2026-09-01
 

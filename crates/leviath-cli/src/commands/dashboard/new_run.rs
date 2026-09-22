@@ -12,7 +12,6 @@
 //! `send_spawn` is deliberately not reused: it prints its report on stdout,
 //! which would land in the middle of the alternate screen.
 
-use std::collections::HashMap;
 use std::path::Path;
 
 use leviath_runtime::control_socket::{ControlClient, ControlResponse};
@@ -62,10 +61,21 @@ impl Dashboard {
         // setting, and one that survived out of sight is one somebody can
         // leave on and forget.
         self.new_run_yolo = false;
+        self.new_run_yolo_profile = None;
+        // The profiles as the file stands now, so a profile added since the
+        // dashboard started is on the cycle. A file that will not load offers
+        // none: a spawn naming one would be refused anyway.
+        self.new_run_profiles = crate::yolo::load_current()
+            .map(|file| file.profiles().cloned().collect())
+            .unwrap_or_default();
         self.close_file_ref();
         self.refresh_new_run_agents();
         self.select_last_launched_agent();
         self.new_run_files = collect_workdir_files(&self.new_run_ctx.workdir, FILE_CANDIDATE_CAP);
+        // Fresh slots for the agent the screen opened on: what was typed for
+        // a run already started is not what the next one wants.
+        self.new_run_inputs_key.clear();
+        self.sync_new_run_inputs();
     }
 
     /// Open on the agent last launched from here, when it is still offered.
@@ -170,19 +180,64 @@ impl Dashboard {
             self.toast("Write a task first", ToastLevel::Error);
             return;
         }
+        // The files the task names with `@path`, read from the workdir now,
+        // so a file that cannot be read is a toast here rather than a
+        // stand-in in the run. A token that names nothing stays text.
+        let read =
+            crate::commands::run::attach::inline_parts(&task, None, &self.new_run_ctx.workdir);
+        let (task, mut parts, mut unresolved) = match read {
+            Ok(read) => read,
+            Err(e) => {
+                self.toast(format!("Could not attach a file: {e}"), ToastLevel::Error);
+                return;
+            }
+        };
+        // The Inputs pane's slots, each to its own region.
+        let regions = match self.new_run_input_values() {
+            Ok(inputs) => {
+                parts.extend(inputs.parts);
+                unresolved.extend(inputs.unresolved);
+                inputs.regions
+            }
+            Err(e) => {
+                self.toast(format!("Could not read an input: {e}"), ToastLevel::Error);
+                return;
+            }
+        };
+        for token in &unresolved {
+            self.toast(
+                format!("'@{token}' names no file in the working directory; sent as text"),
+                ToastLevel::Warning,
+            );
+        }
+        let with_files = match parts.len() {
+            0 => String::new(),
+            1 => " with 1 file".to_string(),
+            n => format!(" with {n} files"),
+        };
         let _ = self.spawn_cmd_tx.send(SpawnCommand {
             agent_path: agent.path.clone(),
             task,
             workdir: self.new_run_ctx.workdir.display().to_string(),
             yolo: self.new_run_yolo,
+            yolo_profile: self.new_run_yolo_profile.clone(),
+            parts,
+            regions,
         });
         // An unattended start is the warning the toggle gave, restated at the
         // moment it takes effect; an attended one is work in flight, not done.
-        let (how, level) = match self.new_run_yolo {
-            true => (" unattended", ToastLevel::Warning),
-            false => ("", ToastLevel::Progress),
+        let (how, level) = match (self.new_run_yolo, &self.new_run_yolo_profile) {
+            (true, Some(profile)) => (
+                format!(" unattended under '{profile}'"),
+                ToastLevel::Warning,
+            ),
+            (true, None) => (" unattended".to_string(), ToastLevel::Warning),
+            (false, _) => (String::new(), ToastLevel::Progress),
         };
-        self.toast(format!("Starting '{}'{how}…", agent.name), level);
+        self.toast(
+            format!("Starting '{}'{how}{with_files}…", agent.name),
+            level,
+        );
         self.add_log(format!("run requested: {}", agent.name));
         // Recorded on the launch rather than on the selection: moving the
         // cursor down the list to read a blueprint's preview is not a choice
@@ -245,6 +300,20 @@ impl Dashboard {
 
     // ── `@` file references ──────────────────────────────────────────────────
 
+    /// The files the task names with `@path` that the workdir holds, for the
+    /// task box's title. Checked as you type, so a typo shows as a missing
+    /// name before the run starts.
+    pub(super) fn new_run_attached_names(&self) -> Vec<String> {
+        let workdir = &self.new_run_ctx.workdir;
+        leviath_core::mime::inline_refs::extract(&self.new_run_task.text(), &mut |path| {
+            workdir.join(path).is_file()
+        })
+        .refs
+        .into_iter()
+        .map(|r| r.path)
+        .collect()
+    }
+
     /// The workdir paths matching what has been typed after the `@`, capped to
     /// what the popup shows.
     pub(super) fn file_ref_matches(&self) -> Vec<&str> {
@@ -295,16 +364,46 @@ impl Dashboard {
     /// not the next read as the toggle misbehaving rather than remembering.
     /// Turning it off never asks: nothing needs confirming about deciding to
     /// be asked more.
+    ///
+    /// With profiles in `yolo.toml`, the key steps through them after plain
+    /// yolo, each one narrower than the last is likely to be, and then off:
+    /// off, on, `careful`, `build-only`, off. Every step past the first is a
+    /// step toward asking more, so none of them asks first.
     pub(super) fn toggle_new_run_yolo(&mut self) {
-        if self.new_run_yolo {
-            self.new_run_yolo = false;
-            self.toast(
-                "Unattended OFF: runs will ask you before each tool call",
-                ToastLevel::Info,
-            );
+        if !self.new_run_yolo {
+            self.pending_confirm = Some((ConfirmAction::EnableYolo, yolo_warning()));
             return;
         }
-        self.pending_confirm = Some((ConfirmAction::EnableYolo, yolo_warning()));
+        let position = self
+            .new_run_yolo_profile
+            .as_ref()
+            .and_then(|current| {
+                self.new_run_profiles
+                    .iter()
+                    .position(|p| &p.name == current)
+            })
+            .map_or(0, |i| i + 1);
+        match self.new_run_profiles.get(position).cloned() {
+            Some(profile) => {
+                self.new_run_yolo_profile = Some(profile.name.clone());
+                let keeps = match profile.holds().first() {
+                    Some(first) => format!("keeps for you: {first}"),
+                    None => "keeps nothing for you".to_string(),
+                };
+                self.toast(
+                    format!("Unattended under '{}': {keeps}", profile.name),
+                    ToastLevel::Warning,
+                );
+            }
+            None => {
+                self.new_run_yolo = false;
+                self.new_run_yolo_profile = None;
+                self.toast(
+                    "Unattended OFF: runs will ask you before each tool call",
+                    ToastLevel::Info,
+                );
+            }
+        }
     }
 
     /// Apply a yes to that warning.
@@ -322,6 +421,12 @@ impl Dashboard {
     /// it is a menu over the text being typed, not a mode beside it - then the
     /// focused pane.
     pub(super) fn handle_new_run_key(&mut self, key: crossterm::event::KeyEvent) {
+        // The file picker is a modal over the Inputs pane; while it is up it
+        // owns every key.
+        if self.new_run_picker_open() {
+            self.handle_new_run_picker_key(key);
+            return;
+        }
         if self.new_run_file_ref {
             self.handle_file_ref_key(key);
             return;
@@ -334,6 +439,9 @@ impl Dashboard {
             self.remember_md_mode(outcome);
             return;
         }
+        // The slots follow the agent the cursor is on, so a Tab out of the
+        // agent list lands on the right ones.
+        self.sync_new_run_inputs();
         // Ahead of both panes: these belong to the screen, not to whichever
         // half of it currently has the cursor. F1 rather than `?`, which is a
         // question mark in both a filter box and a task.
@@ -351,8 +459,18 @@ impl Dashboard {
         }
         match self.new_run_focus {
             NewRunPane::Agents => self.handle_new_run_agents_key(key.code),
+            NewRunPane::Inputs => self.handle_new_run_inputs_key(key),
             NewRunPane::Task => self.handle_new_run_task_key(key),
             NewRunPane::Start => self.handle_new_run_start_key(key.code),
+        }
+    }
+
+    /// The pane after the agent list: the Inputs pane when the blueprint has
+    /// slots, else straight to the task.
+    fn new_run_pane_after_agents(&self) -> NewRunPane {
+        match self.new_run_has_inputs() {
+            true => NewRunPane::Inputs,
+            false => NewRunPane::Task,
         }
     }
 
@@ -371,15 +489,18 @@ impl Dashboard {
                     self.new_run_selected = 0;
                 }
             },
-            KeyCode::Tab | KeyCode::Enter => self.new_run_focus = NewRunPane::Task,
-            KeyCode::BackTab => self.new_run_focus = NewRunPane::Start,
-            KeyCode::Up => {
-                self.new_run_selected = self.new_run_selected.saturating_sub(1);
+            KeyCode::Tab | KeyCode::Enter => {
+                self.new_run_focus = self.new_run_pane_after_agents();
             }
-            KeyCode::Down => {
-                if self.new_run_selected + 1 < self.filtered_new_run_agents().len() {
-                    self.new_run_selected += 1;
-                }
+            KeyCode::BackTab => self.new_run_focus = NewRunPane::Start,
+            KeyCode::Up | KeyCode::Down => {
+                let delta = if key_code == KeyCode::Up { -1 } else { 1 };
+                let len = self.filtered_new_run_agents().len();
+                self.new_run_selected = crate::tui::widgets::list_cursor::move_cursor(
+                    self.new_run_selected,
+                    delta,
+                    len,
+                );
             }
             KeyCode::Backspace => {
                 self.new_run_filter.pop();
@@ -394,20 +515,31 @@ impl Dashboard {
     }
 
     /// Task editor keys. Enter breaks the line, the way it does in any other
-    /// text box, and Ctrl+Enter starts the run.
+    /// text box, and Ctrl+S or Ctrl+Enter starts the run.
     ///
-    /// Ctrl+Enter reaches the program only under the kitty keyboard protocol;
-    /// a terminal without it sends Ctrl+Enter as a plain Enter, which is a
-    /// newline here. That is what the Start button under the editor is for.
-    /// The response box in the detail view works the same way, with a Send
-    /// button in place of Start.
+    /// Two chords because Ctrl+Enter reaches the program only under the kitty
+    /// keyboard protocol; a terminal without it sends Ctrl+Enter as a plain
+    /// Enter (a newline here), and on macOS some terminals swallow it
+    /// entirely. Ctrl+S is an ordinary control byte every terminal delivers,
+    /// and it rhymes with the ^S that commits work elsewhere in the TUI. The
+    /// Start button under the editor remains for the mouse. The response box
+    /// in the detail view works the same way, with a Send button in place of
+    /// Start.
     fn handle_new_run_task_key(&mut self, key: crossterm::event::KeyEvent) {
         use crossterm::event::{KeyCode, KeyModifiers};
         match key.code {
             KeyCode::Esc => self.new_run_focus = NewRunPane::Agents,
             KeyCode::Tab => self.new_run_focus = NewRunPane::Start,
-            KeyCode::BackTab => self.new_run_focus = NewRunPane::Agents,
+            KeyCode::BackTab => {
+                self.new_run_focus = match self.new_run_has_inputs() {
+                    true => NewRunPane::Inputs,
+                    false => NewRunPane::Agents,
+                };
+            }
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.submit_new_run();
+            }
+            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.submit_new_run();
             }
             KeyCode::Char('@') => {
@@ -439,13 +571,13 @@ impl Dashboard {
         match key.code {
             KeyCode::Esc => self.close_file_ref(),
             KeyCode::Enter | KeyCode::Tab => self.accept_file_ref(),
-            KeyCode::Up => {
-                self.new_run_file_selected = self.new_run_file_selected.saturating_sub(1);
-            }
-            KeyCode::Down => {
-                if self.new_run_file_selected + 1 < matches {
-                    self.new_run_file_selected += 1;
-                }
+            KeyCode::Up | KeyCode::Down => {
+                let delta = if key.code == KeyCode::Up { -1 } else { 1 };
+                self.new_run_file_selected = crate::tui::widgets::list_cursor::move_cursor(
+                    self.new_run_file_selected,
+                    delta,
+                    matches,
+                );
             }
             KeyCode::Backspace => {
                 self.new_run_task.area_mut().delete_char();
@@ -488,7 +620,10 @@ fn yolo_warning() -> Confirm {
                  interaction timeout expires.",
             ),
             Line::from(""),
-            Line::from("Ctrl-Y turns it off again."),
+            Line::from(
+                "Ctrl-Y again steps through the profiles in yolo.toml, each narrower than \
+                 plain unattended, and then turns it off.",
+            ),
         ],
         "Run unattended",
         "Keep asking me",
@@ -504,7 +639,7 @@ fn yolo_warning() -> Confirm {
 /// `.venv`, editor state) and `target`. An unreadable directory is skipped
 /// rather than reported - this list is a convenience, and half of it beats an
 /// error message.
-fn collect_workdir_files(root: &Path, cap: usize) -> Vec<String> {
+pub(super) fn collect_workdir_files(root: &Path, cap: usize) -> Vec<String> {
     let mut out = Vec::new();
     let mut stack = vec![(root.to_path_buf(), String::new())];
     while let Some((dir, prefix)) = stack.pop() {
@@ -559,12 +694,13 @@ async fn run_spawn(control: &ControlClient, cmd: SpawnCommand) -> SpawnOutcome {
         model: None,
         workdir: &cmd.workdir,
         yolo: cmd.yolo,
+        yolo_profile: cmd.yolo_profile.clone(),
         allow: Vec::new(),
         max_depth: None,
-        // Region seeds are a `lev run` command line; this screen writes a task.
-        regions: HashMap::new(),
+        regions: cmd.regions,
         no_seed_commands: false,
         output_request: None,
+        parts: cmd.parts,
     }) {
         Ok(args) => args,
         Err(e) => {
@@ -952,10 +1088,24 @@ mod tests {
         assert_eq!(dash.new_run_selected, count - 1, "down stops at the end");
     }
 
+    /// A dashboard opening on an agent that takes only a task, so Tab goes
+    /// straight from the agent list to the task. One with caller inputs
+    /// stops at the Inputs pane first; `new_run_inputs` covers that.
+    fn dash_on_a_plain_agent(dir: &Path) -> Dashboard {
+        write_agent(
+            &dir.join("agents").join("plain"),
+            "plain",
+            "takes only a task",
+        );
+        let mut dash = dash_at(dir);
+        dash.last_launched_agent = Some("plain".to_string());
+        dash
+    }
+
     #[test]
     fn tab_and_enter_reach_the_task_editor() {
         let dir = tempfile::tempdir().unwrap();
-        let mut dash = dash_at(dir.path());
+        let mut dash = dash_on_a_plain_agent(dir.path());
         for code in [KeyCode::Tab, KeyCode::Enter] {
             dash.open_new_run_screen();
             dash.handle_new_run_key(key(code));
@@ -968,7 +1118,7 @@ mod tests {
     #[test]
     fn tab_cycles_agents_task_start_and_backtab_reverses() {
         let dir = tempfile::tempdir().unwrap();
-        let mut dash = dash_at(dir.path());
+        let mut dash = dash_on_a_plain_agent(dir.path());
         dash.open_new_run_screen();
         assert_eq!(dash.new_run_focus, NewRunPane::Agents);
         for expected in [
@@ -1032,7 +1182,7 @@ mod tests {
     #[test]
     fn escape_and_backtab_hand_focus_back_to_the_picker_and_tab_reaches_start() {
         let dir = tempfile::tempdir().unwrap();
-        let mut dash = dash_at(dir.path());
+        let mut dash = dash_on_a_plain_agent(dir.path());
         for code in [KeyCode::Esc, KeyCode::BackTab] {
             dash.open_new_run_screen();
             dash.new_run_focus = NewRunPane::Task;
@@ -1306,6 +1456,120 @@ mod tests {
         assert_eq!(cmd.task, "ship it", "the task is trimmed");
         assert!(cmd.agent_path.ends_with("alpha"), "got: {}", cmd.agent_path);
         assert_eq!(cmd.workdir, dir.path().join("work").display().to_string());
+        assert!(cmd.parts.is_empty());
+    }
+
+    /// A `@path` in the task attaches that workdir file; one that names
+    /// nothing is a warning and stays text; one that cannot be read stops
+    /// the start.
+    #[test]
+    fn a_task_attaches_the_files_it_names() {
+        let dir = tempfile::tempdir().unwrap();
+        write_agent(&dir.path().join("agents/alpha"), "alpha", "first");
+        let mut dash = dash_at(dir.path());
+        std::fs::write(dir.path().join("work/hero.png"), b"\x89PNG\r\n\x1a\nhero").unwrap();
+        std::fs::write(dir.path().join("work/notes.md"), b"# n").unwrap();
+        dash.open_new_run_screen();
+        dash.new_run_filter = "alpha".to_string();
+        dash.new_run_focus = NewRunPane::Task;
+        dash.new_run_task
+            .area_mut()
+            .insert_str("edit @hero.png with @notes.md and @missing.png");
+        assert_eq!(dash.new_run_attached_names(), ["hero.png", "notes.md"]);
+
+        dash.handle_new_run_key(ctrl(KeyCode::Char('s')));
+        let cmd = dash
+            .spawn_cmd_rx_for_test()
+            .try_recv()
+            .expect("a spawn was dispatched");
+        assert_eq!(cmd.task, "edit @hero.png with @notes.md and @missing.png");
+        assert_eq!(cmd.parts.len(), 2);
+        assert_eq!(cmd.parts[0].name, "hero.png");
+        let toasts = dash.toast_messages_for_test();
+        assert!(
+            toasts
+                .iter()
+                .any(|t| t.contains("'@missing.png' names no file")),
+            "{toasts:?}"
+        );
+        assert!(
+            toasts.iter().any(|t| t.contains("with 2 files")),
+            "{toasts:?}"
+        );
+
+        // One file is counted in the singular.
+        dash.open_new_run_screen();
+        dash.new_run_filter = "alpha".to_string();
+        dash.new_run_focus = NewRunPane::Task;
+        dash.new_run_task.area_mut().insert_str("read @notes.md");
+        dash.handle_new_run_key(ctrl(KeyCode::Char('s')));
+        assert_eq!(
+            dash.spawn_cmd_rx_for_test()
+                .try_recv()
+                .expect("a spawn was dispatched")
+                .parts
+                .len(),
+            1
+        );
+        let toasts = dash.toast_messages_for_test();
+        assert!(
+            toasts.iter().any(|t| t.contains("with 1 file…")),
+            "{toasts:?}"
+        );
+
+        // An empty file is a file the run cannot take.
+        std::fs::write(dir.path().join("work/empty.png"), b"").unwrap();
+        dash.open_new_run_screen();
+        dash.new_run_filter = "alpha".to_string();
+        dash.new_run_focus = NewRunPane::Task;
+        dash.new_run_task.area_mut().insert_str("see @empty.png");
+        dash.handle_new_run_key(ctrl(KeyCode::Char('s')));
+        assert!(dash.new_run_screen, "the screen stays open");
+        assert!(dash.spawn_cmd_rx_for_test().try_recv().is_err());
+        let toasts = dash.toast_messages_for_test();
+        assert!(
+            toasts.iter().any(|t| t.contains("Could not attach")),
+            "{toasts:?}"
+        );
+    }
+
+    /// Ctrl+S is the submit chord that works on every terminal: Ctrl+Enter
+    /// only arrives under the kitty keyboard protocol, and on macOS some
+    /// terminals swallow it outright.
+    #[test]
+    fn ctrl_s_submits_like_ctrl_enter() {
+        let dir = tempfile::tempdir().unwrap();
+        write_agent(&dir.path().join("agents/alpha"), "alpha", "first");
+        let mut dash = dash_at(dir.path());
+        dash.open_new_run_screen();
+        dash.new_run_filter = "alpha".to_string();
+        dash.new_run_focus = NewRunPane::Task;
+        dash.new_run_task.area_mut().insert_str("ship it");
+
+        dash.handle_new_run_key(ctrl(KeyCode::Char('s')));
+
+        assert!(!dash.new_run_screen, "the screen closes on dispatch");
+        let cmd = dash
+            .spawn_cmd_rx_for_test()
+            .try_recv()
+            .expect("a spawn was dispatched");
+        assert_eq!(cmd.task, "ship it");
+    }
+
+    /// A bare `s` is text, not a submit: only the chord dispatches.
+    #[test]
+    fn a_plain_s_is_typed_not_submitted() {
+        let dir = tempfile::tempdir().unwrap();
+        write_agent(&dir.path().join("agents/alpha"), "alpha", "first");
+        let mut dash = dash_at(dir.path());
+        dash.open_new_run_screen();
+        dash.new_run_filter = "alpha".to_string();
+        dash.new_run_focus = NewRunPane::Task;
+
+        dash.handle_new_run_key(key(KeyCode::Char('s')));
+        assert!(dash.new_run_screen, "still writing the task");
+        assert_eq!(dash.new_run_task.text(), "s");
+        assert!(dash.spawn_cmd_rx_for_test().try_recv().is_err());
     }
 
     #[test]
@@ -1412,6 +1676,9 @@ mod tests {
                 task: "ship it".to_string(),
                 workdir: dir.path().display().to_string(),
                 yolo: false,
+                yolo_profile: None,
+                parts: Vec::new(),
+                regions: std::collections::HashMap::new(),
             })
             .unwrap();
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), out_rx.recv())
@@ -1462,6 +1729,9 @@ mod tests {
                 task: "ship it".to_string(),
                 workdir: dir.path().display().to_string(),
                 yolo: false,
+                yolo_profile: None,
+                parts: Vec::new(),
+                regions: std::collections::HashMap::new(),
             },
         )
         .await;
@@ -1487,6 +1757,9 @@ mod tests {
                 task: "t".to_string(),
                 workdir: dir.path().display().to_string(),
                 yolo: false,
+                yolo_profile: None,
+                parts: Vec::new(),
+                regions: std::collections::HashMap::new(),
             })
             .unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(5), handle)
@@ -1670,5 +1943,87 @@ mod tests {
             .expect("a start toast");
         assert!(!start.message.contains("unattended"), "{}", start.message);
         assert_eq!(start.level, ToastLevel::Progress);
+    }
+
+    /// With profiles in `yolo.toml`, Ctrl-Y steps through them after plain
+    /// yolo and then off, the help bar names the one showing, and the run
+    /// carries it.
+    #[test]
+    fn the_unattended_toggle_steps_through_the_profiles() {
+        crate::config::with_isolated_config_path("dash-yolo-profiles", |cfg| {
+            std::fs::write(
+                cfg.join("yolo.toml"),
+                "[careful]\ndefault = \"ask\"\nquestions = \"ask\"\n\n[loose]\ndefault = \"allow\"\n",
+            )
+            .unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            write_agent(&dir.path().join("agents/alpha"), "alpha", "first");
+            let mut dash = dash_at(dir.path());
+            dash.open_new_run_screen();
+            assert_eq!(dash.new_run_profiles.len(), 2);
+
+            dash.handle_key(ctrl(KeyCode::Char('y')));
+            dash.handle_key(key(KeyCode::Char('y')));
+            assert!(dash.new_run_yolo);
+            assert!(dash.new_run_yolo_profile.is_none(), "plain yolo first");
+
+            dash.handle_key(ctrl(KeyCode::Char('y')));
+            assert!(dash.pending_confirm.is_none(), "a narrower step never asks");
+            assert_eq!(dash.new_run_yolo_profile.as_deref(), Some("careful"));
+            assert!(
+                dash.new_run_help_bar_text()
+                    .contains("unattended: on (careful)")
+            );
+            let toast = dash
+                .toasts
+                .last()
+                .map(|t| t.message.clone())
+                .unwrap_or_default();
+            assert!(
+                toast.contains("under 'careful'") && toast.contains("keeps for you"),
+                "{toast}"
+            );
+
+            dash.handle_key(ctrl(KeyCode::Char('y')));
+            assert_eq!(dash.new_run_yolo_profile.as_deref(), Some("loose"));
+            let toast = dash
+                .toasts
+                .last()
+                .map(|t| t.message.clone())
+                .unwrap_or_default();
+            assert!(toast.contains("keeps nothing"), "{toast}");
+
+            // The run carries the profile that was showing.
+            dash.new_run_focus = NewRunPane::Task;
+            dash.new_run_task.area_mut().insert_str("do the thing");
+            dash.submit_new_run();
+            let cmd = dash
+                .spawn_cmd_rx_for_test()
+                .try_recv()
+                .expect("a run was sent");
+            assert!(cmd.yolo);
+            assert_eq!(cmd.yolo_profile.as_deref(), Some("loose"));
+            let start = dash
+                .toasts
+                .iter()
+                .find(|t| t.message.starts_with("Starting"))
+                .expect("a start toast");
+            assert!(start.message.contains("under 'loose'"), "{}", start.message);
+
+            // Past the last profile is off, with nothing remembered.
+            dash.new_run_screen = true;
+            dash.new_run_yolo = true;
+            dash.new_run_yolo_profile = Some("loose".to_string());
+            dash.handle_key(ctrl(KeyCode::Char('y')));
+            assert!(!dash.new_run_yolo);
+            assert!(dash.new_run_yolo_profile.is_none());
+
+            // Re-opening forgets the profile with the switch.
+            dash.new_run_yolo = true;
+            dash.new_run_yolo_profile = Some("careful".to_string());
+            dash.open_new_run_screen();
+            assert!(!dash.new_run_yolo);
+            assert!(dash.new_run_yolo_profile.is_none());
+        });
     }
 }

@@ -6,11 +6,56 @@
 
 use std::path::{Path, PathBuf};
 
+/// The blueprint at `path`, or `None` when the file cannot be read or parsed.
+///
+/// For the warnings a spawn prints beside the daemon's answer: a manifest
+/// that will not read or parse is the daemon's to report as the spawn error,
+/// and a warning must never be why a spawn fails.
+pub(crate) fn blueprint_at(path: &Path) -> Option<leviath_core::Blueprint> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let mut bp = leviath_core::manifest::parse_manifest(&content).ok()?;
+    bp.resolve_region_content_schemas(path).ok()?;
+    Some(bp)
+}
+
+/// The "this output format retires your checks" warning for the blueprint at
+/// `path`, given the output `request` a spawn carries. Empty with no request,
+/// nothing retired, or a manifest [`blueprint_at`] cannot read.
+pub(crate) fn retired_check_warnings_at(
+    path: &Path,
+    request: Option<&leviath_core::output::OutputSpec>,
+) -> Vec<String> {
+    match (request, blueprint_at(path)) {
+        (Some(_), Some(blueprint)) => {
+            leviath_core::output::retired_check_warnings(&blueprint, request)
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// Resolve an agent argument to the `agent.leviath` file it names.
 ///
 /// Accepts the file itself, a directory containing one, or an installed
-/// agent's name.
+/// agent's name, and falls back to the manifest in the current directory.
+/// The installed tree is the shared `LEVIATH_HOME`-aware one, so `lev run
+/// <name>` finds what `lev add` wrote when the override is set.
 pub(crate) fn find_manifest(path: &str) -> anyhow::Result<PathBuf> {
+    find_manifest_in(
+        path,
+        leviath_core::paths::agents_dir().as_deref(),
+        Path::new(""),
+    )
+}
+
+/// [`find_manifest`] against a given installed-agents directory and a given
+/// current directory, so every command that takes an agent name-or-path
+/// resolves it by one rule and a test can point both somewhere of its own.
+/// `cwd` may be empty, which leaves the fallback path relative as typed.
+pub(crate) fn find_manifest_in(
+    path: &str,
+    agents_dir: Option<&Path>,
+    cwd: &Path,
+) -> anyhow::Result<PathBuf> {
     let p = Path::new(path);
 
     // 1. Explicit agent.leviath file
@@ -28,13 +73,16 @@ pub(crate) fn find_manifest(path: &str) -> anyhow::Result<PathBuf> {
         }
     }
 
-    // 3. Installed agent by name: <agents_dir>/<name>/agent.leviath.
-    if let Some(installed) = installed_manifest(path) {
+    // 3. Installed agent by name: <agents_dir>/<name>/agent.leviath
+    if let Some(installed) = agents_dir
+        .map(|d| d.join(path).join(leviath_core::files::MANIFEST_FILENAME))
+        .filter(|p| p.exists())
+    {
         return Ok(installed);
     }
 
-    // 4. agent.leviath in current directory (for `lev run` with no path)
-    let current_manifest = PathBuf::from(leviath_core::files::MANIFEST_FILENAME);
+    // 4. agent.leviath in the current directory (for `lev run` with no path)
+    let current_manifest = cwd.join(leviath_core::files::MANIFEST_FILENAME);
     if current_manifest.exists() {
         return Ok(current_manifest);
     }
@@ -45,20 +93,6 @@ pub(crate) fn find_manifest(path: &str) -> anyhow::Result<PathBuf> {
         or an installed agent name (see `lev list`).",
         path
     )
-}
-
-/// The manifest of an installed agent, `<agents_dir>/<name>/agent.leviath`,
-/// when that file exists.
-///
-/// Resolved through the shared `LEVIATH_HOME`-aware helper, so `lev run <name>`
-/// and `lev validate <name>` find the same install tree `lev add` writes when
-/// the override is set. Never consults the current directory: a caller that
-/// wants a typo to stay an error (`lev validate <typo>` run inside an agent
-/// directory) uses this rather than [`find_manifest`].
-pub(crate) fn installed_manifest(name: &str) -> Option<PathBuf> {
-    leviath_core::paths::agents_dir()
-        .map(|d| d.join(name).join(leviath_core::files::MANIFEST_FILENAME))
-        .filter(|p| p.exists())
 }
 
 #[cfg(test)]
@@ -129,24 +163,6 @@ mod tests {
 
         temp_env::with_var("LEVIATH_HOME", Some(home.path()), || {
             assert_eq!(find_manifest("named").unwrap(), manifest_path);
-        });
-    }
-
-    /// `installed_manifest` is the piece of `find_manifest` that other
-    /// commands (`lev validate <name>`) reuse on its own: it answers the
-    /// install tree and nothing else, so a name that is not installed is
-    /// `None` even when the current directory holds a manifest.
-    #[test]
-    fn installed_manifest_answers_only_from_the_install_tree() {
-        let home = tempfile::tempdir().unwrap();
-        let agent_dir = home.path().join(".leviath").join("agents").join("named");
-        std::fs::create_dir_all(&agent_dir).unwrap();
-        let manifest_path = agent_dir.join("agent.leviath");
-        std::fs::write(&manifest_path, "[agent]\nname = \"test\"").unwrap();
-
-        temp_env::with_var("LEVIATH_HOME", Some(home.path()), || {
-            assert_eq!(installed_manifest("named"), Some(manifest_path.clone()));
-            assert_eq!(installed_manifest("unnamed"), None);
         });
     }
 

@@ -151,6 +151,8 @@ pub(crate) struct SeedToolContext {
     /// The run's write budget, shared with the tool lane so what a seed
     /// writes at spawn counts against the same ceiling as turn one.
     pub writes: Arc<crate::daemon::tool_service::WriteBudget>,
+    /// The files no run may change, the same list the tool lane refuses.
+    pub protected: Vec<crate::tools::ProtectedPath>,
 }
 
 /// Decides one seeded call's policy: `(tool name, is_builtin) -> policy`.
@@ -158,7 +160,8 @@ pub(crate) struct SeedToolContext {
 /// A closure rather than [`SeedToolPermissions`] itself, so the spawn path can
 /// hand over the layered resolution it already built without this module
 /// learning its shape or borrowing its four maps for the runner's lifetime.
-pub(crate) type SeedPolicyResolver = Arc<dyn Fn(&str, bool) -> ToolPolicy + Send + Sync>;
+pub(crate) type SeedPolicyResolver =
+    Arc<dyn Fn(&str, bool, &serde_json::Value) -> ToolPolicy + Send + Sync>;
 
 /// Build the runner a real spawn uses.
 pub(crate) fn production_runner(
@@ -167,21 +170,33 @@ pub(crate) fn production_runner(
 ) -> SeedToolRunner {
     Arc::new(move |name: &str, args: &serde_json::Value| {
         let is_builtin = ctx.builtin_names.contains(name);
-        // The same three fences the tool lane applies to a mid-run call, in the
-        // same order. A seed needs them most: it is the one call that runs
-        // before anyone could have been asked.
-        let policy = resolve(name, is_builtin);
-        let policy =
-            crate::tools::clamp_by_effect(name, args, policy, &|| resolve("write_file", true));
-        if let Some(refusal) = seed_policy_refusal(name, policy) {
-            return Err(refusal);
-        }
+        // The same three containment fences the tool lane applies to a mid-run
+        // call, ahead of policy as there: no policy makes any of them allowed,
+        // so a call that is both denied and escaping is refused for escaping.
+        // A seed needs them most: it is the one call that runs before anyone
+        // could have been asked.
         let workdir = ctx.builtins.workdir();
         if let Some(refusal) = crate::tools::escaping_write_refusal(name, args, workdir) {
             return Err(refusal);
         }
+        if let Some(refusal) = crate::tools::protected_path_refusal(
+            name,
+            args,
+            workdir,
+            crate::yolo::home().as_deref(),
+            &ctx.protected,
+        ) {
+            return Err(refusal);
+        }
         if let Some(refusal) = crate::tools::write_budget_refusal(name, args, workdir, &ctx.writes)
         {
+            return Err(refusal);
+        }
+        let policy = resolve(name, is_builtin, args);
+        let policy = crate::tools::clamp_by_effect(name, args, policy, &|| {
+            resolve("write_file", true, &serde_json::Value::Null)
+        });
+        if let Some(refusal) = seed_policy_refusal(name, policy) {
             return Err(refusal);
         }
         if let Some(declared) = crate::tools::declared_write_bytes(name, args) {
@@ -195,11 +210,14 @@ pub(crate) fn production_runner(
                 tool,
                 args.clone(),
                 ctx.script_host.clone(),
-            ));
+            )
+            .into_string());
         }
         match is_builtin {
             true => {
-                let out = block_on_daemon(ctx.builtins.execute(name, args.clone()));
+                let out = block_on_daemon(async {
+                    ctx.builtins.execute(name, args.clone()).await.into_string()
+                });
                 // A redirect is only measurable after the fact, as in the lane.
                 ctx.writes
                     .record(crate::tools::measured_write_bytes(name, args, workdir));
@@ -363,6 +381,7 @@ mod tests {
             success: true,
             data: serde_json::Value::Null,
             text: "the answer".to_string(),
+            blobs: Vec::new(),
         };
         assert_eq!(mcp_text(Ok(ok)), "the answer");
 
@@ -370,6 +389,7 @@ mod tests {
             success: false,
             data: serde_json::Value::Null,
             text: "no such record".to_string(),
+            blobs: Vec::new(),
         };
         assert_eq!(mcp_text(Ok(failed)), "[error] no such record");
 
@@ -407,6 +427,7 @@ mod tests {
         let builtin_names = builtins.names().into_iter().collect();
         SeedToolContext {
             writes,
+            protected: Vec::new(),
             builtins,
             builtin_names,
             script_tools: scripts,
@@ -431,7 +452,7 @@ mod tests {
     /// Every call allowed, which is what an unconfigured environment tool
     /// already resolves to.
     fn allow_all() -> SeedPolicyResolver {
-        Arc::new(|_, _| ToolPolicy::Allow)
+        Arc::new(|_, _, _| ToolPolicy::Allow)
     }
 
     /// No ambient runtime: `block_on_daemon` builds one of its own, which is
@@ -464,12 +485,12 @@ mod tests {
     #[test]
     fn a_denied_tool_is_refused_before_it_runs() {
         let dir = tempfile::tempdir().unwrap();
-        let refuse: SeedPolicyResolver = Arc::new(|_, _| ToolPolicy::Deny);
+        let refuse: SeedPolicyResolver = Arc::new(|_, _, _| ToolPolicy::Deny);
         let runner = production_runner(ctx_over(dir.path(), Default::default()), refuse);
         let err = runner("current_time", &serde_json::json!({})).expect_err("refused");
         assert!(err.contains("denied"), "{err}");
         // An `ask` is refused too, for want of anyone to ask.
-        let ask: SeedPolicyResolver = Arc::new(|_, _| ToolPolicy::Ask);
+        let ask: SeedPolicyResolver = Arc::new(|_, _, _| ToolPolicy::Ask);
         let runner = production_runner(ctx_over(dir.path(), Default::default()), ask);
         let err = runner("current_time", &serde_json::json!({})).expect_err("refused");
         assert!(err.contains("nobody to prompt"), "{err}");
@@ -495,7 +516,7 @@ mod tests {
     #[test]
     fn a_seed_redirect_answers_to_the_write_policy() {
         let dir = tempfile::tempdir().unwrap();
-        let deny_writes: SeedPolicyResolver = Arc::new(|name, _| match name {
+        let deny_writes: SeedPolicyResolver = Arc::new(|name, _, _| match name {
             "write_file" => ToolPolicy::Deny,
             _ => ToolPolicy::Allow,
         });
@@ -560,13 +581,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let seen = Arc::new(std::sync::Mutex::new(Vec::<(String, bool)>::new()));
         let captured = seen.clone();
-        let resolver: SeedPolicyResolver = Arc::new(move |name: &str, is_builtin: bool| {
-            captured
-                .lock()
-                .unwrap()
-                .push((name.to_string(), is_builtin));
-            ToolPolicy::Deny
-        });
+        let resolver: SeedPolicyResolver =
+            Arc::new(move |name: &str, is_builtin: bool, _: &serde_json::Value| {
+                captured
+                    .lock()
+                    .unwrap()
+                    .push((name.to_string(), is_builtin));
+                ToolPolicy::Deny
+            });
         let runner = production_runner(ctx_over(dir.path(), Default::default()), resolver);
         let _ = runner("current_time", &serde_json::json!({}));
         let _ = runner("acme__thing", &serde_json::json!({}));
@@ -673,5 +695,26 @@ for line in sys.stdin:
         assert_eq!(perms.resolve("system_info", true), ToolPolicy::Allow);
         // While a mutating one still defaults to `ask`, which a seed refuses.
         assert_eq!(perms.resolve("write_file", true), ToolPolicy::Ask);
+    }
+
+    /// A seed is held to the same lock as a mid-run call: it runs before any
+    /// prompt, which is exactly when a manifest would try.
+    #[test]
+    fn a_seed_may_not_write_a_permission_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let locked = dir.path().join("yolo.toml");
+        let mut ctx = ctx_over(dir.path(), Default::default());
+        ctx.protected = vec![crate::tools::ProtectedPath {
+            path: locked.clone(),
+            label: "yolo.toml",
+        }];
+        let runner = production_runner(ctx, allow_all());
+        let err = runner(
+            "write_file",
+            &serde_json::json!({"path": "yolo.toml", "content": "[p]\ndefault = \"allow\"\n"}),
+        )
+        .expect_err("refused");
+        assert!(err.contains("is yolo.toml"), "{err}");
+        assert!(!locked.exists());
     }
 }

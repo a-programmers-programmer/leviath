@@ -111,6 +111,12 @@ pub fn restore_agent(
         let mut window = world
             .get_mut::<ContextWindow>(entity)
             .expect("a spawned agent has a context window");
+        // One transaction over every region the overlay is about to write. A
+        // resume rebuilds the whole window in one act, and the record says so:
+        // this is where the window came from after the restart, not a series of
+        // unrelated writes that happened to share a second.
+        let names: Vec<String> = snapshot.regions.iter().map(|r| r.name.clone()).collect();
+        let rebuilding = window.begin_changes(names.iter().map(String::as_str));
         for snap_region in &snapshot.regions {
             if let Some(region) = window
                 .regions
@@ -146,6 +152,14 @@ pub fn restore_agent(
             }
         }
         window.current_tokens = window.calculate_tokens();
+        // A resume rebuilds the window by assignment rather than by writing, so
+        // every entry it puts back is invisible to the write paths. Every one of
+        // them counts as an arrival, which is what `Everything` says.
+        window.commit_change(
+            leviath_core::ContextCause::Resume,
+            rebuilding,
+            crate::components::Pushed::Everything,
+        );
     }
 
     // 2. Jump to the persisted stage, swapping in its inference config and
@@ -274,6 +288,59 @@ fn interrupted_result(tool_name: &str, children: &[String]) -> String {
     }
 }
 
+/// Write the outcome of every execution this resume gave up on.
+///
+/// A call in the pending batch with no journaled result is one nobody ever saw
+/// the end of. The resume does not re-run it: it lands a stand-in result and
+/// carries on, so that execution's real outcome is unobservable from here on.
+/// Recording it is the only moment the fact is knowable, and leaving the journal
+/// silent is what made a crashed batch look like one that never started.
+///
+/// The record carries the stand-in as its result, because that is what the run
+/// went on to reason about. The outcome is what says the tool did not produce
+/// it, and a reader must not take the text for the tool's answer.
+///
+/// Fire and forget, like every other per-call append: a resume must not wait on
+/// the persistence lane, and a record lost here costs the same as any other lost
+/// completion record.
+fn record_abandoned_executions(
+    world: &World,
+    entity: Entity,
+    batch: &leviath_core::run_archive::PendingToolBatch,
+    merged: &[crate::tool_bridge::ToolResult],
+) {
+    let (Some(persist), Some(md)) = (
+        world.get_resource::<crate::pipeline::PersistenceStage>(),
+        world.get::<crate::persistence::RunMetadata>(entity),
+    ) else {
+        return;
+    };
+    // Zipped rather than looked up: `merged` is built from these calls, in this
+    // order, one entry each. A lookup would add a "what if it is missing" branch
+    // to a pairing the caller above guarantees.
+    for (call, (_, stood_in)) in batch
+        .calls
+        .iter()
+        .zip(merged)
+        .filter(|(call, _)| call.result.is_none())
+    {
+        let _ = persist
+            .0
+            .send(crate::persistence_bridge::PersistMsg::Append {
+                run_id: md.run_id.clone(),
+                record: Box::new(leviath_core::run_archive::RunRecord::ToolCallDone {
+                    iteration: batch.iteration,
+                    call_id: call.id.clone(),
+                    execution_id: call.execution_id.clone(),
+                    result: stood_in.clone(),
+                    outcome: Some(leviath_core::execution::ToolOutcome::Indeterminate),
+                    at: chrono::Utc::now().timestamp(),
+                }),
+                ack: None,
+            });
+    }
+}
+
 /// Replay a tool batch that was dispatched but never applied before the crash
 /// (folded from the run journal as a
 /// [`PendingToolBatch`](leviath_core::run_archive::PendingToolBatch)): land the
@@ -292,6 +359,10 @@ fn interrupted_result(tool_name: &str, children: &[String]) -> String {
 /// (modification counters, telemetry, file tracking, log lines) is deliberately
 /// skipped: totals and outcome flags are already restored from the persisted
 /// metadata, and the dead process's calls have no live stage to report to.
+///
+/// One thing is written: every call that got a stand-in is journaled as an
+/// execution whose outcome nobody observed, since the resume is the last moment
+/// that fact is knowable.
 pub fn restore_pending_batch(
     world: &mut World,
     entity: Entity,
@@ -312,17 +383,18 @@ pub fn restore_pending_batch(
             thought_signature: c.thought_signature.clone(),
         })
         .collect();
-    let merged: Vec<(String, String)> = batch
+    let merged: Vec<crate::tool_bridge::ToolResult> = batch
         .calls
         .iter()
         .map(|c| {
             let result = c
                 .result
                 .clone()
-                .unwrap_or_else(|| interrupted_result(&c.name, children));
+                .unwrap_or_else(|| interrupted_result(&c.name, children).into());
             (c.id.clone(), result)
         })
         .collect();
+    record_abandoned_executions(world, entity, batch, &merged);
     let routing = world
         .get::<crate::components::ToolResultRoutingComponent>(entity)
         .map(|c| c.routing.clone());
@@ -367,11 +439,13 @@ mod tests {
                 batch_tool_hint: false,
                 shell_hint: false,
                 request_timeout_secs: None,
+                as_text: Vec::new(),
             },
             routing: None,
             accepts_messages: true,
             context_layout: None,
             context_hide: Vec::new(),
+            context_reset: Vec::new(),
             system_prompt: None,
         }
     }
@@ -404,6 +478,7 @@ mod tests {
                 StageCursor { index: 0 },
                 AgentState {
                     agent_id: "a".to_string(),
+                    current_visit: String::new(),
                     current_stage: "s0".to_string(),
                     iteration: 0,
                     status: AgentStatus::Active,
@@ -435,7 +510,7 @@ mod tests {
                     max_tokens: 10_000,
                     entries: vec![
                         RegionEntrySnapshot {
-                            content: "prior user turn".to_string(),
+                            content: "prior user turn".into(),
                             tokens: 5,
                             kind: EntryKind::UserMessage,
                             metadata: None,
@@ -444,7 +519,7 @@ mod tests {
                             reasoning: None,
                         },
                         RegionEntrySnapshot {
-                            content: "prior assistant".to_string(),
+                            content: "prior assistant".into(),
                             tokens: 3,
                             kind: EntryKind::AssistantTurn { tool_calls: vec![] },
                             metadata: None,
@@ -462,7 +537,7 @@ mod tests {
                     current_tokens: 1,
                     max_tokens: 10,
                     entries: vec![RegionEntrySnapshot {
-                        content: "orphan".to_string(),
+                        content: "orphan".into(),
                         tokens: 1,
                         kind: EntryKind::Text,
                         metadata: None,
@@ -674,10 +749,11 @@ mod tests {
         result: Option<&str>,
     ) -> leviath_core::run_archive::ToolCallRecord {
         leviath_core::run_archive::ToolCallRecord {
+            execution_id: format!("x-{id}"),
             id: id.to_string(),
             name: name.to_string(),
             arguments: r#"{"path":"x.txt"}"#.to_string(),
-            result: result.map(str::to_string),
+            result: result.map(Into::into),
             thought_signature: None,
         }
     }
@@ -758,6 +834,172 @@ mod tests {
         assert!(result_of("c2").contains("Verify whether it took effect"));
     }
 
+    /// What a completion record says.
+    struct Completion<'r> {
+        iteration: usize,
+        call_id: &'r str,
+        execution_id: &'r str,
+        result: &'r leviath_core::region::EntryContent,
+        outcome: Option<leviath_core::execution::ToolOutcome>,
+    }
+
+    /// A completion record read as one, or nothing for any other record.
+    ///
+    /// Exercised both ways below, so the arm that says "this is not a
+    /// completion" is a claim a test makes rather than a branch nothing takes.
+    fn completion_of(record: &leviath_core::run_archive::RunRecord) -> Option<Completion<'_>> {
+        match record {
+            leviath_core::run_archive::RunRecord::ToolCallDone {
+                iteration,
+                call_id,
+                execution_id,
+                result,
+                outcome,
+                ..
+            } => Some(Completion {
+                iteration: *iteration,
+                call_id,
+                execution_id,
+                result,
+                outcome: *outcome,
+            }),
+            _ => None,
+        }
+    }
+
+    /// The run this test's agent belongs to, for the paths that name it.
+    fn run_metadata() -> crate::persistence::RunMetadata {
+        crate::persistence::RunMetadata {
+            run_id: "run-1".to_string(),
+            agent_name: "a".to_string(),
+            agent_path: "/p".to_string(),
+            task: "t".to_string(),
+            model: None,
+            workdir: "/w".to_string(),
+            num_stages: 1,
+            started_at: 0,
+            parent_run_id: None,
+            metadata: std::collections::HashMap::new(),
+            callback_url: None,
+            callback_secret: None,
+            title: None,
+            title_error: None,
+            blueprint_digest: None,
+            unattended: false,
+            yolo_profile: None,
+            read_paths: None,
+            output_request: None,
+            model_override: None,
+        }
+    }
+
+    /// The journal learns which executions the resume gave up on.
+    ///
+    /// A call with a journaled result finished, and nothing more is written
+    /// about it. A call without one is an attempt whose ending nobody observed,
+    /// and the resume is the last moment that is knowable: after it the run has
+    /// moved on with a stand-in and the real outcome is gone. Without this
+    /// record the two look identical to anybody reading the journal afterwards,
+    /// which is the question a run debugger exists to answer.
+    #[test]
+    fn a_resume_records_the_executions_it_gave_up_on() {
+        let (mut world, entity) = agent_world();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        world.insert_resource(crate::pipeline::PersistenceStage(tx));
+        world.entity_mut(entity).insert(run_metadata());
+        restore_agent(
+            &mut world,
+            entity,
+            &snapshot(),
+            1,
+            7,
+            TokenTotals::default(),
+        );
+        restore_pending_batch(
+            &mut world,
+            entity,
+            &pending_batch(vec![
+                pending_call("c1", "write_file", Some("Wrote 42 bytes to x.txt")),
+                pending_call("c2", "shell", None),
+            ]),
+            &[],
+        );
+
+        // Something else on the same lane, so the drain below has to pick the
+        // appends out rather than assume every message is one.
+        let _ = world
+            .resource::<crate::pipeline::PersistenceStage>()
+            .0
+            .send(crate::persistence_bridge::PersistMsg::StageLines {
+                run_id: "run-1".to_string(),
+                output_appends: vec![(0, "a line".to_string())],
+                log_appends: Vec::new(),
+            });
+        let mut recorded = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            if let crate::persistence_bridge::PersistMsg::Append { record, .. } = msg {
+                recorded.push(*record);
+            }
+        }
+        assert_eq!(recorded.len(), 1, "only the unfinished call: {recorded:?}");
+        let completion = completion_of(&recorded[0]).expect("a completion record");
+        let Completion {
+            iteration,
+            call_id,
+            execution_id,
+            result,
+            outcome,
+        } = completion;
+        assert_eq!(call_id, "c2");
+        // The attempt, as dispatch minted it before the crash. Naming the call
+        // alone would leave a later attempt at the same call indistinguishable.
+        assert_eq!(execution_id, "x-c2");
+        assert_eq!(iteration, 7);
+        assert_eq!(
+            outcome,
+            Some(leviath_core::execution::ToolOutcome::Indeterminate)
+        );
+        // The stand-in the run went on to reason about, recorded as what was in
+        // the window rather than as something the tool returned.
+        assert!(result.contains("interrupted"), "{result:?}");
+        // And nothing else reads as a completion: the batch that dispatched the
+        // call is a different record with a different meaning.
+        assert!(
+            completion_of(&leviath_core::run_archive::RunRecord::ToolBatch {
+                calls: Vec::new(),
+                at: 1,
+                stage_index: 0,
+                iteration: 7,
+                visit_id: String::new(),
+                requested_by: String::new(),
+                response: String::new(),
+            })
+            .is_none(),
+            "a batch is not a completion"
+        );
+    }
+
+    /// A resume with no journal behind it records nothing and still replays.
+    ///
+    /// An embedded world keeps no run directory, so there is no journal to tell
+    /// anything. The replay itself is unaffected: the stand-in still lands in
+    /// the window, because that is what the next inference has to see.
+    #[test]
+    fn a_resume_with_no_journal_records_nothing() {
+        let (mut world, entity) = agent_world();
+        restore_pending_batch(
+            &mut world,
+            entity,
+            &pending_batch(vec![pending_call("c2", "shell", None)]),
+            &[],
+        );
+        let entries = conv_entries(&world, entity);
+        assert!(
+            entries.iter().any(|e| e.content.contains("interrupted")),
+            "the stand-in still landed: {entries:?}"
+        );
+    }
+
     #[test]
     fn pending_batch_survives_request_assembly_unstripped() {
         // The whole point of pairing the turn with a result per call: the
@@ -810,6 +1052,51 @@ mod tests {
             }
         }
         assert_eq!((tool_uses, tool_results), (1, 1), "nothing stripped");
+    }
+
+    #[test]
+    fn a_resumed_cut_off_call_assembles_as_an_object() {
+        // A run saved with a cut-off call in its conversation is resumed with
+        // that call as it was stored. The request built from it must still be
+        // one a provider accepts: the stored text is wrapped, not sent as a
+        // bare string that Anthropic refuses on every attempt.
+        let (mut world, entity) = agent_world();
+        world
+            .get_mut::<ContextWindow>(entity)
+            .unwrap()
+            .get_region_mut("conversation")
+            .unwrap()
+            .kind = RegionKind::SlidingWindow {
+            max_items: 100,
+            eviction_strategy: Default::default(),
+        };
+        restore_agent(
+            &mut world,
+            entity,
+            &snapshot(),
+            1,
+            7,
+            TokenTotals::default(),
+        );
+        let mut call = pending_call("c1", "shell", None);
+        call.arguments = "not json {".to_string();
+        restore_pending_batch(&mut world, entity, &pending_batch(vec![call]), &[]);
+
+        let assembled = world.get::<ContextWindow>(entity).unwrap().assemble();
+        let inputs: Vec<serde_json::Value> = assembled
+            .messages
+            .iter()
+            .filter_map(|msg| match &msg.content {
+                leviath_providers::MessageContent::Blocks(blocks) => Some(blocks),
+                leviath_providers::MessageContent::Text(_) => None,
+            })
+            .flatten()
+            .filter_map(|block| match block {
+                leviath_providers::ContentBlock::ToolUse { input, .. } => Some(input.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(inputs, vec![serde_json::json!({ "_raw": "not json {" })]);
     }
 
     #[test]

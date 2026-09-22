@@ -19,6 +19,54 @@ pub fn is_subagent_tool(name: &str) -> bool {
     SUBAGENT_TOOLS.contains(&name)
 }
 
+/// Every canonical built-in tool name, before platform gating and without
+/// aliases. [`BuiltinTools::names`] is this list minus what the host cannot
+/// provide, plus the aliases; this is the one to ask "is this name a
+/// built-in at all", which is what a group grant (`@builtin`) needs to sort
+/// a run's tool defs by source.
+pub const BUILTIN_TOOL_NAMES: &[&str] = &[
+    "read_file",
+    "read_files",
+    "write_file",
+    "edit_file",
+    "list_dir",
+    "shell",
+    "present_for_review",
+    "ask_user_text",
+    "ask_user_choice",
+    "ask_user_confirm",
+    "edit_document",
+    "context_write",
+    "context_append",
+    "context_read",
+    "context_delete",
+    "context_list",
+    "context_attach",
+    "context_export",
+    "todo_add",
+    "todo_done",
+    "todo_note",
+    "current_time",
+    "system_info",
+    "locale_info",
+    "environment_info",
+    "which_command",
+    "runtime_info",
+    "install_global_tool",
+    "install_self_tool",
+    crate::SUBMIT_OUTPUT_TOOL,
+    crate::FAN_OUT_TOOL,
+];
+
+/// The built-ins a stage mode grants rather than a manifest: `submit_output`
+/// and `fan_out` end or fork the run, so no group hands them out.
+pub const STAGE_CONTROL_TOOLS: &[&str] = &[crate::SUBMIT_OUTPUT_TOOL, crate::FAN_OUT_TOOL];
+
+/// Whether `name` is a canonical built-in (not an alias, not a sub-agent tool).
+pub fn is_builtin_tool(name: &str) -> bool {
+    BUILTIN_TOOL_NAMES.contains(&name)
+}
+
 /// The `shell` tool's description, naming the shell this host actually resolved
 /// instead of listing every platform's and leaving the model to guess which one
 /// it got. Pure over the shell so both wordings are testable on any platform.
@@ -109,7 +157,7 @@ impl BuiltinTools {
             },
             Tool {
                 name: "write_file".to_string(),
-                description: "Write content to a file, creating it (and any parent directories) if necessary. Use this to create new files or completely replace existing file content.".to_string(),
+                description: "Write content to a file, creating it (and any parent directories) if necessary. Use this to create new files or completely replace existing file content. Set append to add to the end of the file instead, which is how to write a file too large for one call: the first part without append, each later part with append.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -119,7 +167,11 @@ impl BuiltinTools {
                         },
                         "content": {
                             "type": "string",
-                            "description": "The full content to write to the file"
+                            "description": "The content to write: the whole file, or with append the part to add"
+                        },
+                        "append": {
+                            "type": "boolean",
+                            "description": "Add content to the end of the file instead of replacing it, creating the file if it does not exist. Defaults to false."
                         }
                     },
                     "required": ["path", "content"]
@@ -296,6 +348,59 @@ impl BuiltinTools {
                 }),
             },
             Tool {
+                name: "context_attach".to_string(),
+                description: "Put a file from the working directory into a section of your context window as a typed part (an image, a recording, a model, a document): a model that takes the type sees the bytes, and a tool that takes a part can be handed it by name. Give a key so a newer version of the same thing replaces the older one, and a caption so the part reads as more than a file name.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "region": {
+                            "type": "string",
+                            "description": "Name of the context window section to put the part in"
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "The file, relative to the working directory"
+                        },
+                        "key": {
+                            "type": "string",
+                            "description": "Key for the entry. Replaces an existing entry with the same key."
+                        },
+                        "caption": {
+                            "type": "string",
+                            "description": "Text stored beside the part, describing it"
+                        },
+                        "type": {
+                            "type": "string",
+                            "description": "The mime type (type/subtype), when the file's bytes and name do not say"
+                        },
+                        "deliver": {
+                            "type": "string",
+                            "enum": ["native", "text", "stand_in"],
+                            "description": "How the part reaches the model: as its own type, as text, or as a one-line stand-in"
+                        }
+                    },
+                    "required": ["region", "path"]
+                }),
+            },
+            Tool {
+                name: "context_export".to_string(),
+                description: "Write a stored part from your context window into the working directory, so a shell tool or a script can work on its bytes. Name it by its file name or by the start of its sha256, both shown where the part appears in your context.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "The part's file name, or the start of its sha256"
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "Where to write it, relative to the working directory. Defaults to the part's own file name."
+                        }
+                    },
+                    "required": ["name"]
+                }),
+            },
+            Tool {
                 name: "todo_add".to_string(),
                 description: "Add an item to a checklist region. Returns the item's id, which todo_done and todo_note take. Use this for work you have identified but not finished, so that what is left is tracked rather than remembered.".to_string(),
                 parameters: json!({
@@ -377,7 +482,7 @@ impl BuiltinTools {
             },
             Tool {
                 name: "context_read".to_string(),
-                description: "Read what's currently stored in a section of your context window. If no key is specified and the section contains keyed entries, returns a summary of all keys and their sizes.".to_string(),
+                description: "Read what's currently stored in a section of your context window. Name one entry by 'key' (on any section kind) or by 'index' as shown in context_list; with neither, a keyed section returns a summary of all keys and their sizes, and any other section returns its whole text.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -388,6 +493,10 @@ impl BuiltinTools {
                         "key": {
                             "type": "string",
                             "description": "Key of a specific entry to read"
+                        },
+                        "index": {
+                            "type": "integer",
+                            "description": "Position of a specific entry to read, as shown in context_list"
                         }
                     },
                     "required": ["region"]
@@ -448,8 +557,21 @@ impl BuiltinTools {
                         },
                         "artifacts": {
                             "type": "array",
-                            "items": { "type": "string" },
-                            "description": "Files you produced that the caller should read, as paths relative to the working directory. Use this for anything too large to put in the answer: a dataset, a long report, a generated file. Name the file here rather than only mentioning it in prose."
+                            "items": {
+                                "oneOf": [
+                                    { "type": "string" },
+                                    {
+                                        "type": "object",
+                                        "properties": {
+                                            "name": { "type": "string", "description": "The name the stage declared for this file, or any name you choose" },
+                                            "path": { "type": "string", "description": "The file, relative to the working directory" },
+                                            "type": { "type": "string", "description": "Its mime type, when the file's bytes and name do not say" }
+                                        },
+                                        "required": ["path"]
+                                    }
+                                ]
+                            },
+                            "description": "Files you produced that the caller should read: a path relative to the working directory, or { name, path, type }. Use this for anything too large to put in the answer: a dataset, a long report, a generated file, an image. Each file must exist when you submit. Name the file here rather than only mentioning it in prose."
                         }
                     },
                     "required": ["content"]
@@ -554,8 +676,30 @@ impl BuiltinTools {
                 }),
             },
             Tool {
-                name: "install_tool".to_string(),
-                description: "Compile a Rhai tool script and install it into the global tools directory so every future agent run can call it. Refuses a script that does not compile, lacks `// @tool <name>` or `// @description`, or collides with an existing tool name. Use for repeatable mechanical steps, never for judgement.".to_string(),
+                name: "install_self_tool".to_string(),
+                description: "Compile a Rhai tool script and install it into this agent's own tools directory, so this agent's future runs can call it and no other agent sees it. Prefer this over install_global_tool: what you learned is usually about your own job. Refuses a script that does not compile, lacks `// @tool <name>` or `// @description`, or collides with an existing tool name. Use for repeatable mechanical steps, never for judgement.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "The tool's name. Must equal the script's `// @tool` directive and be a plain file stem: letters, digits, '.', '_' or '-' only"
+                        },
+                        "source": {
+                            "type": "string",
+                            "description": "The complete .rhai source, starting with `// @tool <name>` and `// @description <text>`, then `// @param <name> <type> <required|optional> \"<description>\"` per parameter and an optional `// @requires <network|shell|filesystem>`. Arguments arrive in `params`; the script's value is the tool result"
+                        },
+                        "overwrite": {
+                            "type": "boolean",
+                            "description": "Replace an existing script of the same name (default false)"
+                        }
+                    },
+                    "required": ["name", "source"]
+                }),
+            },
+            Tool {
+                name: "install_global_tool".to_string(),
+                description: "Compile a Rhai tool script and install it into the machine-wide tools directory, so every agent on this machine that asks for script tools can call it. Use install_self_tool instead unless the tool is genuinely useful to agents other than this one. Refuses a script that does not compile, lacks `// @tool <name>` or `// @description`, or collides with an existing tool name. Use for repeatable mechanical steps, never for judgement.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -609,13 +753,18 @@ impl BuiltinTools {
                             "type": "string",
                             "description": "Optional initial context to inject into the sub-agent's first Pinned region"
                         },
+                        "parts": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Optional stored parts of this run to hand the sub-agent, each by name or by a prefix of its sha256 (as listed in your context). Each lands in the child's task region as a typed part."
+                        },
                         "max_child_depth": {
                             "type": "integer",
                             "description": "Optional max depth for the sub-agent's own children"
                         },
                         "output_format": {
                             "type": "string",
-                            "description": "Optional shape to ask the sub-agent for its final answer in, overriding its blueprint's. Any label works (markdown, json, xml, a media type, your own); it is passed to the sub-agent, not interpreted here."
+                            "description": "Optional shape to ask the sub-agent for its final answer in, overriding its blueprint's. Any label works (markdown, json, xml, a mime type, your own); it is passed to the sub-agent, not interpreted here."
                         },
                         "output_instructions": {
                             "type": "string",
@@ -709,43 +858,14 @@ impl BuiltinTools {
     /// under an alias name as a built-in; the canonical names are what get
     /// advertised to the model.
     pub fn names(&self) -> Vec<String> {
-        let mut names: Vec<String> = [
-            "read_file",
-            "read_files",
-            "write_file",
-            "edit_file",
-            "list_dir",
-            "shell",
-            "present_for_review",
-            "ask_user_text",
-            "ask_user_choice",
-            "ask_user_confirm",
-            "edit_document",
-            "context_write",
-            "context_append",
-            "context_read",
-            "context_delete",
-            "context_list",
-            "todo_add",
-            "todo_done",
-            "todo_note",
-            "current_time",
-            "system_info",
-            "locale_info",
-            "environment_info",
-            "which_command",
-            "runtime_info",
-            "install_tool",
-            crate::SUBMIT_OUTPUT_TOOL,
-            crate::FAN_OUT_TOOL,
-        ]
-        .iter()
-        // Drop any canonical built-in the current platform can't provide, so a
-        // filtered-out tool (e.g. `shell` without `ProcessSpawn`) isn't even
-        // recognized as a built-in on dispatch.
-        .filter(|n| self.available(n))
-        .map(|s| s.to_string())
-        .collect();
+        let mut names: Vec<String> = BUILTIN_TOOL_NAMES
+            .iter()
+            // Drop any canonical built-in the current platform can't provide, so a
+            // filtered-out tool (e.g. `shell` without `ProcessSpawn`) isn't even
+            // recognized as a built-in on dispatch.
+            .filter(|n| self.available(n))
+            .map(|s| s.to_string())
+            .collect();
         // Include an alias only when its canonical target survived filtering
         // (so `bash` disappears together with `shell`).
         names.extend(

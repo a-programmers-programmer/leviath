@@ -311,17 +311,20 @@ fn to_server_event(event: WorldEvent) -> ServerEvent {
             run_id,
             agent_id,
             call_id,
+            execution_id,
             tool,
         } => ServerEvent::ToolCallStarted {
             agent_id,
             run_id,
             call_id,
+            execution_id,
             tool,
         },
         WorldEvent::ToolCallFinished {
             run_id,
             agent_id,
             call_id,
+            execution_id,
             tool,
             ok,
             summary,
@@ -329,6 +332,7 @@ fn to_server_event(event: WorldEvent) -> ServerEvent {
             agent_id,
             run_id,
             call_id,
+            execution_id,
             tool,
             ok,
             summary,
@@ -519,6 +523,8 @@ mod tests {
         let (tx, rx) = broadcast::channel(64);
         (
             AppState {
+                caches: Default::default(),
+                signer: Default::default(),
                 update_check: Default::default(),
                 update_jobs: Default::default(),
                 config: crate::commands::serve::testutil::fixed_config(Config::default()),
@@ -682,6 +688,7 @@ mod tests {
         );
         assert_eq!(
             mapped_tag(WorldEvent::ToolCallStarted {
+                execution_id: "x1".to_string(),
                 run_id: "r".into(),
                 agent_id: "a".into(),
                 call_id: "c1".into(),
@@ -691,6 +698,7 @@ mod tests {
         );
         assert_eq!(
             mapped_tag(WorldEvent::ToolCallFinished {
+                execution_id: "x1".to_string(),
                 run_id: "r".into(),
                 agent_id: "a".into(),
                 call_id: "c1".into(),
@@ -826,6 +834,7 @@ mod tests {
         assert_eq!(json["iteration"], 2);
 
         let json = serde_json::to_value(to_server_event(WorldEvent::ToolCallStarted {
+            execution_id: "x1".to_string(),
             run_id: "run-9".into(),
             agent_id: "a".into(),
             call_id: "c1".into(),
@@ -841,6 +850,7 @@ mod tests {
         // anything; a client showing a green tick off the finish frame alone
         // would be wrong for a `[blocked]` result.
         let json = serde_json::to_value(to_server_event(WorldEvent::ToolCallFinished {
+            execution_id: "x1".to_string(),
             run_id: "run-9".into(),
             agent_id: "a".into(),
             call_id: "c1".into(),

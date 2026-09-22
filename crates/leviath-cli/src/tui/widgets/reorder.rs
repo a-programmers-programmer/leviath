@@ -14,12 +14,19 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
+use super::list_cursor;
 use super::popup::{centered, popup_frame};
 use crate::tui::theme::{C_ACCENT, C_ACTIVE, C_DIM, C_MUTED, C_WHITE};
 
-/// The grip that lifts a row, and the width of the gutter reserved for it.
-const GRIP: &str = "⠿ ";
-const GRIP_W: u16 = 2;
+/// The grip drawn beside a row the mouse can pick up and drag, with the space
+/// that separates it from the label. Braille dots: the widest-supported glyph
+/// that reads as "handle" rather than as content. Shared with the agent
+/// editor's model-chain reorder so the two drags look the same.
+pub(crate) const GRIP: &str = "⠿ ";
+/// Cells [`GRIP`] occupies, and so the width of the column reserved for it on
+/// every row: a grip that shifted its own row two columns right would be a
+/// worse cue than one that lines up with the blanks above it.
+pub(crate) const GRIP_W: u16 = 2;
 
 /// What a key or click did to the modal.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,13 +39,18 @@ pub(crate) enum ReorderOutcome {
     Cancelled,
 }
 
-/// One row: the value that will be written, and a few words on what it is.
+/// One row: the value that will be written, a few words on what it is, and
+/// whether it is in the list at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ReorderItem {
     /// The value written back (a provider name).
     pub(crate) value: String,
     /// A short note shown beside it (e.g. "configured", "not configured").
     pub(crate) detail: String,
+    /// Whether the row is part of the order that is kept. A row left out is
+    /// still shown, dimmed, so it can be brought in with Space; at least one
+    /// row always stays in, since an empty order means nothing.
+    pub(crate) included: bool,
 }
 
 /// A drag in progress: the row it was lifted from, and where the pointer is now.
@@ -90,9 +102,26 @@ impl Reorder {
         }
     }
 
-    /// The values in their current order, for a caller keeping the result.
+    /// The included values in their current order, for a caller keeping the
+    /// result.
     fn values(&self) -> Vec<String> {
-        self.ordered().into_iter().map(|i| i.value).collect()
+        self.ordered()
+            .into_iter()
+            .filter(|i| i.included)
+            .map(|i| i.value)
+            .collect()
+    }
+
+    /// Bring the row under the cursor into the order, or leave it out. The
+    /// last included row stays in: an order with nothing in it is not one.
+    fn toggle_included(&mut self) {
+        let included = self.items.iter().filter(|i| i.included).count();
+        if let Some(item) = self.items.get_mut(self.cursor) {
+            if item.included && included <= 1 {
+                return;
+            }
+            item.included = !item.included;
+        }
     }
 
     /// The rows as `(value, detail)`, for a caller (a test) checking what the
@@ -107,8 +136,7 @@ impl Reorder {
 
     /// Move the cursor, clamped to the list.
     fn move_cursor(&mut self, delta: isize) {
-        let next = self.cursor as isize + delta;
-        self.cursor = next.clamp(0, self.items.len().saturating_sub(1) as isize) as usize;
+        self.cursor = list_cursor::move_cursor(self.cursor, delta, self.items.len());
     }
 
     /// Move the row under the cursor one place, the cursor following it. A move
@@ -126,6 +154,12 @@ impl Reorder {
     }
 
     /// Keys while the modal is open.
+    ///
+    /// `K`/`J` move the row exactly as Shift+↑/↓ do, because several terminals
+    /// (Apple Terminal among them) drop the Shift modifier from arrow keys, so
+    /// Shift+↑ arrives here as a plain ↑. A capital letter is an ordinary
+    /// character every terminal delivers. Their lowercase pair moves the
+    /// cursor, mirroring the arrows.
     pub(crate) fn handle_key(&mut self, key: &KeyEvent) -> ReorderOutcome {
         use crossterm::event::KeyModifiers as Mods;
         let shifted = key.modifiers.contains(Mods::SHIFT);
@@ -134,6 +168,15 @@ impl Reorder {
             KeyCode::Down if shifted => self.move_row(1),
             KeyCode::Up => self.move_cursor(-1),
             KeyCode::Down => self.move_cursor(1),
+            // Shift+k may arrive as 'K', or as 'k' with the modifier set,
+            // depending on the terminal's encoding; both mean the row.
+            KeyCode::Char('K') => self.move_row(-1),
+            KeyCode::Char('J') => self.move_row(1),
+            KeyCode::Char('k') if shifted => self.move_row(-1),
+            KeyCode::Char('j') if shifted => self.move_row(1),
+            KeyCode::Char('k') => self.move_cursor(-1),
+            KeyCode::Char('j') => self.move_cursor(1),
+            KeyCode::Char(' ') => self.toggle_included(),
             KeyCode::Enter => return ReorderOutcome::Confirmed(self.values()),
             KeyCode::Esc => return ReorderOutcome::Cancelled,
             _ => {}
@@ -238,13 +281,26 @@ impl Reorder {
             .map(|text| Line::from(Span::styled(text.clone(), Style::default().fg(C_MUTED))))
             .collect();
         lines.push(Line::from(Span::styled(
-            "Drag ⠿, or Shift+↑/↓ to move a row. Enter keeps the order, Esc cancels.",
+            "Drag ⠿, or Shift+↑/↓ or K/J to move a row. Space takes a row in or out of the \
+             order. Enter keeps the order, Esc cancels.",
             Style::default().fg(C_DIM),
         )));
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), chunks[0]);
 
         // The row the pointer is holding, so it can be marked while dragged.
+        // Positions count included rows only: a row left out has no place in
+        // the order and is shown without one.
         let held = self.drag.map(|d| d.to);
+        // The value column is the widest value plus a gap, so a long provider
+        // name never runs into the note beside it.
+        let value_w = self
+            .items
+            .iter()
+            .map(|item| item.value.chars().count())
+            .max()
+            .unwrap_or(0)
+            + 2;
+        let mut place = 0;
         let rows: Vec<Line<'static>> = self
             .ordered()
             .iter()
@@ -252,18 +308,28 @@ impl Reorder {
             .map(|(position, item)| {
                 let on = position == self.cursor;
                 let dragged = Some(position) == held;
+                let number = match item.included {
+                    true => {
+                        place += 1;
+                        format!("{place}. ")
+                    }
+                    false => "-  ".to_string(),
+                };
+                let value_style = match (item.included, on || dragged) {
+                    (true, true) => Style::default().fg(C_ACTIVE).add_modifier(Modifier::BOLD),
+                    (true, false) => Style::default().fg(C_WHITE),
+                    (false, true) => Style::default().fg(C_MUTED).add_modifier(Modifier::BOLD),
+                    (false, false) => Style::default().fg(C_DIM),
+                };
+                let detail = match item.included {
+                    true => item.detail.clone(),
+                    false => format!("{} (not in the order)", item.detail),
+                };
                 Line::from(vec![
                     Span::styled(GRIP, Style::default().fg(if on { C_ACCENT } else { C_DIM })),
-                    Span::styled(format!("{}. ", position + 1), Style::default().fg(C_DIM)),
-                    Span::styled(
-                        format!("{:<16}", item.value),
-                        if on || dragged {
-                            Style::default().fg(C_ACTIVE).add_modifier(Modifier::BOLD)
-                        } else {
-                            Style::default().fg(C_WHITE)
-                        },
-                    ),
-                    Span::styled(item.detail.clone(), Style::default().fg(C_DIM)),
+                    Span::styled(number, Style::default().fg(C_DIM)),
+                    Span::styled(format!("{:<value_w$}", item.value), value_style),
+                    Span::styled(detail, Style::default().fg(C_DIM)),
                 ])
             })
             .collect();
@@ -284,8 +350,76 @@ mod tests {
             .map(|v| ReorderItem {
                 value: v.to_string(),
                 detail: "configured".to_string(),
+                included: true,
             })
             .collect()
+    }
+
+    /// Space takes a row out of the order and back in; the last included row
+    /// stays, and the kept order is only the included rows.
+    #[test]
+    fn space_takes_a_row_out_of_the_order_but_never_the_last_one() {
+        let mut r = reorder();
+        r.handle_key(&key(KeyCode::Down));
+        assert_eq!(
+            r.handle_key(&key(KeyCode::Char(' '))),
+            ReorderOutcome::Pending
+        );
+        assert_eq!(
+            r.handle_key(&key(KeyCode::Enter)),
+            ReorderOutcome::Confirmed(vec!["a".to_string(), "c".to_string()])
+        );
+        let mut r = reorder();
+        r.handle_key(&key(KeyCode::Char(' ')));
+        r.handle_key(&key(KeyCode::Down));
+        r.handle_key(&key(KeyCode::Char(' ')));
+        r.handle_key(&key(KeyCode::Down));
+        r.handle_key(&key(KeyCode::Char(' ')));
+        assert_eq!(
+            r.handle_key(&key(KeyCode::Enter)),
+            ReorderOutcome::Confirmed(vec!["c".to_string()]),
+            "the last included row cannot be taken out"
+        );
+        // Back in, at its place in the list.
+        let mut r = reorder();
+        r.handle_key(&key(KeyCode::Char(' ')));
+        r.handle_key(&key(KeyCode::Char(' ')));
+        assert_eq!(
+            r.handle_key(&key(KeyCode::Enter)),
+            ReorderOutcome::Confirmed(vec!["a".to_string(), "b".to_string(), "c".to_string()])
+        );
+        // And an excluded row draws without a place number.
+        let mut r = reorder();
+        r.handle_key(&key(KeyCode::Char(' ')));
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| r.draw(f, f.area())).unwrap();
+        let text = format!("{:?}", terminal.backend().buffer());
+        assert!(text.contains("not in the order"), "{text}");
+        // Nothing to take in or out of an empty list.
+        let mut empty = Reorder::new("Provider priority", vec![], vec![]);
+        empty.handle_key(&key(KeyCode::Char(' ')));
+        assert_eq!(
+            empty.handle_key(&key(KeyCode::Enter)),
+            ReorderOutcome::Confirmed(vec![])
+        );
+    }
+
+    /// A value wider than a fixed column ran into its note; the column is
+    /// as wide as the widest value plus a gap.
+    #[test]
+    fn a_long_value_keeps_its_gap_before_the_note() {
+        let r = Reorder::new(
+            "Provider priority",
+            vec![],
+            items(&["openai-compatible", "b"]),
+        );
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| r.draw(f, f.area())).unwrap();
+        let text = format!("{:?}", terminal.backend().buffer());
+        assert!(text.contains("openai-compatible  configured"), "{text}");
+        assert!(text.contains("b                  configured"), "{text}");
     }
 
     fn reorder() -> Reorder {
@@ -335,6 +469,31 @@ mod tests {
         // And back up one: b, c, a -> b, a, c.
         r.handle_key(&shift(KeyCode::Up));
         assert_eq!(r.values(), ["b", "a", "c"]);
+    }
+
+    /// The letters exist because a terminal that drops Shift from the arrows
+    /// (Apple Terminal does) leaves Shift+↑/↓ meaning "move the cursor". They
+    /// arrive either as a capital, or as the lowercase letter with the Shift
+    /// flag; both spellings move the row, and the bare letters mirror the
+    /// arrows.
+    #[test]
+    fn capital_j_and_k_move_the_row_and_lowercase_move_the_cursor() {
+        let mut r = reorder();
+        r.handle_key(&key(KeyCode::Char('J')));
+        r.handle_key(&shift(KeyCode::Char('j')));
+        assert_eq!(r.values(), ["b", "c", "a"]);
+        assert_eq!(r.cursor, 2, "the cursor rode with the row");
+        r.handle_key(&key(KeyCode::Char('K')));
+        assert_eq!(r.values(), ["b", "a", "c"]);
+        r.handle_key(&shift(KeyCode::Char('k')));
+        assert_eq!(r.values(), ["a", "b", "c"]);
+
+        let mut r = reorder();
+        r.handle_key(&key(KeyCode::Char('j')));
+        assert_eq!(r.cursor, 1, "bare j is the cursor");
+        r.handle_key(&key(KeyCode::Char('k')));
+        assert_eq!(r.cursor, 0, "bare k is the cursor");
+        assert_eq!(r.values(), ["a", "b", "c"], "neither moved a row");
     }
 
     #[test]

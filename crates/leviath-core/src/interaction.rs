@@ -41,7 +41,11 @@ pub enum BodyFormat {
 /// A pending interaction request written by the worker.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct InteractionRequest {
-    /// Unique ID for this request (uuid-lite: timestamp + stage index).
+    /// What an answer names this request by, and nothing else names.
+    ///
+    /// Minted by [`request_id`], which leads with the run: one daemon holds
+    /// every run's open requests in one place, so an id unique within a run is
+    /// not unique enough.
     pub id: String,
     /// What kind of answer is expected.
     pub kind: InteractionKind,
@@ -379,6 +383,68 @@ pub enum ApprovalScope {
     Run,
 }
 
+/// How a question this run asked ended up.
+///
+/// Recorded in the journal, because nothing else records it: the hub hands an
+/// answer to the caller that was waiting and forgets it, so an approved tool
+/// call looked exactly like one no policy ever stopped, and a run that paused
+/// for a person looked exactly like one that never asked.
+///
+/// The decision rather than the whole response: an answer may carry files, and
+/// those are already stored as parts and named by the tool result.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum Settlement {
+    /// A person answered.
+    Answered {
+        /// Whether a tool approval was granted. `None` for every other kind.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        approved: Option<bool>,
+        /// The scope they chose for an approval: this call, this stage, or the
+        /// rest of the run. `None` where they were not offered one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<ApprovalScope>,
+        /// Which option they picked, for a question that offered a list.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        choice: Option<usize>,
+        /// What they typed, for a question that took text. An edited document
+        /// comes back here too, which is why it is not capped: the point of
+        /// recording it is that the run acted on exactly these words.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+        /// What they told the model to do instead, on a denial.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        feedback: Option<String>,
+    },
+    /// Nobody answered before `[limits] interaction_timeout_secs` ran out, so
+    /// the hub answered for them.
+    TimedOut,
+    /// The request was withdrawn: the run was cancelled, or the agent that
+    /// asked went away.
+    Cancelled,
+    /// The request never opened, because one was already open under the same
+    /// id, and the hub keeps the one a person may already be reading.
+    ///
+    /// Not a decision anybody made, and not a denial either: the caller was
+    /// handed the neutral answer, which an approval or a taint gate reads as
+    /// not-approved. Its own settlement because it means the id scheme failed,
+    /// and a reader who cannot tell it from a denial cannot tell that either.
+    Refused,
+}
+
+impl Settlement {
+    /// The settlement of one response, as the journal records it.
+    pub fn of(response: &InteractionResponse) -> Self {
+        Self::Answered {
+            approved: response.approved,
+            scope: response.scope,
+            choice: response.choice_index,
+            text: response.value.clone(),
+            feedback: response.feedback.clone(),
+        }
+    }
+}
+
 /// A response written by the dashboard (or `lev respond`) to answer the worker.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct InteractionResponse {
@@ -401,9 +467,22 @@ pub struct InteractionResponse {
     /// redirect.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub feedback: Option<String>,
+    /// Files attached to a text answer: what `lev respond --attach` and a
+    /// `@path` in a dashboard reply send. The run stores each one and
+    /// writes it beside the answer's text in the tool result. Absent on
+    /// every answer written before parts existed, and on every answer that
+    /// is not text.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parts: Vec<crate::mime::InboundPart>,
 }
 
 impl InteractionResponse {
+    /// The same answer, with files attached.
+    pub fn with_parts(mut self, parts: Vec<crate::mime::InboundPart>) -> Self {
+        self.parts = parts;
+        self
+    }
+
     /// Build a simple text response.
     pub fn text(request_id: impl Into<String>, value: impl Into<String>) -> Self {
         Self {
@@ -413,6 +492,7 @@ impl InteractionResponse {
             approved: None,
             scope: None,
             feedback: None,
+            parts: Vec::new(),
         }
     }
 
@@ -425,6 +505,7 @@ impl InteractionResponse {
             approved: None,
             scope: None,
             feedback: None,
+            parts: Vec::new(),
         }
     }
 
@@ -437,6 +518,7 @@ impl InteractionResponse {
             approved: Some(approved),
             scope: Some(scope),
             feedback: None,
+            parts: Vec::new(),
         }
     }
 
@@ -454,6 +536,7 @@ impl InteractionResponse {
             approved: Some(false),
             scope: Some(ApprovalScope::Once),
             feedback: (!feedback.is_empty()).then(|| feedback.to_string()),
+            parts: Vec::new(),
         }
     }
 
@@ -499,9 +582,62 @@ pub fn make_interaction_id(stage_idx: usize, iteration: usize) -> String {
     format!("{}-{}", stage_idx, iteration)
 }
 
+/// The id one interaction request answers to: `<run id>-<kind>-<tail>`.
+///
+/// The run id leads because the id has to be unique across every request the
+/// daemon holds open at once, not just within one run: the hub that keeps them
+/// is one per daemon and keyed by this id alone, and an answer arriving over
+/// the API or from `lev respond` names nothing else. The tail is usually a
+/// provider's tool-call id, which is only unique within the conversation that
+/// produced it, and for two providers it is a counter that starts again at one.
+///
+/// `kind` is the word that says which question this is: `approve`, `gate`,
+/// `ask`, `review`, `edit` or `point`.
+pub fn request_id(run_id: &str, kind: &str, tail: &str) -> String {
+    format!("{run_id}-{kind}-{tail}")
+}
+
+/// What every id of one kind, for one run, starts with.
+///
+/// For the one reader that has to tell a run's requests apart by kind rather
+/// than by answering them. Built here so it cannot drift from
+/// [`request_id`]: a reader matching a hand-written prefix would still match
+/// after the scheme moved, on the wrong requests.
+pub fn request_id_prefix(run_id: &str, kind: &str) -> String {
+    format!("{run_id}-{kind}-")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The run leads, so the same tool-call id in two runs is two requests.
+    ///
+    /// That is the whole point of the scheme: one daemon holds every run's open
+    /// requests in one place, and an answer names the request and nothing else.
+    #[test]
+    fn a_request_id_is_unique_to_the_run_that_raised_it() {
+        assert_eq!(
+            request_id("coder-1788924523-abc123", "approve", "call_1"),
+            "coder-1788924523-abc123-approve-call_1"
+        );
+        assert_ne!(
+            request_id("run-a", "approve", "call_1"),
+            request_id("run-b", "approve", "call_1"),
+            "one provider id, two runs, two requests"
+        );
+        assert_ne!(
+            request_id("run-a", "approve", "call_1"),
+            request_id("run-a", "gate", "call_1"),
+            "one call can be asked about twice, for different reasons"
+        );
+        // What a reader telling one run's kinds apart matches on, built from the
+        // same pieces in the same order.
+        let prefix = request_id_prefix("run-a", "point");
+        assert_eq!(prefix, "run-a-point-");
+        assert!(request_id("run-a", "point", "plan-0").starts_with(&prefix));
+        assert!(!request_id("run-a", "approve", "call_1").starts_with(&prefix));
+    }
 
     /// "Allow tool call: `bash`?" asks whether to run a shell command without
     /// saying which one - the only safe answer is no and the only practical one
@@ -760,6 +896,26 @@ mod tests {
         assert_eq!(r.scope, Some(ApprovalScope::Run));
     }
 
+    /// An answer's files ride the wire only when there are some, so every
+    /// client that never heard of parts reads and writes the same JSON.
+    #[test]
+    fn parts_ride_the_answer_only_when_attached() {
+        let bare = InteractionResponse::text("q1", "hi");
+        let json = serde_json::to_string(&bare).unwrap();
+        assert!(!json.contains("parts"), "{json}");
+        let parsed: InteractionResponse = serde_json::from_str(&json).unwrap();
+        assert!(parsed.parts.is_empty());
+        let with = bare.with_parts(vec![crate::mime::InboundPart::from_bytes(
+            "a.png",
+            vec![1, 2, 3],
+        )]);
+        let json = serde_json::to_string(&with).unwrap();
+        assert!(json.contains("\"parts\""), "{json}");
+        let parsed: InteractionResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.parts.len(), 1);
+        assert_eq!(parsed.parts[0].name, "a.png");
+    }
+
     #[test]
     fn test_response_as_text() {
         let r = InteractionResponse::text("id", "answer");
@@ -771,6 +927,7 @@ mod tests {
             approved: None,
             scope: None,
             feedback: None,
+            parts: Vec::new(),
         };
         assert_eq!(response_as_text(&empty), "");
     }
@@ -845,6 +1002,49 @@ mod tests {
         assert!(r.choice_index.is_none());
         assert!(r.approved.is_none());
         assert!(r.scope.is_none());
+    }
+
+    /// Every part of an answer a reader would ask about reaches the record, and
+    /// the files attached to one deliberately do not.
+    ///
+    /// A journal record is read long after the run; the parts are already stored
+    /// and named by the tool result, and copying their bytes into the journal
+    /// once per answer is the one thing this record must not do.
+    #[test]
+    fn a_settlement_carries_the_decision_and_not_the_files() {
+        let denied = InteractionResponse {
+            request_id: "approve-1".to_string(),
+            value: Some("go ahead".to_string()),
+            choice_index: Some(2),
+            approved: Some(false),
+            scope: Some(ApprovalScope::Stage),
+            feedback: Some("try the safe one".to_string()),
+            parts: vec![],
+        };
+        assert_eq!(
+            Settlement::of(&denied),
+            Settlement::Answered {
+                approved: Some(false),
+                scope: Some(ApprovalScope::Stage),
+                choice: Some(2),
+                text: Some("go ahead".to_string()),
+                feedback: Some("try the safe one".to_string()),
+            }
+        );
+
+        // A plain text answer carries no approval and no scope: there was
+        // nothing to approve and nothing to scope.
+        let text = InteractionResponse::text("ask-1", "the second one");
+        assert_eq!(
+            Settlement::of(&text),
+            Settlement::Answered {
+                approved: None,
+                scope: None,
+                choice: None,
+                text: Some("the second one".to_string()),
+                feedback: None,
+            }
+        );
     }
 
     #[test]

@@ -18,6 +18,27 @@ conversation = {{ kind = "sliding_window", max_items = 50, max_tokens = 10000 }}
     )
 }
 
+/// [`manifest`] with a region seeded from the task, which a blueprint that runs
+/// its own fan-out workers must have: each worker is spawned with its work
+/// item as the task.
+fn manifest_taking_task(stages_toml: &str) -> String {
+    format!(
+        r#"
+[agent]
+name = "lint-fixture"
+version = "0.1.0"
+description = "a fixture"
+
+{stages_toml}
+
+[context.regions]
+system = {{ kind = "pinned", max_tokens = 1000 }}
+task = {{ kind = "pinned", max_tokens = 1000, seed = "task" }}
+conversation = {{ kind = "sliding_window", max_items = 50, max_tokens = 10000 }}
+"#
+    )
+}
+
 impl LintEnv {
     /// A default env that also knows how big the shipped models' windows are,
     /// which is what the percentage-budget check needs to say a number.
@@ -45,6 +66,36 @@ fn codes(findings: &[LintFinding]) -> Vec<&'static str> {
 /// Every finding carrying `code`.
 fn with_code<'a>(findings: &'a [LintFinding], code: &str) -> Vec<&'a LintFinding> {
     findings.iter().filter(|f| f.code == code).collect()
+}
+
+/// A blueprint row that changes what a built-in type is warns; one that only
+/// adds to it, or describes a type of the agent's own, does not.
+#[test]
+fn a_mime_row_that_changes_a_builtin_type_is_flagged() {
+    let text = format!(
+        "{}\n[mime_types.\"image/png\"]\nfamily = \"model\"\ntext = true\n\
+         [mime_types.\"image/webp\"]\nextensions = [\"webp\", \"wbp\"]\n\
+         [mime_types.\"application/x-acme-scene\"]\nfamily = \"model\"\n\
+         [mime_types.\"model/*\"]\ntext = true\n\
+         [mime_types.\"model/obj\"]\ntext = true\n",
+        manifest(CLEAN_STAGE)
+    );
+    let findings = lint(&text, &LintEnv::default());
+    let said = with_code(&findings, "mime-type-overrides-builtin");
+    // `image/png` and the `model/*` family row, whose text flag the compiled
+    // table sets; `model/obj` already reads as text, and the rest add to
+    // their types or describe a new one.
+    let messages: Vec<&str> = said.iter().map(|f| f.message.as_str()).collect();
+    assert_eq!(said.len(), 2, "{messages:?}");
+    assert!(
+        messages[0].contains("image/png")
+            && messages[0].contains("family from image to model; text from false to true"),
+        "{messages:?}"
+    );
+    assert!(
+        messages[1].contains("model/*") && messages[1].contains("text from false to true"),
+        "{messages:?}"
+    );
 }
 
 /// A stage that declares everything the linter looks for, so a test can add a
@@ -164,7 +215,7 @@ model = { models = [{ provider = "anthropic", model = "claude-sonnet-5" }] }
 /// to cap and must not be nagged for one.
 #[test]
 fn a_fan_out_stage_needs_no_max_iterations() {
-    let toml = manifest(
+    let toml = manifest_taking_task(
         r#"
 [stages.split]
 mode = "fan_out"
@@ -192,7 +243,7 @@ max_iterations = 5
 /// `fail_all` with nowhere to go means one flaky worker ends the run.
 #[test]
 fn a_fail_all_fan_out_without_an_escape_is_warned_about() {
-    let toml = manifest(
+    let toml = manifest_taking_task(
         r#"
 [stages.split]
 mode = "fan_out"
@@ -211,11 +262,66 @@ allow_as_worker = true
     assert_eq!(codes(&findings), ["fanout-no-escape"]);
 }
 
+/// A worker is spawned with its work item as the task, so a blueprint that
+/// runs its own workers and declares no region seeded from the task refuses
+/// every one of them - and the run still completes, which is why the lint is
+/// an error rather than a warning.
+#[test]
+fn a_fan_out_on_a_blueprint_with_no_task_region_is_an_error() {
+    let toml = manifest(
+        r#"
+[stages.split]
+mode = "fan_out"
+worker_stage = "work"
+model = { models = [{ provider = "anthropic", model = "claude-sonnet-5" }] }
+
+[stages.work]
+mode = "autonomous"
+model = { models = [{ provider = "anthropic", model = "claude-sonnet-5" }] }
+max_iterations = 5
+allow_as_worker = true
+"#,
+    );
+    let findings = lint(&toml, &LintEnv::default());
+    assert_eq!(codes(&findings), ["fanout-worker-task-unheld"]);
+    let finding = &findings[0];
+    assert_eq!(finding.severity, LintSeverity::Error);
+    assert_eq!(finding.stage.as_deref(), Some("split"));
+    assert!(finding.message.contains("stage 'work'"), "{finding:?}");
+    assert!(
+        finding
+            .fix
+            .as_deref()
+            .is_some_and(|f| f.contains("seed = \"task\"")),
+        "{finding:?}"
+    );
+}
+
+/// `worker_agent` names another blueprint, linted when it is validated itself;
+/// whether *this* one takes a task says nothing about it.
+#[test]
+fn a_fan_out_onto_another_agent_is_not_held_to_this_blueprints_regions() {
+    let toml = manifest(
+        r#"
+[stages.split]
+mode = "fan_out"
+worker_agent = "some-other-agent"
+model = { models = [{ provider = "anthropic", model = "claude-sonnet-5" }] }
+"#,
+    );
+    let findings = lint(&toml, &LintEnv::default());
+    assert!(
+        !codes(&findings).contains(&"fanout-worker-task-unheld"),
+        "{:?}",
+        codes(&findings)
+    );
+}
+
 /// The default policy merges what succeeded, so there is nothing to escape from
 /// and nothing to say.
 #[test]
 fn a_continuing_fan_out_needs_no_escape() {
-    let toml = manifest(
+    let toml = manifest_taking_task(
         r#"
 [stages.split]
 mode = "fan_out"
@@ -237,7 +343,7 @@ allow_as_worker = true
 /// go on" - so it satisfies the check too.
 #[test]
 fn a_dead_end_edge_satisfies_the_fan_out_escape_check() {
-    let toml = manifest(
+    let toml = manifest_taking_task(
         r#"
 [stages.split]
 mode = "fan_out"
@@ -632,6 +738,335 @@ read_file = "allow"
     assert!(lint(&toml, &LintEnv::default()).is_empty());
 }
 
+// ─── Tool groups ──────────────────────────────────────────────────────────────
+
+/// An install that knows one tool of each kind, so a group-aware check can
+/// say which group reaches what.
+fn grouped_env() -> LintEnv {
+    use leviath_core::blueprint::ToolGroup;
+    let sources = [
+        ("read_file", ToolGroup::Builtin),
+        ("shell", ToolGroup::Builtin),
+        ("bash", ToolGroup::Builtin),
+        ("write_file", ToolGroup::Builtin),
+        ("ask_user_text", ToolGroup::Builtin),
+        ("ask_user_choice", ToolGroup::Builtin),
+        ("ask_user_confirm", ToolGroup::Builtin),
+        ("present_for_review", ToolGroup::Builtin),
+        ("edit_document", ToolGroup::Builtin),
+        ("spawn_agent", ToolGroup::Subagent),
+        ("summarize", ToolGroup::Scripts),
+    ];
+    LintEnv {
+        known_tools: known_tools(&sources.map(|(n, _)| n)),
+        tool_sources: sources
+            .map(|(n, g)| (n.to_string(), g))
+            .into_iter()
+            .collect(),
+        ..LintEnv::default()
+    }
+}
+
+/// A group token is a grant, not a tool name: `@scripts` is never "not a
+/// built-in", and everything it reaches is left to the runtime to enumerate.
+#[test]
+fn a_group_token_is_not_an_unknown_tool() {
+    let toml = manifest(
+        r#"
+[stages.main]
+mode = "autonomous"
+model = { models = [{ provider = "anthropic", model = "claude-sonnet-5" }] }
+max_iterations = 10
+available_tools = ["@scripts", "@mcp", "read_file"]
+"#,
+    );
+    let findings = lint(&toml, &grouped_env());
+    assert!(findings.is_empty(), "{:?}", codes(&findings));
+}
+
+/// `Stage::validate` cannot say whether `@scripts` reaches `summarize`; the
+/// lint can, given an inventory, and a required tool nothing grants is an
+/// error either way.
+#[test]
+fn a_required_tool_no_group_reaches_is_an_error() {
+    let toml = manifest(
+        r#"
+[stages.main]
+mode = "autonomous"
+model = { models = [{ provider = "anthropic", model = "claude-sonnet-5" }] }
+max_iterations = 10
+available_tools = ["@scripts"]
+required_tools = ["summarize", "read_file", "github__create_issue"]
+"#,
+    );
+    let findings = lint(&toml, &grouped_env());
+    let missing = with_code(&findings, "required-tool-not-granted");
+    let named: Vec<&str> = missing
+        .iter()
+        .map(|f| {
+            f.message
+                .split('\'')
+                .nth(1)
+                .expect("the message quotes the tool")
+        })
+        .collect();
+    assert_eq!(named, ["read_file", "github__create_issue"], "{findings:?}");
+    assert!(missing.iter().all(|f| f.is_error()));
+    assert!(missing[0].message.contains("@scripts"), "{findings:?}");
+
+    // With no inventory the question cannot be answered, so it is not asked.
+    assert!(
+        with_code(
+            &lint(&toml, &LintEnv::default()),
+            "required-tool-not-granted"
+        )
+        .is_empty()
+    );
+}
+
+/// A required tool reached by name (either spelling) or by its group is fine,
+/// and `@all` reaches everything, MCP names included.
+#[test]
+fn a_required_tool_a_group_reaches_is_fine() {
+    let toml = manifest(
+        r#"
+[stages.main]
+mode = "autonomous"
+model = { models = [{ provider = "anthropic", model = "claude-sonnet-5" }] }
+max_iterations = 10
+available_tools = ["@builtin", "@scripts", "bash"]
+required_tools = ["summarize", "read_file", "shell"]
+allow_blocking_tools = true
+
+[stages.main.tool_permissions]
+shell = "ask"
+"#,
+    );
+    let findings = lint(&toml, &grouped_env());
+    assert!(findings.is_empty(), "{:?}", codes(&findings));
+
+    let toml = manifest(
+        r#"
+[stages.main]
+mode = "autonomous"
+model = { models = [{ provider = "anthropic", model = "claude-sonnet-5" }] }
+max_iterations = 10
+available_tools = ["@all"]
+required_tools = ["spawn_agent", "github__create_issue"]
+allow_blocking_tools = true
+
+[stages.main.tool_permissions]
+shell = "ask"
+"#,
+    );
+    let findings = lint(&toml, &grouped_env());
+    assert!(findings.is_empty(), "{:?}", codes(&findings));
+}
+
+/// A permission is orphaned only when nothing grants the tool: a group that
+/// reaches it counts, and with no inventory to classify by the check stays
+/// quiet, as it does under a connector.
+#[test]
+fn a_permission_a_group_reaches_is_not_orphaned() {
+    let toml = manifest(
+        r#"
+[stages.main]
+mode = "autonomous"
+model = { models = [{ provider = "anthropic", model = "claude-sonnet-5" }] }
+max_iterations = 10
+available_tools = ["@scripts", "@mcp", "read_file"]
+
+[stages.main.tool_permissions]
+summarize = "allow"
+github__create_issue = "ask"
+write_file = "allow"
+"#,
+    );
+    let findings = lint(&toml, &grouped_env());
+    assert_eq!(codes(&findings), ["orphan-stage-permission"]);
+    assert!(findings[0].message.contains("write_file"), "{findings:?}");
+
+    assert!(lint(&toml, &LintEnv::default()).is_empty());
+}
+
+/// `@builtin` in an autonomous stage carries every blocking tool, reported
+/// once as the group; keeping one in `required_tools` takes it off the list,
+/// and `allow_blocking_tools` silences it.
+#[test]
+fn a_builtin_group_in_an_autonomous_stage_is_warned_about_once() {
+    let toml = manifest(
+        r#"
+[stages.main]
+mode = "autonomous"
+model = { models = [{ provider = "anthropic", model = "claude-sonnet-5" }] }
+max_iterations = 10
+available_tools = ["@builtin"]
+required_tools = ["ask_user_text"]
+
+[stages.main.tool_permissions]
+shell = "allow"
+"#,
+    );
+    // The required ask tool also earns its own `holds-under-yolo` note, which
+    // is not what this test is about.
+    let blocking = |toml: &str| -> Vec<LintFinding> {
+        lint(toml, &grouped_env())
+            .into_iter()
+            .filter(|f| f.code != "holds-under-yolo")
+            .collect()
+    };
+    let findings = blocking(&toml);
+    assert_eq!(codes(&findings), ["blocking-tool-in-autonomous-stage"]);
+    assert_eq!(findings[0].severity, LintSeverity::Warning);
+    assert!(findings[0].message.contains("'@builtin'"), "{findings:?}");
+    assert!(
+        findings[0].message.contains("present_for_review"),
+        "{findings:?}"
+    );
+    assert!(
+        !findings[0].message.contains("ask_user_text"),
+        "{findings:?}"
+    );
+
+    let silenced = blocking(&toml.replace(
+        "required_tools",
+        "allow_blocking_tools = true\nrequired_tools",
+    ));
+    assert!(silenced.is_empty(), "{:?}", codes(&silenced));
+
+    // Naming every blocking tool in required_tools leaves nothing to say.
+    let all_required = toml.replace(
+        r#"required_tools = ["ask_user_text"]"#,
+        r#"required_tools = ["ask_user_text", "ask_user_choice", "ask_user_confirm", "present_for_review", "edit_document"]"#,
+    );
+    let findings = blocking(&all_required);
+    assert!(findings.is_empty(), "{:?}", codes(&findings));
+}
+
+/// The shell arrives with `@builtin` as surely as by name, and its default
+/// policy is still `ask`. Said once, through the group; not at all when the
+/// shell is also named, since that finding already covers it.
+#[test]
+fn a_builtin_group_with_no_shell_policy_is_warned_about() {
+    let toml = manifest(
+        r#"
+[stages.main]
+mode = "autonomous"
+model = { models = [{ provider = "anthropic", model = "claude-sonnet-5" }] }
+max_iterations = 10
+available_tools = ["@all"]
+allow_blocking_tools = true
+"#,
+    );
+    let findings = lint(&toml, &grouped_env());
+    assert_eq!(codes(&findings), ["implicit-shell-policy"]);
+    assert!(
+        findings[0].message.contains("'shell' through '@all'"),
+        "{findings:?}"
+    );
+    assert!(
+        findings[0]
+            .fix
+            .as_deref()
+            .is_some_and(|f| f.contains("set shell =")),
+        "{findings:?}"
+    );
+
+    let named = lint(
+        &toml.replace(r#"["@all"]"#, r#"["@all", "bash"]"#),
+        &grouped_env(),
+    );
+    let shells = with_code(&named, "implicit-shell-policy");
+    assert_eq!(shells.len(), 1, "{named:?}");
+    assert!(shells[0].message.contains("'bash'"), "{named:?}");
+}
+
+/// An output stage reaching the built-ins through a group can modify the
+/// workspace, reported once as the group rather than once per member.
+#[test]
+fn an_output_stage_granting_the_builtin_group_is_warned_about() {
+    let toml = manifest(
+        r#"
+[stages.main]
+mode = "output"
+model = { models = [{ provider = "anthropic", model = "claude-sonnet-5" }] }
+max_iterations = 10
+available_tools = ["@builtin", "submit_output"]
+require_output = true
+
+[stages.main.tool_permissions]
+shell = "allow"
+"#,
+    );
+    let findings = lint(&toml, &grouped_env());
+    let modify = with_code(&findings, "output-stage-can-modify");
+    assert_eq!(modify.len(), 1, "{findings:?}");
+    assert!(modify[0].message.contains("'@builtin'"), "{findings:?}");
+}
+
+/// Routing tool output into a region with `@builtin` granted is fine: the
+/// group carries `context_read` along with `read_file`.
+#[test]
+fn a_builtin_group_satisfies_the_region_read_check() {
+    let toml = manifest(
+        r#"
+[stages.main]
+mode = "autonomous"
+model = { models = [{ provider = "anthropic", model = "claude-sonnet-5" }] }
+max_iterations = 10
+available_tools = ["@builtin"]
+allow_blocking_tools = true
+
+[stages.main.tool_routing]
+default_region = "notes"
+
+[stages.main.tool_permissions]
+shell = "allow"
+
+[stages.main.context.regions]
+system = { kind = "pinned", max_tokens = 1000 }
+conversation = { kind = "sliding_window", max_items = 50, max_tokens = 10000 }
+notes = { kind = "temporary", max_tokens = 1000 }
+"#,
+    );
+    let findings = lint(&toml, &grouped_env());
+    assert!(
+        with_code(&findings, "routing-without-region-read").is_empty(),
+        "{:?}",
+        codes(&findings)
+    );
+}
+
+/// A required region is enforceable through `@builtin`: the group carries the
+/// context-writing tools.
+#[test]
+fn a_builtin_group_makes_a_required_region_enforceable() {
+    let toml = manifest(
+        r#"
+[stages.main]
+mode = "autonomous"
+model = { models = [{ provider = "anthropic", model = "claude-sonnet-5" }] }
+max_iterations = 10
+available_tools = ["@builtin"]
+allow_blocking_tools = true
+
+[stages.main.tool_permissions]
+shell = "allow"
+
+[stages.main.context.regions]
+system = { kind = "pinned", max_tokens = 1000 }
+conversation = { kind = "sliding_window", max_items = 50, max_tokens = 10000 }
+findings = { kind = "pinned", max_tokens = 1000, required = true }
+"#,
+    );
+    let findings = lint(&toml, &grouped_env());
+    assert!(
+        with_code(&findings, "required-region-unenforceable").is_empty(),
+        "{:?}",
+        codes(&findings)
+    );
+}
+
 // ─── Blocking tools ───────────────────────────────────────────────────────────
 
 #[test]
@@ -789,7 +1224,7 @@ max_iterations = 10
 available_tools = ["bash"]
 
 [stages.main.tool_permissions]
-bash = "allow"
+bash = "ask"
 "#,
     );
     assert!(lint(&toml, &LintEnv::default()).is_empty());
@@ -1816,7 +2251,7 @@ max_iterations = 5
 /// orphans in a correctly wired blueprint.
 #[test]
 fn fan_out_worker_and_merge_stages_are_reachable() {
-    let toml = manifest(
+    let toml = manifest_taking_task(
         r#"
 [stages.split]
 mode = "fan_out"
@@ -2458,6 +2893,126 @@ fn every_evicting_kind_is_covered_not_just_temporary() {
     }
 }
 
+/// An output stage on a model that cannot call tools has one way to answer:
+/// a declared artifact fed by a routed produced part. Each half missing is
+/// named; a stage with both, a tool-capable model, an open route, or no
+/// output duty at all is left alone.
+#[test]
+fn an_output_stage_whose_models_cannot_call_tools_must_route_a_declared_file() {
+    let manifest = |model: &str, mode: &str, extra: &str| {
+        format!(
+            r#"
+[agent]
+name = "builder"
+version = "0.1.0"
+description = "d"
+
+[stages.build]
+mode = "{mode}"
+model = {{ models = [{model}] }}
+description = "Builds"
+max_iterations = 3
+{extra}
+
+[context.regions]
+task = {{ kind = "pinned", max_tokens = 1000 }}
+model = {{ kind = "pinned", max_tokens = 1000, accepts = ["model/*"] }}
+conversation = {{ kind = "sliding_window", max_items = 50, max_tokens = 10000 }}
+"#
+        )
+    };
+    let meshy = r#"{ provider = "meshy", model = "image-to-3d" }"#;
+    let routing = "[stages.build.output_routing]\n\"model/*\" = \"model\"\n";
+    let artifact = "[[stages.build.output.artifacts]]\nname = \"mesh\"\ntype = \"model/*\"\n";
+    let code = "output-stage-cannot-answer";
+
+    let bare = lint(&manifest(meshy, "output", ""), &LintEnv::default());
+    let found = with_code(&bare, code);
+    assert_eq!(found.len(), 1, "{:?}", codes(&bare));
+    assert_eq!(found[0].severity, LintSeverity::Error);
+    assert_eq!(found[0].stage.as_deref(), Some("build"));
+    assert!(
+        found[0].message.contains("meshy/image-to-3d")
+            && found[0]
+                .message
+                .contains("declares no artifact and routes no produced part"),
+        "{}",
+        found[0].message
+    );
+    assert!(
+        found[0]
+            .fix
+            .as_deref()
+            .unwrap_or_default()
+            .contains("output_routing")
+    );
+
+    let routed = lint(&manifest(meshy, "output", routing), &LintEnv::default());
+    assert!(
+        with_code(&routed, code)[0]
+            .message
+            .contains("declares no artifact for it"),
+        "{:?}",
+        codes(&routed)
+    );
+    let declared = lint(&manifest(meshy, "output", artifact), &LintEnv::default());
+    assert!(
+        with_code(&declared, code)[0]
+            .message
+            .contains("routes no produced part"),
+        "{:?}",
+        codes(&declared)
+    );
+
+    let both = format!("{routing}{artifact}");
+    for (label, text) in [
+        ("both halves", manifest(meshy, "output", &both)),
+        (
+            "a tool-capable model",
+            manifest(
+                r#"{ provider = "anthropic", model = "claude-sonnet-5" }"#,
+                "output",
+                "",
+            ),
+        ),
+        (
+            "an open route",
+            manifest(r#"{ model = "something" }"#, "output", ""),
+        ),
+        ("no output duty", manifest(meshy, "autonomous", "")),
+    ] {
+        let findings = lint(&text, &LintEnv::default());
+        assert!(
+            with_code(&findings, code).is_empty(),
+            "{label}: {:?}",
+            codes(&findings)
+        );
+    }
+}
+
+/// A 3D generator's "window" is the ceiling its REST call takes a mesh under,
+/// not a context window: one Meshy stage made every percentage region resolve
+/// against 64 million tokens. The widest window is the widest among the models
+/// that write text.
+#[test]
+fn a_model_that_does_not_write_text_is_not_the_widest_window() {
+    let toml = format!(
+        "{}\n[stages.build]\nmode = \"output\"\nmodel = {{ models = [{{ provider = \"meshy\", model = \"image-to-3d\" }}] }}\ndescription = \"Builds\"\nmax_iterations = 3\n",
+        manifest_with_regions(r#"raw_findings = { kind = "temporary", budget = "38%" }"#)
+    );
+    let findings = lint(&toml, &LintEnv::default_with_windows());
+    let found = findings
+        .iter()
+        .find(|f| f.code == "unbounded-percentage-budget")
+        .expect("the region is still warned about, against the text model");
+    assert!(
+        found.message.contains("claude-sonnet-5") && found.message.contains("380000"),
+        "{}",
+        found.message
+    );
+    assert!(!found.message.contains("64000000"), "{}", found.message);
+}
+
 /// Without a window there is no number to report, and a warning that cannot say
 /// what "38%" comes to is one nobody acts on.
 #[test]
@@ -2808,6 +3363,94 @@ fn script_registry(
     (registry, dir)
 }
 
+/// A registry of providers that publish what they serve, under the names
+/// the retention table knows.
+fn registry_serving(providers: &[(&str, &str)]) -> leviath_runtime::ProviderRegistry {
+    let mut registry = leviath_runtime::ProviderRegistry::new();
+    for (name, model) in providers {
+        registry.register(
+            (*name).to_string(),
+            std::sync::Arc::new(ExplainingProvider {
+                serves: vec![(*model).to_string()],
+                reason: "not here".to_string(),
+            }),
+        );
+    }
+    registry
+}
+
+fn zero_retention_config() -> crate::config::Config {
+    let mut config = crate::config::Config::default();
+    config.providers.zero_retention = true;
+    config
+}
+
+/// Under the switch, the model a stage would start on is judged the way the
+/// spawn gate judges it: a provider that keeps an abuse log is an error
+/// carrying the reason; local inference passes. Off, nothing is recorded.
+#[test]
+fn a_retaining_head_model_is_an_error_under_zero_retention() {
+    let registry = registry_serving(&[("openai", "gpt-5.5"), ("ollama", "q")]);
+    let bp = blueprint_pinning(&[("openai", "gpt-5.5"), ("ollama", "q")]);
+
+    let env = LintEnv::default().with_retention(&bp, &zero_retention_config(), &registry);
+    let refusals = &env.retention_refusals["main"];
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
+    let refusal = &refusals[0];
+    assert!(refusal.head);
+    assert_eq!(refusal.route, "openai/gpt-5.5");
+    let reason = refusal.reason.as_str();
+    assert!(reason.contains("30 days"), "{reason}");
+
+    let findings = lint_manifest("", &bp, &env);
+    assert_eq!(codes(&findings), ["retention-not-zero"]);
+    let message = findings[0].message.as_str();
+    assert!(message.contains("openai/gpt-5.5"), "{message}");
+    assert!(message.contains("30 days"), "{message}");
+    let fix = findings[0].fix.clone().unwrap_or_default();
+    assert!(fix.contains("zero_retention_agreements"), "{fix}");
+
+    let off = LintEnv::default().with_retention(&bp, &crate::config::Config::default(), &registry);
+    assert!(off.retention_refusals.is_empty());
+    assert!(lint_manifest("", &bp, &off).is_empty());
+}
+
+/// A fallback that keeps something is a warning, since failover drops it
+/// rather than the spawn refusing it; a fallback on a provider this install
+/// does not have is not judged, because it is not in the failover list
+/// either; a declared agreement clears the provider.
+#[test]
+fn a_retaining_fallback_is_a_warning_under_zero_retention() {
+    let registry = registry_serving(&[("openai", "gpt-5.5"), ("ollama", "q")]);
+    let bp = blueprint_pinning(&[
+        ("ollama", "q"),
+        ("openai", "gpt-5.5"),
+        ("anthropic", "claude-sonnet-5"),
+    ]);
+
+    let env = LintEnv::default().with_retention(&bp, &zero_retention_config(), &registry);
+    let refusals = &env.retention_refusals["main"];
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
+    let refusal = &refusals[0];
+    assert!(!refusal.head);
+    assert_eq!(refusal.route, "openai/gpt-5.5");
+
+    let findings = lint_manifest("", &bp, &env);
+    assert_eq!(codes(&findings), ["retention-fallback-dropped"]);
+    assert_eq!(findings[0].severity, LintSeverity::Warning);
+    let message = findings[0].message.as_str();
+    assert!(message.contains("failover skips it"), "{message}");
+
+    let mut config = zero_retention_config();
+    config.providers.zero_retention_agreements = vec!["openai".to_string()];
+    let cleared = LintEnv::default().with_retention(&bp, &config, &registry);
+    assert!(
+        cleared.retention_refusals.is_empty(),
+        "{:?}",
+        cleared.retention_refusals
+    );
+}
+
 /// The case the whole check exists for: a Rhai provider that answers
 /// `list_models` publishes a complete catalogue, and the blueprint's model is
 /// then checkable.
@@ -3040,4 +3683,282 @@ fn a_silent_native_provider_is_not_reported_as_unchecked() {
         env.provider_catalogs.is_empty(),
         "a native provider that publishes nothing is not `catalog-unchecked`"
     );
+}
+
+// ─── Mime a stage takes but its models cannot see ───────────────────────────
+
+#[test]
+fn a_stage_taking_mime_its_models_cannot_see_is_warned_once() {
+    let manifest = r#"
+[agent]
+name = "artist"
+version = "0.1.0"
+description = "d"
+
+[stages.look]
+mode = "autonomous"
+model = { models = [{ provider = "anthropic", model = "claude-sonnet-5" }] }
+description = "Main"
+max_iterations = 10
+available_tools = ["read_file"]
+
+[stages.listen]
+mode = "autonomous"
+model = { models = [{ provider = "anthropic", model = "claude-sonnet-5" }] }
+description = "Hears"
+max_iterations = 10
+available_tools = ["read_file"]
+[stages.listen.input]
+accepts = ["audio/*"]
+
+[stages.hears_anyway]
+mode = "autonomous"
+model = { models = [{ provider = "anthropic", model = "claude-sonnet-5" }, { provider = "gemini", model = "gemini-2.5-pro" }] }
+description = "Hears"
+max_iterations = 10
+available_tools = ["read_file"]
+[stages.hears_anyway.input]
+accepts = ["audio/*"]
+
+[stages.open_route]
+mode = "autonomous"
+model = { models = [{ model = "something" }] }
+description = "Unknown"
+max_iterations = 10
+available_tools = ["read_file"]
+[stages.open_route.input]
+accepts = ["audio/*"]
+
+[stages.mixed]
+mode = "autonomous"
+model = { models = [{ provider = "anthropic", model = "claude-sonnet-5" }] }
+description = "Sees the pictures, not the sound"
+max_iterations = 10
+available_tools = ["read_file"]
+[stages.mixed.input]
+accepts = ["audio/*", "image/*"]
+
+[context.regions]
+task = { kind = "pinned", max_tokens = 1000 }
+storyboard = { kind = "pinned", max_tokens = 1000, accepts = ["image/*"] }
+conversation = { kind = "sliding_window", max_items = 50, max_tokens = 10000 }
+"#;
+    let findings = lint(manifest, &LintEnv::default());
+    assert!(with_code(&findings, "tool-accepts-ungranted").is_empty());
+    let unseen = with_code(&findings, "mime-unseen");
+    assert_eq!(unseen.len(), 2, "{:?}", codes(&findings));
+    // A stage whose model sees some of what it takes is a pipeline working as
+    // designed: said as a note, naming only what is unseen.
+    let mixed = unseen
+        .iter()
+        .find(|f| f.stage.as_deref() == Some("mixed"))
+        .expect("the mixed stage is noted");
+    assert_eq!(mixed.severity, LintSeverity::Note);
+    assert!(mixed.message.contains("takes audio/*"), "{}", mixed.message);
+    assert!(!mixed.message.contains("image/*"), "{}", mixed.message);
+    let unseen: Vec<&&LintFinding> = unseen
+        .iter()
+        .filter(|f| f.stage.as_deref() == Some("listen"))
+        .collect();
+    assert_eq!(unseen[0].severity, LintSeverity::Warning);
+    assert_eq!(unseen[0].stage.as_deref(), Some("listen"));
+    assert!(
+        unseen[0].message.contains("takes audio/*"),
+        "{}",
+        unseen[0].message
+    );
+    assert!(
+        unseen[0].message.contains("anthropic/claude-sonnet-5"),
+        "{}",
+        unseen[0].message
+    );
+    assert!(
+        unseen[0]
+            .fix
+            .as_deref()
+            .unwrap_or_default()
+            .contains("as_text")
+    );
+}
+
+/// A `tool_accepts` limit on a tool the stage never grants is said once,
+/// unless a group grant makes the question one for the install.
+#[test]
+fn a_tool_limit_on_an_ungranted_tool_is_said_once() {
+    let text = manifest(
+        r#"
+[stages.named]
+mode = "autonomous"
+model = { provider = "anthropic", model = "claude-sonnet-5" }
+description = "Named"
+max_iterations = 10
+available_tools = ["read_file", "spawn_agent"]
+[stages.named.tool_accepts]
+spawn_agent = ["image/*"]
+ghost = ["audio/*", "video/mp4"]
+
+[stages.grouped]
+mode = "autonomous"
+model = { provider = "anthropic", model = "claude-sonnet-5" }
+description = "Grouped"
+max_iterations = 10
+available_tools = ["@builtin"]
+[stages.grouped.tool_accepts]
+ghost = ["audio/*"]
+"#,
+    );
+    let findings = lint(&text, &LintEnv::default());
+    let said = with_code(&findings, "tool-accepts-ungranted");
+    assert_eq!(said.len(), 1, "{:?}", codes(&findings));
+    assert_eq!(said[0].stage.as_deref(), Some("named"));
+    assert!(
+        said[0]
+            .message
+            .contains("limits 'ghost' to audio/*, video/mp4"),
+        "{}",
+        said[0].message
+    );
+    assert!(
+        said[0]
+            .fix
+            .as_deref()
+            .is_some_and(|f| f.contains("available_tools"))
+    );
+}
+
+/// A blueprint that sets a tool more permissive than its built-in default is
+/// warned that the runtime clamps it; a tool a blueprint may pre-approve, and
+/// one set no looser than the default, are left alone.
+#[test]
+fn a_blueprint_that_loosens_a_tool_is_told_the_runtime_clamps_it() {
+    let toml = manifest(
+        r#"
+[stages.main]
+mode = "autonomous"
+model = { models = [{ provider = "anthropic", model = "claude-sonnet-5" }] }
+max_iterations = 10
+available_tools = ["shell", "write_file", "read_file", "web_search"]
+
+[stages.main.tool_permissions]
+shell = "allow"
+write_file = "allow"
+read_file = "allow"
+web_search = "allow"
+"#,
+    );
+    let findings = lint(&toml, &LintEnv::default());
+    let clamped = with_code(&findings, "blueprint-permission-clamped");
+    // shell and write_file default to ask, so allow is clamped; read_file
+    // already defaults to allow (nothing loosened); web_search is on the
+    // pre-approvable list, so a blueprint may grant it.
+    assert_eq!(clamped.len(), 2, "{:?}", codes(&findings));
+    assert!(
+        clamped.iter().any(|f| f.message.contains("shell")),
+        "{clamped:?}"
+    );
+    assert!(
+        clamped.iter().any(|f| f.message.contains("write_file")),
+        "{clamped:?}"
+    );
+    assert!(clamped.iter().all(|f| f.stage.as_deref() == Some("main")));
+    assert!(
+        clamped.iter().all(|f| f.message.contains("clamps it back")
+            && f.fix.as_deref().is_some_and(|x| x.contains("--yolo"))),
+        "{clamped:?}"
+    );
+
+    // A stage that denies a tool (stricter than the default) is not loosening.
+    let strict = lint(
+        &toml.replace("shell = \"allow\"", "shell = \"deny\""),
+        &LintEnv::default(),
+    );
+    assert!(
+        !with_code(&strict, "blueprint-permission-clamped")
+            .iter()
+            .any(|f| f.message.contains("shell")),
+        "{strict:?}"
+    );
+
+    // The agent-level table is checked too, once per tool.
+    let agent_level = manifest(
+        r#"
+[tool_permissions]
+write_file = "allow"
+
+[stages.main]
+mode = "autonomous"
+model = { models = [{ provider = "anthropic", model = "claude-sonnet-5" }] }
+max_iterations = 10
+available_tools = ["write_file"]
+"#,
+    );
+    let findings = lint(&agent_level, &LintEnv::default());
+    let clamped = with_code(&findings, "blueprint-permission-clamped");
+    assert_eq!(clamped.len(), 1, "{:?}", codes(&findings));
+    assert!(
+        clamped[0].message.contains("[tool_permissions]"),
+        "{clamped:?}"
+    );
+}
+
+/// A manifest whose stage runs on `provider/model` with regions totalling
+/// `conversation_tokens` beside a small pinned one.
+fn manifest_on(provider: &str, model: &str, conversation_tokens: usize) -> String {
+    format!(
+        r#"
+[agent]
+name = "lint-fixture"
+version = "0.1.0"
+description = "a fixture"
+
+[stages.work]
+mode = "autonomous"
+model = {{ models = [{{ provider = "{provider}", model = "{model}" }}] }}
+max_iterations = 10
+allow_complete = true
+
+[context.regions]
+system = {{ kind = "pinned", max_tokens = 1000 }}
+conversation = {{ kind = "sliding_window", max_items = 50, max_tokens = {conversation_tokens} }}
+"#
+    )
+}
+
+#[test]
+fn a_stage_that_can_reach_a_long_context_tier_gets_a_note_and_nothing_more() {
+    let big = manifest_on("google", "gemini-2.5-pro", 300_000);
+    let findings = lint(&big, &LintEnv::default_with_windows());
+    let found = findings
+        .iter()
+        .find(|f| f.code == "long-context-price")
+        .expect("the tier is noted");
+    assert_eq!(found.severity, LintSeverity::Note);
+    assert!(
+        found.message.contains("google/gemini-2.5-pro"),
+        "{}",
+        found.message
+    );
+    assert!(found.message.contains("200000"), "{}", found.message);
+    assert!(found.message.contains("301000"), "{}", found.message);
+    assert!(
+        found.fix.as_deref().unwrap_or_default().contains("200000"),
+        "{found:?}"
+    );
+
+    let small = manifest_on("google", "gemini-2.5-pro", 100_000);
+    assert!(
+        !codes(&lint(&small, &LintEnv::default_with_windows())).contains(&"long-context-price")
+    );
+
+    // No tier in the price table, no window known, or no model priced: silent.
+    let untiered = manifest_on("anthropic", "claude-sonnet-5", 900_000);
+    assert!(
+        !codes(&lint(&untiered, &LintEnv::default_with_windows())).contains(&"long-context-price")
+    );
+    assert!(!codes(&lint(&big, &LintEnv::default())).contains(&"long-context-price"));
+    let unknown = manifest_on("google", "gemini-unlisted", 900_000);
+    let mut env = LintEnv::default_with_windows();
+    env.model_windows
+        .insert(("google".into(), "gemini-unlisted".into()), 1_000_000);
+    assert!(!codes(&lint(&unknown, &env)).contains(&"long-context-price"));
 }

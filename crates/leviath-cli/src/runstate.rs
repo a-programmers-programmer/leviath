@@ -2,7 +2,6 @@
 //!
 //! Each run lives under `~/.leviath/runs/<run-id>/` with:
 //! - `meta.json`    - run metadata, updated atomically (tmp + rename)
-//! - `output.log`  - append-only combined worker stdout (legacy/fallback)
 //! - `stages.json` - index of per-stage records
 //! - `stages/<idx>/output.log` - readable agent output for that stage
 //! - `stages/<idx>/logs.log`   - operational events + tool activity
@@ -72,7 +71,7 @@ pub(crate) fn write_context_snapshot(run_id: &str, snap: &ContextSnapshot) -> an
 /// Not JSON-specific despite where it started: the final-output sidecar is raw
 /// content, and wants the same private-then-rename treatment for the same
 /// reason.
-fn write_private_atomic(path: &std::path::Path, body: &str) -> anyhow::Result<()> {
+pub(crate) fn write_private_atomic(path: &std::path::Path, body: &str) -> anyhow::Result<()> {
     let tmp = path.with_extension("tmp");
     // `write_private`: these files carry the run's full task prompt,
     // conversation and tool output - and `meta.json` carries the webhook
@@ -163,8 +162,21 @@ impl<T> StatCache<T> {
         parse: impl FnOnce(&str) -> Option<T>,
         recheck_after: std::time::Duration,
     ) -> Option<Arc<T>> {
+        self.get_with_recheck_by(path, parse, |_| recheck_after)
+    }
+
+    /// [`get_with_recheck`](Self::get_with_recheck), with the window worked
+    /// out from what the cache holds for `path` (`None` for nothing, or a file
+    /// that did not parse), in one lookup: a poller over thousands of settled
+    /// runs does little else per run but hash its path.
+    pub(crate) fn get_with_recheck_by(
+        &mut self,
+        path: &Path,
+        parse: impl FnOnce(&str) -> Option<T>,
+        recheck_after: impl FnOnce(Option<&T>) -> std::time::Duration,
+    ) -> Option<Arc<T>> {
         if let Some(entry) = self.entries.get(path)
-            && entry.checked.elapsed() < recheck_after
+            && entry.checked.elapsed() < recheck_after(entry.value.as_deref())
         {
             return entry.value.clone();
         }
@@ -198,11 +210,6 @@ impl<T> StatCache<T> {
         value
     }
 
-    /// The cached value for `path`, without asking the filesystem anything.
-    pub(crate) fn peek(&self, path: &Path) -> Option<Arc<T>> {
-        self.entries.get(path).and_then(|entry| entry.value.clone())
-    }
-
     /// Drop entries for files under runs that no longer exist, so a
     /// long-lived poller's cache stays bounded by the live run set.
     pub(crate) fn retain_under(&mut self, keep: &std::collections::HashSet<PathBuf>) {
@@ -229,6 +236,24 @@ pub(crate) fn read_run_archive(run_id: &str) -> Option<Vec<leviath_core::run_arc
     leviath_core::run_archive::read_archive_lenient(&mut bytes.as_slice())
         .ok()
         .map(|(_version, records)| records)
+}
+
+/// A file's size and modification time: what tells a reader whether it has
+/// changed since it was last read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FileStamp {
+    pub(crate) mtime: std::time::SystemTime,
+    pub(crate) len: u64,
+}
+
+/// The stamp of a run's archive (`<run_dir>/run.lvr`), or `None` when it has
+/// none.
+pub(crate) fn archive_stamp(run_id: &str) -> Option<FileStamp> {
+    let meta = std::fs::metadata(run_dir(run_id).join(leviath_core::files::ARCHIVE_FILE)).ok()?;
+    Some(FileStamp {
+        mtime: meta.modified().unwrap_or(std::time::UNIX_EPOCH),
+        len: meta.len(),
+    })
 }
 
 /// Stream a run's raw journal records through `visit`, one at a time, without
@@ -347,6 +372,40 @@ pub(crate) fn run_dir_in(runs_dir: &std::path::Path, run_id: &str) -> PathBuf {
         return runs_dir.join("<invalid>");
     }
     runs_dir.join(run_id)
+}
+
+/// Delete what the run `run_id` put in providers' file storage, reading its
+/// ledger now, before the caller removes the run's directory. The deletes run
+/// in the background on a runtime that is already going, or here, bounded,
+/// when there is none. Best effort: the vendor's expiry is the backstop.
+pub(crate) fn forget_provider_files(run_id: &str) {
+    let entries = leviath_runtime::provider_files::take_ledger(&run_dir(run_id));
+    if entries.is_empty() {
+        return;
+    }
+    // Built where the deletes run: a provider's client wants a runtime to
+    // stand in. One that cannot be built is one whose files are left to
+    // expire, which the delete says per file.
+    let work = async move {
+        let config = crate::config::Config::load().unwrap_or_default();
+        let registry = crate::commands::run::session::build_provider_registry_from_config(&config)
+            .unwrap_or_default();
+        leviath_runtime::provider_files::delete_entries(&entries, &registry).await
+    };
+    match tokio::runtime::Handle::try_current() {
+        Ok(runtime) => {
+            runtime.spawn(work);
+        }
+        Err(_) => {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a current-thread runtime builds");
+            let _ = runtime.block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(30), work).await
+            });
+        }
+    }
 }
 
 /// How many random bits go in a run ID's suffix, rendered as 12 hex digits.
@@ -657,33 +716,106 @@ pub(crate) fn family_of(root_id: &str) -> Vec<String> {
 }
 
 /// [`list_runs`] through a [`StatCache`], for pollers: each `meta.json` is
-/// re-parsed only when its stat changes, and cache entries for deleted runs
-/// are dropped. Same ordering and skip-unreadable behavior as `list_runs`.
-pub(crate) fn list_runs_cached(cache: &mut StatCache<RunMeta>) -> Vec<Arc<RunMeta>> {
-    let dir = runs_dir();
-    let mut runs = Vec::new();
-    let mut live_dirs = std::collections::HashSet::new();
-    if let Ok(entries) = std::fs::read_dir(&dir) {
-        for entry in entries.filter_map(|e| e.ok()) {
-            live_dirs.insert(entry.path());
-            let meta_path = entry.path().join(leviath_core::files::META_FILE);
-            // A run this poller already knows to be finished is asked about
-            // once a second; a live one (or one never seen) every time.
-            let recheck = cache
-                .peek(&meta_path)
-                .map_or(std::time::Duration::ZERO, |meta| settle_window(&meta));
-            if let Some(meta) = cache.get_with_recheck(
-                &meta_path,
-                |json| serde_json::from_str::<RunMeta>(json).ok(),
-                recheck,
-            ) {
-                runs.push(meta);
-            }
+/// re-parsed only when its stat changes, the runs directory is listed again
+/// only when it may have gained or lost a run (see [`RunDirListing`]), and
+/// cache entries for deleted runs are dropped. Same ordering and
+/// skip-unreadable behavior as `list_runs`.
+pub(crate) fn list_runs_cached(
+    cache: &mut StatCache<RunMeta>,
+    listing: &mut RunDirListing,
+) -> Vec<Arc<RunMeta>> {
+    if listing.refresh(&runs_dir()) {
+        cache.retain_under(&listing.dir_set());
+    }
+    let mut runs = Vec::with_capacity(listing.dirs.len());
+    for dir in &listing.dirs {
+        let meta_path = dir.join(leviath_core::files::META_FILE);
+        // A run this poller already knows to be finished is asked about
+        // once a second; a live one (or one never seen) every time.
+        if let Some(meta) = cache.get_with_recheck_by(
+            &meta_path,
+            |json| serde_json::from_str::<RunMeta>(json).ok(),
+            |meta| meta.map_or(std::time::Duration::ZERO, settle_window),
+        ) {
+            runs.push(meta);
         }
     }
-    cache.retain_under(&live_dirs);
     runs.sort_by_key(|r| std::cmp::Reverse(r.started_at));
     runs
+}
+
+/// The run directories under the runs directory, for a poller that asks many
+/// times a second.
+///
+/// Listing a directory of thousands of runs ten times a second, to learn that
+/// no run was created or deleted, would be most of what an idle poller does.
+/// Either one changes the runs directory's mtime, so the listing is kept
+/// until the mtime moves.
+///
+/// Unless the mtime is recent: a filesystem stamps times more coarsely than a
+/// poller asks (a second, on some), so a run created in the same stamp as the
+/// last listing would leave the mtime where it was. A listing is only trusted
+/// once its mtime is [`LISTING_TRUSTED_AFTER`] older than the moment it was
+/// taken; a directory that changed more recently than that is listed every
+/// time, as it always was.
+#[derive(Default)]
+pub(crate) struct RunDirListing {
+    dirs: Vec<PathBuf>,
+    /// The runs directory's mtime at the last listing, and when it was taken.
+    stamp: Option<(std::time::SystemTime, std::time::SystemTime)>,
+    /// Whether the last [`refresh`](Self::refresh) listed the directory.
+    relisted: bool,
+}
+
+#[cfg(test)]
+impl RunDirListing {
+    /// As if the last listing was taken long after its directory last
+    /// changed, so an unchanged directory is not listed again.
+    pub(crate) fn age(&mut self) {
+        self.stamp = self
+            .stamp
+            .map(|(mtime, _)| (mtime, mtime + LISTING_TRUSTED_AFTER));
+    }
+}
+
+/// See [`RunDirListing`]: coarser than any filesystem's time stamps.
+const LISTING_TRUSTED_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
+
+impl RunDirListing {
+    /// List `dir` again unless it cannot have changed since the last listing.
+    /// Returns whether it listed, which is when the set of runs may differ.
+    pub(crate) fn refresh(&mut self, dir: &Path) -> bool {
+        let mtime = std::fs::metadata(dir).and_then(|meta| meta.modified()).ok();
+        let settled = match (mtime, self.stamp) {
+            (Some(now), Some((then, listed_at))) => {
+                now == then
+                    && listed_at
+                        .duration_since(then)
+                        .is_ok_and(|age| age >= LISTING_TRUSTED_AFTER)
+            }
+            _ => false,
+        };
+        self.relisted = !settled;
+        if settled {
+            return false;
+        }
+        let listed_at = std::time::SystemTime::now();
+        self.dirs = std::fs::read_dir(dir)
+            .map(|entries| entries.filter_map(|e| e.ok()).map(|e| e.path()).collect())
+            .unwrap_or_default();
+        self.stamp = mtime.map(|mtime| (mtime, listed_at));
+        true
+    }
+
+    /// Whether the last [`refresh`](Self::refresh) listed the directory.
+    pub(crate) fn relisted(&self) -> bool {
+        self.relisted
+    }
+
+    /// The listed run directories, as a set for [`StatCache::retain_under`].
+    pub(crate) fn dir_set(&self) -> std::collections::HashSet<PathBuf> {
+        self.dirs.iter().cloned().collect()
+    }
 }
 
 /// How long a poller may go without re-stat'ing a run's files once the run
@@ -711,21 +843,21 @@ const SETTLED_RECHECK: std::time::Duration = std::time::Duration::from_secs(1);
 pub(crate) fn read_stages_index_cached(
     run_id: &str,
     cache: &mut StatCache<Vec<StageRecord>>,
-) -> Vec<StageRecord> {
+) -> Arc<Vec<StageRecord>> {
     read_stages_index_settled(run_id, cache, std::time::Duration::ZERO)
 }
 
 /// [`read_stages_index_cached`] with the poller's [`settle_window`] for the
 /// run, so a finished run's stage ledger is not stat'ed every tick either.
+/// Shared, not copied: the ledger is handed to the run list every tick.
 pub(crate) fn read_stages_index_settled(
     run_id: &str,
     cache: &mut StatCache<Vec<StageRecord>>,
     recheck_after: std::time::Duration,
-) -> Vec<StageRecord> {
+) -> Arc<Vec<StageRecord>> {
     let path = run_dir(run_id).join(leviath_core::files::STAGES_FILE);
     cache
         .get_with_recheck(&path, |json| serde_json::from_str(json).ok(), recheck_after)
-        .map(|records| records.as_ref().clone())
         .unwrap_or_default()
 }
 
@@ -902,12 +1034,9 @@ pub(crate) enum LogStream {
 
 /// Read a run's logs, choosing the stage and the stream.
 ///
-/// Exists because there were two answers in the codebase to "where is a run's
-/// output", and one of them was wrong: `GET /api/agents/{id}/logs` read
-/// `<run_dir>/output.log`, which nothing has ever written, so it returned an
-/// empty string for every run there has ever been. The real logs are per-stage,
-/// under `stages/<idx>/`. Routing both that handler and `agent_result` through
-/// here leaves one answer.
+/// The one answer to "where is a run's output" for `GET /api/agents/{id}/logs`
+/// and `agent_result` alike: logs live per stage under `stages/<idx>/`, and a
+/// run with no stage recorded yet has none.
 ///
 /// Stages come from `stages.json` rather than a `read_dir` of `stages/`, because
 /// that index is the record of which stages exist and in what order - the
@@ -929,13 +1058,7 @@ pub(crate) fn tail_run_logs(
     let stages = read_stages_index(run_id);
     match selector {
         StageSelector::Index(idx) => read(idx),
-        StageSelector::Current => match stages.len().checked_sub(1) {
-            Some(last) => read(last),
-            // No stages recorded yet. Fall back to the legacy run-level file:
-            // nothing writes it today, but a run whose stage dirs were pruned
-            // still reads honestly instead of claiming it produced nothing.
-            None => tail_file(&run_dir(run_id).join("output.log"), max_bytes),
-        },
+        StageSelector::Current => stages.len().checked_sub(1).map(read).unwrap_or_default(),
         StageSelector::All => {
             let joined = stages
                 .iter()
@@ -985,10 +1108,14 @@ fn make_runs_base_dir(unique: &str) -> tempfile::TempDir {
 
 /// The env overrides that point run-state I/O at `base_dir` instead of the
 /// real `~/.leviath/`. Handed to `temp_env` for scoped set-and-restore.
+///
+/// The config path comes along: a daemon host booted in this scope builds its
+/// reloader from `Config::config_path()`, and left to the environment that
+/// would be whatever file a concurrently isolated test is pointing at.
 #[cfg(test)]
 fn runs_dir_isolation_vars(
     base_dir: &std::path::Path,
-) -> [(&'static str, Option<std::ffi::OsString>); 2] {
+) -> [(&'static str, Option<std::ffi::OsString>); 3] {
     [
         (
             "LEVIATH_RUNS_DIR",
@@ -997,6 +1124,10 @@ fn runs_dir_isolation_vars(
         (
             "LEVIATH_DASHBOARD_LOG_PATH",
             Some(base_dir.join("dashboard.log").into_os_string()),
+        ),
+        (
+            "LEVIATH_CONFIG_PATH",
+            Some(base_dir.join("config.toml").into_os_string()),
         ),
     ]
 }
@@ -1894,8 +2025,9 @@ mod tests {
             let mut metas = StatCache::default();
             let mut stages = StatCache::default();
             let mut contexts = StatCache::default();
+            let mut listing = RunDirListing::default();
 
-            let listed = list_runs_cached(&mut metas);
+            let listed = list_runs_cached(&mut metas, &mut listing);
             assert_eq!(listed.len(), 1);
             assert_eq!(listed[0].run_id, list_runs()[0].run_id);
 
@@ -1926,7 +2058,7 @@ mod tests {
             );
             second.started_at += 100;
             create_run(&second).unwrap();
-            let listed = list_runs_cached(&mut metas);
+            let listed = list_runs_cached(&mut metas, &mut listing);
             assert_eq!(listed.len(), 2);
             assert_eq!(listed[0].run_id, "cached-run-2", "newest first");
 
@@ -1935,25 +2067,59 @@ mod tests {
             // cached until the file changes).
             std::fs::create_dir_all(run_dir("garbled-run")).unwrap();
             std::fs::write(run_dir("garbled-run").join("meta.json"), "not json {{").unwrap();
-            assert_eq!(list_runs_cached(&mut metas).len(), 2);
+            assert_eq!(list_runs_cached(&mut metas, &mut listing).len(), 2);
 
             // A run whose dir disappears falls out of the cached listing.
             std::fs::remove_dir_all(run_dir("garbled-run")).unwrap();
             std::fs::remove_dir_all(run_dir("cached-run")).unwrap();
             std::fs::remove_dir_all(run_dir("cached-run-2")).unwrap();
-            assert!(list_runs_cached(&mut metas).is_empty());
+            assert!(list_runs_cached(&mut metas, &mut listing).is_empty());
             assert!(read_stages_index_cached("cached-run", &mut stages).is_empty());
             assert!(read_context_snapshot_cached("cached-run", &mut contexts).is_none());
 
             // And a missing runs DIRECTORY altogether lists nothing (the
             // read_dir-failed arm).
             std::fs::remove_dir_all(runs_dir()).unwrap();
-            assert!(list_runs_cached(&mut metas).is_empty());
+            assert!(list_runs_cached(&mut metas, &mut listing).is_empty());
         });
     }
 
+    /// A listing is kept only once the directory's mtime is older than the
+    /// listing by more than a coarse filesystem's stamp; a directory that
+    /// changed since, or recently, or is missing, is listed again.
+    #[test]
+    fn a_run_listing_is_kept_only_once_its_directory_has_settled() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("run-a")).unwrap();
+        let mut listing = RunDirListing::default();
+        assert!(listing.refresh(dir.path()), "never listed");
+        assert!(listing.relisted());
+        assert_eq!(listing.dir_set().len(), 1);
+        assert!(listing.refresh(dir.path()), "changed too recently to trust");
+
+        // As if listed well after the directory last changed.
+        listing.age();
+        let (mtime, _) = listing.stamp.unwrap();
+        assert!(!listing.refresh(dir.path()), "settled and unchanged");
+        assert!(!listing.relisted());
+
+        // The directory moved on since that listing.
+        listing.stamp = Some((
+            mtime - std::time::Duration::from_secs(60),
+            mtime + LISTING_TRUSTED_AFTER,
+        ));
+        assert!(listing.refresh(dir.path()));
+
+        // A runs directory that is not there lists nothing.
+        let missing = dir.path().join("missing");
+        assert!(listing.refresh(&missing));
+        assert!(listing.dir_set().is_empty());
+        assert!(listing.stamp.is_none());
+    }
+
     /// A settled entry is answered from memory inside its window and from the
-    /// filesystem outside it; `peek` never asks the filesystem at all.
+    /// filesystem outside it, and the window is worked out from what is
+    /// cached.
     #[test]
     fn a_stat_cache_honours_the_recheck_window() {
         let dir = tempfile::tempdir().unwrap();
@@ -1961,9 +2127,26 @@ mod tests {
         std::fs::write(&path, "1").unwrap();
         let mut cache: StatCache<String> = StatCache::default();
         let parse = |s: &str| Some(s.to_string());
-        assert!(cache.peek(&path).is_none(), "nothing cached yet");
-        assert_eq!(*cache.get_with(&path, parse).unwrap(), "1");
-        assert_eq!(*cache.peek(&path).unwrap(), "1");
+        let mut seen = Vec::new();
+        let mut window_for = |cached: Option<&String>| {
+            seen.push(cached.cloned());
+            std::time::Duration::from_secs(3600)
+        };
+        assert_eq!(
+            *cache
+                .get_with_recheck_by(&path, parse, &mut window_for)
+                .unwrap(),
+            "1"
+        );
+        assert_eq!(
+            *cache
+                .get_with_recheck_by(&path, parse, &mut window_for)
+                .unwrap(),
+            "1"
+        );
+        // Nothing was cached for the first read, so it had no window to ask
+        // about; the second saw what the first cached.
+        assert_eq!(seen, vec![Some("1".to_string())]);
 
         // The file changes. Inside the window the old value stands, because
         // the point is not to stat; outside it the change is seen. The new
@@ -1982,7 +2165,6 @@ mod tests {
         // A missing file is forgotten, and a window does not resurrect it.
         std::fs::remove_file(&path).unwrap();
         assert!(cache.get_with(&path, parse).is_none());
-        assert!(cache.peek(&path).is_none());
         assert!(cache.get_with_recheck(&path, parse, hour).is_none());
     }
 
@@ -2021,6 +2203,17 @@ mod tests {
     /// The listing asks a finished run once a second and a live one every
     /// time: a rename of a finished run shows up within the window, a live
     /// run's progress immediately.
+    /// Give `path` a modification time comfortably in the future, so a rewrite
+    /// that lands inside one filesystem clock tick still reads as a change.
+    fn touch_newer(path: &std::path::Path) {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("the record is there to touch");
+        file.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))
+            .expect("the modification time is ours to set");
+    }
+
     #[test]
     fn a_cached_listing_settles_finished_runs() {
         with_isolated_runs_dir("cached-listing-settles", |_d| {
@@ -2047,15 +2240,22 @@ mod tests {
             live.status = RunStatus::Running;
             create_run(&live).unwrap();
             let mut metas = StatCache::default();
+            let mut listing = RunDirListing::default();
             let mut stages = StatCache::default();
-            assert_eq!(list_runs_cached(&mut metas).len(), 2);
+            assert_eq!(list_runs_cached(&mut metas, &mut listing).len(), 2);
 
             // Both records change on disk.
             done.title = Some("renamed".to_string());
             write_meta(&done).unwrap();
             live.iteration = 7;
             write_meta(&live).unwrap();
-            let listed = list_runs_cached(&mut metas);
+            // Written with a strictly newer mtime, the way `save_config` does:
+            // the cache re-reads on a changed stat, and `iteration: 0` becomes
+            // `iteration: 7` without the file changing length, so a rewrite
+            // inside one filesystem clock tick is a stat the cache cannot tell
+            // from the one it already holds.
+            touch_newer(&run_dir("live").join(leviath_core::files::META_FILE));
+            let listed = list_runs_cached(&mut metas, &mut listing);
             let by_id = |id: &str| listed.iter().find(|m| m.run_id == id).unwrap().clone();
             assert_eq!(by_id("live").iteration, 7, "a live run is read every tick");
             assert_eq!(
@@ -3496,5 +3696,42 @@ mod tests {
             assert!(descendant_run_ids("lonely").is_empty());
             assert!(descendant_run_ids("no-such-run").is_empty());
         });
+    }
+
+    /// A deleted run's uploads are read from its ledger before its directory
+    /// goes; with no provider configured to delete them they are left to
+    /// expire, and a run with no ledger does nothing at all.
+    #[test]
+    fn a_deleted_runs_uploads_are_taken_from_its_ledger_first() {
+        with_isolated_runs_dir("forget-files", |_d| {
+            let dir = run_dir("uploaded");
+            std::fs::create_dir_all(&dir).unwrap();
+            let ledger = dir.join(leviath_runtime::provider_files::LEDGER_FILE);
+            std::fs::write(
+                &ledger,
+                r#"{"files":[{"provider":"nobody","sha256":"a","file":{"id":"f"}}]}"#,
+            )
+            .unwrap();
+            forget_provider_files("uploaded");
+            assert!(!ledger.exists(), "the ledger is taken");
+            forget_provider_files("uploaded");
+        });
+    }
+
+    #[tokio::test]
+    async fn a_deleted_runs_uploads_are_deleted_in_the_background_on_a_running_runtime() {
+        with_isolated_runs_dir_async("forget-files-async", |_d| async move {
+            let dir = run_dir("uploaded");
+            std::fs::create_dir_all(&dir).unwrap();
+            let ledger = dir.join(leviath_runtime::provider_files::LEDGER_FILE);
+            std::fs::write(
+                &ledger,
+                r#"{"files":[{"provider":"nobody","sha256":"a","file":{"id":"f"}}]}"#,
+            )
+            .unwrap();
+            forget_provider_files("uploaded");
+            assert!(!ledger.exists());
+        })
+        .await;
     }
 }

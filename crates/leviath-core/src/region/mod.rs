@@ -6,8 +6,10 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod parts;
 pub mod policy;
 
+pub use parts::EntryContent;
 pub use policy::{Admission, EvictionStrategy, Volatility};
 
 /// The kind of content stored in a region entry.
@@ -152,10 +154,10 @@ pub enum RegionKind {
     /// `script` is the blueprint-dir-relative path to the `.rhai` file; path
     /// resolution and compilation happen in the CLI spawner (this crate stays
     /// filesystem-free), and the compiled script travels on the runtime's
-    /// context window keyed by this path. `persistent` regions behave like
+    /// context window keyed by this path. A `pinned` custom region behaves like
     /// [`Pinned`](Self::Pinned) for lifecycle - never evicted, immune to edge
-    /// `Clear` transforms, counted as fixed budget - while non-persistent
-    /// regions behave like [`Temporary`](Self::Temporary).
+    /// `Clear` transforms, counted as fixed budget - while an unpinned one
+    /// behaves like [`Temporary`](Self::Temporary).
     ///
     /// Note: this kind is orthogonal to [`RegionSchema`]'s (unwired)
     /// `custom_script` field, which is a content-*validation* concept.
@@ -163,8 +165,11 @@ pub enum RegionKind {
         /// Blueprint-dir-relative path to the Rhai script backing this region
         script: String,
         /// Lifecycle: `true` = Pinned-like (protected, fixed budget),
-        /// `false` = Temporary-like (stage-specific, evictable)
-        persistent: bool,
+        /// `false` = Temporary-like (stage-specific, evictable).
+        ///
+        /// Written `persistent` before it was renamed; both spellings parse.
+        #[serde(alias = "persistent")]
+        pinned: bool,
     },
 }
 
@@ -202,11 +207,11 @@ impl PartialEq for RegionKind {
             (
                 Self::Custom {
                     script: a,
-                    persistent: pa,
+                    pinned: pa,
                 },
                 Self::Custom {
                     script: b,
-                    persistent: pb,
+                    pinned: pb,
                 },
             ) => a == b && pa == pb,
             _ => false,
@@ -246,7 +251,7 @@ impl RegionEntry {
         let meta = self.metadata.as_ref()?;
         Some(ChecklistItem {
             id: meta.get(ITEM_ID)?.as_u64()? as usize,
-            text: self.content.clone(),
+            text: self.content.to_string(),
             done: meta
                 .get(ITEM_DONE)
                 .and_then(|v| v.as_bool())
@@ -379,11 +384,11 @@ impl RegionKind {
             // than a tool result and far rarer than a turn.
             RegionKind::Checklist => crate::cache::CacheHint::UntilChanged,
             RegionKind::Temporary | RegionKind::Clearable => crate::cache::CacheHint::Never,
-            // A persistent custom region is Pinned-like: its rendered output is
-            // expected to be stable. Non-persistent custom content changes on
+            // A pinned custom region is Pinned-like: its rendered output is
+            // expected to be stable. Unpinned custom content changes on
             // writes, like Compacting/HashMap.
-            RegionKind::Custom { persistent, .. } => {
-                if *persistent {
+            RegionKind::Custom { pinned, .. } => {
+                if *pinned {
                     crate::cache::CacheHint::Always
                 } else {
                     crate::cache::CacheHint::UntilChanged
@@ -445,6 +450,12 @@ pub struct Region {
     #[serde(default)]
     pub volatility: Volatility,
 
+    /// Mime type patterns this region takes (`text/*`, `image/png`). Empty
+    /// means anything. A write carrying a part outside the list is refused
+    /// with the list, so the writer learns what the region is for.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accepts: Vec<String>,
+
     /// One line on what this region is for.
     ///
     /// Documentation first: it is what `GET /api/blueprints/{name}` reports and
@@ -486,9 +497,40 @@ impl Region {
             summarizable: true,
             admission: Admission::default(),
             volatility: Volatility::default(),
+            accepts: Vec::new(),
             description: None,
             describe_in_prompt: false,
         }
+    }
+
+    /// Whether every part of `content` is a type this region takes.
+    /// Always true for a region with no `accepts` list.
+    pub fn accepts_content(&self, content: &EntryContent) -> Result<(), crate::mime::MimeType> {
+        if self.accepts.is_empty() {
+            return Ok(());
+        }
+        // `accepts` gates the media payload a region holds, not the plain-text
+        // caption that travels with it. A stored image or model is routinely
+        // attached alongside a `text/plain` caption; that caption is the
+        // universal carrier and always travels inline, so an `image/*` or
+        // `model/*` region must not reject an attachment just because it carries
+        // one. Only `text/plain` is exempt - a region that lists specific text
+        // subtypes (e.g. `text/plain` but not `text/markdown`) still gates the
+        // rest. Everything non-`text/plain` is checked against `accepts`.
+        match content
+            .parts()
+            .iter()
+            .filter(|p| !p.mime_type.matches("text/plain"))
+            .find(|p| !p.mime_type.matches_any(&self.accepts))
+        {
+            Some(p) => Err(p.mime_type.clone()),
+            None => Ok(()),
+        }
+    }
+
+    /// How many stored parts the region holds across every entry.
+    pub fn stored_count(&self) -> usize {
+        self.content.iter().map(|e| e.content.stored_count()).sum()
     }
 
     /// Enable taint tracking for this region.
@@ -523,7 +565,7 @@ impl Region {
     /// named method that says which of the three it cares about.
     fn push_entry(
         &mut self,
-        content: String,
+        content: EntryContent,
         tokens: usize,
         metadata: Option<serde_json::Value>,
         kind: EntryKind,
@@ -531,9 +573,25 @@ impl Region {
         key: Option<&str>,
     ) -> crate::error::Result<()> {
         if let Some(schema) = &self.schema {
+            // A schema describes text. A stored part has no text to check, so
+            // a region that validates its entries takes text only.
+            if content.has_stored() {
+                return Err(crate::error::Error::ValidationFailed(format!(
+                    "region '{}' validates its entries and cannot hold a stored part",
+                    self.name
+                )));
+            }
             schema.validate(&content)?;
         }
-
+        if let Err(mime_type) = self.accepts_content(&content) {
+            return Err(crate::error::Error::RegionRefusedWrite {
+                region: self.name.clone(),
+                reason: format!(
+                    "it takes {} and this write carries {mime_type}",
+                    self.accepts.join(", ")
+                ),
+            });
+        }
         if self.current_tokens + tokens > self.max_tokens {
             // Which failure this is depends on whether anything would have been
             // dropped to fit. A region that never evicts reports being full,
@@ -607,11 +665,11 @@ impl Region {
     pub fn add_keyed_entry(
         &mut self,
         key: &str,
-        content: String,
+        content: impl Into<EntryContent>,
         tokens: usize,
     ) -> crate::error::Result<()> {
         self.push_entry(
-            content,
+            content.into(),
             tokens,
             None,
             EntryKind::default(),
@@ -637,12 +695,12 @@ impl Region {
     /// Add an entry with a taint level. Used when taint tracking is enabled.
     pub fn add_tainted_entry(
         &mut self,
-        content: String,
+        content: impl Into<EntryContent>,
         tokens: usize,
         taint_level: crate::taint::TaintLevel,
     ) -> crate::error::Result<()> {
         self.push_entry(
-            content,
+            content.into(),
             tokens,
             None,
             EntryKind::default(),
@@ -661,12 +719,12 @@ impl Region {
     /// both keeps its `ToolResult` kind and raises the region's taint level.
     pub fn add_typed_tainted_entry(
         &mut self,
-        content: String,
+        content: impl Into<EntryContent>,
         tokens: usize,
         kind: EntryKind,
         taint_level: crate::taint::TaintLevel,
     ) -> crate::error::Result<()> {
-        self.push_entry(content, tokens, None, kind, taint_level, None)
+        self.push_entry(content.into(), tokens, None, kind, taint_level, None)
     }
 
     /// Add a validation schema to this region.
@@ -679,9 +737,13 @@ impl Region {
     ///
     /// Validates content against schema if present, checks token budget,
     /// and adds the entry to the region.
-    pub fn add_entry(&mut self, content: String, tokens: usize) -> crate::error::Result<()> {
+    pub fn add_entry(
+        &mut self,
+        content: impl Into<EntryContent>,
+        tokens: usize,
+    ) -> crate::error::Result<()> {
         self.push_entry(
-            content,
+            content.into(),
             tokens,
             None,
             EntryKind::default(),
@@ -693,12 +755,12 @@ impl Region {
     /// Add an entry with metadata.
     pub fn add_entry_with_metadata(
         &mut self,
-        content: String,
+        content: impl Into<EntryContent>,
         tokens: usize,
         metadata: serde_json::Value,
     ) -> crate::error::Result<()> {
         self.push_entry(
-            content,
+            content.into(),
             tokens,
             Some(metadata),
             EntryKind::default(),
@@ -714,7 +776,7 @@ impl Region {
     /// text-prefix parsing.
     pub fn add_typed_entry(
         &mut self,
-        content: String,
+        content: impl Into<EntryContent>,
         tokens: usize,
         kind: EntryKind,
     ) -> crate::error::Result<()> {
@@ -729,13 +791,13 @@ impl Region {
     /// such token and no reason to grow a parameter for one.
     pub fn add_typed_entry_with_reasoning(
         &mut self,
-        content: String,
+        content: impl Into<EntryContent>,
         tokens: usize,
         kind: EntryKind,
         reasoning: Option<String>,
     ) -> crate::error::Result<()> {
         self.push_entry(
-            content,
+            content.into(),
             tokens,
             None,
             kind,
@@ -788,9 +850,43 @@ impl Region {
     pub fn upsert_by_key(
         &mut self,
         key: &str,
-        content: String,
+        content: impl Into<EntryContent>,
         tokens: usize,
     ) -> Result<(), String> {
+        self.upsert_by_key_content(key, content.into(), tokens)
+    }
+
+    /// [`Self::upsert_by_key`] with the content already typed. The generic
+    /// wrapper above stays a one-liner so each instantiation is trivially
+    /// exercised; the logic lives here, once.
+    fn upsert_by_key_content(
+        &mut self,
+        key: &str,
+        content: EntryContent,
+        tokens: usize,
+    ) -> Result<(), String> {
+        // Same checks `push_entry` runs before admitting text: a hashmap write
+        // used to skip schema validation entirely, so blueprint content schemas
+        // could never reject a bad `context_write`.
+        if let Some(schema) = &self.schema {
+            if content.has_stored() {
+                return Err(format!(
+                    "region '{}' validates its entries and cannot hold a stored part",
+                    self.name
+                ));
+            }
+            schema
+                .validate(content.as_str())
+                .map_err(|e| e.to_string())?;
+        }
+        if let Err(mime_type) = self.accepts_content(&content) {
+            return Err(format!(
+                "region '{}' takes {} and this write carries {mime_type}",
+                self.name,
+                self.accepts.join(", ")
+            ));
+        }
+
         // If key exists, update in place
         if let Some(pos) = self
             .content
@@ -928,8 +1024,9 @@ impl Region {
 /// Each entry has content and metadata tracking its token usage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegionEntry {
-    /// The actual content of this entry
-    pub content: String,
+    /// The entry's typed parts, and the text they read as. A plain string
+    /// still lands here as one `text/plain` part; see [`EntryContent`].
+    pub content: EntryContent,
 
     /// Token count for this entry
     pub tokens: usize,
@@ -1166,7 +1263,7 @@ mod tests {
         assert!(
             !RegionKind::Custom {
                 script: "r.rhai".to_string(),
-                persistent: false,
+                pinned: false,
             }
             .rolls_off_oldest()
         );
@@ -1390,21 +1487,21 @@ mod tests {
     fn custom_kind_equality_compares_script_and_persistent() {
         let a = RegionKind::Custom {
             script: "conv.rhai".to_string(),
-            persistent: false,
+            pinned: false,
         };
         assert_eq!(a, a.clone());
         assert_ne!(
             a,
             RegionKind::Custom {
                 script: "other.rhai".to_string(),
-                persistent: false,
+                pinned: false,
             }
         );
         assert_ne!(
             a,
             RegionKind::Custom {
                 script: "conv.rhai".to_string(),
-                persistent: true,
+                pinned: true,
             }
         );
         assert_ne!(a, RegionKind::Temporary);
@@ -1414,7 +1511,7 @@ mod tests {
     fn custom_kind_serde_round_trips() {
         let kind = RegionKind::Custom {
             script: "hooks/conv.rhai".to_string(),
-            persistent: true,
+            pinned: true,
         };
         let json = serde_json::to_string(&kind).unwrap();
         let back: RegionKind = serde_json::from_str(&json).unwrap();
@@ -1429,7 +1526,7 @@ mod tests {
         assert_eq!(
             RegionKind::Custom {
                 script: "s.rhai".to_string(),
-                persistent: true,
+                pinned: true,
             }
             .cache_hint(),
             crate::cache::CacheHint::Always
@@ -1437,7 +1534,7 @@ mod tests {
         assert_eq!(
             RegionKind::Custom {
                 script: "s.rhai".to_string(),
-                persistent: false,
+                pinned: false,
             }
             .cache_hint(),
             crate::cache::CacheHint::UntilChanged
@@ -1653,6 +1750,32 @@ mod tests {
     }
 
     #[test]
+    fn accepts_content_allows_a_caption_beside_media_but_gates_the_payload() {
+        use crate::mime::{MimeType, Part};
+        let mut region = Region::new("art".to_string(), RegionKind::Pinned, 1000);
+        region.accepts = vec!["image/*".to_string()];
+        let png = || Part::inline(MimeType::parse("image/png").unwrap(), "x");
+        let wav = || Part::inline(MimeType::parse("audio/wav").unwrap(), "x");
+
+        // An image payload paired with a text caption: the caption (text/*) is
+        // allowed through, and the image matches `accepts`.
+        let ok = EntryContent::from_parts(vec![Part::text("a caption"), png()]);
+        assert!(region.accepts_content(&ok).is_ok());
+
+        // A non-text payload the region does not accept is still refused, even
+        // with a caption present.
+        let bad = EntryContent::from_parts(vec![Part::text("a caption"), wav()]);
+        assert_eq!(
+            region.accepts_content(&bad).unwrap_err(),
+            MimeType::parse("audio/wav").unwrap()
+        );
+
+        // A region with no `accepts` list takes anything.
+        let open = Region::new("open".to_string(), RegionKind::Pinned, 1000);
+        assert!(open.accepts_content(&bad).is_ok());
+    }
+
+    #[test]
     fn test_add_entry_rejects_over_budget() {
         let mut region = Region::new("data".to_string(), RegionKind::Temporary, 10);
         let result = region.add_entry("too much".to_string(), 20);
@@ -1758,6 +1881,57 @@ mod tests {
     fn test_needs_compaction_false_for_non_compacting_kind() {
         let region = Region::new("data".to_string(), RegionKind::Temporary, 1000);
         assert!(!region.needs_compaction());
+    }
+
+    // ─── hashmap upsert enforces content schema ────────────────────────────
+
+    #[test]
+    fn upsert_by_key_rejects_json_failing_content_schema() {
+        let schema = RegionSchema::new(ContentFormat::Json).with_content_schema(serde_json::json!({
+            "type": "object",
+            "required": ["steps", "current_step_id"],
+            "properties": {
+                "steps": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "required": ["id", "title", "status"],
+                        "properties": {
+                            "id": { "type": "string" },
+                            "title": { "type": "string" },
+                            "status": {
+                                "type": "string",
+                                "enum": ["pending", "active", "done", "skipped"]
+                            }
+                        }
+                    }
+                },
+                "current_step_id": { "type": "string" }
+            }
+        }));
+        let mut region = Region::new(
+            "task_plans".to_string(),
+            RegionKind::HashMap { max_entries: Some(40) },
+            5000,
+        )
+        .with_schema(schema);
+
+        let invalid = r#"{"steps":[{"id":"s1","title":"Bad","status":"nope"}]}"#;
+        let err = region
+            .upsert_by_key("1-bad", invalid.to_string(), 20)
+            .expect_err("invalid plan must be rejected");
+        assert!(
+            err.contains("JSON Schema") || err.contains("content failed"),
+            "unexpected err: {err}"
+        );
+        assert!(region.get_by_key("1-bad").is_none());
+
+        let valid = r#"{"steps":[{"id":"s1","title":"Ok","status":"pending"}],"current_step_id":"s1"}"#;
+        region
+            .upsert_by_key("1", valid.to_string(), 30)
+            .expect("valid plan must be accepted");
+        assert!(region.get_by_key("1").is_some());
     }
 
     // ─── RegionSchema::with_custom_script ──────────────────────────────────
@@ -3048,7 +3222,7 @@ mod tests {
     #[test]
     fn test_region_entry_key_serde_skip_when_none() {
         let entry = RegionEntry {
-            content: "test".to_string(),
+            content: "test".into(),
             tokens: 5,
             timestamp: 0,
             metadata: None,
@@ -3063,7 +3237,7 @@ mod tests {
     #[test]
     fn test_region_entry_key_serde_roundtrip() {
         let entry = RegionEntry {
-            content: "test".to_string(),
+            content: "test".into(),
             tokens: 5,
             timestamp: 0,
             metadata: None,
@@ -3297,7 +3471,7 @@ mod tests {
     fn test_region_entry_serialization_with_key_field() {
         // Entry with key
         let entry_with_key = RegionEntry {
-            content: "some data".to_string(),
+            content: "some data".into(),
             tokens: 10,
             timestamp: 1234567890,
             metadata: None,
@@ -3313,7 +3487,7 @@ mod tests {
 
         // Entry without key
         let entry_no_key = RegionEntry {
-            content: "no key data".to_string(),
+            content: "no key data".into(),
             tokens: 7,
             timestamp: 1234567890,
             metadata: None,

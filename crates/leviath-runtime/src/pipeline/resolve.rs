@@ -8,7 +8,7 @@
 //! arrives as a plain [`ModelDefaults`] value.
 
 use leviath_core::Blueprint;
-use leviath_core::blueprint::{ModelConfig, ModelEntry};
+use leviath_core::blueprint::{ModelConfig, ModelEntry, ToolGroup};
 
 use super::ResolvedStage;
 use crate::providers::ProviderRegistry;
@@ -22,11 +22,19 @@ use leviath_providers::Tool;
 pub struct ModelDefaults {
     /// The default provider name (e.g. `anthropic`).
     pub provider: String,
-    /// The default model, if the user configured one.
-    pub model: Option<String>,
+    /// The user's `override_model`: while set, every stage that allows a user
+    /// default starts on it, ahead of the models its blueprint names. A bare
+    /// model id on [`provider`](Self::provider).
+    pub override_model: Option<String>,
+    /// The user's `fallback_model`: tried after every model a stage names and
+    /// before [`fallback_order`](Self::fallback_order), so a stage whose own
+    /// entries are all unroutable still has somewhere to go. Never promoted
+    /// ahead of the blueprint's own choices. A bare model id on
+    /// [`provider`](Self::provider).
+    pub fallback_model: Option<String>,
     /// The host-wide failover chain, from `[providers] fallback_order`.
     ///
-    /// Appended after a stage's own entries and the user default, so a
+    /// Appended after a stage's own entries and the user's models, so a
     /// blueprint that names exactly one model still has somewhere to go when
     /// that provider stops answering. The case it covers: every stage names a
     /// single OpenRouter model, so there is nothing to fall back to when the
@@ -35,14 +43,22 @@ pub struct ModelDefaults {
     /// The user's ordered provider preference, from `[providers] provider_order`,
     /// best first (e.g. `["codex", "openrouter", "openai"]`).
     ///
-    /// This is what decides, for a bare model name that more than one configured
-    /// provider serves, which one wins - generalizing [`provider`](Self::provider)
-    /// from a single front-runner into a full ordering. Empty means "use
-    /// [`provider`](Self::provider) alone", which is the historical behavior. Naming a provider
-    /// here is also a deliberate choice to route bare names through it, so a
-    /// subscription transport that is otherwise reachable only by an explicit
-    /// `provider/model` becomes eligible at the priority it is listed.
+    /// This is the whole set of providers a bare model name may run on, and
+    /// the order among them when more than one serves it - generalizing
+    /// [`provider`](Self::provider) from a single front-runner into a full
+    /// ordering. Empty means "use [`provider`](Self::provider) alone". A
+    /// configured provider not named here is never chosen for a bare name and
+    /// stays reachable by an explicit `provider/model` or a fallback entry,
+    /// so configuring one cannot silently move a stage, or its billing.
     pub provider_order: Vec<String>,
+    /// The operator's data retention settings, from `config.toml` as it
+    /// stands at spawn: whether zero retention is asked for (in which case a
+    /// stage whose model cannot give it is refused rather than sent), the
+    /// agreements declared, and the per-model and per-host words. Carried
+    /// here rather than read off the registry because the registry's copy
+    /// follows the config on the housekeeper's cadence, and a spawn should
+    /// answer to the config the operator just wrote.
+    pub retention: leviath_providers::retention::RetentionSettings,
 }
 
 impl ModelDefaults {
@@ -51,8 +67,10 @@ impl ModelDefaults {
     ///
     /// Every routing decision reads the preference through here, so the
     /// empty-`provider_order` case reduces to exactly the single-default
-    /// behavior that shipped before an order could be configured.
-    fn order(&self) -> Vec<&str> {
+    /// behavior that shipped before an order could be configured. Public so
+    /// `lev doctor` can judge a config by the same preference the router
+    /// uses, rather than by a copy of this rule.
+    pub fn order(&self) -> Vec<&str> {
         match self.provider_order.is_empty() {
             true => vec![self.provider.as_str()],
             false => self.provider_order.iter().map(String::as_str).collect(),
@@ -72,7 +90,10 @@ impl ModelDefaults {
     /// Whether `name` is named in the preference at all. A provider reachable
     /// only by an explicit route (a subscription transport) is exempt from that
     /// restriction for a bare name exactly when the user named it here.
-    fn is_preferred(&self, name: &str) -> bool {
+    /// Whether `name` is in the preference: the only providers an open
+    /// route (a bare model name) may land on. A configured provider left out
+    /// is reachable by an explicit `provider/model` and nothing else.
+    pub fn is_preferred(&self, name: &str) -> bool {
         self.order().contains(&name)
     }
 }
@@ -95,18 +116,6 @@ pub fn resolve_stage_model(
     (first.provider, first.model)
 }
 
-/// Every provider/model this stage may run on, best first.
-///
-/// [`resolve_stage_model`] is this list's head. The tail is what the runtime
-/// fails over to when a provider turns out to be unusable mid-run. Consult the
-/// ordered list in `ModelConfig.models` only for *registration* at spawn time
-/// and a provider that is configured but out of credits gets picked and then
-/// never abandoned.
-///
-/// Order: the stage's own registered entries, then the user default, then the
-/// host-wide `fallback_order`. Deduplicated, because the same pair reaching the
-/// list twice would spend a failover step going nowhere. Never empty: with
-/// nothing registered it yields the blueprint's own first entry, exactly as
 /// A model's identity, independent of the route it is reached by.
 ///
 /// The same model is spelled differently depending on the provider serving it:
@@ -127,8 +136,61 @@ pub fn model_key(model: &str) -> &str {
     model.rsplit('/').next().unwrap_or(model)
 }
 
-/// before, and `resolve_stages` rejects that unusable case with a clear error.
+/// Every provider/model this stage may run on, best first.
+///
+/// [`resolve_stage_model`] is this list's head. The tail is what the runtime
+/// fails over to when a provider turns out to be unusable mid-run, so a
+/// provider that is configured but out of credits is abandoned for the next
+/// entry instead of being pinned for the whole run.
+///
+/// Order: the stage's own registered entries, then the user default, then the
+/// host-wide `fallback_order`. Deduplicated, because the same pair reaching the
+/// list twice would spend a failover step going nowhere. Never empty: with
+/// nothing registered it yields the blueprint's own first entry, and
+/// `resolve_stages` rejects that unusable case with a clear error.
 pub(crate) fn resolve_stage_candidates(
+    model_cfg: &ModelConfig,
+    model_override: Option<&str>,
+    defaults: &ModelDefaults,
+    registry: &ProviderRegistry,
+) -> Vec<ModelEntry> {
+    resolve_stage_candidates_for(model_cfg, model_override, defaults, registry, &[])
+}
+
+/// [`resolve_stage_candidates`], with the mime the stage takes.
+///
+/// `needs` is what the stage's regions accept beyond text. A candidate whose
+/// model takes all of it moves ahead of one that does not, in an otherwise
+/// stable order, so a stage reading a storyboard lands on the model that
+/// can see it when the blueprint lists such a model anywhere. A pinned
+/// `provider/model` override is never reordered: the caller asked for it.
+pub(crate) fn resolve_stage_candidates_for(
+    model_cfg: &ModelConfig,
+    model_override: Option<&str>,
+    defaults: &ModelDefaults,
+    registry: &ProviderRegistry,
+    needs: &[String],
+) -> Vec<ModelEntry> {
+    let mut candidates = resolve_candidates_in_order(model_cfg, model_override, defaults, registry);
+    let needs: Vec<String> = needs.iter().filter(|n| *n != "*/*").cloned().collect();
+    if needs.is_empty() || candidates.len() < 2 {
+        return candidates;
+    }
+    let covers = |entry: &ModelEntry| {
+        registry
+            .get(&entry.provider)
+            .is_some_and(|p| p.mime(&entry.model).covers(&needs))
+    };
+    let (seeing, blind): (Vec<ModelEntry>, Vec<ModelEntry>) =
+        candidates.drain(..).partition(covers);
+    if seeing.is_empty() {
+        return blind;
+    }
+    seeing.into_iter().chain(blind).collect()
+}
+
+/// The candidates in blueprint order, before any mime preference.
+fn resolve_candidates_in_order(
     model_cfg: &ModelConfig,
     model_override: Option<&str>,
     defaults: &ModelDefaults,
@@ -253,14 +315,14 @@ pub(crate) fn resolve_stage_candidates(
         }
         let mut routed = false;
         for (name, provider) in candidates_for_model {
-            // A provider that may only be reached by name does not win an open
-            // route. Selecting one changes what gets billed - a subscription
-            // transport spends a plan rather than an API balance - so enabling
-            // it must not silently move every bare-named stage onto it. It is
-            // still reachable by an explicit `provider/model`, a fallback
-            // entry, or being named in the preference, which is the deliberate
-            // choice that exempts it.
-            if provider.explicit_route_only() && !defaults.is_preferred(name) {
+            // Only a provider in the preference wins an open route. A bare
+            // model name is the blueprint leaving the route to the machine,
+            // and the preference is the machine's answer: a configured
+            // provider left out of it is still reachable by an explicit
+            // `provider/model` or a fallback entry, and never chosen on its
+            // own, so configuring a key cannot silently move every bare-named
+            // stage (and what it bills) onto a provider nobody listed.
+            if !defaults.is_preferred(name) {
                 continue;
             }
             if let Some(id) = provider.serves_model(key) {
@@ -280,9 +342,16 @@ pub(crate) fn resolve_stage_candidates(
         }
     }
 
-    let user_default = user_default_model(model_cfg, override_model.as_deref(), defaults, registry);
+    let user_default =
+        user_override_model(model_cfg, override_model.as_deref(), defaults, registry);
     if let Some((provider, model)) = &user_default {
         push(provider.clone(), model.clone());
+    }
+    // The user's fallback sits behind everything the blueprint named and is
+    // never moved: it is the answer to "nothing I listed is configured here",
+    // not a preference over what was listed.
+    if let Some((provider, model)) = user_fallback_model(model_cfg, defaults, registry) {
+        push(provider, model);
     }
 
     // The host-wide chain last: it is the safety net for a blueprint that names
@@ -301,13 +370,14 @@ pub(crate) fn resolve_stage_candidates(
     // dispatched every stage at a localhost server that was not running.
     //
     // Registered candidates on the user's default provider therefore move to
-    // the front, the user's own `default_model` first among them and the rest
-    // in blueprint order. The default model leads because it is the one the
-    // user named: every bundled blueprint lists Ollama as `qwen3.5:9b`, and
-    // someone who set `default_model = "qwen3.8:latest"` was still sent to the
-    // blueprint's model, which they may never have pulled. A blueprint that
-    // must pin its own provider already has the way to say so -
-    // `allow_user_default = false` - and that suppresses this too.
+    // the front, the user's own `override_model` first among them and the rest
+    // in blueprint order. The override leads because that is what it is for:
+    // someone who set `override_model = "qwen3.8:latest"` under
+    // `default_provider = "ollama"` means every stage to run there, whatever
+    // the blueprint lists for Ollama. A blueprint that must pin its own
+    // provider already has the way to say so - `allow_user_default = false` -
+    // and that suppresses this too. The user's `fallback_model` is deliberately
+    // not promoted here: it stays behind the blueprint's entries.
     if model_cfg.allow_user_default && defaults.order().iter().any(|p| registry.has(p)) {
         // Grouped by MODEL, not by provider. The provider preference says where
         // a run should go, which is a statement about routes; letting it reorder
@@ -316,9 +386,9 @@ pub(crate) fn resolve_stage_candidates(
         // another.
         //
         // Models keep blueprint order, except that the user's own
-        // `default_model` leads - that IS a model preference, and someone who
-        // named a model meant it.
-        let default_model = user_default.as_ref().map(|(_, m)| m.as_str());
+        // `override_model` leads - that IS a model preference, and someone who
+        // named an override meant it.
+        let override_model = user_default.as_ref().map(|(_, m)| m.as_str());
         let mut order: Vec<String> = Vec::new();
         for c in &candidates {
             let key = model_key(&c.model).to_string();
@@ -326,7 +396,7 @@ pub(crate) fn resolve_stage_candidates(
                 order.push(key);
             }
         }
-        if let Some(dm) = default_model
+        if let Some(dm) = override_model
             && let Some(at) = order.iter().position(|k| k == model_key(dm))
         {
             let key = order.remove(at);
@@ -362,7 +432,7 @@ pub(crate) fn resolve_stage_candidates(
     // rejects with a readable error. The *tail* is different: every entry in
     // it is somewhere the runtime will actually dispatch to, so an
     // unregistered one is not a fallback but a phantom that parks the run on
-    // `StallReason::ProviderMissing`. `user_default_model` hands one back
+    // `StallReason::ProviderMissing`. `user_override_model` hands one back
     // whenever a bare `--model` override is in play, so filter here.
     //
     // A pair whose provider is here and says it does not carry that model is a
@@ -379,9 +449,10 @@ pub(crate) fn resolve_stage_candidates(
     candidates
 }
 
-/// The user-default fallback for [`resolve_stage_model`]: `None` when the stage
-/// forbids it or no usable default exists.
-fn user_default_model(
+/// The user's override for [`resolve_stage_model`]: the run-level bare
+/// `--model` when one is in play, else the configured `override_model`.
+/// `None` when the stage forbids a user default or nothing usable is set.
+fn user_override_model(
     model_cfg: &ModelConfig,
     override_model: Option<&str>,
     defaults: &ModelDefaults,
@@ -393,24 +464,100 @@ fn user_default_model(
     if let Some(model) = override_model {
         return Some((defaults.provider.clone(), model.to_string()));
     }
-    if let Some(default_model) = &defaults.model
+    if let Some(model) = &defaults.override_model
         && registry.has(&defaults.provider)
     {
-        let model = bare_default_model(&defaults.provider, default_model);
+        let model = bare_user_model(&defaults.provider, model);
         return Some((defaults.provider.clone(), model.to_string()));
     }
     None
 }
 
-/// The model id a `default_model` setting actually names, with a leading
-/// `<default_provider>/` taken off.
+/// The user's `fallback_model` on the default provider, when the stage allows a
+/// user default and the provider is registered.
+fn user_fallback_model(
+    model_cfg: &ModelConfig,
+    defaults: &ModelDefaults,
+    registry: &ProviderRegistry,
+) -> Option<(String, String)> {
+    if !model_cfg.allow_user_default {
+        return None;
+    }
+    let model = defaults.fallback_model.as_deref()?;
+    if !registry.has(&defaults.provider) {
+        return None;
+    }
+    let model = bare_user_model(&defaults.provider, model);
+    Some((defaults.provider.clone(), model.to_string()))
+}
+
+/// Where a stage's head came from: its own list, or one of the user's models.
 ///
-/// `default_model` is a bare model id that pairs with `default_provider`, but
-/// it is easy to write qualified: `--model` and `[providers] fallback_order`
+/// Told apart so a run can say when a substitution happened rather than
+/// silently starting somewhere the blueprint did not name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeadSource {
+    /// The blueprint's own first usable entry.
+    Blueprint,
+    /// The user's `override_model` displaced the blueprint's choice.
+    Override,
+    /// Nothing the blueprint named is configured; the user's `fallback_model`
+    /// is carrying the stage.
+    Fallback,
+}
+
+/// Which of the user's models, if any, put `head` at the front of a stage.
+///
+/// Resolved twice on purpose: once as the install has it and once with the
+/// user's two models taken out. When the two heads agree, the user's settings
+/// changed nothing worth saying; when they differ, the head is whichever of
+/// the two settings it matches. A run-level `--model` is the caller overriding
+/// on purpose and is not reported.
+pub fn head_source(
+    model_cfg: &ModelConfig,
+    model_override: Option<&str>,
+    defaults: &ModelDefaults,
+    registry: &ProviderRegistry,
+    head: &ModelEntry,
+) -> HeadSource {
+    if model_override.is_some() || !model_cfg.allow_user_default {
+        return HeadSource::Blueprint;
+    }
+    let without = ModelDefaults {
+        override_model: None,
+        fallback_model: None,
+        ..defaults.clone()
+    };
+    let own = resolve_stage_candidates(model_cfg, None, &without, registry);
+    if own
+        .first()
+        .is_some_and(|e| e.provider == head.provider && e.model == head.model)
+    {
+        return HeadSource::Blueprint;
+    }
+    let is = |setting: &Option<String>| {
+        setting.as_deref().is_some_and(|m| {
+            head.provider == defaults.provider
+                && head.model == bare_user_model(&defaults.provider, m)
+        })
+    };
+    // The two settings are the only things taken out of `without`, so a head
+    // that changed and is not the fallback is the override.
+    match is(&defaults.fallback_model) {
+        true => HeadSource::Fallback,
+        false => HeadSource::Override,
+    }
+}
+
+/// The model id an `override_model` or `fallback_model` setting actually names,
+/// with a leading `<default_provider>/` taken off.
+///
+/// Both settings are bare model ids that pair with `default_provider`, but they
+/// are easy to write qualified: `--model` and `[providers] fallback_order`
 /// both take `provider/model`, an OpenRouter id such as
 /// `deepseek/deepseek-v4-flash` already looks qualified, and a console that
 /// lists models as `provider/id` hands the pair back in one string. Sent
-/// verbatim, `default_provider = "ollama"` with `default_model =
+/// verbatim, `default_provider = "ollama"` with `override_model =
 /// "ollama/qwen3.8:latest"` reached Ollama as a request for a model called
 /// `ollama/qwen3.8:latest`, which it does not have. The prefix names the
 /// provider the setting already names, so dropping it loses nothing.
@@ -421,7 +568,7 @@ fn user_default_model(
 /// (`openrouter/deepseek/deepseek-v4-flash`), which is how the two are told
 /// apart. Anything that does not begin with the provider's name is returned as
 /// written.
-pub fn bare_default_model<'a>(provider: &str, model: &'a str) -> &'a str {
+pub fn bare_user_model<'a>(provider: &str, model: &'a str) -> &'a str {
     let Some(rest) = model
         .strip_prefix(provider)
         .and_then(|rest| rest.strip_prefix('/'))
@@ -439,12 +586,32 @@ pub fn bare_default_model<'a>(provider: &str, model: &'a str) -> &'a str {
 ///
 /// Built where the servers are registered, because that is the only place the
 /// mapping exists. A [`Tool`] carries a name, a description and a schema, and
-/// the advertised name does not reliably contain the server: `leviath-mcp`
-/// prefers the bare tool name and only prefixes with the server on a collision,
-/// so `github`'s `create_issue` is usually advertised as `create_issue`. There
-/// is no string pattern that answers "does this tool belong to github", which
-/// is why a grant names the server and this table answers for it.
+/// although `leviath-mcp` always advertises exactly `<server>__<tool>`, the
+/// server half cannot be read back out of it: a server name may itself contain
+/// `_`, so `a__b__c` is either `a`'s `b__c` or `a__b`'s `c`. There is no string
+/// pattern that reliably answers "does this tool belong to tracker". A grant
+/// names the server and this table answers for it. It is also how the filter
+/// tells an MCP def from a script def, which nothing on the [`Tool`] itself
+/// records.
 pub type ToolOwners = std::collections::HashMap<String, String>;
+
+/// Where a run-time tool def came from, which is what a group grant selects on.
+///
+/// Decided by name, because a [`Tool`] carries no provenance: the built-in and
+/// sub-agent names are fixed lists, an MCP name is in `owners`, and script
+/// discovery drops any script whose name one of those already owns, so what
+/// is left can only be a script.
+pub fn tool_source(name: &str, owners: &ToolOwners) -> ToolGroup {
+    if leviath_tools::is_builtin_tool(name) {
+        ToolGroup::Builtin
+    } else if leviath_tools::is_subagent_tool(name) {
+        ToolGroup::Subagent
+    } else if owners.contains_key(name) {
+        ToolGroup::Mcp
+    } else {
+        ToolGroup::Scripts
+    }
+}
 
 /// Every tool a run could offer, and which MCP server each came from.
 ///
@@ -502,19 +669,31 @@ pub fn expand_connector_grants(
     granted
 }
 
-/// Filter `all` tool defs down to those a stage's `available_tools` names
-/// (alias-resolved). Shared by spawn-time stage resolution and the mid-run
+/// Filter the catalog's tool defs down to those a stage's `available_tools`
+/// grants: the names it lists (alias-resolved), plus every def whose source a
+/// listed group covers. Shared by spawn-time stage resolution and the mid-run
 /// tool-service refresh so both apply Layer-1 identically.
 ///
 /// Connector grants are expanded into `available` by
-/// [`expand_connector_grants`] before this sees it, so both callers apply one
-/// rule and this stays an exact-match filter.
-pub(crate) fn filter_tools_by_available(all: &[Tool], available: &[String]) -> Vec<Tool> {
+/// [`expand_connector_grants`] before this sees it. Group grants are *not*
+/// pre-expanded, on purpose: a `dynamic_tools` agent that grants `@scripts`
+/// installs a tool mid-run and expects the next refresh to offer it, which
+/// only works if the group is still a group when the refresh filters.
+///
+/// The stage-control tools (`submit_output`, `fan_out`) are never granted by
+/// a group; the stage mode writes them into the list by name.
+pub(crate) fn filter_tools_by_available(
+    catalog: ToolCatalog<'_>,
+    available: &[String],
+) -> Vec<Tool> {
     if available.is_empty() {
         return Vec::new();
     }
+    let all = catalog.defs;
+    let groups = leviath_core::blueprint::groups_in(available);
     let wanted: std::collections::HashSet<&str> = available
         .iter()
+        .filter(|n| !leviath_core::blueprint::is_tool_group_token(n))
         .map(|n| leviath_tools::canonical_tool_name(n))
         .collect();
     // Names that match nothing get one more chance, as a server-qualified MCP
@@ -527,8 +706,19 @@ pub(crate) fn filter_tools_by_available(all: &[Tool], available: &[String]) -> V
         .filter(|n| !all.iter().any(|t| t.name == *n))
         .collect();
     let recovered = recover_unqualified(all, &unmatched);
+    let grouped = |name: &str| {
+        !groups.is_empty()
+            && !leviath_tools::STAGE_CONTROL_TOOLS.contains(&name)
+            && groups
+                .iter()
+                .any(|g| g.covers(tool_source(name, catalog.owners)))
+    };
     all.iter()
-        .filter(|t| wanted.contains(t.name.as_str()) || recovered.contains(t.name.as_str()))
+        .filter(|t| {
+            wanted.contains(t.name.as_str())
+                || recovered.contains(t.name.as_str())
+                || grouped(&t.name)
+        })
         .cloned()
         .collect()
 }
@@ -589,12 +779,12 @@ fn recover_unqualified<'a>(
 /// that arrives anyway (a model repeating itself from context) meets the ordinary
 /// unoffered-tool refusal.
 pub fn filter_tools_for_stage(
-    all: &[Tool],
+    catalog: ToolCatalog<'_>,
     available: &[String],
     required: &[String],
     unattended: bool,
 ) -> Vec<Tool> {
-    let mut tools = filter_tools_by_available(all, available);
+    let mut tools = filter_tools_by_available(catalog, available);
     if unattended {
         tools.retain(|t| {
             !crate::dynamic_interaction::BLOCKING_INTERACTION_TOOLS.contains(&t.name.as_str())
@@ -667,6 +857,23 @@ pub fn providers_tried(
     names.join(", ")
 }
 
+/// A stage's own model list as the blueprint wrote it, for the substitution
+/// note: a bare name for an open route, `provider/model` for a pinned one.
+fn blueprint_choice(model_cfg: &ModelConfig) -> String {
+    let listed: Vec<String> = model_cfg
+        .models
+        .iter()
+        .map(|e| match e.provider.is_empty() {
+            true => e.model.clone(),
+            false => format!("{}/{}", e.provider, e.model),
+        })
+        .collect();
+    match listed.is_empty() {
+        true => "no model".to_string(),
+        false => listed.join(", "),
+    }
+}
+
 /// Resolve every stage's provider/model + effective tool set from the
 /// blueprint, or report the first stage that has no usable provider.
 ///
@@ -695,12 +902,29 @@ pub fn resolve_stages(
     unattended: bool,
     output_request: Option<&leviath_core::output::OutputSpec>,
 ) -> Result<Vec<ResolvedStage>, String> {
+    // The compaction model is sent the run's context too. Judged only when
+    // its provider is registered: one that is not is never called.
+    if let Some(compaction) = &blueprint.compaction_config
+        && registry.has(&compaction.provider)
+        && let Some(refusal) = registry.retention_refusal_with(
+            &defaults.retention,
+            &compaction.provider,
+            &compaction.model,
+        )
+    {
+        return Err(format!("the blueprint's compaction model is {refusal}"));
+    }
     blueprint
         .stages
         .iter()
         .map(|stage| {
-            let mut candidates =
-                resolve_stage_candidates(&stage.model, model_override, defaults, registry);
+            let mut candidates = resolve_stage_candidates_for(
+                &stage.model,
+                model_override,
+                defaults,
+                registry,
+                &blueprint.stage_inputs(stage),
+            );
             let head = candidates.remove(0);
             // `registry.has` also consults the script layer, so a `.rhai`
             // provider sitting on disk counts as usable and is never
@@ -744,29 +968,98 @@ pub fn resolve_stages(
                     ),
                 });
             }
+            // Zero data retention was asked for, so a model that keeps
+            // anything is refused here, with the provider's own reason, rather
+            // than sent with a request field that cannot reach the abuse log.
+            // Refused rather than skipped for the same reason as the check
+            // above: an author who pinned a model would not see it swapped
+            // for one at another vendor.
+            let mut dropped = Vec::new();
+            if defaults.retention.zero_requested {
+                if let Some(refusal) = registry.retention_refusal_with(
+                    &defaults.retention,
+                    &head.provider,
+                    &head.model,
+                ) {
+                    return Err(format!("stage '{}' names {refusal}", stage.name));
+                }
+                // The fallbacks are held to the same bar. A failover is the
+                // one place a request could otherwise reach a model that
+                // keeps something after the head was checked, so a fallback
+                // that cannot run with zero retention is dropped here, and
+                // the stage's log says which.
+                candidates.retain(|entry| {
+                    let policy =
+                        registry.retention_with(&defaults.retention, &entry.provider, &entry.model);
+                    if policy.is_zero() {
+                        return true;
+                    }
+                    dropped.push(format!(
+                        "[model] stage '{}' will not fail over to {}/{}: it does not run \
+                         with zero data retention (retention {}: {})",
+                        stage.name,
+                        entry.provider,
+                        entry.model,
+                        policy.retention.describe(),
+                        policy.note,
+                    ));
+                    false
+                });
+            }
             // Empty `available_tools` exposes no tools; otherwise filter the full
-            // set by name (alias-resolved). A name matching nothing (a typo, or an
-            // MCP tool whose server isn't installed) is simply omitted. An
-            // unattended run also loses the tools that block on a person.
+            // set by name (alias-resolved) and by group. A name matching nothing
+            // (a typo, or an MCP tool whose server isn't installed) is simply
+            // omitted. An unattended run also loses the tools that block on a
+            // person.
             let granted = expand_connector_grants(
                 &stage.available_tools,
                 &stage.available_connectors,
                 catalog.owners,
             );
             let mut tools =
-                filter_tools_for_stage(catalog.defs, &granted, &stage.required_tools, unattended);
+                filter_tools_for_stage(catalog, &granted, &stage.required_tools, unattended);
             let output = leviath_core::resolve_output_spec(
                 blueprint.output.as_ref(),
                 stage.output.as_ref(),
                 output_request,
             );
             apply_output_shape(&mut tools, output.as_ref());
+            // One line, at spawn, when the user's settings moved this stage off
+            // the model its blueprint named. It rides the stage's operational
+            // log so `lev run`, the dashboard and the journal all carry it;
+            // a stage that starts on its own first choice says nothing.
+            let mut notes = match head_source(
+                &stage.model,
+                model_override,
+                defaults,
+                registry,
+                &head,
+            ) {
+                HeadSource::Blueprint => Vec::new(),
+                HeadSource::Override => vec![format!(
+                    "[model] stage '{}' starts on {}/{} (override_model); blueprint asked for {}",
+                    stage.name,
+                    head.provider,
+                    head.model,
+                    blueprint_choice(&stage.model)
+                )],
+                HeadSource::Fallback => vec![format!(
+                    "[model] stage '{}' starts on {}/{} (fallback_model); nothing the blueprint \
+                     named is configured here ({})",
+                    stage.name,
+                    head.provider,
+                    head.model,
+                    blueprint_choice(&stage.model)
+                )],
+            };
+            notes.extend(dropped);
             Ok(ResolvedStage {
                 provider_name: head.provider,
                 model: head.model,
                 tools,
                 fallbacks: candidates,
                 output,
+                notes,
             })
         })
         .collect()
@@ -872,8 +1165,10 @@ mod tests {
             .prime_capabilities(std::time::Duration::from_secs(5), &["spark"])
             .await;
         let defaults = ModelDefaults {
+            retention: Default::default(),
             provider: "spark".to_string(),
-            model: None,
+            override_model: None,
+            fallback_model: None,
             fallback_order: Vec::new(),
             provider_order: Vec::new(),
         };
@@ -892,7 +1187,7 @@ mod tests {
 
     /// The preference decides the route, not the model, so a blueprint that
     /// tiers its stages keeps each stage's own model. This is what separates it
-    /// from `default_model`, which pins one model everywhere.
+    /// from `override_model`, which pins one model everywhere.
     #[tokio::test]
     async fn preferring_a_script_provider_keeps_each_stage_on_its_own_model() {
         let (registry, _dir) = registry_with_script_default(&["cheap-model", "costly-model"]);
@@ -900,8 +1195,10 @@ mod tests {
             .prime_capabilities(std::time::Duration::from_secs(5), &["spark"])
             .await;
         let defaults = ModelDefaults {
+            retention: Default::default(),
             provider: "spark".to_string(),
-            model: None,
+            override_model: None,
+            fallback_model: None,
             fallback_order: Vec::new(),
             provider_order: Vec::new(),
         };
@@ -923,8 +1220,10 @@ mod tests {
             .prime_capabilities(std::time::Duration::from_secs(5), &["spark"])
             .await;
         let defaults = ModelDefaults {
+            retention: Default::default(),
             provider: "spark".to_string(),
-            model: None,
+            override_model: None,
+            fallback_model: None,
             fallback_order: Vec::new(),
             provider_order: Vec::new(),
         };
@@ -957,6 +1256,7 @@ mod tests {
                     serves: models.iter().map(|m| (*m).to_string()).collect(),
                     catalog: None,
                     refusal: None,
+                    mime: None,
                 }),
             );
         }
@@ -974,6 +1274,8 @@ mod tests {
         catalog: Option<Vec<String>>,
         /// What it says about refusing something outside that catalogue.
         refusal: Option<String>,
+        /// What its models take, when the test cares; text only otherwise.
+        mime: Option<leviath_providers::ModelMime>,
     }
     #[async_trait::async_trait]
     impl leviath_providers::Provider for FakeProvider {
@@ -996,6 +1298,11 @@ mod tests {
         }
         fn capabilities(&self, _m: &str) -> leviath_providers::ModelCapabilities {
             leviath_providers::ModelCapabilities::default()
+        }
+        fn mime(&self, _m: &str) -> leviath_providers::ModelMime {
+            self.mime
+                .clone()
+                .unwrap_or_else(leviath_providers::ModelMime::text_only)
         }
         fn serves_model(&self, model_key: &str) -> Option<String> {
             self.serves
@@ -1023,6 +1330,7 @@ mod tests {
                     serves: models.iter().map(|m| (*m).to_string()).collect(),
                     catalog: Some(models.iter().map(|m| (*m).to_string()).collect()),
                     refusal: None,
+                    mime: None,
                 }),
             );
         }
@@ -1090,8 +1398,10 @@ mod tests {
     fn resolve_user_default_when_nothing_listed_available() {
         // Listed provider "ghost" is unavailable; anthropic (the default) is.
         let defaults = ModelDefaults {
+            retention: Default::default(),
             provider: "anthropic".to_string(),
-            model: Some("claude-default".to_string()),
+            override_model: Some("claude-default".to_string()),
+            fallback_model: None,
             fallback_order: Vec::new(),
             provider_order: Vec::new(),
         };
@@ -1105,13 +1415,15 @@ mod tests {
     }
 
     /// The case that reached Ollama as a request for `ollama/qwen3.8:latest`: a
-    /// `default_model` written as `provider/model` next to the provider it
+    /// `override_model` written as `provider/model` next to the provider it
     /// names. The prefix is dropped on the way to the resolver.
     #[test]
-    fn a_default_model_qualified_with_its_own_provider_is_sent_bare() {
+    fn an_override_model_qualified_with_its_own_provider_is_sent_bare() {
         let defaults = ModelDefaults {
+            retention: Default::default(),
             provider: "ollama".to_string(),
-            model: Some("ollama/qwen3.8:latest".to_string()),
+            override_model: Some("ollama/qwen3.8:latest".to_string()),
+            fallback_model: None,
             fallback_order: Vec::new(),
             provider_order: Vec::new(),
         };
@@ -1125,45 +1437,45 @@ mod tests {
     }
 
     #[test]
-    fn bare_default_model_strips_only_the_named_providers_prefix() {
+    fn bare_user_model_strips_only_the_named_providers_prefix() {
         // The provider's own name, and nothing else, comes off.
         assert_eq!(
-            bare_default_model("ollama", "ollama/qwen3.8:latest"),
+            bare_user_model("ollama", "ollama/qwen3.8:latest"),
             "qwen3.8:latest"
         );
         assert_eq!(
-            bare_default_model("anthropic", "anthropic/claude-sonnet-5"),
+            bare_user_model("anthropic", "anthropic/claude-sonnet-5"),
             "claude-sonnet-5"
         );
         // Another provider's name is part of the model id, as far as this
         // provider is concerned.
-        assert_eq!(bare_default_model("ollama", "openai/gpt-5"), "openai/gpt-5");
+        assert_eq!(bare_user_model("ollama", "openai/gpt-5"), "openai/gpt-5");
         // A bare id is untouched, as is one that merely starts with the same
         // letters or has nothing after the slash.
         assert_eq!(
-            bare_default_model("ollama", "qwen3.8:latest"),
+            bare_user_model("ollama", "qwen3.8:latest"),
             "qwen3.8:latest"
         );
-        assert_eq!(bare_default_model("ollama", "ollamafoo/x"), "ollamafoo/x");
-        assert_eq!(bare_default_model("ollama", "ollama/"), "ollama/");
-        assert_eq!(bare_default_model("ollama", "ollama"), "ollama");
+        assert_eq!(bare_user_model("ollama", "ollamafoo/x"), "ollamafoo/x");
+        assert_eq!(bare_user_model("ollama", "ollama/"), "ollama/");
+        assert_eq!(bare_user_model("ollama", "ollama"), "ollama");
     }
 
     #[test]
-    fn bare_default_model_keeps_openrouters_own_catalog_ids() {
+    fn bare_user_model_keeps_openrouters_own_catalog_ids() {
         // `openrouter/auto` is a real OpenRouter model, not a qualified one.
         assert_eq!(
-            bare_default_model("openrouter", "openrouter/auto"),
+            bare_user_model("openrouter", "openrouter/auto"),
             "openrouter/auto"
         );
         // A qualified OpenRouter model still carries the vendor segment, so
         // there is a second slash and the prefix comes off.
         assert_eq!(
-            bare_default_model("openrouter", "openrouter/deepseek/deepseek-v4-flash"),
+            bare_user_model("openrouter", "openrouter/deepseek/deepseek-v4-flash"),
             "deepseek/deepseek-v4-flash"
         );
         assert_eq!(
-            bare_default_model("openrouter", "deepseek/deepseek-v4-flash"),
+            bare_user_model("openrouter", "deepseek/deepseek-v4-flash"),
             "deepseek/deepseek-v4-flash"
         );
     }
@@ -1171,8 +1483,10 @@ mod tests {
     #[test]
     fn resolve_user_default_with_model_override() {
         let defaults = ModelDefaults {
+            retention: Default::default(),
             provider: "anthropic".to_string(),
-            model: None,
+            override_model: None,
+            fallback_model: None,
             fallback_order: Vec::new(),
             provider_order: Vec::new(),
         };
@@ -1190,8 +1504,10 @@ mod tests {
         // allow_user_default, a default model set, but the default provider isn't
         // registered ⇒ neither user-default branch fires ⇒ last resort.
         let defaults = ModelDefaults {
+            retention: Default::default(),
             provider: "ghost-default".to_string(),
-            model: Some("dm".to_string()),
+            override_model: Some("dm".to_string()),
+            fallback_model: None,
             fallback_order: Vec::new(),
             provider_order: Vec::new(),
         };
@@ -1221,8 +1537,10 @@ mod tests {
         let mut cfg = model_cfg(vec![("ghost", "g")]);
         cfg.allow_user_default = false; // forbid the default fallback
         let defaults = ModelDefaults {
+            retention: Default::default(),
             provider: "anthropic".to_string(),
-            model: Some("would-be-default".to_string()),
+            override_model: Some("would-be-default".to_string()),
+            fallback_model: None,
             fallback_order: Vec::new(),
             provider_order: Vec::new(),
         };
@@ -1311,6 +1629,187 @@ mod tests {
         assert!(err.contains("lev models list"), "says what to do: {err}");
     }
 
+    /// With zero retention asked for, a model the table says keeps
+    /// something is refused with that reason, one that keeps nothing goes
+    /// through, and a declared agreement turns the first into the second.
+    /// The head passes and a fallback that keeps something is dropped from
+    /// the failover list, with a note in the stage's log; off, the fallback
+    /// stays.
+    #[test]
+    fn resolve_stages_drops_a_retaining_fallback_when_zero_retention_is_asked_for() {
+        let stage = leviath_core::Stage::new(
+            "plan".to_string(),
+            model_cfg(vec![
+                ("ollama", "q"),
+                ("openai", "gpt-5.5"),
+                ("llama-cpp", "local"),
+            ]),
+        );
+        let layout = leviath_core::layout::ContextLayout::new(vec![], 1000);
+        let bp = Blueprint::new("t".to_string(), "d".to_string(), vec![stage], layout);
+        let registry = registry_publishing(&[
+            ("openai", &["gpt-5.5"]),
+            ("ollama", &["q"]),
+            ("llama-cpp", &["local"]),
+        ]);
+        let defaults = ModelDefaults {
+            retention: leviath_providers::retention::RetentionSettings {
+                zero_requested: true,
+                ..Default::default()
+            },
+            ..ModelDefaults::default()
+        };
+
+        let resolved = resolve_stages(&bp, None, &defaults, &registry, catalog(&[]), false, None)
+            .expect("the head keeps nothing");
+        assert_eq!(resolved[0].provider_name, "ollama");
+        // The local fallback keeps nothing and stays; OpenAI's is dropped.
+        let kept: Vec<String> = resolved[0]
+            .fallbacks
+            .iter()
+            .map(|e| format!("{}/{}", e.provider, e.model))
+            .collect();
+        assert_eq!(kept, vec!["llama-cpp/local".to_string()]);
+        let notes = resolved[0].notes.join("\n");
+        assert!(
+            notes.contains("will not fail over to openai/gpt-5.5"),
+            "{notes}"
+        );
+        assert_eq!(resolved[0].notes.len(), 1, "{notes}");
+
+        let off = resolve_stages(
+            &bp,
+            None,
+            &ModelDefaults::default(),
+            &registry,
+            catalog(&[]),
+            false,
+            None,
+        )
+        .expect("resolves");
+        assert_eq!(off[0].fallbacks.len(), 2);
+        assert!(off[0].notes.is_empty());
+    }
+
+    #[test]
+    fn resolve_stages_refuses_a_retaining_model_when_zero_retention_is_asked_for() {
+        let stage = |name: &str, provider: &str, model: &str| {
+            leviath_core::Stage::new(name.to_string(), model_cfg(vec![(provider, model)]))
+        };
+        let layout = leviath_core::layout::ContextLayout::new(vec![], 1000);
+        let bp = Blueprint::new(
+            "t".to_string(),
+            "d".to_string(),
+            vec![stage("plan", "openai", "gpt-5.5")],
+            layout.clone(),
+        );
+        let defaults = ModelDefaults {
+            retention: leviath_providers::retention::RetentionSettings {
+                zero_requested: true,
+                ..Default::default()
+            },
+            ..ModelDefaults::default()
+        };
+        let registry = registry_publishing(&[("openai", &["gpt-5.5"]), ("ollama", &["q"])]);
+
+        let err = resolve_stages(&bp, None, &defaults, &registry, catalog(&[]), false, None)
+            .expect_err("OpenAI keeps an abuse log");
+        assert!(err.contains("plan"), "{err}");
+        assert!(err.contains("30 days"), "{err}");
+        assert!(err.contains("zero_retention_agreements"), "{err}");
+
+        let local = Blueprint::new(
+            "t".to_string(),
+            "d".to_string(),
+            vec![stage("plan", "ollama", "q")],
+            layout.clone(),
+        );
+        resolve_stages(
+            &local,
+            None,
+            &defaults,
+            &registry,
+            catalog(&[]),
+            false,
+            None,
+        )
+        .expect("local inference keeps nothing");
+
+        // Off, nothing is checked.
+        resolve_stages(
+            &bp,
+            None,
+            &ModelDefaults::default(),
+            &registry,
+            catalog(&[]),
+            false,
+            None,
+        )
+        .expect("not asked for, not refused");
+
+        let with_agreement = ModelDefaults {
+            retention: leviath_providers::retention::RetentionSettings {
+                zero_requested: true,
+                agreements: vec!["openai".to_string()],
+                ..Default::default()
+            },
+            ..ModelDefaults::default()
+        };
+        resolve_stages(
+            &bp,
+            None,
+            &with_agreement,
+            &registry,
+            catalog(&[]),
+            false,
+            None,
+        )
+        .expect("a declared agreement makes OpenAI zero");
+    }
+
+    /// The compaction model is held to the same rule as the stages, since a
+    /// summary sends the run's context; one on a provider that is not
+    /// registered is never called and so is not judged.
+    #[test]
+    fn resolve_stages_refuses_a_retaining_compaction_model() {
+        let stage = leviath_core::Stage::new("plan".to_string(), model_cfg(vec![("ollama", "q")]));
+        let layout = leviath_core::layout::ContextLayout::new(vec![], 1000);
+        let mut bp = Blueprint::new("t".to_string(), "d".to_string(), vec![stage], layout);
+        bp.compaction_config = Some(leviath_core::lifecycle::CompactionConfig {
+            provider: "openai".to_string(),
+            model: "gpt-5.5".to_string(),
+            ..Default::default()
+        });
+        let defaults = ModelDefaults {
+            retention: leviath_providers::retention::RetentionSettings {
+                zero_requested: true,
+                ..Default::default()
+            },
+            ..ModelDefaults::default()
+        };
+        let registry = registry_publishing(&[("openai", &["gpt-5.5"]), ("ollama", &["q"])]);
+        let err = resolve_stages(&bp, None, &defaults, &registry, catalog(&[]), false, None)
+            .expect_err("the compaction model keeps an abuse log");
+        assert!(
+            err.starts_with("the blueprint's compaction model is openai/gpt-5.5, which does not"),
+            "{err}"
+        );
+
+        let only_local = registry_publishing(&[("ollama", &["q"])]);
+        resolve_stages(&bp, None, &defaults, &only_local, catalog(&[]), false, None)
+            .expect("an unregistered compaction provider is never called");
+        resolve_stages(
+            &bp,
+            None,
+            &ModelDefaults::default(),
+            &registry,
+            catalog(&[]),
+            false,
+            None,
+        )
+        .expect("not asked for, not refused");
+    }
+
     /// And when the provider can say *why*, the spawn error says that instead.
     ///
     /// "Does not serve it" is right for a typo and wrong for a model the route
@@ -1337,6 +1836,7 @@ mod tests {
                 refusal: Some(
                     "your ChatGPT plus plan does not include it. Available: gpt-5.5".to_string(),
                 ),
+                mime: None,
             }),
         );
 
@@ -1440,8 +1940,10 @@ mod tests {
     #[test]
     fn providers_tried_lists_the_blueprint_entries_and_the_user_default() {
         let defaults = ModelDefaults {
+            retention: Default::default(),
             provider: "fallback".to_string(),
-            model: None,
+            override_model: None,
+            fallback_model: None,
             fallback_order: Vec::new(),
             provider_order: Vec::new(),
         };
@@ -1560,7 +2062,7 @@ mod tests {
             "ask_user_text".to_string(),
             "ask_user_choice".to_string(),
         ];
-        let tools = filter_tools_for_stage(&ask_and_read_defs(), &available, &[], false);
+        let tools = filter_tools_for_stage(catalog(&ask_and_read_defs()), &available, &[], false);
         assert_eq!(
             names(&tools),
             vec!["read_file", "ask_user_text", "ask_user_choice"]
@@ -1578,8 +2080,8 @@ mod tests {
     #[test]
     fn an_entry_with_no_provider_resolves_to_whoever_serves_the_model() {
         // What a blueprint that names models rather than routes produces. The
-        // author asks for `gpt-5.5`; which providers can reach it is a property
-        // of the machine, so every registered one is asked.
+        // author asks for `gpt-5.5`; which providers may reach it is the
+        // machine's preference, so every provider in it is asked, in order.
         let cfg = model_cfg_open(vec!["gpt-5.5"]);
         let registry = registry_serving(&[
             ("anthropic", &[][..]),
@@ -1588,15 +2090,24 @@ mod tests {
         ]);
         let defaults = ModelDefaults {
             provider: "openrouter".to_string(),
+            provider_order: vec!["openrouter".to_string(), "openai".to_string()],
             ..Default::default()
         };
         let got = resolve_stage_candidates(&cfg, None, &defaults, &registry);
         assert_eq!(
             pairs(&got),
             vec![("openrouter", "gpt-5.5"), ("openai", "gpt-5.5")],
-            "both routes are offered, the user's default provider first, and \
+            "both preferred routes are offered, in the preference's order, and \
              the provider that does not serve it is not offered at all"
         );
+        // A configured provider left out of the preference is never chosen for
+        // a bare name, however well it serves it.
+        let only_default = ModelDefaults {
+            provider: "openrouter".to_string(),
+            ..Default::default()
+        };
+        let got = resolve_stage_candidates(&cfg, None, &only_default, &registry);
+        assert_eq!(pairs(&got), vec![("openrouter", "gpt-5.5")]);
     }
 
     #[test]
@@ -1605,8 +2116,58 @@ mod tests {
         // a fallback list is for. It warns rather than failing the stage.
         let cfg = model_cfg_open(vec!["nobody-serves-this", "claude-sonnet-5"]);
         let registry = registry_serving(&[("anthropic", &["claude-sonnet-5"][..])]);
-        let got = resolve_stage_candidates(&cfg, None, &ModelDefaults::default(), &registry);
+        let defaults = ModelDefaults {
+            provider: "anthropic".to_string(),
+            ..Default::default()
+        };
+        let got = resolve_stage_candidates(&cfg, None, &defaults, &registry);
         assert_eq!(pairs(&got), vec![("anthropic", "claude-sonnet-5")]);
+    }
+
+    #[test]
+    fn a_stage_that_takes_mime_prefers_a_model_that_sees_it() {
+        let mut registry = registry_with(&["blind"]);
+        registry.register(
+            "seeing".to_string(),
+            Arc::new(FakeProvider {
+                mime: Some(leviath_providers::ModelMime::new(
+                    &["text/*", "image/*"],
+                    &["text/*"],
+                )),
+                ..Default::default()
+            }),
+        );
+        let cfg = model_cfg(vec![("blind", "text-only"), ("seeing", "vision")]);
+        let needs = vec!["image/*".to_string()];
+        let got =
+            resolve_stage_candidates_for(&cfg, None, &ModelDefaults::default(), &registry, &needs);
+        assert_eq!(
+            pairs(&got),
+            vec![("seeing", "vision"), ("blind", "text-only")]
+        );
+        // Nothing needed, or nothing that sees: the blueprint's order stands.
+        let got =
+            resolve_stage_candidates_for(&cfg, None, &ModelDefaults::default(), &registry, &[]);
+        assert_eq!(
+            pairs(&got),
+            vec![("blind", "text-only"), ("seeing", "vision")]
+        );
+        let got = resolve_stage_candidates_for(
+            &cfg,
+            None,
+            &ModelDefaults::default(),
+            &registry,
+            &["audio/*".to_string(), "*/*".to_string()],
+        );
+        assert_eq!(
+            pairs(&got),
+            vec![("blind", "text-only"), ("seeing", "vision")]
+        );
+        // One candidate has nothing to be reordered against.
+        let one = model_cfg(vec![("blind", "text-only")]);
+        let got =
+            resolve_stage_candidates_for(&one, None, &ModelDefaults::default(), &registry, &needs);
+        assert_eq!(pairs(&got), vec![("blind", "text-only")]);
     }
 
     #[test]
@@ -1637,8 +2198,10 @@ mod tests {
     fn the_global_chain_comes_after_the_user_default() {
         let cfg = model_cfg(vec![("openrouter", "deepseek")]);
         let defaults = ModelDefaults {
+            retention: Default::default(),
             provider: "anthropic".to_string(),
-            model: Some("sonnet".to_string()),
+            override_model: Some("sonnet".to_string()),
+            fallback_model: None,
             fallback_order: vec![ModelEntry::new("openai".to_string(), "gpt".to_string())],
             provider_order: Vec::new(),
         };
@@ -1657,18 +2220,240 @@ mod tests {
         );
     }
 
+    /// `fallback_model` sits behind every model the stage named and ahead of
+    /// the host-wide chain, and the regroup that promotes `override_model`
+    /// leaves it where it is: it is the answer to "nothing I listed is
+    /// configured", not a preference over what was listed.
+    #[test]
+    fn the_fallback_model_comes_after_the_stages_own_entries_and_is_never_promoted() {
+        let cfg = model_cfg(vec![("openrouter", "deepseek"), ("anthropic", "opus")]);
+        let defaults = ModelDefaults {
+            retention: Default::default(),
+            provider: "anthropic".to_string(),
+            override_model: None,
+            fallback_model: Some("haiku".to_string()),
+            fallback_order: vec![ModelEntry::new("openai".to_string(), "gpt".to_string())],
+            provider_order: Vec::new(),
+        };
+        let registry = registry_with(&["openrouter", "anthropic", "openai"]);
+        let got = resolve_stage_candidates(&cfg, None, &defaults, &registry);
+        // The blueprint's model order stands (the preference reorders routes
+        // within a model, never across models); the fallback stays behind both
+        // listed models and ahead of the host-wide chain.
+        assert_eq!(
+            pairs(&got),
+            vec![
+                ("openrouter", "deepseek"),
+                ("anthropic", "opus"),
+                ("anthropic", "haiku"),
+                ("openai", "gpt"),
+            ]
+        );
+    }
+
+    /// A stage none of whose models is configured lands on the fallback, and
+    /// the run is told that is what happened.
+    #[test]
+    fn a_stage_with_nothing_configured_starts_on_the_fallback_model_and_says_so() {
+        let cfg = model_cfg(vec![("ghost", "m")]);
+        let defaults = ModelDefaults {
+            retention: Default::default(),
+            provider: "anthropic".to_string(),
+            override_model: None,
+            fallback_model: Some("anthropic/haiku".to_string()),
+            fallback_order: Vec::new(),
+            provider_order: Vec::new(),
+        };
+        let registry = registry_with(&["anthropic"]);
+        let got = resolve_stage_candidates(&cfg, None, &defaults, &registry);
+        assert_eq!(pairs(&got), vec![("anthropic", "haiku")]);
+        assert_eq!(
+            head_source(&cfg, None, &defaults, &registry, &got[0]),
+            HeadSource::Fallback
+        );
+    }
+
+    /// A stage that forbids the user default gets neither of the user's models.
+    #[test]
+    fn a_stage_that_forbids_the_user_default_gets_no_fallback_model() {
+        let mut cfg = model_cfg(vec![("openrouter", "deepseek")]);
+        cfg.allow_user_default = false;
+        let defaults = ModelDefaults {
+            retention: Default::default(),
+            provider: "anthropic".to_string(),
+            override_model: Some("sonnet".to_string()),
+            fallback_model: Some("haiku".to_string()),
+            fallback_order: Vec::new(),
+            provider_order: Vec::new(),
+        };
+        let registry = registry_with(&["openrouter", "anthropic"]);
+        let got = resolve_stage_candidates(&cfg, None, &defaults, &registry);
+        assert_eq!(pairs(&got), vec![("openrouter", "deepseek")]);
+        assert_eq!(
+            head_source(&cfg, None, &defaults, &registry, &got[0]),
+            HeadSource::Blueprint
+        );
+    }
+
+    /// An unregistered default provider has no fallback to offer.
+    #[test]
+    fn the_fallback_model_needs_its_provider_registered() {
+        let cfg = model_cfg(vec![("openrouter", "deepseek")]);
+        let defaults = ModelDefaults {
+            retention: Default::default(),
+            provider: "anthropic".to_string(),
+            override_model: None,
+            fallback_model: Some("haiku".to_string()),
+            fallback_order: Vec::new(),
+            provider_order: Vec::new(),
+        };
+        let registry = registry_with(&["openrouter"]);
+        let got = resolve_stage_candidates(&cfg, None, &defaults, &registry);
+        assert_eq!(pairs(&got), vec![("openrouter", "deepseek")]);
+    }
+
+    /// The head's source: the override when it displaced the blueprint's
+    /// choice, the blueprint when the two agree (the override names the same
+    /// model), and the blueprint under a run-level `--model`, which is the
+    /// caller overriding on purpose.
+    #[test]
+    fn head_source_tells_an_override_from_the_blueprints_own_choice() {
+        let cfg = model_cfg(vec![("anthropic", "opus")]);
+        let registry = registry_with(&["anthropic"]);
+        let displaced = ModelDefaults {
+            retention: Default::default(),
+            provider: "anthropic".to_string(),
+            override_model: Some("sonnet".to_string()),
+            fallback_model: None,
+            fallback_order: Vec::new(),
+            provider_order: Vec::new(),
+        };
+        let got = resolve_stage_candidates(&cfg, None, &displaced, &registry);
+        assert_eq!(got[0].model, "sonnet");
+        assert_eq!(
+            head_source(&cfg, None, &displaced, &registry, &got[0]),
+            HeadSource::Override
+        );
+        let same = ModelDefaults {
+            override_model: Some("opus".to_string()),
+            ..displaced.clone()
+        };
+        let got = resolve_stage_candidates(&cfg, None, &same, &registry);
+        assert_eq!(
+            head_source(&cfg, None, &same, &registry, &got[0]),
+            HeadSource::Blueprint
+        );
+        let got = resolve_stage_candidates(&cfg, Some("anthropic/sonnet"), &displaced, &registry);
+        assert_eq!(
+            head_source(
+                &cfg,
+                Some("anthropic/sonnet"),
+                &displaced,
+                &registry,
+                &got[0]
+            ),
+            HeadSource::Blueprint
+        );
+    }
+
+    /// The blueprint's list is rendered the way it was written; an empty list
+    /// is named as such rather than as nothing.
+    #[test]
+    fn blueprint_choice_renders_routes_and_names_an_empty_list() {
+        let mut mixed = model_cfg(vec![("anthropic", "opus")]);
+        mixed
+            .models
+            .push(ModelEntry::new(String::new(), "gpt".to_string()));
+        assert_eq!(blueprint_choice(&mixed), "anthropic/opus, gpt");
+        let empty = ModelConfig {
+            models: Vec::new(),
+            allow_user_default: true,
+            parameters: HashMap::new(),
+            request_timeout_secs: None,
+        };
+        assert_eq!(blueprint_choice(&empty), "no model");
+    }
+
+    /// The spawn-time note rides the resolved stage: one line naming the
+    /// substitution and the blueprint's own list, nothing when the blueprint's
+    /// choice stands.
+    #[test]
+    fn resolve_stages_notes_a_substitution_and_is_silent_otherwise() {
+        let stage =
+            leviath_core::Stage::new("fix".to_string(), model_cfg(vec![("anthropic", "opus")]));
+        let layout = leviath_core::layout::ContextLayout::new(vec![], 1000);
+        let bp = Blueprint::new("t".to_string(), "d".to_string(), vec![stage], layout);
+        let registry = registry_with(&["anthropic"]);
+        let overridden = ModelDefaults {
+            retention: Default::default(),
+            provider: "anthropic".to_string(),
+            override_model: Some("sonnet".to_string()),
+            fallback_model: None,
+            fallback_order: Vec::new(),
+            provider_order: Vec::new(),
+        };
+        let resolved = resolve_stages(&bp, None, &overridden, &registry, catalog(&[]), false, None)
+            .expect("anthropic is registered");
+        assert_eq!(
+            resolved[0].notes,
+            vec![
+                "[model] stage 'fix' starts on anthropic/sonnet (override_model); blueprint asked \
+                 for anthropic/opus"
+                    .to_string()
+            ]
+        );
+        let quiet = resolve_stages(
+            &bp,
+            None,
+            &ModelDefaults::default(),
+            &registry,
+            catalog(&[]),
+            false,
+            None,
+        )
+        .expect("anthropic is registered");
+        assert!(quiet[0].notes.is_empty());
+
+        // The fallback wording says why the blueprint's own list did not do.
+        let ghost = leviath_core::Stage::new("fix".to_string(), model_cfg_open(vec!["nowhere"]));
+        let bp = Blueprint::new(
+            "t".to_string(),
+            "d".to_string(),
+            vec![ghost],
+            leviath_core::layout::ContextLayout::new(vec![], 1000),
+        );
+        let fallback = ModelDefaults {
+            retention: Default::default(),
+            provider: "anthropic".to_string(),
+            override_model: None,
+            fallback_model: Some("haiku".to_string()),
+            fallback_order: Vec::new(),
+            provider_order: Vec::new(),
+        };
+        let resolved = resolve_stages(&bp, None, &fallback, &registry, catalog(&[]), false, None)
+            .expect("the fallback carries it");
+        assert_eq!(
+            resolved[0].notes,
+            vec![
+                "[model] stage 'fix' starts on anthropic/haiku (fallback_model); nothing the \
+                 blueprint named is configured here (nowhere)"
+                    .to_string()
+            ]
+        );
+    }
+
     /// Every bundled blueprint lists Ollama as `qwen3.5:9b`. A user who set
-    /// `default_model = "qwen3.8:latest"` was still sent to the blueprint's
+    /// `override_model = "qwen3.8:latest"` was still sent to the blueprint's
     /// model, so the named default leads.
     ///
     /// What it does NOT do is drag the rest of that provider's entries with it.
-    /// `default_model` is a statement about a model and moves that model;
+    /// `override_model` is a statement about a model and moves that model;
     /// `default_provider` is a statement about a route and reorders routes
     /// within a model. So the blueprint's own first model stays ahead of the
     /// blueprint's later ones, and only falls through when nothing registered
     /// can serve it.
     #[test]
-    fn the_users_default_model_leads_the_blueprints_entry_on_the_same_provider() {
+    fn the_users_override_model_leads_the_blueprints_entry_on_the_same_provider() {
         let cfg = model_cfg(vec![
             ("anthropic", "claude-sonnet-5"),
             ("ollama", "qwen3.5:9b"),
@@ -1676,7 +2461,8 @@ mod tests {
         ]);
         let defaults = ModelDefaults {
             provider: "ollama".to_string(),
-            model: Some("qwen3.8:latest".to_string()),
+            override_model: Some("qwen3.8:latest".to_string()),
+            fallback_model: None,
             ..Default::default()
         };
         let registry = registry_with(&["anthropic", "ollama"]);
@@ -1697,7 +2483,8 @@ mod tests {
         // reorders the routes to a model, not the models themselves.
         let repeated = ModelDefaults {
             provider: "ollama".to_string(),
-            model: Some("qwen3.6:27b".to_string()),
+            override_model: Some("qwen3.6:27b".to_string()),
+            fallback_model: None,
             ..Default::default()
         };
         let got = resolve_stage_candidates(&cfg, None, &repeated, &registry);
@@ -1723,7 +2510,8 @@ mod tests {
         ]);
         let defaults = ModelDefaults {
             provider: "openrouter".to_string(),
-            model: Some("openai/gpt-4o-mini".to_string()),
+            override_model: Some("openai/gpt-4o-mini".to_string()),
+            fallback_model: None,
             ..Default::default()
         };
         let registry = registry_with(&["openrouter", "ollama"]);
@@ -1750,7 +2538,8 @@ mod tests {
         };
         let defaults = ModelDefaults {
             provider: "openrouter".to_string(),
-            model: Some("deepseek".to_string()),
+            override_model: Some("deepseek".to_string()),
+            fallback_model: None,
             ..Default::default()
         };
         let registry = registry_with(&["openrouter", "anthropic"]);
@@ -1770,7 +2559,8 @@ mod tests {
         let cfg = model_cfg(vec![("anthropic", "sonnet"), ("ollama", "qwen")]);
         let defaults = ModelDefaults {
             provider: "openrouter".to_string(),
-            model: Some("deepseek".to_string()),
+            override_model: Some("deepseek".to_string()),
+            fallback_model: None,
             ..Default::default()
         };
         let registry = registry_with(&["anthropic", "ollama"]);
@@ -1787,8 +2577,10 @@ mod tests {
         // nowhere, which reads to the operator as a swap that did nothing.
         let cfg = model_cfg(vec![("anthropic", "sonnet"), ("anthropic", "sonnet")]);
         let defaults = ModelDefaults {
+            retention: Default::default(),
             provider: "anthropic".to_string(),
-            model: Some("sonnet".to_string()),
+            override_model: Some("sonnet".to_string()),
+            fallback_model: None,
             fallback_order: vec![ModelEntry::new(
                 "anthropic".to_string(),
                 "sonnet".to_string(),
@@ -1918,7 +2710,7 @@ mod tests {
             "ask_user_text".to_string(),
             "ask_user_choice".to_string(),
         ];
-        let tools = filter_tools_for_stage(&ask_and_read_defs(), &available, &[], true);
+        let tools = filter_tools_for_stage(catalog(&ask_and_read_defs()), &available, &[], true);
         assert_eq!(names(&tools), vec!["read_file"]);
     }
 
@@ -1932,7 +2724,8 @@ mod tests {
             "ask_user_choice".to_string(),
         ];
         let required = vec!["ask_user_text".to_string()];
-        let tools = filter_tools_for_stage(&ask_and_read_defs(), &available, &required, true);
+        let tools =
+            filter_tools_for_stage(catalog(&ask_and_read_defs()), &available, &required, true);
         assert_eq!(names(&tools), vec!["read_file", "ask_user_text"]);
     }
 
@@ -1943,7 +2736,8 @@ mod tests {
         // this is the belt to that pair of braces.)
         let available = vec!["read_file".to_string()];
         let required = vec!["ask_user_text".to_string()];
-        let tools = filter_tools_for_stage(&ask_and_read_defs(), &available, &required, true);
+        let tools =
+            filter_tools_for_stage(catalog(&ask_and_read_defs()), &available, &required, true);
         assert_eq!(names(&tools), vec!["read_file"]);
     }
 
@@ -1992,7 +2786,7 @@ mod tests {
             parameters: serde_json::Value::Null,
         }];
         let available = vec!["bash".to_string()];
-        let tools = filter_tools_for_stage(&defs, &available, &[], true);
+        let tools = filter_tools_for_stage(catalog(&defs), &available, &[], true);
         assert_eq!(names(&tools), vec!["shell"]);
     }
 
@@ -2074,6 +2868,8 @@ mod tests {
                 schema: None,
                 validator: None,
                 on_validator_error: None,
+                overwrite_artifacts: None,
+                artifacts: Vec::new(),
             }),
         );
         let resolved = resolve_one(&bp, None);
@@ -2294,38 +3090,44 @@ mod tests {
     }
 
     /// Two servers advertising the same tool name, which is the case worth
-    /// pinning: `leviath-mcp` gives the first registrant the bare name and
-    /// prefixes the second, so the advertised names never collide - and a
-    /// grant of either kind has to reach exactly one server's tool.
+    /// pinning: every advertised name carries its server, so the two never
+    /// collide, and a grant of either kind has to reach exactly one of them.
     #[test]
     fn same_named_tools_on_two_servers_stay_separable() {
-        // What `unique_advertised_name` produces for two servers that both
-        // advertise `search`: alpha registered first and kept the bare name.
+        // What the executor produces for two servers that both advertise
+        // `search`. Neither depends on which registered first.
         let owned = owners(&[
-            ("search", "alpha"),
+            ("alpha__search", "alpha"),
             ("beta__search", "beta"),
-            ("only_beta", "beta"),
+            ("beta__only_beta", "beta"),
         ]);
 
         // Naming a tool individually reaches one server's, not both.
         let just_beta = expand_connector_grants(&["beta__search".to_string()], &[], &owned);
         assert_eq!(granted_names(&just_beta), vec!["beta__search"]);
 
-        let just_alpha = expand_connector_grants(&["search".to_string()], &[], &owned);
-        assert_eq!(granted_names(&just_alpha), vec!["search"]);
+        let just_alpha = expand_connector_grants(&["alpha__search".to_string()], &[], &owned);
+        assert_eq!(granted_names(&just_alpha), vec!["alpha__search"]);
 
         // A connector grant takes that server's tools and none of the other's,
         // even though one of them is named identically on the far side.
         let all_beta = expand_connector_grants(&[], &["beta".to_string()], &owned);
-        assert_eq!(granted_names(&all_beta), vec!["beta__search", "only_beta"]);
+        assert_eq!(
+            granted_names(&all_beta),
+            vec!["beta__only_beta", "beta__search"]
+        );
         let all_alpha = expand_connector_grants(&[], &["alpha".to_string()], &owned);
-        assert_eq!(granted_names(&all_alpha), vec!["search"]);
+        assert_eq!(granted_names(&all_alpha), vec!["alpha__search"]);
 
         // And the two mix: a whole connector plus one tool from the other.
-        let mixed = expand_connector_grants(&["search".to_string()], &["beta".to_string()], &owned);
+        let mixed = expand_connector_grants(
+            &["alpha__search".to_string()],
+            &["beta".to_string()],
+            &owned,
+        );
         assert_eq!(
             granted_names(&mixed),
-            vec!["search", "beta__search", "only_beta"]
+            vec!["alpha__search", "beta__only_beta", "beta__search"]
         );
     }
 
@@ -2334,26 +3136,31 @@ mod tests {
     #[test]
     fn granting_two_connectors_keeps_both_sets_whole() {
         let owned = owners(&[
-            ("search", "alpha"),
-            ("only_alpha", "alpha"),
+            ("alpha__search", "alpha"),
+            ("alpha__only_alpha", "alpha"),
             ("beta__search", "beta"),
-            ("only_beta", "beta"),
+            ("beta__only_beta", "beta"),
         ]);
         let granted =
             expand_connector_grants(&[], &["alpha".to_string(), "beta".to_string()], &owned);
         assert_eq!(
             granted_names(&granted),
-            vec!["only_alpha", "search", "beta__search", "only_beta"],
+            vec![
+                "alpha__only_alpha",
+                "alpha__search",
+                "beta__only_beta",
+                "beta__search"
+            ],
             "each server's tools, sorted within the server, in the order named"
         );
     }
 
     /// The whole point of separability: what the model is actually offered.
-    /// A stage granting only beta must not be handed alpha's `search`, even
-    /// though alpha's tool is the one wearing the plain name.
+    /// A stage granting only beta must not be handed alpha's `search`, which
+    /// is named identically on the far side.
     #[test]
     fn a_stage_granting_one_of_two_colliding_servers_is_offered_only_its_tools() {
-        let defs: Vec<Tool> = ["search", "beta__search", "only_beta"]
+        let defs: Vec<Tool> = ["alpha__search", "beta__search", "beta__only_beta"]
             .iter()
             .map(|n| Tool {
                 name: n.to_string(),
@@ -2362,9 +3169,9 @@ mod tests {
             })
             .collect();
         let owned = owners(&[
-            ("search", "alpha"),
+            ("alpha__search", "alpha"),
             ("beta__search", "beta"),
-            ("only_beta", "beta"),
+            ("beta__only_beta", "beta"),
         ]);
         let mut stage =
             leviath_core::Stage::new("work".to_string(), model_cfg(vec![("anthropic", "m")]));
@@ -2392,7 +3199,7 @@ mod tests {
         .expect("anthropic is registered");
 
         let offered: Vec<&str> = resolved[0].tools.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(offered, vec!["beta__search", "only_beta"]);
+        assert_eq!(offered, vec!["beta__search", "beta__only_beta"]);
     }
     fn defs_named(names: &[&str]) -> Vec<Tool> {
         names
@@ -2415,7 +3222,7 @@ mod tests {
     #[test]
     fn a_grant_naming_an_mcp_tool_without_its_server_still_resolves() {
         let defs = defs_named(&["github__create_issue", "read_file"]);
-        let tools = filter_tools_by_available(&defs, &["create_issue".to_string()]);
+        let tools = filter_tools_by_available(catalog(&defs), &["create_issue".to_string()]);
         assert_eq!(offered(&tools), vec!["github__create_issue"]);
     }
 
@@ -2426,7 +3233,7 @@ mod tests {
     #[test]
     fn an_ambiguous_unqualified_grant_resolves_to_nothing() {
         let defs = defs_named(&["github__create_issue", "gitlab__create_issue"]);
-        let tools = filter_tools_by_available(&defs, &["create_issue".to_string()]);
+        let tools = filter_tools_by_available(catalog(&defs), &["create_issue".to_string()]);
         assert_eq!(offered(&tools), Vec::<&str>::new());
     }
 
@@ -2437,7 +3244,7 @@ mod tests {
     #[test]
     fn a_builtin_is_never_captured_by_a_server_offering_the_same_name() {
         let defs = defs_named(&["read_file", "scratch__read_file"]);
-        let tools = filter_tools_by_available(&defs, &["read_file".to_string()]);
+        let tools = filter_tools_by_available(catalog(&defs), &["read_file".to_string()]);
         assert_eq!(
             offered(&tools),
             vec!["read_file"],
@@ -2451,7 +3258,7 @@ mod tests {
     #[test]
     fn an_already_qualified_grant_is_untouched() {
         let defs = defs_named(&["github__search", "other__github__search"]);
-        let tools = filter_tools_by_available(&defs, &["github__search".to_string()]);
+        let tools = filter_tools_by_available(catalog(&defs), &["github__search".to_string()]);
         assert_eq!(offered(&tools), vec!["github__search"]);
     }
 
@@ -2460,16 +3267,155 @@ mod tests {
     #[test]
     fn a_name_matching_nothing_is_still_omitted() {
         let defs = defs_named(&["read_file"]);
-        let tools = filter_tools_by_available(&defs, &["nonsense".to_string()]);
+        let tools = filter_tools_by_available(catalog(&defs), &["nonsense".to_string()]);
         assert!(offered(&tools).is_empty());
     }
 
-    // ── explicit-route-only providers ───────────────────────────────────────
+    // ── group grants ────────────────────────────────────────────────────────
 
-    /// A provider serving one model, optionally only reachable by name.
+    /// One of everything a run can carry: a built-in, a stage-control
+    /// built-in, a sub-agent tool, an MCP tool and a script.
+    fn mixed_defs() -> Vec<Tool> {
+        defs_named(&[
+            "read_file",
+            "shell",
+            leviath_tools::SUBMIT_OUTPUT_TOOL,
+            leviath_tools::FAN_OUT_TOOL,
+            "spawn_agent",
+            "github__create_issue",
+            "summarize",
+        ])
+    }
+
+    fn mixed_owners() -> ToolOwners {
+        ToolOwners::from([("github__create_issue".to_string(), "github".to_string())])
+    }
+
+    fn strings(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    #[test]
+    fn tool_source_sorts_a_def_by_name() {
+        let owners = mixed_owners();
+        assert_eq!(tool_source("read_file", &owners), ToolGroup::Builtin);
+        assert_eq!(tool_source("spawn_agent", &owners), ToolGroup::Subagent);
+        assert_eq!(tool_source("github__create_issue", &owners), ToolGroup::Mcp);
+        assert_eq!(tool_source("summarize", &owners), ToolGroup::Scripts);
+    }
+
+    #[test]
+    fn each_group_grants_its_own_source_and_nothing_else() {
+        let defs = mixed_defs();
+        let owners = mixed_owners();
+        let cat = ToolCatalog {
+            defs: &defs,
+            owners: &owners,
+        };
+        let by = |grant: &str| offered_owned(filter_tools_by_available(cat, &strings(&[grant])));
+        assert_eq!(by("@builtin"), vec!["read_file", "shell"]);
+        assert_eq!(by("@subagent"), vec!["spawn_agent"]);
+        assert_eq!(by("@mcp"), vec!["github__create_issue"]);
+        assert_eq!(by("@scripts"), vec!["summarize"]);
+    }
+
+    /// `@all` is every source at once, and still not the stage-control pair:
+    /// the mode grants those, or the manifest names them.
+    #[test]
+    fn all_grants_every_source_but_never_the_stage_control_tools() {
+        let defs = mixed_defs();
+        let owners = mixed_owners();
+        let cat = ToolCatalog {
+            defs: &defs,
+            owners: &owners,
+        };
+        assert_eq!(
+            offered_owned(filter_tools_by_available(cat, &strings(&["@all"]))),
+            vec![
+                "read_file",
+                "shell",
+                "spawn_agent",
+                "github__create_issue",
+                "summarize"
+            ]
+        );
+        // Named alongside the group, the stage-control tool is granted as
+        // ever: the group's exclusion is not a veto.
+        assert_eq!(
+            offered_owned(filter_tools_by_available(
+                cat,
+                &strings(&["@all", leviath_tools::SUBMIT_OUTPUT_TOOL])
+            )),
+            vec![
+                "read_file",
+                "shell",
+                leviath_tools::SUBMIT_OUTPUT_TOOL,
+                "spawn_agent",
+                "github__create_issue",
+                "summarize"
+            ]
+        );
+    }
+
+    /// The shapes the feature exists for: groups and names mix, and a name
+    /// that a group already covers is granted once.
+    #[test]
+    fn groups_and_names_mix_without_duplicates() {
+        let defs = mixed_defs();
+        let owners = mixed_owners();
+        let cat = ToolCatalog {
+            defs: &defs,
+            owners: &owners,
+        };
+        assert_eq!(
+            offered_owned(filter_tools_by_available(
+                cat,
+                &strings(&["@builtin", "summarize", "github__create_issue"])
+            )),
+            vec!["read_file", "shell", "github__create_issue", "summarize"]
+        );
+        assert_eq!(
+            offered_owned(filter_tools_by_available(
+                cat,
+                &strings(&["@builtin", "@scripts", "github__create_issue", "read_file"])
+            )),
+            vec!["read_file", "shell", "github__create_issue", "summarize"]
+        );
+    }
+
+    /// A group token is not a name: it never reaches the unqualified-MCP
+    /// recovery, so `@mcp` cannot be "resolved" to a tool ending in `__@mcp`.
+    #[test]
+    fn a_group_token_is_never_treated_as_a_tool_name() {
+        let defs = defs_named(&["weird__@mcp", "read_file"]);
+        let tools = filter_tools_by_available(catalog(&defs), &strings(&["@mcp"]));
+        assert_eq!(offered(&tools), Vec::<&str>::new());
+    }
+
+    /// The unattended cut applies to a grouped tool exactly as to a named one.
+    #[test]
+    fn an_unattended_run_still_drops_grouped_blocking_tools() {
+        let defs = ask_and_read_defs();
+        let tools = filter_tools_for_stage(catalog(&defs), &strings(&["@builtin"]), &[], true);
+        assert_eq!(offered(&tools), vec!["read_file"]);
+        let tools = filter_tools_for_stage(
+            catalog(&defs),
+            &strings(&["@builtin"]),
+            &strings(&["ask_user_text"]),
+            true,
+        );
+        assert_eq!(offered(&tools), vec!["read_file", "ask_user_text"]);
+    }
+
+    fn offered_owned(tools: Vec<Tool>) -> Vec<String> {
+        tools.into_iter().map(|t| t.name).collect()
+    }
+
+    // ── providers outside the preference ────────────────────────────────────
+
+    /// A provider serving one model.
     struct Named {
         model: String,
-        by_name_only: bool,
     }
 
     #[async_trait::async_trait]
@@ -2495,25 +3441,21 @@ mod tests {
         fn serves_model(&self, model_key: &str) -> Option<String> {
             (model_key == self.model).then(|| model_key.to_string())
         }
-        fn explicit_route_only(&self) -> bool {
-            self.by_name_only
-        }
     }
 
-    fn two_providers(open_first: bool) -> ProviderRegistry {
+    /// An API key and a subscription transport, both serving the same name.
+    fn two_providers() -> ProviderRegistry {
         let mut registry = ProviderRegistry::new();
         registry.register(
             "openai".to_string(),
             Arc::new(Named {
                 model: "gpt-5.6-sol".to_string(),
-                by_name_only: !open_first,
             }),
         );
         registry.register(
             "codex".to_string(),
             Arc::new(Named {
                 model: "gpt-5.6-sol".to_string(),
-                by_name_only: true,
             }),
         );
         registry
@@ -2521,8 +3463,10 @@ mod tests {
 
     fn defaults_of(provider: &str) -> ModelDefaults {
         ModelDefaults {
+            retention: Default::default(),
             provider: provider.to_string(),
-            model: None,
+            override_model: None,
+            fallback_model: None,
             fallback_order: Vec::new(),
             provider_order: Vec::new(),
         }
@@ -2536,7 +3480,6 @@ mod tests {
         use leviath_providers::Provider as _;
         let p = Named {
             model: "m".to_string(),
-            by_name_only: false,
         };
         assert_eq!(p.name(), "named");
         assert_eq!(p.max_context_tokens("m"), 100_000);
@@ -2563,18 +3506,19 @@ mod tests {
         assert!(runtime.block_on(p.infer(&request)).is_err());
     }
 
-    /// Enabling a subscription transport must not silently move billing.
+    /// Configuring a provider must not silently move a stage, or its billing.
     ///
     /// `model_key` compares only the last path segment, so `openai` and `codex`
-    /// both answer to a bare `gpt-5.6-sol`. Without the exclusion, adding one
-    /// line of config re-routes every existing bare-named stage onto a plan.
+    /// both answer to a bare `gpt-5.6-sol`. Only the preference decides who
+    /// serves it: with `openai` the sole preferred provider, a configured
+    /// `codex` is never chosen for the bare name.
     #[test]
-    fn a_by_name_only_provider_never_wins_an_open_route() {
+    fn a_provider_outside_the_preference_never_wins_an_open_route() {
         let picked = resolve_stage_candidates(
             &model_cfg_open(vec!["gpt-5.6-sol"]),
             None,
             &defaults_of("openai"),
-            &two_providers(true),
+            &two_providers(),
         );
         assert_eq!(picked.len(), 1, "codex joined an open route: {picked:?}");
         assert_eq!(picked[0].provider, "openai");
@@ -2587,7 +3531,7 @@ mod tests {
             &model_cfg_open(vec!["gpt-5.6-sol"]),
             None,
             &defaults_of("codex"),
-            &two_providers(true),
+            &two_providers(),
         );
         assert_eq!(picked[0].provider, "codex");
     }
@@ -2599,7 +3543,7 @@ mod tests {
             &model_cfg(vec![("codex", "gpt-5.6-sol")]),
             None,
             &defaults_of("openai"),
-            &two_providers(true),
+            &two_providers(),
         );
         assert_eq!(picked.len(), 1);
         assert_eq!(picked[0].provider, "codex");
@@ -2612,7 +3556,7 @@ mod tests {
             &model_cfg_open(vec!["gpt-5.6-sol"]),
             Some("codex/gpt-5.6-sol"),
             &defaults_of("openai"),
-            &two_providers(true),
+            &two_providers(),
         );
         assert_eq!(picked[0].provider, "codex");
     }
@@ -2631,11 +3575,11 @@ mod tests {
             &model_cfg_open(vec!["gpt-5.6-sol"]),
             None,
             &defaults_of("anthropic"),
-            &two_providers(false),
+            &two_providers(),
         );
         assert!(
             picked.iter().all(|e| e.provider != "codex"),
-            "a by-name-only provider was reached anyway: {picked:?}"
+            "a provider outside the preference was reached anyway: {picked:?}"
         );
         assert!(
             picked.iter().all(|e| e.provider != "openai"),
@@ -2645,8 +3589,10 @@ mod tests {
 
     fn defaults_ordered(default_provider: &str, order: &[&str]) -> ModelDefaults {
         ModelDefaults {
+            retention: Default::default(),
             provider: default_provider.to_string(),
-            model: None,
+            override_model: None,
+            fallback_model: None,
             fallback_order: Vec::new(),
             provider_order: order.iter().map(|s| s.to_string()).collect(),
         }
@@ -2661,7 +3607,7 @@ mod tests {
             &model_cfg_open(vec!["gpt-5.6-sol"]),
             None,
             &defaults_ordered("openai", &["codex", "openai"]),
-            &two_providers(true),
+            &two_providers(),
         );
         assert_eq!(picked[0].provider, "codex", "{picked:?}");
     }
@@ -2675,7 +3621,7 @@ mod tests {
             &model_cfg_open(vec!["gpt-5.6-sol"]),
             None,
             &defaults_ordered("openai", &["openai", "codex"]),
-            &two_providers(true),
+            &two_providers(),
         );
         assert_eq!(picked[0].provider, "openai", "{picked:?}");
         assert!(
@@ -2693,7 +3639,7 @@ mod tests {
             &model_cfg_open(vec!["gpt-5.6-sol"]),
             None,
             &defaults_ordered("openai", &["openrouter", "openai"]),
-            &two_providers(true),
+            &two_providers(),
         );
         assert!(
             picked.iter().all(|e| e.provider != "codex"),
@@ -2728,7 +3674,7 @@ mod tests {
             &model_cfg_open(vec!["gpt-5.6-sol"]),
             None,
             &defaults_ordered("openai", &[]),
-            &two_providers(true),
+            &two_providers(),
         );
         assert_eq!(picked.len(), 1);
         assert_eq!(picked[0].provider, "openai");

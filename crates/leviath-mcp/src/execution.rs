@@ -7,35 +7,10 @@ use std::sync::Arc;
 use crate::client::{MCPClient, ToolResult, ToolResultContent};
 use crate::discovery::ToolMetadata;
 
-/// Provider tool-name limit: the name advertised to the LLM must match
-/// `^[A-Za-z0-9_-]{1,64}$` (the Anthropic/OpenAI rule). MCP names are laxer
-/// (they allow dots), so any MCP name that violates this would make the
-/// provider reject the *entire* request.
-const MAX_TOOL_NAME_LEN: usize = 64;
-
-/// Sanitize an MCP tool name into the provider-accepted character set.
-///
-/// Every character outside `[A-Za-z0-9_-]` (notably `.`, which MCP allows and
-/// real servers use) becomes `_`, and the result is truncated to 64 bytes. An
-/// empty result (a name of only illegal characters) falls back to `tool`.
-pub fn sanitize_tool_name(name: &str) -> String {
-    let mut out: String = name
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    out.truncate(MAX_TOOL_NAME_LEN);
-    if out.is_empty() {
-        "tool".to_string()
-    } else {
-        out
-    }
-}
+/// The advertised-name rule, which the taint gate and the dashboard's tool
+/// chooser need to reach the same answer as this module. It lives in
+/// `leviath-core` so there is one of it; see [`leviath_core::mcp_names`].
+pub use leviath_core::mcp_names::sanitize_tool_name;
 
 /// Result of a tool execution, with convenience fields.
 #[derive(Debug, Clone)]
@@ -46,6 +21,10 @@ pub struct ExecutionResult {
     pub data: Value,
     /// Concatenated text content for convenience
     pub text: String,
+    /// The binary blocks the server returned (`image`, `audio`, and a
+    /// `resource` carrying a `blob`), decoded, each typed by the server's
+    /// `mimeType`. The caller stores them; the executor has nowhere to.
+    pub blobs: Vec<leviath_core::mime::Blob>,
 }
 
 /// A registered server's client, shared with every call in flight to it.
@@ -79,20 +58,33 @@ impl ToolExecutor {
 
     /// Register a client and return its tools under *advertised* names.
     ///
-    /// Each advertised name is [`sanitize_tool_name`]d and made unique against
-    /// `reserved` (e.g. the built-in tool names) and every previously-registered
-    /// tool, so the set of names handed to the provider is always valid and
-    /// collision-free. The returned metadata carries the advertised names; the
-    /// alias back to `(server, original)` is recorded for routing.
+    /// Every name is [`leviath_core::mcp_names::advertised_name`] and nothing
+    /// else, so a blueprint can name a tool before the server has ever been
+    /// reached. The alias back to `(server, original)` is recorded for routing.
+    ///
+    /// A name that is already taken is **refused, not renamed**: that tool is
+    /// left out of the returned set and a warning says which two names ran into
+    /// each other. Re-registering the same server replaces it, so its own
+    /// aliases are dropped first and only a genuine clash is left to refuse.
     pub fn add_client_advertised(
         &mut self,
         server_name: String,
         client: MCPClient,
         reserved: &HashSet<String>,
     ) -> Vec<ToolMetadata> {
+        // Re-registering a server (a reload, or a second blueprint declaring
+        // the same name) replaces its client below. Its old aliases would
+        // otherwise survive and route this server's names to the client that
+        // just went away.
+        self.aliases.retain(|_, (server, _)| *server != server_name);
+
         let mut advertised = Vec::new();
         for tool in client.cached_tools() {
-            let name = self.unique_advertised_name(&tool.name, &server_name, reserved);
+            let name = leviath_core::mcp_names::advertised_name(&server_name, &tool.name);
+            if reserved.contains(&name) || self.aliases.contains_key(&name) {
+                self.refuse_tool(&server_name, &tool.name, &name);
+                continue;
+            }
             self.aliases
                 .insert(name.clone(), (server_name.clone(), tool.name.clone()));
             // Unconditional: every advertised name is server-qualified, so it
@@ -114,6 +106,37 @@ impl ToolExecutor {
         self.clients
             .insert(server_name, Arc::new(tokio::sync::Mutex::new(client)));
         advertised
+    }
+
+    /// Say out loud that a tool is not being offered, and why.
+    ///
+    /// The alternative was a `_2` suffix, which renamed the tool to something
+    /// no blueprint, `[mcp_overrides]` key or grant could have predicted, and
+    /// which changed with the order servers connected in. Refusing the one
+    /// tool keeps every other name exactly `<server>__<tool>`.
+    ///
+    /// Two ways to get here, and the message has to serve both. Two servers
+    /// whose names collide is the operator's to fix, by renaming one in
+    /// `config.toml`. A single server offering two tools that collide only
+    /// after the 64-character limit is not, so the message says which names
+    /// ran into each other rather than implying a fix.
+    fn refuse_tool(&self, server: &str, original: &str, advertised: &str) {
+        let owner = match self.aliases.get(advertised) {
+            Some((other_server, other_tool)) => {
+                format!("{other_server}'s {other_tool}")
+            }
+            None => "a built-in tool".to_string(),
+        };
+        tracing::warn!(
+            server = %server,
+            tool = %original,
+            advertised = %advertised,
+            conflicts_with = %owner,
+            "not offering an MCP tool: its name is already taken. Two names that differ only \
+             outside [A-Za-z0-9_-], or that match within the first 64 characters, land on the \
+             same advertised name. Rename the server in config.toml if the other name is a \
+             different server's"
+        );
     }
 
     /// Take a server's client back out of the executor, dropping the aliases
@@ -143,61 +166,16 @@ impl ToolExecutor {
         Some(client)
     }
 
-    /// Compute a unique, provider-safe advertised name for `original`.
-    ///
-    /// **Always** `<server>__<tool>`, sanitized. The server is part of the name
-    /// whether or not anything would collide, because the alternative -
-    /// bare name, prefixed only on a clash - makes the name a function of
-    /// registration order. Two servers both advertising `search` would give the
-    /// bare name to whichever appears first in `config.toml`, so a blueprint
-    /// saying `available_tools = ["search"]` would mean a different server's
-    /// tool depending on the order of a file it does not control, and
-    /// reordering that file would silently re-point the grant.
-    ///
-    /// Qualifying every name removes the question. `alpha__search` and
-    /// `beta__search` say which server they came from, and neither depends on
-    /// who registered first.
-    ///
-    /// `__` rather than the `.` this reads more naturally as: the advertised
-    /// name has to match `^[A-Za-z0-9_-]{1,64}$` or the provider rejects the
-    /// whole request, and [`sanitize_tool_name`] would rewrite a dot to `_`
-    /// anyway - so a manifest written with one would match nothing.
-    ///
-    /// A numeric suffix still resolves the residual case: two servers whose
-    /// *names* sanitize to the same thing, or a qualified name that collides
-    /// with a reserved built-in.
-    fn unique_advertised_name(
-        &self,
-        original: &str,
-        server: &str,
-        reserved: &HashSet<String>,
-    ) -> String {
-        let free = |name: &str| !reserved.contains(name) && !self.aliases.contains_key(name);
-
-        let qualified = sanitize_tool_name(&format!("{server}__{original}"));
-        if free(&qualified) {
-            return qualified;
-        }
-        let mut n = 2;
-        loop {
-            let candidate = sanitize_tool_name(&format!("{qualified}_{n}"));
-            if free(&candidate) {
-                return candidate;
-            }
-            n += 1;
-        }
-    }
-
     /// Which server advertises each tool: advertised name -> server name.
     ///
     /// The routing table read the other way round: a blueprint that grants a
     /// whole server needs to turn that server's name into the set of tools it
     /// covers.
     ///
-    /// Advertised names are server-qualified, so most of them carry the answer
-    /// in the string - but not reliably enough to parse it back out. A server
-    /// named `my.server` sanitizes to `my_server`, and a collision appends
-    /// `_2`, so splitting on `__` is a guess where this is a fact.
+    /// Advertised names are server-qualified, so they carry the answer in the
+    /// string, but not in a form that can be parsed back out. A server name
+    /// may itself contain `_`, so `a__b__c` is either `a`'s `b__c` or `a__b`'s
+    /// `c`. Splitting on `__` is a guess where this table is a fact.
     pub fn tool_owners(&self) -> HashMap<String, String> {
         self.aliases
             .iter()
@@ -304,22 +282,50 @@ impl ToolExecutor {
 
     /// Map a ToolResult into an ExecutionResult.
     ///
-    /// Only the model-readable blocks contribute to `text`; binary payloads
-    /// (image/audio) and bare resource links do not, and an unmodelled block is
+    /// The model-readable blocks contribute to `text`; the binary payloads
+    /// (image, audio, a resource carrying a blob) are decoded into `blobs`
+    /// for the caller to store; a bare resource link is described in the
+    /// text, since its bytes were never sent; and an unmodelled block is
     /// skipped with a warning rather than failing the call.
     fn map_result(tool_result: ToolResult) -> ExecutionResult {
-        let mut parts: Vec<&str> = Vec::new();
+        let mut parts: Vec<String> = Vec::new();
+        let mut blobs = Vec::new();
         for content in &tool_result.content {
             match content {
-                ToolResultContent::Text { text } => parts.push(text.as_str()),
+                ToolResultContent::Text { text } => parts.push(text.clone()),
                 ToolResultContent::Resource { resource } => {
                     if let Some(text) = resource.text.as_deref() {
-                        parts.push(text);
+                        parts.push(text.to_string());
+                    }
+                    if let Some(blob) = resource.blob.as_deref() {
+                        let name = resource
+                            .uri
+                            .rsplit('/')
+                            .find(|s| !s.is_empty())
+                            .unwrap_or(&resource.uri)
+                            .to_string();
+                        push_blob(&mut blobs, blob, resource.mime_type.as_deref(), Some(name));
                     }
                 }
-                ToolResultContent::Image { .. }
-                | ToolResultContent::Audio { .. }
-                | ToolResultContent::ResourceLink { .. } => {}
+                ToolResultContent::Image { data, mime_type }
+                | ToolResultContent::Audio { data, mime_type } => {
+                    push_blob(&mut blobs, data, Some(mime_type), None);
+                }
+                ToolResultContent::ResourceLink {
+                    uri,
+                    name,
+                    mime_type,
+                    ..
+                } => {
+                    let label = match name.is_empty() {
+                        true => uri.clone(),
+                        false => format!("{name} ({uri})"),
+                    };
+                    parts.push(match mime_type {
+                        Some(t) => format!("[link: {label}, {t}]"),
+                        None => format!("[link: {label}]"),
+                    });
+                }
                 ToolResultContent::Unknown => {
                     tracing::warn!("Skipping unrecognized MCP content block in tool result");
                 }
@@ -342,8 +348,37 @@ impl ToolExecutor {
             success: !tool_result.is_error,
             data,
             text,
+            blobs,
         }
     }
+}
+
+/// Decode one base64 payload into `blobs`, typed by the server's `mimeType`
+/// (or `application/octet-stream` when it sent none or nonsense). A payload
+/// that is not base64 is dropped with a warning: the server's bug, and not a
+/// reason to fail a call whose text may still be useful.
+fn push_blob(
+    blobs: &mut Vec<leviath_core::mime::Blob>,
+    data: &str,
+    mime_type: Option<&str>,
+    name: Option<String>,
+) {
+    use base64::Engine;
+    let bytes = match base64::engine::general_purpose::STANDARD.decode(data.trim()) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!("Skipping an MCP binary block that is not base64: {e}");
+            return;
+        }
+    };
+    let mime_type = mime_type
+        .and_then(|t| leviath_core::mime::MimeType::parse(t).ok())
+        .unwrap_or_else(leviath_core::mime::octet_stream);
+    let mut blob = leviath_core::mime::Blob::new(mime_type, bytes);
+    if let Some(name) = name {
+        blob = blob.named(name);
+    }
+    blobs.push(blob);
 }
 
 impl Default for ToolExecutor {
@@ -761,6 +796,7 @@ mod tests {
             success: true,
             data: serde_json::json!("test"),
             text: "hello".to_string(),
+            blobs: Vec::new(),
         };
         let cloned = result.clone();
         assert!(cloned.success);
@@ -773,6 +809,7 @@ mod tests {
             success: false,
             data: Value::Null,
             text: "error".to_string(),
+            blobs: Vec::new(),
         };
         let debug = format!("{:?}", result);
         assert!(debug.contains("success"));
@@ -838,35 +875,68 @@ mod tests {
     }
 
     #[test]
-    fn map_result_skips_binary_blocks() {
-        let text = text_of(vec![
-            ToolResultContent::Text {
-                text: "before".to_string(),
-            },
-            ToolResultContent::Image {
-                data: "YWJj".to_string(),
-                mime_type: "image/png".to_string(),
-            },
-            ToolResultContent::Audio {
-                data: "YWJj".to_string(),
-                mime_type: "audio/wav".to_string(),
-            },
-            ToolResultContent::Text {
-                text: "after".to_string(),
-            },
-        ]);
-        assert_eq!(text, "before\nafter");
+    fn map_result_decodes_binary_blocks_beside_the_text() {
+        let _guard = always_on_tracing_guard();
+        let result = ToolExecutor::map_result(ToolResult {
+            content: vec![
+                ToolResultContent::Text {
+                    text: "before".to_string(),
+                },
+                ToolResultContent::Image {
+                    data: "YWJj".to_string(),
+                    mime_type: "image/png".to_string(),
+                },
+                ToolResultContent::Audio {
+                    data: " YWJj ".to_string(),
+                    mime_type: "not a type".to_string(),
+                },
+                ToolResultContent::Image {
+                    data: "!!!".to_string(),
+                    mime_type: "image/png".to_string(),
+                },
+                ToolResultContent::Text {
+                    text: "after".to_string(),
+                },
+            ],
+            structured_content: None,
+            is_error: false,
+        });
+        assert_eq!(result.text, "before\nafter");
+        assert_eq!(
+            result.blobs.len(),
+            2,
+            "the block that is not base64 is dropped"
+        );
+        assert_eq!(result.blobs[0].mime_type.as_str(), "image/png");
+        assert_eq!(result.blobs[0].bytes, b"abc");
+        assert_eq!(result.blobs[0].name, None);
+        assert_eq!(
+            result.blobs[1].mime_type.as_str(),
+            "application/octet-stream",
+            "a mime type that does not parse falls back"
+        );
     }
 
     #[test]
-    fn map_result_skips_resource_links() {
-        let text = text_of(vec![ToolResultContent::ResourceLink {
-            uri: "file:///x".to_string(),
-            name: "x".to_string(),
-            description: None,
-            mime_type: None,
-        }]);
-        assert_eq!(text, "");
+    fn map_result_describes_resource_links() {
+        let text = text_of(vec![
+            ToolResultContent::ResourceLink {
+                uri: "file:///x".to_string(),
+                name: "x".to_string(),
+                description: None,
+                mime_type: None,
+            },
+            ToolResultContent::ResourceLink {
+                uri: "https://h/report.pdf".to_string(),
+                name: String::new(),
+                description: None,
+                mime_type: Some("application/pdf".to_string()),
+            },
+        ]);
+        assert_eq!(
+            text,
+            "[link: x (file:///x)]\n[link: https://h/report.pdf, application/pdf]"
+        );
     }
 
     #[test]
@@ -906,113 +976,37 @@ mod tests {
     }
 
     #[test]
-    fn map_result_embedded_resource_blob_contributes_no_text() {
-        let text = text_of(vec![ToolResultContent::Resource {
-            resource: EmbeddedResource {
-                uri: "file:///a.png".to_string(),
-                text: None,
-                blob: Some("YWJj".to_string()),
-                mime_type: Some("image/png".to_string()),
-            },
-        }]);
-        assert_eq!(text, "");
-    }
-
-    // ─── tool-name sanitization ───────────────────────────────────────────
-
-    #[test]
-    fn sanitize_passes_a_clean_name_through() {
-        assert_eq!(sanitize_tool_name("get_weather-2"), "get_weather-2");
-    }
-
-    #[test]
-    fn sanitize_replaces_dots_and_other_illegal_chars() {
-        // Dots are legal in MCP but rejected by the provider name rule.
-        assert_eq!(sanitize_tool_name("admin.tools.list"), "admin_tools_list");
-        assert_eq!(sanitize_tool_name("weird name!/#"), "weird_name___");
-    }
-
-    #[test]
-    fn sanitize_truncates_to_the_limit() {
-        let long = "a".repeat(200);
-        assert_eq!(sanitize_tool_name(&long).len(), MAX_TOOL_NAME_LEN);
-    }
-
-    #[test]
-    fn sanitize_of_illegal_chars_becomes_underscores_and_empty_falls_back() {
-        // Illegal chars each become `_` (still a valid name); only a fully
-        // empty result falls back to a placeholder.
-        assert_eq!(sanitize_tool_name("...."), "____");
-        assert_eq!(sanitize_tool_name(""), "tool");
-    }
-
-    // ─── unique_advertised_name ───────────────────────────────────────────
-
-    /// Every advertised name carries its server, whether or not anything would
-    /// collide, so the name never depends on which server registered first.
-    #[test]
-    fn unique_name_always_qualifies_with_the_server() {
-        let exec = ToolExecutor::new();
-        let reserved = HashSet::new();
+    fn map_result_embedded_resource_blob_is_a_named_blob() {
+        let result = ToolExecutor::map_result(ToolResult {
+            content: vec![
+                ToolResultContent::Resource {
+                    resource: EmbeddedResource {
+                        uri: "file:///dir/a.png".to_string(),
+                        text: None,
+                        blob: Some("YWJj".to_string()),
+                        mime_type: Some("image/png".to_string()),
+                    },
+                },
+                ToolResultContent::Resource {
+                    resource: EmbeddedResource {
+                        uri: "///".to_string(),
+                        text: None,
+                        blob: Some("YWJj".to_string()),
+                        mime_type: None,
+                    },
+                },
+            ],
+            structured_content: None,
+            is_error: false,
+        });
+        assert_eq!(result.text, "");
+        assert_eq!(result.blobs.len(), 2);
+        assert_eq!(result.blobs[0].name.as_deref(), Some("a.png"));
+        assert_eq!(result.blobs[0].mime_type.as_str(), "image/png");
+        assert_eq!(result.blobs[1].name.as_deref(), Some("///"));
         assert_eq!(
-            exec.unique_advertised_name("github.search", "gh", &reserved),
-            "gh__github_search",
-            "qualified, and the dot sanitized to satisfy the provider rule"
-        );
-        assert_eq!(
-            exec.unique_advertised_name("search", "alpha", &reserved),
-            "alpha__search",
-            "qualified even with nothing to collide with"
-        );
-    }
-
-    #[test]
-    fn unique_name_prefixes_on_a_reserved_collision() {
-        // The base clashes with a built-in tool name → prefix with the server.
-        let exec = ToolExecutor::new();
-        let reserved: HashSet<String> = ["bash".to_string()].into_iter().collect();
-        assert_eq!(
-            exec.unique_advertised_name("bash", "srv", &reserved),
-            "srv__bash"
-        );
-    }
-
-    #[test]
-    fn unique_name_prefixes_on_an_existing_alias_collision() {
-        let mut exec = ToolExecutor::new();
-        exec.aliases.insert(
-            "search".to_string(),
-            ("a".to_string(), "search".to_string()),
-        );
-        assert_eq!(
-            exec.unique_advertised_name("search", "b", &HashSet::new()),
-            "b__search"
-        );
-    }
-
-    #[test]
-    fn unique_name_appends_a_number_when_the_prefix_also_collides() {
-        let mut exec = ToolExecutor::new();
-        // Both the base and the server-prefixed form are already taken.
-        exec.aliases.insert(
-            "search".to_string(),
-            ("a".to_string(), "search".to_string()),
-        );
-        exec.aliases
-            .insert("b__search".to_string(), ("x".to_string(), "y".to_string()));
-        assert_eq!(
-            exec.unique_advertised_name("search", "b", &HashSet::new()),
-            "b__search_2"
-        );
-
-        // And when _2 is taken too, it moves on to _3 (covers the loop step).
-        exec.aliases.insert(
-            "b__search_2".to_string(),
-            ("x".to_string(), "y".to_string()),
-        );
-        assert_eq!(
-            exec.unique_advertised_name("search", "b", &HashSet::new()),
-            "b__search_3"
+            result.blobs[1].mime_type.as_str(),
+            "application/octet-stream"
         );
     }
 
@@ -1048,6 +1042,125 @@ mod tests {
         assert_eq!(result.text, "called github.search");
     }
 
+    /// The name is the same whether or not anything else is registered, so a
+    /// blueprint can be written against it before the server is ever reached.
+    ///
+    /// This is what the `_2` suffix used to take away. A tool's name depended
+    /// on which servers had connected first, so the same `config.toml` could
+    /// advertise `srv__search` on one daemon start and `srv__search_2` on the
+    /// next, and nothing outside the executor could tell which.
+    #[tokio::test]
+    async fn an_advertised_name_never_depends_on_what_else_is_registered() {
+        let _guard = always_on_tracing_guard();
+        let predicted = leviath_core::mcp_names::advertised_name("srv", "search");
+
+        let mut alone = ToolExecutor::new();
+        let names = alone.add_client_advertised(
+            "srv".to_string(),
+            spawn_named("search").await,
+            &HashSet::new(),
+        );
+        assert_eq!(names[0].name, predicted);
+
+        // Now with the name already claimed by something else, and with a
+        // built-in reserved. Neither moves it.
+        let mut crowded = ToolExecutor::new();
+        crowded.aliases.insert(
+            "other__search".to_string(),
+            ("other".to_string(), "search".to_string()),
+        );
+        let reserved: HashSet<String> = ["bash".to_string()].into_iter().collect();
+        let names = crowded.add_client_advertised(
+            "srv".to_string(),
+            spawn_named("search").await,
+            &reserved,
+        );
+        assert_eq!(names[0].name, predicted, "no suffix, ever");
+    }
+
+    /// A name that is genuinely taken refuses the tool instead of renaming it.
+    /// Reachable when two server names collide, or when two long names match
+    /// within the provider's 64-character limit.
+    #[tokio::test]
+    async fn a_tool_whose_name_is_taken_is_refused_not_renamed() {
+        let _guard = always_on_tracing_guard();
+        let mut executor = ToolExecutor::new();
+        // Stand in for whatever already owns the name.
+        executor.aliases.insert(
+            "srv__search".to_string(),
+            ("elsewhere".to_string(), "search".to_string()),
+        );
+        let names = executor.add_client_advertised(
+            "srv".to_string(),
+            spawn_named("search").await,
+            &HashSet::new(),
+        );
+        assert!(
+            names.is_empty(),
+            "the tool is not offered at all: {names:?}"
+        );
+        assert_eq!(
+            executor.aliases.get("srv__search"),
+            Some(&("elsewhere".to_string(), "search".to_string())),
+            "the name still belongs to whoever had it"
+        );
+        assert!(
+            !executor.aliases.contains_key("srv__search_2"),
+            "and nothing was invented to hold the refused tool"
+        );
+    }
+
+    /// A tool whose advertised name is a built-in's is refused too, rather
+    /// than renamed around the built-in.
+    #[tokio::test]
+    async fn a_tool_colliding_with_a_reserved_name_is_refused() {
+        let _guard = always_on_tracing_guard();
+        let mut executor = ToolExecutor::new();
+        let reserved: HashSet<String> = ["srv__search".to_string()].into_iter().collect();
+        let names = executor.add_client_advertised(
+            "srv".to_string(),
+            spawn_named("search").await,
+            &reserved,
+        );
+        assert!(names.is_empty(), "{names:?}");
+    }
+
+    /// Re-registering a server replaces it. Its old aliases have to go with
+    /// the old client, or they route this server's names into a client that is
+    /// no longer there, and every tool looks like a collision with itself.
+    #[tokio::test]
+    async fn re_registering_a_server_replaces_its_aliases() {
+        let _guard = always_on_tracing_guard();
+        let mut executor = ToolExecutor::new();
+
+        let first = executor.add_client_advertised(
+            "srv".to_string(),
+            spawn_named("search").await,
+            &HashSet::new(),
+        );
+        assert_eq!(first[0].name, "srv__search");
+
+        // The same server name again, now offering a different tool.
+        let second = executor.add_client_advertised(
+            "srv".to_string(),
+            spawn_named("lookup").await,
+            &HashSet::new(),
+        );
+        assert_eq!(second[0].name, "srv__lookup");
+        let left: Vec<&String> = executor.aliases.keys().collect();
+        assert!(
+            !executor.aliases.contains_key("srv__search"),
+            "the replaced server's aliases are gone: {left:?}"
+        );
+        assert!(
+            executor
+                .execute("srv__lookup", serde_json::json!({}))
+                .await
+                .expect("the new tool routes")
+                .success
+        );
+    }
+
     #[tokio::test]
     async fn two_servers_sharing_a_tool_name_are_disambiguated() {
         let _guard = always_on_tracing_guard();
@@ -1081,9 +1194,9 @@ mod tests {
     }
 
     /// A blueprint granting a whole connector needs to turn a server's name
-    /// into the tools it covers. The advertised name usually carries it, but
-    /// parsing it back out is a guess - a server named `my.server` sanitizes to
-    /// `my_server`, and a collision appends `_2` - so the table answers instead.
+    /// into the tools it covers. The advertised name carries it, but parsing it
+    /// back out is a guess, because a server name may itself contain `_`. The
+    /// table answers instead.
     #[tokio::test]
     async fn tool_owners_names_the_server_behind_each_advertised_tool() {
         let _guard = always_on_tracing_guard();

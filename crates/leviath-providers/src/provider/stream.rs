@@ -151,6 +151,22 @@ impl FramedStream {
         self
     }
 
+    /// The next item in the bytes already held. A parser answers `None` both
+    /// for "no whole frame yet" and for a frame it read and had nothing to
+    /// say about, so it is asked again for as long as it keeps consuming:
+    /// the frames behind a silent one may be all that is left of the reply.
+    fn next_held(&mut self) -> Option<Option<Result<StreamChunk>>> {
+        loop {
+            let before = self.buffer.len();
+            if let Some(item) = (self.parse)(&mut self.buffer) {
+                return Some(item);
+            }
+            if self.buffer.len() == before {
+                return None;
+            }
+        }
+    }
+
     /// Lower the frame cap, so a test can overrun it with a few kilobytes.
     #[cfg(test)]
     pub fn with_frame_cap(mut self, cap: usize) -> Self {
@@ -168,7 +184,7 @@ impl Stream for FramedStream {
     ) -> std::task::Poll<Option<Self::Item>> {
         let this = self.get_mut();
         loop {
-            if let Some(item) = (this.parse)(&mut this.buffer) {
+            if let Some(item) = this.next_held() {
                 return std::task::Poll::Ready(item);
             }
             match this.inner.as_mut().poll_next(cx) {
@@ -196,12 +212,10 @@ impl Stream for FramedStream {
                     ))));
                 }
                 std::task::Poll::Ready(None) => {
-                    // The bytes are over: a frame that arrived whole with the
-                    // last of them, then whatever the format does with a tail.
+                    // The bytes are over, and every whole frame in them was
+                    // read at the top of the loop: what is left is a tail,
+                    // for the format to make what it can of.
                     this.carry.finish(&mut this.buffer);
-                    if let Some(item) = (this.parse)(&mut this.buffer) {
-                        return std::task::Poll::Ready(item);
-                    }
                     if let Some(flush) = this.flush.as_mut()
                         && let Some(chunk) = flush(&mut this.buffer)
                     {
@@ -252,10 +266,12 @@ pub async fn collect_stream(
     // Whichever chunk carried the provider's reasoning item, which is not
     // necessarily the last one.
     let mut reasoning = None;
+    let mut parts = Vec::new();
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
         content.push_str(&chunk.delta);
+        parts.extend(chunk.parts);
         for delta in chunk.tool_calls {
             let call = calls.entry(delta.index).or_default();
             // The opening delta carries the id, the name and the signature; the
@@ -297,6 +313,7 @@ pub async fn collect_stream(
         tokens_used: tokens,
         finish_reason,
         reasoning,
+        parts,
     })
 }
 
@@ -363,6 +380,7 @@ mod tests {
 
     fn text_chunk(text: &str) -> StreamChunk {
         StreamChunk {
+            parts: Vec::new(),
             delta: text.to_string(),
             tool_calls: Vec::new(),
             tokens: None,
@@ -435,6 +453,30 @@ mod tests {
         out
     }
 
+    /// Frames the parser consumes without answering (a stream's bookkeeping
+    /// events) are read past in the bytes already held. A whole reply that
+    /// lands in one read, as a fast one over HTTP/2 does, keeps the frames
+    /// after them.
+    #[tokio::test]
+    async fn frames_after_silent_ones_in_the_same_read_are_not_lost() {
+        let bytes = [Ok::<bytes::Bytes, reqwest::Error>(
+            bytes::Bytes::from_static(b"skip\nskip\nhello\nskip\n"),
+        )];
+        let stream = FramedStream::new(
+            tokio_stream::iter(bytes),
+            Box::new(|buffer: &mut String| {
+                let idx = buffer.find('\n')?;
+                let line: String = buffer.drain(..=idx).collect();
+                match line.trim_end() {
+                    "skip" => None,
+                    text => Some(Some(Ok(text_chunk(text)))),
+                }
+            }),
+            None,
+        );
+        assert_eq!(deltas(stream).await, vec!["hello".to_string()]);
+    }
+
     /// The transport cuts wherever it likes, including through a character.
     /// reqwest's `bytes_stream()` hands over whatever the socket had, so a
     /// four-byte emoji is routinely two bytes in one chunk and two in the
@@ -495,6 +537,7 @@ mod tests {
             text_chunk("Let me "),
             text_chunk("check that."),
             StreamChunk {
+                parts: Vec::new(),
                 delta: String::new(),
                 tool_calls: vec![ToolCallDelta {
                     index: 0,
@@ -522,6 +565,7 @@ mod tests {
                 tokens: None,
                 finish_reason: None,
                 reasoning: None,
+                parts: Vec::new(),
             },
             StreamChunk {
                 delta: String::new(),
@@ -529,6 +573,7 @@ mod tests {
                 tokens: None,
                 finish_reason: Some(FinishReason::ToolCall),
                 reasoning: None,
+                parts: Vec::new(),
             },
         ]);
 
@@ -555,6 +600,7 @@ mod tests {
     async fn collect_stream_keeps_a_cut_off_tool_call_argument_as_text() {
         let stream = chunks(vec![
             StreamChunk {
+                parts: Vec::new(),
                 delta: String::new(),
                 tool_calls: vec![ToolCallDelta {
                     index: 0,
@@ -568,6 +614,7 @@ mod tests {
                 reasoning: None,
             },
             StreamChunk {
+                parts: Vec::new(),
                 delta: String::new(),
                 tool_calls: Vec::new(),
                 tokens: None,
@@ -585,6 +632,32 @@ mod tests {
         );
     }
 
+    /// Mime a chunk carried whole comes out on the collected response, in
+    /// arrival order across chunks.
+    #[tokio::test]
+    async fn collect_stream_keeps_the_mime_chunks_carried() {
+        let blob = |name: &str| {
+            leviath_core::mime::Blob::new(
+                leviath_core::mime::MimeType::parse("image/png").unwrap(),
+                vec![1, 2, 3],
+            )
+            .named(name)
+        };
+        let mut first = text_chunk("a");
+        first.parts = vec![blob("one.png")];
+        let mut second = text_chunk("b");
+        second.parts = vec![blob("two.png")];
+        second.finish_reason = Some(FinishReason::Complete);
+        let response = collect_stream(chunks(vec![first, second])).await.unwrap();
+        assert_eq!(response.content, "ab");
+        let names: Vec<&str> = response
+            .parts
+            .iter()
+            .map(|b| b.name.as_deref().unwrap())
+            .collect();
+        assert_eq!(names, ["one.png", "two.png"]);
+    }
+
     /// Usage chunks add up rather than replacing one another.
     ///
     /// Anthropic reports its input counts on `message_start` and its output
@@ -595,6 +668,7 @@ mod tests {
     async fn collect_stream_adds_usage_across_chunks() {
         let stream = chunks(vec![
             StreamChunk {
+                parts: Vec::new(),
                 delta: String::new(),
                 tool_calls: Vec::new(),
                 tokens: Some(TokenUsage::new(100, 20, 5, 0)),
@@ -602,6 +676,7 @@ mod tests {
                 reasoning: None,
             },
             StreamChunk {
+                parts: Vec::new(),
                 delta: String::new(),
                 tool_calls: Vec::new(),
                 tokens: Some(TokenUsage::new(0, 0, 0, 42).with_reported_cost(Some(0.25))),
@@ -677,6 +752,7 @@ mod tests {
             reported_cost_usd: None,
         };
         let stream = chunks(vec![StreamChunk {
+            parts: Vec::new(),
             delta: String::new(),
             tool_calls: Vec::new(),
             tokens: Some(total_only),

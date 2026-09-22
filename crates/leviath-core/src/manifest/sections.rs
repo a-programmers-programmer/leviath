@@ -164,10 +164,32 @@ pub(super) fn parse_output_spec(
             }
         },
     };
+    let overwrite_artifacts = match table.get("overwrite_artifacts") {
+        None => None,
+        Some(toml::Value::Boolean(b)) => Some(*b),
+        Some(value) => {
+            return Err(Error::Other(format!(
+                "{where_}: overwrite_artifacts must be true or false, got: {value}"
+            )));
+        }
+    };
+    let mut artifacts = Vec::new();
+    if let Some(listed) = table.get("artifacts") {
+        let items = listed.as_array().ok_or_else(|| {
+            Error::Other(format!(
+                "{where_}: artifacts must be a list of tables, e.g. \
+                 [[stages.x.output.artifacts]] name = \"final\", type = \"video/mp4\""
+            ))
+        })?;
+        for item in items {
+            artifacts.push(parse_artifact_spec(where_, item)?);
+        }
+    }
     Ok(crate::output::OutputSpec {
         format: string_field("format"),
         instructions: string_field("instructions"),
         example: string_field("example"),
+        artifacts,
         // A schema that will not convert is dropped rather than fatal: the
         // validator itself already treats an uncompilable schema as "skip the
         // check" rather than "refuse every submission", and disagreeing here
@@ -177,6 +199,51 @@ pub(super) fn parse_output_spec(
             .and_then(|v| serde_json::to_value(v).ok()),
         validator: string_field("validator"),
         on_validator_error,
+        overwrite_artifacts,
+    })
+}
+
+/// One `[[...output.artifacts]]` table: a name, a type or pattern, and
+/// whether the submission may leave it out.
+fn parse_artifact_spec(where_: &str, item: &toml::Value) -> Result<crate::output::ArtifactSpec> {
+    let table = item.as_table().ok_or_else(|| {
+        Error::Other(format!(
+            "{where_}: each artifact must be a table with name and type, got: {item}"
+        ))
+    })?;
+    let text = |key: &str| {
+        table
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    };
+    let name = text("name")
+        .ok_or_else(|| Error::Other(format!("{where_}: an artifact needs a name")))?
+        .to_string();
+    let mime_type = text("type")
+        .ok_or_else(|| {
+            Error::Other(format!(
+                "{where_}: artifact '{name}' needs a type, such as \"video/mp4\" or \"image/*\""
+            ))
+        })?
+        .to_ascii_lowercase();
+    let well_formed = mime_type
+        .split_once('/')
+        .is_some_and(|(kind, sub)| !kind.is_empty() && !sub.is_empty() && !sub.contains('/'));
+    if !well_formed {
+        return Err(Error::Other(format!(
+            "{where_}: artifact '{name}' has type '{mime_type}', which is not type/subtype"
+        )));
+    }
+    Ok(crate::output::ArtifactSpec {
+        name,
+        mime_type,
+        required: table
+            .get("required")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        description: text("description").map(str::to_string),
     })
 }
 
@@ -185,12 +252,211 @@ pub(super) fn parse_output_spec(
 /// ignores a key it does not know.
 #[cfg(test)]
 pub(super) const OUTPUT_KEYS: &[&str] = &[
+    "artifacts",
     "example",
     "format",
     "instructions",
     "on_validator_error",
+    "overwrite_artifacts",
     "schema",
     "validator",
+];
+
+/// Parse the `[[dependencies]]` array: what an agent needs in place before it
+/// runs. Shape only - whether a dependency is satisfied is a spawn/`lev deps`
+/// concern. A missing or unknown `kind`, or a kind missing its field, is a hard
+/// error so a broken declaration fails `lev validate` rather than at spawn.
+pub(super) fn parse_dependencies(
+    items: &[toml::Value],
+) -> Result<Vec<crate::blueprint::Dependency>> {
+    items.iter().map(parse_dependency).collect()
+}
+
+fn parse_dependency(item: &toml::Value) -> Result<crate::blueprint::Dependency> {
+    use crate::blueprint::{Dependency, DependencyKind};
+    let table = item
+        .as_table()
+        .ok_or_else(|| Error::Other("each [[dependencies]] entry must be a table".to_string()))?;
+    let text = |key: &str| {
+        table
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    };
+    let name = text("name")
+        .ok_or_else(|| Error::Other("a dependency needs a name".to_string()))?
+        .to_string();
+    let kind_tag = text("kind").ok_or_else(|| {
+        Error::Other(format!(
+            "dependency '{name}' needs a kind (mcp_server, env, binary or script)"
+        ))
+    })?;
+    let need = |key: &str| -> Result<String> {
+        text(key).map(str::to_string).ok_or_else(|| {
+            Error::Other(format!(
+                "dependency '{name}' of kind '{kind_tag}' needs '{key}'"
+            ))
+        })
+    };
+    let string_list = |key: &str| -> Result<Vec<String>> {
+        let Some(arr) = table.get(key).and_then(|v| v.as_array()) else {
+            return Ok(Vec::new());
+        };
+        arr.iter()
+            .map(|e| {
+                e.as_str().map(str::to_string).ok_or_else(|| {
+                    Error::Other(format!(
+                        "dependency '{name}': {key} entries must be strings, got: {e}"
+                    ))
+                })
+            })
+            .collect()
+    };
+    let kind = match kind_tag {
+        "mcp_server" => DependencyKind::McpServer {
+            server: need("server")?,
+            env: string_list("env")?,
+        },
+        "env" => DependencyKind::Env { var: need("var")? },
+        "binary" => DependencyKind::Binary {
+            command: need("command")?,
+        },
+        "script" => DependencyKind::Script {
+            check: need("check")?,
+        },
+        other => {
+            return Err(Error::Other(format!(
+                "dependency '{name}' has unknown kind '{other}' \
+                 (valid: mcp_server, env, binary, script)"
+            )));
+        }
+    };
+    let install = match table.get("install") {
+        None => None,
+        Some(value) => Some(parse_dependency_install(&name, value)?),
+    };
+    Ok(Dependency {
+        name,
+        kind,
+        required: table
+            .get("required")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true),
+        remedy: text("remedy").map(str::to_string),
+        description: text("description").map(str::to_string),
+        install,
+    })
+}
+
+fn parse_dependency_install(
+    dep: &str,
+    value: &toml::Value,
+) -> Result<crate::blueprint::DependencyInstall> {
+    use crate::blueprint::{DependencyInstall, McpServerTemplate};
+    let table = value
+        .as_table()
+        .ok_or_else(|| Error::Other(format!("dependency '{dep}': install must be a table")))?;
+    let text = |key: &str| {
+        table
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    };
+    let str_map = |key: &str| -> Result<std::collections::BTreeMap<String, String>> {
+        let Some(t) = table.get(key).and_then(|v| v.as_table()) else {
+            return Ok(std::collections::BTreeMap::new());
+        };
+        t.iter()
+            .map(|(k, v)| {
+                v.as_str()
+                    .map(|s| (k.clone(), s.to_string()))
+                    .ok_or_else(|| {
+                        Error::Other(format!(
+                            "dependency '{dep}': install.{key} values must be strings"
+                        ))
+                    })
+            })
+            .collect()
+    };
+    let server = match table.get("server") {
+        None => None,
+        Some(sv) => {
+            let st = sv.as_table().ok_or_else(|| {
+                Error::Other(format!(
+                    "dependency '{dep}': install.server must be a table"
+                ))
+            })?;
+            let stext = |key: &str| {
+                st.get(key)
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+            };
+            let args = match st.get("args").and_then(|v| v.as_array()) {
+                None => Vec::new(),
+                Some(a) => a
+                    .iter()
+                    .map(|e| {
+                        e.as_str().map(str::to_string).ok_or_else(|| {
+                            Error::Other(format!(
+                                "dependency '{dep}': install.server.args entries must be strings"
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            };
+            let str_table = |key: &str| -> Result<std::collections::BTreeMap<String, String>> {
+                match st.get(key).and_then(|v| v.as_table()) {
+                    None => Ok(std::collections::BTreeMap::new()),
+                    Some(h) => h
+                        .iter()
+                        .map(|(k, v)| {
+                            v.as_str().map(|s| (k.clone(), s.to_string())).ok_or_else(|| {
+                                Error::Other(format!(
+                                    "dependency '{dep}': install.server.{key} values must be strings"
+                                ))
+                            })
+                        })
+                        .collect(),
+                }
+            };
+            Some(McpServerTemplate {
+                transport: stext("transport"),
+                command: stext("command"),
+                url: stext("url"),
+                args,
+                headers: str_table("headers")?,
+                env: str_table("env")?,
+            })
+        }
+    };
+    Ok(DependencyInstall {
+        command: text("command").map(str::to_string),
+        commands: str_map("commands")?,
+        script: text("script").map(str::to_string),
+        server,
+    })
+}
+
+/// Every key a `[[dependencies]]` entry may carry, across all kinds, for the
+/// schema guard in `tests.rs`. A flat union: the parser reads the keys its kind
+/// needs and kind mismatches are caught in `Blueprint::validate`.
+#[cfg(test)]
+pub(super) const DEPENDENCIES_KEYS: &[&str] = &[
+    "check",
+    "command",
+    "description",
+    "env",
+    "install",
+    "kind",
+    "name",
+    "remedy",
+    "required",
+    "server",
+    "var",
 ];
 
 pub(super) fn parse_security_config(security_table: &toml::value::Table) -> crate::SecurityConfig {
@@ -212,7 +478,10 @@ pub(super) const SANDBOX_KEYS: &[&str] = &[
     "mount",
     "mounts",
     "network",
+    "keep_warm",
     "on_unavailable",
+    // The name `keep_warm` used to carry. Still read, still listed, so a
+    // blueprint written before the rename is not told it has a typo.
     "persist",
 ];
 
@@ -254,8 +523,8 @@ pub(super) fn parse_sandbox_config(
     if let Some(network) = bool_of(table, "network") {
         sc.network = network;
     }
-    if let Some(persist) = bool_of(table, "persist") {
-        sc.persist = persist;
+    if let Some(keep_warm) = renamed_bool_of(table, &renamed::KEEP_WARM) {
+        sc.keep_warm = keep_warm;
     }
     // Both spellings: the published schema lists both, and `config.toml`'s own
     // `[sandbox]` table (a different parser) documents `mounts`, so a blueprint

@@ -35,14 +35,19 @@ where
 #[derive(Serialize, Deserialize)]
 pub(super) struct RedactedConfig {
     pub(super) default_provider: String,
-    /// `default_model`: the one model every stage runs on while it is set.
+    /// `override_model`: the one model every stage that allows a user default
+    /// starts on while it is set, ahead of what its blueprint names.
     ///
     /// Always serialized, `null` when nothing is set, which is the
     /// distinction a console needs. A daemon too old to report this omits the
     /// key entirely, and that has to read as "cannot say" rather than as
     /// "nothing is set" - without the field, a picker drew an empty box over
     /// a machine that had a model pinned.
-    pub(super) default_model: Option<String>,
+    pub(super) override_model: Option<String>,
+    /// `fallback_model`: the model a stage falls back to when none of the
+    /// models it names is configured here, never ahead of them. Always
+    /// serialized, `null` when unset, for the same reason as `override_model`.
+    pub(super) fallback_model: Option<String>,
     /// `[providers] provider_order`: the ordered provider preference for a bare
     /// model name, best first. Empty when the user set none, in which case
     /// `default_provider` alone decides. Always serialized (empty array, not
@@ -53,6 +58,13 @@ pub(super) struct RedactedConfig {
     pub(super) has_openai_key: bool,
     pub(super) has_google_key: bool,
     pub(super) has_openrouter_key: bool,
+    pub(super) has_bedrock_key: bool,
+    pub(super) has_xai_key: bool,
+    pub(super) has_meta_key: bool,
+    /// The AWS region Bedrock is called in, when the config pins one. Always
+    /// sent, `null` when unset, so a console can tell "unset" from a daemon
+    /// too old to report it.
+    pub(super) bedrock_region: Option<String>,
     pub(super) ollama_base_url: Option<String>,
     /// Whether Ollama is on.
     ///
@@ -65,6 +77,12 @@ pub(super) struct RedactedConfig {
     /// Whether the Codex transport is on. Whether it is *signed in* is a
     /// separate question with a separate route: see `GET /api/providers`.
     pub(super) codex_enabled: bool,
+    /// Whether Grok billed to a subscription is on. Whether it is signed in
+    /// is `GET /api/providers`, as for Codex.
+    pub(super) grok_enabled: bool,
+    /// Whether media parts are uploaded to a provider's file storage and sent
+    /// by id. Zero data retention turns uploads off whatever this says.
+    pub(super) file_uploads: bool,
     /// Its reasoning effort, when the config pins one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) codex_reasoning_effort: Option<String>,
@@ -178,6 +196,49 @@ pub(super) const API_CAPABILITIES: &[&str] = &[
     "runs.parent",
     "runs.files.listing",
     "runs.files.workdir",
+    // `mime_type` on every file-listing entry, typed by the run's registry from
+    // the file's name. A console can decide whether to render a row, or whether
+    // to offer it to a region that `accepts` a type, without a request per file
+    // or a hardcoded extension table of its own.
+    "runs.files.mime_type",
+    // `input_types` and `output_types` on every `GET /api/models` entry: the
+    // mime type patterns a model takes and hands back. Announced so a
+    // console can offer "models that can see this image" without inferring
+    // it from names, and can tell a text-only answer from a missing field.
+    "models.mime_types",
+    // `GET /api/models` answers from a catalogue this server keeps, so it is
+    // safe to call when a page opens: the providers are asked once per config
+    // and then behind the answer, never on the request's clock. Announced so
+    // a console knows the call is cheap, and that `X-Leviath-Catalog-Age`,
+    // `X-Leviath-Catalog-Complete` and `?refresh=1` are there.
+    "models.cached",
+    // `parts` and `multipart/form-data` on `POST /api/agents` and
+    // `POST /api/agents/{id}/message`, and `@path` tokens in a task or
+    // message resolved inside the run's working directory: a caller can send
+    // files with a run. An older daemon reads `parts` as nothing at all.
+    "spawn.parts",
+    "messages.parts",
+    // `GET /api/agents/{id}/blobs` and `.../blobs/{sha256}`: the stored parts
+    // a run holds and their bytes, so a console can show an image the run
+    // produced without reaching into the workdir.
+    "runs.blobs",
+    // `GET /api/agents/{id}/files/raw?path=`: a workdir file's bytes under
+    // their own content type, where the JSON files route wraps text.
+    "runs.files.raw",
+    "runs.artifacts",
+    // `artifacts` on a run's answer as `{ name, path, mime_type, size,
+    // sha256 }` objects rather than paths.
+    "runs.result.artifacts",
+    // `GET /api/mime`: the effective mime registry and where each row
+    // came from.
+    "mime.registry",
+    // `PUT /api/mime` and `DELETE /api/mime`: write a row into
+    // `mime_types.toml` or take one out. Admin-gated, so announced whether or
+    // not `--allow-admin` was passed - the same narrower promise as the other
+    // admin routes, that this build has them, not that this daemon mounts
+    // them. A console offers "New type..." where it will land, and knows
+    // to fall back to handing over the TOML where it will not.
+    "mime.write",
     "runs.stages",
     // `cost_usd`, `unpriced_calls` and `cost_is_exact` on each stage record, and
     // the `visits` split beneath them. Without the price a console drawing a
@@ -189,6 +250,14 @@ pub(super) const API_CAPABILITIES: &[&str] = &[
     // an older daemon serves stage records with no cost at all, and `null`
     // there means unknown for a different reason than it does here.
     "runs.stages.cost",
+    // `models` on each stage record: the provider and model pairs the stage
+    // actually ran an inference on, in the order it reached them. Announced
+    // because an absent list and an empty one read the same in JSON and mean
+    // opposite things: an older daemon never recorded this, while a stage that
+    // has not run yet has nothing to record. A console offering "which model
+    // ran this stage" needs to know which of the two it is looking at before
+    // it draws an answer.
+    "runs.stages.models",
     "logs.stage",
     "logs.stream",
     "context.history.page",
@@ -261,6 +330,18 @@ pub(super) const API_CAPABILITIES: &[&str] = &[
     // `max_items`. A console that has this can show and edit the caps without
     // re-implementing the parser's defaults.
     "blueprints.fan_outs",
+    // `stage_routing` on the detail route: the stages that route the model's
+    // produced parts by mime type (`output_routing`) or empty a region on
+    // entry (`context.reset`), so a console shows or checks them without
+    // parsing the manifest.
+    "blueprints.stage_routing",
+    // `dependencies` on the detail route: what an agent declares it needs
+    // before it runs (an MCP server, an env var, a program on PATH, a Rhai
+    // check), each with its kind, whether it is required, and whether the
+    // blueprint says how to install it. A console can show them and warn before
+    // a spawn that would fail the dependency gate, rather than parsing the
+    // manifest or discovering the failure by running.
+    "blueprints.dependencies",
     "tools.list",
     // `GET /api/update`: how this copy was installed, and the command that
     // upgrades it. Announced because the fallback is guessing, and the console
@@ -298,6 +379,12 @@ pub(super) const API_CAPABILITIES: &[&str] = &[
     // circle the parameter exists to break: without it a console cannot tell
     // "this agent has no other scripts" from "this daemon does not look".
     "scripts.candidates",
+    // `mime_check` as a sixth `kind` on the scripts routes: the byte checks
+    // a mime row names, beside the config for the operator's rows and
+    // beside the agent for a blueprint's. Announced for the same reason
+    // `scripts.providers` is: a console offering the kind to an older
+    // daemon would put an editor in front of a 400.
+    "scripts.mime_checks",
     "config.gateways",
     // `kind`, `header_names` and `models` on each gateway `GET /api/config`
     // reports, and `kind`, `headers` and `models` on what `PUT /api/config`
@@ -317,11 +404,6 @@ pub(super) const API_CAPABILITIES: &[&str] = &[
     // 404s. The `GET` half is deliberately not announced: it shipped
     // unannounced, so its absence from this list proves nothing.
     "fs.mkdir",
-    // `feedback` on `POST /api/agents/{id}/interaction` beside
-    // `approved: false`, and the "Deny with feedback" option on a tool
-    // approval request. Announced because an older daemon drops the field
-    // without a word: a console that offered the box against one would send
-    // the person's redirect nowhere.
     // `GET /api/providers` and the three admin routes under it: the browser
     // sign-in for a provider that has no API key. Announced because a console
     // that cannot tell whether they exist has to offer a Codex row that either
@@ -331,6 +413,22 @@ pub(super) const API_CAPABILITIES: &[&str] = &[
     // and a client finds that out the way it does for the MCP admin routes,
     // by calling one and reading the status.
     "providers.signin",
+    // `?quota=true` on that listing, the `quota` object it adds to each
+    // signed-in subscription, the `X-Leviath-Quota-Age` and
+    // `X-Leviath-Quota-Complete` headers on the answer, and `?refresh=1` to
+    // read the accounts again. Announced because the absence of a `quota`
+    // object says two different things at once - a daemon that ignored the
+    // parameter, and a subscription with nothing to report - and a console
+    // that cannot tell them apart has to choose between showing "usage
+    // unavailable" everywhere and dropping the feature everywhere. It also
+    // says the call is cheap: the reading is kept, so a providers page can ask
+    // every time it opens.
+    "providers.quota",
+    // `feedback` on `POST /api/agents/{id}/interaction` beside
+    // `approved: false`, and the "Deny with feedback" option on a tool
+    // approval request. Announced because an older daemon drops the field
+    // without a word: a console that offered the box against one would send
+    // the person's redirect nowhere.
     "interaction.feedback",
     // `config_error` and `config_mtime` on `GET /api/config`, and the
     // `config_health` websocket frame. Announced because the absence of
@@ -339,6 +437,61 @@ pub(super) const API_CAPABILITIES: &[&str] = &[
     // apart has to keep showing the config as authoritative while the user's
     // edits are quietly going nowhere.
     "config.health",
+    // `POST /graphql`. Announced because a client picks its transport once, at
+    // start-up: a Lair that would use GraphQL where it exists and REST
+    // otherwise has to know which server it is talking to before it builds its
+    // first request, and finding out by posting a query and reading a 404
+    // costs a round trip on every launch.
+    "graphql",
+    // `blueprint_digest` on a run, and the manifest copy beside it. Announced
+    // because the absence of the digest has to be readable as "this run
+    // predates snapshots" rather than as "this run executed what is installed
+    // now": a client that cannot tell those apart shows a blueprint the run may
+    // never have seen.
+    "runs.blueprint_snapshot",
+    // `GET /ws/graphql`: the live frames with server-side filtering. Separate
+    // from `graphql` because a client picks its live transport separately from
+    // its read transport, and because the filtering is the reason to move: a
+    // console watching one run of five thousand should not be handed the
+    // fleet's frames to sort through.
+    "graphql.subscriptions",
+    // `Run.executions`: what a run tried, read from its journal, with each
+    // attempt's outcome and its call typed by its tool. Announced because a
+    // console cannot infer it from anything else it can see, and the tab it
+    // would draw is empty without it: the run's own counters say how many tool
+    // calls there were, never which ones were refused or cut off.
+    "graphql.executions",
+    // `Run.interactions`: every question a run put to a person, read from its
+    // journal, with the settlement typed - how it ended, and what was
+    // answered. Announced because nothing else in the API carries this: a run
+    // counter says how many tool calls there were, never which of them a
+    // person stopped to approve, and once a tool has read the answer a
+    // granted call looks exactly like one no policy ever stopped.
+    "graphql.interactions",
+    // `Run.inferences`: every trip a run made to a provider, read from its
+    // journal, with the move to another provider on the attempt it followed.
+    // Announced because the run's own usage is per call that worked: a call
+    // refused three times and answered on the fourth is billed once, so a
+    // console without this can show what the calls cost and never what getting
+    // them took.
+    "graphql.inferences",
+    // `Run.contextChanges`: why each of a run's regions changed, read from its
+    // journal, beside the snapshots `Run.contextHistory` serves. Announced
+    // because the snapshots cannot answer it: a region that lost its plan looks
+    // identical whether a compaction took it, a transform cleared it, or the
+    // model deleted it, and a console that cannot tell those apart is showing
+    // three different bugs as one.
+    "graphql.context_changes",
+    // Short-lived signed URLs on the byte routes, which is what lets a browser
+    // put a run's picture in an `<img src>`. Announced because the alternative
+    // a client writes without it - fetch with the token, hold the bytes, mint a
+    // blob URL - is real work it can skip entirely when this is here.
+    "bytes.signed_urls",
+    // The `bulkExportRuns` mutation and `GET /api/exports/{id}`: the whole run
+    // store as one JSONL file. Announced because the alternative is two hundred
+    // paged requests, and a client that does not know this is here writes that
+    // loop and keeps it forever.
+    "runs.export",
 ];
 
 /// The server's numeric limits.
@@ -373,6 +526,9 @@ pub(super) struct ApiLimits {
     /// Seconds a request may take before this server answers 408. `0` means
     /// there is no deadline. `--request-timeout-secs` over `[serve]`.
     pub(super) request_timeout_secs: u64,
+    /// Bytes one request body may carry: the ceiling on a multipart upload.
+    /// `[serve] max_upload_bytes`.
+    pub(super) max_upload_bytes: u64,
 }
 
 impl ApiLimits {
@@ -381,16 +537,17 @@ impl ApiLimits {
     /// resolved at start-up, for the same reason.
     pub(super) fn current(requests: &super::request_limits::RequestLimits) -> Self {
         Self {
-            max_limit: super::runs::MAX_LIMIT,
-            max_ids: super::runs::MAX_IDS,
+            max_limit: super::core::runs::MAX_LIMIT,
+            max_ids: super::core::runs::MAX_IDS,
             max_file_bytes: super::agents::MAX_FILE_READ_BYTES,
-            max_listing_entries: super::agents::MAX_LISTING_ENTRIES,
-            max_search_scan: super::runs::MAX_SEARCH_SCAN,
-            search_log_tail_bytes: super::runs::SEARCH_LOG_TAIL_BYTES,
-            max_history_limit: super::agents::HISTORY_MAX_LIMIT,
+            max_listing_entries: super::core::files::MAX_LISTING_ENTRIES,
+            max_search_scan: super::core::runs::MAX_SEARCH_SCAN,
+            search_log_tail_bytes: super::core::runs::SEARCH_LOG_TAIL_BYTES,
+            max_history_limit: super::core::history::HISTORY_MAX_LIMIT,
             max_tracked_modified_files: leviath_core::run_meta::MAX_TRACKED_MODIFIED_FILES,
             max_concurrent_requests: requests.max_concurrent_requests,
             request_timeout_secs: requests.request_timeout_secs,
+            max_upload_bytes: requests.max_upload_bytes,
         }
     }
 }
@@ -404,6 +561,10 @@ pub(super) struct ModelsQuery {
     /// providers is whatever this machine has configured, so "no models" is
     /// the honest answer to asking about one it has not.
     pub(super) provider: Option<String>,
+    /// Ask the providers again and wait for them, rather than answering from
+    /// the catalogue. For a settings page that just changed something.
+    #[serde(default, deserialize_with = "super::types::flag")]
+    pub(super) refresh: bool,
 }
 
 /// Body of `PUT /api/config` (admin-only). Every field is optional; a present
@@ -416,7 +577,7 @@ pub(super) struct WriteConfigReq {
     /// alone, `null` clears it, a string sets it. See [`double_option`].
     ///
     /// Unset is a real state here, and usually the better one: a pinned
-    /// `default_model` runs every stage of every blueprint on one model,
+    /// `override_model` runs every stage of every blueprint on one model,
     /// which puts the cheap stages on a top-tier price. A route that could
     /// set it and never unset it was a one-way door, the same gap
     /// `remove_gateways` exists to close for gateways.
@@ -425,11 +586,37 @@ pub(super) struct WriteConfigReq {
     /// `""` is not a model id, and a console that sends one by accident
     /// should hear about it instead of quietly losing the setting.
     #[serde(default, deserialize_with = "double_option")]
-    pub(super) default_model: Option<Option<String>>,
-    pub(super) anthropic_key: Option<String>,
-    pub(super) openai_key: Option<String>,
-    pub(super) google_key: Option<String>,
-    pub(super) openrouter_key: Option<String>,
+    pub(super) override_model: Option<Option<String>>,
+    /// `fallback_model`, with the same three states and the same empty-string
+    /// refusal as `override_model`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub(super) fallback_model: Option<Option<String>>,
+    /// The provider keys, each three-state like `override_model`: absent
+    /// leaves the key alone, `null` clears it (taking the provider out of
+    /// this install, the way the setup wizard's remove does), a string sets
+    /// it. An empty string is refused with a 400 rather than read as a
+    /// clear, since a form that posts its empty box should be told.
+    #[serde(default, deserialize_with = "double_option")]
+    pub(super) anthropic_key: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub(super) openai_key: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub(super) google_key: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub(super) openrouter_key: Option<Option<String>>,
+    /// A Bedrock API key, sent as a bearer token.
+    #[serde(default, deserialize_with = "double_option")]
+    pub(super) bedrock_key: Option<Option<String>>,
+    /// An xAI API key.
+    #[serde(default, deserialize_with = "double_option")]
+    pub(super) xai_key: Option<Option<String>>,
+    /// A Meta Model API key.
+    #[serde(default, deserialize_with = "double_option")]
+    pub(super) meta_key: Option<Option<String>>,
+    /// The AWS region Bedrock is called in. An empty string is refused with
+    /// a 400: `""` is not a region, and losing the setting to a stray form
+    /// field is worse than an error.
+    pub(super) bedrock_region: Option<String>,
     pub(super) ollama_base_url: Option<String>,
     /// Turn the Codex transport on or off.
     ///
@@ -439,12 +626,16 @@ pub(super) struct WriteConfigReq {
     /// `GET /api/providers` reports the two separately.
     /// Turn Ollama on or off.
     ///
-    /// Off, no run registers it. It needs no key and answers on a well-known
-    /// local port, so it used to be registered on every machine whether or
-    /// not anybody asked - which made a bare model name resolvable against
-    /// whatever happened to be running there.
+    /// Off, no run registers it. Needing no key and answering on a well-known
+    /// local port is not a reason to register it unasked: that makes a bare
+    /// model name resolvable against whatever happens to be running there.
     pub(super) ollama_enabled: Option<bool>,
     pub(super) codex_enabled: Option<bool>,
+    /// Turn Grok billed to a subscription on or off. Its credential is a
+    /// browser sign-in, taken through `POST /api/providers/grok/login`.
+    pub(super) grok_enabled: Option<bool>,
+    /// Turn uploads of media parts to providers' file storage on or off.
+    pub(super) file_uploads: Option<bool>,
     /// How hard Codex thinks: `none`, `minimal`, `low`, `medium`, `high` or
     /// `xhigh`. Validated before anything is written.
     pub(super) codex_reasoning_effort: Option<String>,
@@ -490,7 +681,7 @@ pub(super) struct GatewayInfo {
     pub(super) base_url: Option<String>,
     /// Whether a key is configured for it.
     pub(super) has_api_key: bool,
-    /// What backs it: `script` or `openai-compatible`.
+    /// What backs it: `script`, `openai-compatible` or `openai`.
     pub(super) kind: String,
     /// The Rhai provider script backing it, when the entry names one.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -530,7 +721,7 @@ pub(super) struct GatewayWrite {
     /// Absent leaves the existing script name.
     #[serde(default)]
     pub(super) script: Option<String>,
-    /// `script` or `openai-compatible`. Absent leaves the existing kind, and
+    /// `script`, `openai-compatible` or `openai`. Absent leaves the existing kind, and
     /// an entry created without one is a script, as in the file.
     #[serde(default)]
     pub(super) kind: Option<String>,

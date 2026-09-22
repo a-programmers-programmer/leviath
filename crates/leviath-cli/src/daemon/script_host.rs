@@ -18,8 +18,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use std::sync::Mutex as StdMutex;
+
 use leviath_core::floor_char_boundary;
+use leviath_core::mime::Part;
 use leviath_scripting::ScriptHost;
+use leviath_scripting::parts::{part_matches, part_summary};
 use leviath_tools::ShellExecutor;
 use tokio::process::Command as TokioCommand;
 
@@ -62,6 +66,13 @@ pub(crate) struct ScriptAllow {
 pub(crate) trait ScriptIo: Send + Sync {
     /// Perform an HTTP GET, returning the response body (or an error message).
     fn http_get(&self, url: &str, headers: BTreeMap<String, String>) -> Result<String, String>;
+    /// Perform an HTTP GET, returning the declared content type and the raw
+    /// bytes: the path for a body that is not text.
+    fn http_get_bytes(
+        &self,
+        url: &str,
+        headers: BTreeMap<String, String>,
+    ) -> Result<(String, Vec<u8>), String>;
     /// Perform an HTTP POST, returning the response body (or an error message).
     fn http_post(
         &self,
@@ -74,6 +85,9 @@ pub(crate) trait ScriptIo: Send + Sync {
     fn run_shell(&self, cmd: TokioCommand, timeout: Duration) -> Result<String, String>;
     /// Read the file at an already-confined absolute `path`.
     fn read_file(&self, path: &Path) -> Result<String, String>;
+    /// Read the raw bytes of the file at an already-confined absolute `path`,
+    /// refusing one larger than `max` bytes rather than reading it.
+    fn read_file_bytes(&self, path: &Path, max: u64) -> Result<Vec<u8>, String>;
     /// Write `content` to an already-confined absolute `path`, creating parent
     /// directories as needed. Returns a short confirmation.
     fn write_file(&self, path: &Path, content: &str) -> Result<String, String>;
@@ -110,6 +124,13 @@ pub(crate) struct DaemonScriptHost {
     /// `write_file` and a redirect in its `shell` are writes the run pays
     /// for like any other; without this they were the two that did not.
     writes: Option<Arc<crate::daemon::tool_service::WriteBudget>>,
+    /// The run's blob store, when this host serves a run: where `write_part`
+    /// puts bytes and `read_part` gets them.
+    mime: Option<Arc<leviath_tools::ToolMime>>,
+    /// The parts a script may name: what the runtime offered from the window
+    /// before the batch, plus what scripts in it wrote. Shared with the tool
+    /// state, which the runtime hands the offer to.
+    parts: Arc<StdMutex<Vec<Part>>>,
 }
 
 impl DaemonScriptHost {
@@ -127,7 +148,21 @@ impl DaemonScriptHost {
             allow_env_vars: Vec::new(),
             shell_env: leviath_tools::ShellEnvPolicy::default(),
             writes: None,
+            mime: None,
+            parts: Arc::new(StdMutex::new(Vec::new())),
         }
+    }
+
+    /// Give scripts the run's blob store and the parts they may name.
+    /// Consuming builder used at spawn.
+    pub(crate) fn with_mime(
+        mut self,
+        mime: Arc<leviath_tools::ToolMime>,
+        parts: Arc<StdMutex<Vec<Part>>>,
+    ) -> Self {
+        self.mime = Some(mime);
+        self.parts = parts;
+        self
     }
 
     /// Charge this run's write budget for what scripts write. Consuming
@@ -206,6 +241,124 @@ fn check_outbound(url: &str, allow_local: bool) -> Result<(), String> {
     leviath_net::check_url(&parsed, allow_local).map_err(|e| format!("[denied] {e}"))
 }
 
+/// A run's script host seen through a stage's `tool_accepts` for one tool:
+/// the stored parts outside the tool's list are not there, and asking for
+/// one by name says why. Everything else passes through to the host.
+pub(crate) struct LimitedHost {
+    inner: Arc<dyn ScriptHost>,
+    /// The parts the run offers, shared with the host underneath.
+    parts: Arc<StdMutex<Vec<Part>>>,
+    /// The tool the limit is for, for the refusal.
+    tool: String,
+    /// The mime type patterns the tool may be handed.
+    allowed: Vec<String>,
+}
+
+impl LimitedHost {
+    pub(crate) fn new(
+        inner: Arc<dyn ScriptHost>,
+        parts: Arc<StdMutex<Vec<Part>>>,
+        tool: &str,
+        allowed: Vec<String>,
+    ) -> Self {
+        Self {
+            inner,
+            parts,
+            tool: tool.to_string(),
+            allowed,
+        }
+    }
+
+    /// Whether the tool may be handed `part`: inline text always, a stored
+    /// part when its type matches the list.
+    fn within(&self, part: &Part) -> bool {
+        part.blob()
+            .is_none_or(|b| b.mime_type.matches_any(&self.allowed))
+    }
+}
+
+impl ScriptHost for LimitedHost {
+    fn http_get(&self, url: &str, headers: BTreeMap<String, String>) -> Result<String, String> {
+        self.inner.http_get(url, headers)
+    }
+
+    fn http_get_bytes(
+        &self,
+        url: &str,
+        headers: BTreeMap<String, String>,
+    ) -> Result<(String, Vec<u8>), String> {
+        self.inner.http_get_bytes(url, headers)
+    }
+
+    fn http_post(
+        &self,
+        url: &str,
+        body: &str,
+        headers: BTreeMap<String, String>,
+    ) -> Result<String, String> {
+        self.inner.http_post(url, body, headers)
+    }
+
+    fn shell(&self, command: &str) -> Result<String, String> {
+        self.inner.shell(command)
+    }
+
+    fn read_file(&self, path: &str) -> Result<String, String> {
+        self.inner.read_file(path)
+    }
+
+    fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
+        self.inner.read_file_bytes(path)
+    }
+
+    fn write_file(&self, path: &str, content: &str) -> Result<String, String> {
+        self.inner.write_file(path, content)
+    }
+
+    fn env_var(&self, name: &str) -> Result<String, String> {
+        self.inner.env_var(name)
+    }
+
+    fn read_part(&self, wanted: &str) -> Result<Vec<u8>, String> {
+        let outside = leviath_core::sync::lock(&self.parts)
+            .iter()
+            .rev()
+            .find(|p| part_matches(p, wanted))
+            .filter(|p| !self.within(p))
+            .cloned();
+        if let Some(part) = outside {
+            return Err(format!(
+                "'{wanted}' is {}; at this stage {} may be handed only {}",
+                part.mime_type,
+                self.tool,
+                self.allowed.join(", ")
+            ));
+        }
+        self.inner.read_part(wanted)
+    }
+
+    fn write_part(
+        &self,
+        bytes: Vec<u8>,
+        mime_type: Option<&str>,
+        name: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
+        self.inner.write_part(bytes, mime_type, name)
+    }
+
+    fn list_parts(&self) -> Vec<serde_json::Value> {
+        leviath_core::sync::lock(&self.parts)
+            .iter()
+            .filter(|p| p.is_stored() && self.within(p))
+            .map(part_summary)
+            .collect()
+    }
+
+    fn part(&self, sha256: &str) -> Option<Part> {
+        self.inner.part(sha256)
+    }
+}
+
 impl ScriptHost for DaemonScriptHost {
     fn http_get(&self, url: &str, headers: BTreeMap<String, String>) -> Result<String, String> {
         if !self.allow.http_get {
@@ -213,6 +366,20 @@ impl ScriptHost for DaemonScriptHost {
         }
         check_outbound(url, self.allow_local_network)?;
         self.io.http_get(url, headers)
+    }
+
+    // The same permission as `http_get`: it is the same request, read as
+    // bytes instead of text, so a stage that may fetch may fetch either way.
+    fn http_get_bytes(
+        &self,
+        url: &str,
+        headers: BTreeMap<String, String>,
+    ) -> Result<(String, Vec<u8>), String> {
+        if !self.allow.http_get {
+            return Err(denied("http_get_bytes"));
+        }
+        check_outbound(url, self.allow_local_network)?;
+        self.io.http_get_bytes(url, headers)
     }
 
     fn http_post(
@@ -281,6 +448,21 @@ impl ScriptHost for DaemonScriptHost {
         self.io.read_file(&resolved)
     }
 
+    // The same permission and confinement as `read_file`: it is the same
+    // file, read as bytes instead of text. The ceiling is the largest part
+    // the run may store, since `write_part` is where the bytes are headed.
+    fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
+        if !self.allow.read_file {
+            return Err(denied("read_file_bytes"));
+        }
+        let resolved = self.resolve_in_workdir(path)?;
+        let max = self
+            .mime
+            .as_ref()
+            .map_or(MAX_RESPONSE_BYTES, |m| m.max_part_bytes);
+        self.io.read_file_bytes(&resolved, max)
+    }
+
     fn write_file(&self, path: &str, content: &str) -> Result<String, String> {
         if !self.allow.write_file {
             return Err(denied("write_file"));
@@ -307,6 +489,74 @@ impl ScriptHost for DaemonScriptHost {
             writes.record(bytes);
         }
         out
+    }
+
+    fn read_part(&self, wanted: &str) -> Result<Vec<u8>, String> {
+        let Some(mime) = &self.mime else {
+            return Err("this run has no blob store, so it holds no parts".to_string());
+        };
+        let part = leviath_core::sync::lock(&self.parts)
+            .iter()
+            .rev()
+            .find(|p| part_matches(p, wanted))
+            .cloned();
+        let Some(part) = part else {
+            return Err(format!(
+                "no stored part is named '{wanted}'; list_parts() shows what this run holds"
+            ));
+        };
+        let Some(blob) = part.blob() else {
+            return Err(format!("'{wanted}' is inline text, not a stored part"));
+        };
+        mime.store
+            .read(&mime.run_id, &blob.sha256)
+            .map(|bytes| bytes.to_vec())
+            .map_err(|e| format!("could not read the bytes of '{wanted}': {e}"))
+    }
+
+    fn write_part(
+        &self,
+        bytes: Vec<u8>,
+        mime_type: Option<&str>,
+        name: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
+        // Storing a part is writing the run, as `write_file` is.
+        if !self.allow.write_file {
+            return Err(denied("write_part"));
+        }
+        let Some(mime) = &self.mime else {
+            return Err("this run has no blob store to write a part into".to_string());
+        };
+        let mime_type = mime.type_of(mime_type, name, &bytes);
+        let name = match name {
+            Some(n) => n.to_string(),
+            None => {
+                let n = leviath_core::sync::lock(&self.parts).len() + 1;
+                mime.name_for(&format!("part-{n}"), &mime_type)
+            }
+        };
+        let size = bytes.len() as u64;
+        let part = mime.store(leviath_core::mime::Blob::new(mime_type, bytes).named(name))?;
+        if let Some(writes) = &self.writes {
+            writes.record(size);
+        }
+        leviath_core::sync::lock(&self.parts).push(part.clone());
+        Ok(part_summary(&part))
+    }
+
+    fn list_parts(&self) -> Vec<serde_json::Value> {
+        leviath_core::sync::lock(&self.parts)
+            .iter()
+            .filter(|p| p.is_stored())
+            .map(part_summary)
+            .collect()
+    }
+
+    fn part(&self, sha256: &str) -> Option<Part> {
+        leviath_core::sync::lock(&self.parts)
+            .iter()
+            .find(|p| p.blob().is_some_and(|b| b.sha256 == sha256))
+            .cloned()
     }
 
     fn env_var(&self, name: &str) -> Result<String, String> {
@@ -464,6 +714,47 @@ impl RealScriptIo {
         }
     }
 
+    /// Send a built request and read its body as bytes, with its declared
+    /// type: the path a script takes for an image, a sound or a document it
+    /// means to store with `write_part`. No text decoding, no binary refusal;
+    /// the same size ceiling as [`send`](Self::send).
+    fn send_bytes(
+        url: &str,
+        build: &dyn Fn() -> reqwest::blocking::RequestBuilder,
+    ) -> Result<(String, Vec<u8>), String> {
+        Self::send_bytes_capped(url, build, MAX_RESPONSE_BYTES)
+    }
+
+    /// [`send_bytes`](Self::send_bytes) with the body cap injected, so the
+    /// refusals are testable against a small response.
+    fn send_bytes_capped(
+        url: &str,
+        build: &dyn Fn() -> reqwest::blocking::RequestBuilder,
+        max: u64,
+    ) -> Result<(String, Vec<u8>), String> {
+        let resp = Self::send_with_retry(url, build)?;
+        let status = resp.status();
+        let content_type = content_type_essence(
+            resp.headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default(),
+        );
+        if let Some(msg) = oversized_body_message(resp.content_length(), max) {
+            return Err(msg);
+        }
+        if !status.is_success() {
+            return Err(format!("http {status}"));
+        }
+        let bytes = resp.bytes().map_err(|e| format!("read body: {e}"))?;
+        // A chunked body declares no length, so the ceiling is checked again
+        // on what actually arrived.
+        if let Some(msg) = oversized_body_message(Some(bytes.len() as u64), max) {
+            return Err(msg);
+        }
+        Ok((content_type, bytes.to_vec()))
+    }
+
     /// [`send`](Self::send) with the body cap injected, so the oversized-body
     /// refusal is testable against a small response instead of a 32 MiB one.
     fn send_capped(
@@ -512,7 +803,7 @@ impl RealScriptIo {
     }
 }
 
-/// Media types that are never text, so decoding them would only produce noise.
+/// Mime types that are never text, so decoding them would only produce noise.
 ///
 /// The check is on the declared type, deliberately **not** on UTF-8 validity of
 /// the bytes: `Response::text` is charset-aware and decodes Shift-JIS,
@@ -536,15 +827,20 @@ const BINARY_CONTENT_PREFIXES: &[&str] = &[
     "application/msword",
 ];
 
-/// Whether a `Content-Type` header names content this tool cannot render as text.
-fn is_binary_content_type(content_type: &str) -> bool {
-    // Trim parameters (`image/png; charset=binary`) and normalise case.
-    let essence = content_type
+/// The type a `Content-Type` header names, without its parameters
+/// (`image/png; charset=binary` is `image/png`), lowercased.
+fn content_type_essence(content_type: &str) -> String {
+    content_type
         .split(';')
         .next()
         .unwrap_or_default()
         .trim()
-        .to_ascii_lowercase();
+        .to_ascii_lowercase()
+}
+
+/// Whether a `Content-Type` header names content this tool cannot render as text.
+fn is_binary_content_type(content_type: &str) -> bool {
+    let essence = content_type_essence(content_type);
     // `application/xml`, `+json`, `+xml` etc. are structured *text* despite the
     // `application/` prefix, so match on the concrete list rather than the tree.
     BINARY_CONTENT_PREFIXES
@@ -592,7 +888,10 @@ fn non_text_body_message(content_type: &str, len: Option<u64>) -> String {
         Some(bytes) => format!(", {} KB", bytes.div_ceil(1024)),
         None => String::new(),
     };
-    format!("non-text content ({content_type}{size}) - this tool returns text only")
+    format!(
+        "non-text content ({content_type}{size}) - http_get returns text only; fetch it with \
+         http_get_bytes and store it with write_part"
+    )
 }
 
 /// Cap a host-I/O string below the tool engine's 1 MB `max_string_size`
@@ -642,6 +941,17 @@ impl ScriptIo for RealScriptIo {
     fn http_get(&self, url: &str, headers: BTreeMap<String, String>) -> Result<String, String> {
         let client = Self::client();
         Self::send(url, &|| {
+            Self::with_headers(client.get(url), headers.clone())
+        })
+    }
+
+    fn http_get_bytes(
+        &self,
+        url: &str,
+        headers: BTreeMap<String, String>,
+    ) -> Result<(String, Vec<u8>), String> {
+        let client = Self::client();
+        Self::send_bytes(url, &|| {
             Self::with_headers(client.get(url), headers.clone())
         })
     }
@@ -708,6 +1018,27 @@ impl ScriptIo for RealScriptIo {
         std::fs::read_to_string(path)
             .map(cap_script_io)
             .map_err(|e| format!("read '{}': {e}", path.display()))
+    }
+
+    fn read_file_bytes(&self, path: &Path, max: u64) -> Result<Vec<u8>, String> {
+        use std::io::Read;
+        // One message for both failures: a directory opens on Unix and fails
+        // at the read, and fails at the open on Windows.
+        let failed = |e: std::io::Error| format!("read '{}': {e}", path.display());
+        // Read at most one byte past the ceiling: a file that grows between a
+        // size check and the read is still caught, and a huge one is never
+        // pulled into memory to find out.
+        let mut bytes = Vec::new();
+        std::fs::File::open(path)
+            .and_then(|file| file.take(max.saturating_add(1)).read_to_end(&mut bytes))
+            .map_err(failed)?;
+        if bytes.len() as u64 > max {
+            return Err(format!(
+                "'{}' is over the {max}-byte limit on a part, so it was not read",
+                path.display()
+            ));
+        }
+        Ok(bytes)
     }
 
     fn write_file(&self, path: &Path, content: &str) -> Result<String, String> {
@@ -1105,6 +1436,14 @@ mod tests {
             self.calls.lock().unwrap().push(format!("get:{url}"));
             Ok("g".into())
         }
+        fn http_get_bytes(
+            &self,
+            url: &str,
+            _h: BTreeMap<String, String>,
+        ) -> Result<(String, Vec<u8>), String> {
+            self.calls.lock().unwrap().push(format!("get_bytes:{url}"));
+            Ok(("image/png".into(), vec![1, 2, 3]))
+        }
         fn http_post(
             &self,
             url: &str,
@@ -1129,6 +1468,13 @@ mod tests {
                 .unwrap()
                 .push(format!("read:{}", path.display()));
             Ok("r".into())
+        }
+        fn read_file_bytes(&self, path: &Path, max: u64) -> Result<Vec<u8>, String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("read_bytes:{}:{max}", path.display()));
+            Ok(vec![0x89, b'P'])
         }
         fn write_file(&self, path: &Path, content: &str) -> Result<String, String> {
             self.calls
@@ -1404,6 +1750,11 @@ mod tests {
         assert!(host.shell("ls").unwrap_err().contains("shell"));
         assert!(host.read_file("a.txt").unwrap_err().contains("read_file"));
         assert!(
+            host.read_file_bytes("a.png")
+                .unwrap_err()
+                .contains("read_file_bytes")
+        );
+        assert!(
             host.write_file("a.txt", "b")
                 .unwrap_err()
                 .contains("write_file")
@@ -1412,6 +1763,24 @@ mod tests {
         assert!(
             io.calls.lock().unwrap().is_empty(),
             "no I/O on denied calls"
+        );
+    }
+
+    /// `read_file_bytes` is confined like `read_file`, and a host with no
+    /// store reads up to the fetch ceiling.
+    #[test]
+    fn read_file_bytes_is_confined_and_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        let io = RecordingIo::arc();
+        let host = DaemonScriptHost::with_io(all_allowed(), dir.path().to_path_buf(), io.clone());
+        assert_eq!(host.read_file_bytes("a.png").unwrap(), vec![0x89, b'P']);
+        let err = host.read_file_bytes("../../etc/passwd").unwrap_err();
+        assert!(err.contains("escape"), "got: {err}");
+        let calls = io.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "the escaping read reached no I/O");
+        assert!(
+            calls[0].ends_with(&format!(":{MAX_RESPONSE_BYTES}")),
+            "got: {calls:?}"
         );
     }
 
@@ -1509,6 +1878,19 @@ mod tests {
                     )
                 }),
             )
+            // A chunked body: no Content-Length, so the byte ceiling can only
+            // be judged on what arrives.
+            .route(
+                "/chunked",
+                get(|| async {
+                    let chunks: Vec<Result<Vec<u8>, std::io::Error>> =
+                        vec![Ok(b"\x89PNG".to_vec()), Ok(b"\r\n\x1a\n".to_vec())];
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "image/png; x=y")],
+                        axum::body::Body::from_stream(futures_util::stream::iter(chunks)),
+                    )
+                }),
+            )
             // Declared text, answered with bytes that are not text in any
             // charset: the shape a compressed body arrives in. `text()` decodes
             // it lossily and succeeds, so only the decoded result gives it away.
@@ -1575,6 +1957,82 @@ mod tests {
         assert!(
             !without_len.contains("KB"),
             "no size to report: {without_len}"
+        );
+    }
+
+    /// The bytes path is what `web_fetch` takes for an image: the declared
+    /// type comes back with the raw bytes, a chunked body is read whole, the
+    /// ceiling holds whether the length was declared or not, and an error
+    /// status is an error.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bytes_come_back_typed_whole_and_under_the_ceiling() {
+        let base = mock_http().await;
+        let (png, chunked, boom, declared_over, arrived_over) =
+            tokio::task::spawn_blocking(move || {
+                let client = RealScriptIo::client();
+                let chunked_url = format!("{base}/chunked");
+                (
+                    RealScriptIo.http_get_bytes(&format!("{base}/png"), BTreeMap::new()),
+                    RealScriptIo.http_get_bytes(&chunked_url, BTreeMap::new()),
+                    RealScriptIo.http_get_bytes(&format!("{base}/boom"), BTreeMap::new()),
+                    RealScriptIo::send_bytes_capped(
+                        &format!("{base}/png"),
+                        &|| client.get(format!("{base}/png")),
+                        4,
+                    ),
+                    RealScriptIo::send_bytes_capped(&chunked_url, &|| client.get(&chunked_url), 4),
+                )
+            })
+            .await
+            .unwrap();
+        let (mime_type, bytes) = png.unwrap();
+        assert_eq!(mime_type, "image/png");
+        assert_eq!(bytes.len(), 10);
+        assert_eq!(&bytes[..4], b"\x89PNG");
+        let (mime_type, bytes) = chunked.unwrap();
+        assert_eq!(mime_type, "image/png", "parameters are dropped");
+        assert_eq!(bytes, b"\x89PNG\r\n\x1a\n");
+        assert!(boom.unwrap_err().starts_with("http 500"));
+        assert!(declared_over.unwrap_err().contains("declares 10 bytes"));
+        assert!(arrived_over.unwrap_err().contains("declares 8 bytes"));
+    }
+
+    /// The daemon host gates the bytes path on the same permission as
+    /// `http_get`, and a limited host passes it through.
+    #[test]
+    fn http_get_bytes_is_gated_like_http_get_and_passed_through_a_limit() {
+        let denied_host =
+            DaemonScriptHost::with_io(none_allowed(), PathBuf::from("wd"), RecordingIo::arc());
+        let err = denied_host
+            .http_get_bytes("http://example.com/a.png", BTreeMap::new())
+            .unwrap_err();
+        assert!(err.contains("http_get_bytes"), "got: {err}");
+
+        let io = RecordingIo::arc();
+        let host: Arc<dyn ScriptHost> = Arc::new(DaemonScriptHost::with_io(
+            all_allowed(),
+            PathBuf::from("wd"),
+            io.clone(),
+        ));
+        assert!(
+            host.http_get_bytes("http://localhost/a.png", BTreeMap::new())
+                .is_err(),
+            "a local address is refused before any I/O"
+        );
+        let limited = LimitedHost::new(
+            host,
+            Arc::new(StdMutex::new(Vec::new())),
+            "peek",
+            vec!["image/*".to_string()],
+        );
+        let (mime_type, bytes) = limited
+            .http_get_bytes("http://example.com/a.png", BTreeMap::new())
+            .unwrap();
+        assert_eq!(mime_type, "image/png");
+        assert_eq!(bytes, vec![1, 2, 3]);
+        assert_eq!(
+            io.calls.lock().unwrap().as_slice(),
+            ["get_bytes:http://example.com/a.png"]
         );
     }
 
@@ -1905,6 +2363,22 @@ mod tests {
         .unwrap();
         let err = out.unwrap_err();
         assert!(err.contains("read body"), "got: {err}");
+
+        // The bytes path fails the same two ways: a body cut short, and a
+        // host that never answers.
+        let base = spawn_truncated_body_server().await;
+        let (cut, dead) = tokio::task::spawn_blocking(move || {
+            (
+                RealScriptIo.http_get_bytes(&format!("{base}/x"), BTreeMap::new()),
+                RealScriptIo.http_get_bytes("http://127.0.0.1:19997/x", BTreeMap::new()),
+            )
+        })
+        .await
+        .unwrap();
+        let err = cut.unwrap_err();
+        assert!(err.contains("read body"), "got: {err}");
+        let err = dead.unwrap_err();
+        assert!(err.contains("request failed"), "got: {err}");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2198,5 +2672,233 @@ mod tests {
         let capped = cap_script_io(s);
         // Valid UTF-8 (would panic on construction if a codepoint were split).
         assert!(capped.contains("[...truncated by leviath"));
+    }
+}
+
+#[cfg(test)]
+mod parts_tests {
+    use super::*;
+    use leviath_core::mime::{Blob, BlobStore, MemoryBlobStore, MimeType};
+
+    fn mime_and_store() -> (Arc<leviath_tools::ToolMime>, Arc<MemoryBlobStore>) {
+        let store = Arc::new(MemoryBlobStore::new());
+        let mime = Arc::new(leviath_tools::ToolMime {
+            store: store.clone(),
+            registry: Arc::new(leviath_core::mime::RegistryCell::default()),
+            run_id: "run-1".to_string(),
+            max_part_bytes: 64,
+        });
+        (mime, store)
+    }
+
+    fn all_allowed() -> ScriptAllow {
+        ScriptAllow {
+            http_get: true,
+            http_post: true,
+            shell: true,
+            read_file: true,
+            write_file: true,
+            env_var: true,
+        }
+    }
+
+    /// A file the script (or its shell) wrote reaches `write_part` as bytes,
+    /// through a stage's limit too, and one over the run's part ceiling is
+    /// refused before it is read into memory.
+    #[test]
+    fn a_workdir_file_read_as_bytes_becomes_a_part() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = b"\x89PNG\r\n\x1a\n\x00\xffdiagram".to_vec();
+        std::fs::write(dir.path().join("out.png"), &png).unwrap();
+        std::fs::write(dir.path().join("huge.bin"), vec![7u8; 65]).unwrap();
+        std::fs::write(dir.path().join("edge.bin"), vec![7u8; 64]).unwrap();
+        let (mime, store) = mime_and_store();
+        let parts = Arc::new(StdMutex::new(Vec::new()));
+        let host: Arc<dyn ScriptHost> = Arc::new(
+            DaemonScriptHost::new(all_allowed(), dir.path().to_path_buf())
+                .with_mime(mime, parts.clone()),
+        );
+        let limited = LimitedHost::new(host, parts, "render", vec!["image/*".to_string()]);
+        let bytes = limited.read_file_bytes("out.png").unwrap();
+        assert_eq!(bytes, png, "the bytes are exact, not text-decoded");
+        let summary = limited
+            .write_part(bytes, None, Some("diagram.png"))
+            .unwrap();
+        assert_eq!(summary["mime_type"], "image/png");
+        let sha = summary["sha256"].as_str().unwrap();
+        assert_eq!(store.read("run-1", sha).unwrap().to_vec(), png);
+        assert_eq!(limited.read_file_bytes("edge.bin").unwrap().len(), 64);
+        let err = limited.read_file_bytes("huge.bin").unwrap_err();
+        assert!(err.contains("over the 64-byte limit"), "got: {err}");
+        let err = limited.read_file_bytes("missing.png").unwrap_err();
+        assert!(err.contains("missing.png"), "got: {err}");
+    }
+
+    /// Through a stage's limit, a script sees only the parts the tool may
+    /// be handed; the rest of the host is untouched.
+    #[test]
+    fn a_limited_host_hides_the_parts_outside_the_tools_list() {
+        let (mime, store) = mime_and_store();
+        let parts = Arc::new(StdMutex::new(Vec::new()));
+        let host: Arc<dyn ScriptHost> = Arc::new(
+            DaemonScriptHost::new(all_allowed(), std::env::temp_dir())
+                .with_mime(mime.clone(), parts.clone()),
+        );
+        let png = store
+            .put(
+                "run-1",
+                &Blob::new(
+                    MimeType::parse("image/png").unwrap(),
+                    b"\x89PNG\r\n\x1a\nhero".to_vec(),
+                ),
+                &mime.registry.load(),
+            )
+            .unwrap();
+        let wav = store
+            .put(
+                "run-1",
+                &Blob::new(MimeType::parse("audio/wav").unwrap(), b"RIFFwav".to_vec()),
+                &mime.registry.load(),
+            )
+            .unwrap();
+        let sha = png.sha256.clone();
+        *parts.lock().unwrap() = vec![
+            Part::text("note").named("note"),
+            Part::stored(png).named("hero.png"),
+            Part::stored(wav).named("voice.wav"),
+        ];
+        let limited = LimitedHost::new(
+            host.clone(),
+            parts.clone(),
+            "peek",
+            vec!["image/*".to_string()],
+        );
+        let listed = limited.list_parts();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0]["name"], "hero.png");
+        assert_eq!(limited.read_part("hero.png").unwrap().len(), 12);
+        assert_eq!(
+            limited.read_part("voice.wav").unwrap_err(),
+            "'voice.wav' is audio/wav; at this stage peek may be handed only image/*"
+        );
+        // Text is never hidden, and a name nothing answers to is the host's
+        // own refusal.
+        assert!(
+            limited
+                .read_part("note")
+                .unwrap_err()
+                .contains("inline text")
+        );
+        assert!(
+            limited
+                .read_part("ghost")
+                .unwrap_err()
+                .contains("list_parts()")
+        );
+        assert!(limited.part(&sha).is_some());
+        // The rest passes straight through.
+        let written = limited
+            .write_part(b"\x89PNG\r\n\x1a\ncopy".to_vec(), None, None)
+            .unwrap();
+        assert_eq!(written["mime_type"], "image/png");
+        assert!(limited.read_file("../nope").is_err());
+        assert!(limited.write_file("../nope", "x").is_err());
+        assert!(limited.env_var("ANTHROPIC_API_KEY").is_err());
+        assert!(limited.http_get("not a url", BTreeMap::new()).is_err());
+        assert!(limited.http_post("not a url", "", BTreeMap::new()).is_err());
+        assert!(limited.shell("").is_err());
+    }
+
+    #[test]
+    fn parts_are_read_written_listed_and_resolved() {
+        let (mime, store) = mime_and_store();
+        let parts = Arc::new(StdMutex::new(Vec::new()));
+        let writes = Arc::new(crate::daemon::tool_service::WriteBudget::new(
+            leviath_core::write_limits::WriteLimits::default(),
+        ));
+        let host = DaemonScriptHost::new(all_allowed(), std::env::temp_dir())
+            .with_mime(mime.clone(), parts.clone())
+            .with_write_budget(writes.clone());
+        // An offered part, as the runtime hands it over.
+        let blob = Blob::new(
+            MimeType::parse("image/png").unwrap(),
+            b"\x89PNG\r\n\x1a\nhero".to_vec(),
+        )
+        .named("hero.png");
+        let r = store.put("run-1", &blob, &mime.registry.load()).unwrap();
+        let sha = r.sha256.clone();
+        parts
+            .lock()
+            .unwrap()
+            .push(Part::stored(r).named("hero.png"));
+        parts.lock().unwrap().push(Part::text("note").named("note"));
+
+        assert_eq!(host.read_part("hero.png").unwrap().len(), 12);
+        let prefix: String = sha.chars().take(10).collect();
+        assert_eq!(host.read_part(&prefix).unwrap().len(), 12);
+        let err = host.read_part("note").unwrap_err();
+        assert!(err.contains("inline text"), "{err}");
+        let err = host.read_part("ghost.png").unwrap_err();
+        assert!(err.contains("list_parts()"), "{err}");
+
+        let written = host
+            .write_part(b"\x89PNG\r\n\x1a\ncopy".to_vec(), None, None)
+            .unwrap();
+        assert_eq!(written["name"], "part-3.png");
+        assert_eq!(written["mime_type"], "image/png");
+        let named = host
+            .write_part(vec![1, 2, 3], Some("audio/wav"), Some("beep.wav"))
+            .unwrap();
+        assert_eq!(named["name"], "beep.wav");
+        assert_eq!(named["mime_type"], "audio/wav");
+        assert_eq!(writes.written(), 15);
+        assert_eq!(host.list_parts().len(), 3, "the inline note is not listed");
+        assert!(host.part(&sha).is_some());
+        assert!(host.part("nope").is_none());
+        let err = host.write_part(vec![0; 100], None, None).unwrap_err();
+        assert!(err.contains("ceiling"), "{err}");
+
+        // Bytes the store no longer has.
+        parts.lock().unwrap().push(
+            Part::stored(leviath_core::mime::BlobRef {
+                sha256: "f".repeat(64),
+                mime_type: MimeType::parse("image/png").unwrap(),
+                size: 1,
+                width: None,
+                height: None,
+                duration_ms: None,
+                tokens: 1,
+                stand_in: String::new(),
+            })
+            .named("lost.png"),
+        );
+        let err = host.read_part("lost.png").unwrap_err();
+        assert!(err.contains("could not read the bytes"), "{err}");
+    }
+
+    #[test]
+    fn without_a_store_or_a_grant_parts_are_refused() {
+        let host = DaemonScriptHost::new(all_allowed(), std::env::temp_dir());
+        assert!(host.read_part("x").unwrap_err().contains("no blob store"));
+        assert!(
+            host.write_part(vec![1], None, None)
+                .unwrap_err()
+                .contains("no blob store")
+        );
+        let (mime, _) = mime_and_store();
+        let mut allow = all_allowed();
+        allow.write_file = false;
+        let host = DaemonScriptHost::new(allow, std::env::temp_dir())
+            .with_mime(mime, Arc::new(StdMutex::new(Vec::new())));
+        let err = host.write_part(vec![1], None, None).unwrap_err();
+        assert!(
+            err.contains("[denied]") && err.contains("write_part"),
+            "{err}"
+        );
+        // Without a budget the write is still stored.
+        let (mime, _) = mime_and_store();
+        let host = DaemonScriptHost::new(all_allowed(), std::env::temp_dir())
+            .with_mime(mime, Arc::new(StdMutex::new(Vec::new())));
+        assert!(host.write_part(vec![1], None, Some("a.bin")).is_ok());
     }
 }

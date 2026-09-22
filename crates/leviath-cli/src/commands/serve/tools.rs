@@ -12,11 +12,10 @@
 use std::path::PathBuf;
 
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
 use axum::response::Json;
 use serde::{Deserialize, Serialize};
 
-use super::types::{ApiError, AppState, err};
+use super::types::{ApiError, AppState};
 use crate::tool_inventory::ToolInventory;
 
 /// The directory of the agent called `name`, refusing a name that is not a
@@ -36,15 +35,15 @@ use crate::tool_inventory::ToolInventory;
 /// absolute path, and this name arrives in a query string. Shared from here
 /// because the tools and scripts routes both take an `?agent=` and both would
 /// otherwise write their own copy of the check.
-pub(super) fn agent_dir(config: &crate::config::Config, name: &str) -> Result<PathBuf, ApiError> {
+pub(super) fn agent_dir(
+    config: &crate::config::Config,
+    name: &str,
+) -> Result<PathBuf, super::core::error::ServeError> {
     if !leviath_core::is_safe_path_component(name) {
-        return Err(err(
-            StatusCode::BAD_REQUEST,
-            format!(
-                "Invalid agent name '{name}': names may contain only letters, digits, \
-                 '.', '_' and '-'"
-            ),
-        ));
+        return Err(super::core::error::ServeError::BadRequest(format!(
+            "Invalid agent name '{name}': names may contain only letters, digits, \
+             '.', '_' and '-'"
+        )));
     }
     let known = super::blueprints::discover_blueprints(config)
         .into_iter()
@@ -68,6 +67,16 @@ pub(super) struct ToolItem {
     pub(super) name: String,
     /// `builtin`, `subagent`, `agent` or `global`.
     pub(super) source: String,
+    /// What the tool does, in the words the model is given.
+    pub(super) description: String,
+    /// The JSON Schema of its arguments, as the model is given it. A picker
+    /// showing what a tool takes and a model deciding how to call it read one
+    /// thing.
+    pub(super) arguments: serde_json::Value,
+    /// Platform capabilities a script declares with `@requires`. Empty for a
+    /// built-in, whose requirements are compiled in.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) requires: Vec<String>,
     /// The `.rhai` file behind it, for script-backed tools only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) path: Option<String>,
@@ -87,9 +96,22 @@ pub(super) struct SkippedItem {
     pub(super) source: String,
 }
 
+/// One `available_tools` group token: a grant of every tool of one kind.
+#[derive(Debug, Serialize, Deserialize)]
+pub(super) struct GroupItem {
+    /// The token a blueprint writes, `@builtin` and the like.
+    pub(super) name: String,
+    /// What it reaches, in one line.
+    pub(super) description: String,
+}
+
 /// The body of `GET /api/tools`.
 #[derive(Debug, Serialize, Deserialize)]
 pub(super) struct ToolsResp {
+    /// The group tokens `available_tools` accepts alongside tool names, so a
+    /// picker can offer "all the built-ins" as one row rather than making
+    /// the user tick twenty-eight boxes.
+    pub(super) groups: Vec<GroupItem>,
     /// Everything that will work if a blueprint names it.
     pub(super) tools: Vec<ToolItem>,
     /// Everything that looked like a tool and will not work, with the reason.
@@ -109,17 +131,30 @@ pub(super) async fn list_tools(
     Query(q): Query<ToolsQuery>,
 ) -> Result<Json<ToolsResp>, ApiError> {
     let dir = match q.agent.as_deref() {
-        Some(name) => Some(agent_dir(&state.current_config(), name)?),
+        Some(name) => Some(
+            agent_dir(&state.current_config(), name)
+                .map_err(|e| super::core::error::as_api_error(&e))?,
+        ),
         None => None,
     };
     let inventory = ToolInventory::discover(dir.as_deref(), q.agent.as_deref());
 
+    let groups = leviath_core::blueprint::ToolGroup::ALL
+        .iter()
+        .map(|g| GroupItem {
+            name: g.token().to_string(),
+            description: g.describe().to_string(),
+        })
+        .collect();
     let tools = inventory
         .tools
         .into_iter()
         .map(|t| ToolItem {
             name: t.name,
             source: t.source.as_str().to_string(),
+            description: t.description,
+            arguments: t.arguments,
+            requires: t.requires,
             path: t.path.map(|p| p.display().to_string()),
             agent: t.agent,
         })
@@ -134,11 +169,17 @@ pub(super) async fn list_tools(
         })
         .collect();
 
-    Ok(Json(ToolsResp { tools, skipped }))
+    Ok(Json(ToolsResp {
+        groups,
+        tools,
+        skipped,
+    }))
 }
 
 #[cfg(test)]
 mod tests {
+    use axum::http::StatusCode;
+
     use super::*;
     use axum::Router;
     use axum::body::Body;
@@ -207,6 +248,21 @@ mod tests {
                 .expect("a built-in");
             assert!(builtin.get("path").is_none());
             assert!(builtin.get("agent").is_none());
+            // The group tokens ride along, so a picker can offer them, and
+            // none of them is ever listed as a tool.
+            let groups = body["groups"].as_array().expect("a groups array");
+            let names: Vec<&str> = groups.iter().filter_map(|g| g["name"].as_str()).collect();
+            assert_eq!(names, ["@all", "@builtin", "@subagent", "@scripts", "@mcp"]);
+            assert!(
+                groups
+                    .iter()
+                    .all(|g| !g["description"].as_str().unwrap().is_empty())
+            );
+            assert!(
+                tools
+                    .iter()
+                    .all(|t| !t["name"].as_str().unwrap().starts_with('@'))
+            );
         })
         .await;
     }

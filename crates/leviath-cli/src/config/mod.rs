@@ -19,12 +19,18 @@ mod security;
 pub(crate) use security::*;
 mod serve;
 pub(crate) use serve::*;
+mod mime;
+pub(crate) use mime::*;
 
 // Why a config file would not load, kept structured rather than flattened into
 // a string, so the surfaces that have to explain a broken file can point at
 // the line or the key instead of pasting a paragraph.
 mod fault;
 pub(crate) use fault::ConfigFault;
+
+// Keys that changed name: one table, read by the loader, the unread-key
+// warning, `lev doctor` and `lev update`.
+pub(crate) mod renamed;
 
 // Two helpers with no `[table]` of their own: reading a repository's `.env`,
 // and hardening the config file's permissions. Private to this module; the
@@ -100,9 +106,18 @@ pub struct Config {
     #[serde(default)]
     pub mcp_servers: Vec<MCPServerConfig>,
 
-    /// Default model override
+    /// One model every stage that allows a user default starts on, ahead of
+    /// the models its blueprint names. A bare model id on `default_provider`.
+    /// Unset, the usual state, lets each blueprint pick per stage.
     #[serde(default)]
-    pub default_model: Option<String>,
+    pub override_model: Option<String>,
+
+    /// The model a stage falls back to when none of the models it names is
+    /// configured here, tried after all of them and before `[providers]
+    /// fallback_order`. A bare model id on `default_provider`. Never moves a
+    /// stage off a model its blueprint names.
+    #[serde(default)]
+    pub fallback_model: Option<String>,
 
     /// Per-model capability overrides. Key is model ID (e.g. "my-local-llama").
     /// Takes precedence over the provider's built-in capability table.
@@ -235,6 +250,20 @@ pub struct Config {
     #[serde(default = "default_update_check")]
     pub update_check: bool,
 
+    /// Read a `.env` file from the directory `lev` is run in, for provider
+    /// keys kept beside a project.
+    ///
+    /// **Off by default (opt-in).** `lev` is run inside repositories other
+    /// people wrote, and a `.env` there is theirs: loading it by default put
+    /// their values into this process without anyone asking. On, only
+    /// `./.env` is read (never a parent directory), a variable already set
+    /// keeps its value, and names that steer the process (`LEVIATH_*`,
+    /// `PATH`, `EDITOR` and the like) are skipped. `LEVIATH_LOAD_DOTENV=1`
+    /// turns it on for one command; `LEVIATH_SKIP_DOTENV` turns it off
+    /// whatever this says.
+    #[serde(default)]
+    pub load_dotenv: bool,
+
     /// Runtime resource limits (inference concurrency + iteration caps).
     #[serde(default)]
     pub limits: LimitsConfig,
@@ -308,6 +337,20 @@ pub struct Config {
     #[serde(default)]
     pub serve: ServeConfig,
 
+    /// `[mime]`: the size ceilings on typed mime parts.
+    #[serde(default)]
+    pub mime: MimeConfig,
+
+    /// `[mime_types]`: rows added to the mime registry, keyed by
+    /// `type/subtype` or `type/*`, layered over the compiled defaults and
+    /// under `mime_types.toml`, which is where such rows belong; the table
+    /// here still loads so an older config keeps working. A row names only
+    /// the fields it changes. Kept as the table it was written as and handed
+    /// to `leviath_core::mime::MimeRegistry::layer`, which is the one
+    /// reader and reports a malformed row by key.
+    #[serde(default)]
+    pub mime_types: toml::Table,
+
     /// Per-agent read grants, keyed by agent name - the itemized counterpart
     /// of `SecurityConfig::allow_blueprint_read_paths`, analogous to
     /// [`Self::agent_tool_permissions`]:
@@ -334,8 +377,10 @@ impl Default for Config {
             openrouter_api_key: None,
             ollama_base_url: None,
             update_check: default_update_check(),
+            load_dotenv: false,
             mcp_servers: Vec::new(),
-            default_model: None,
+            override_model: None,
+            fallback_model: None,
             model_capabilities: HashMap::new(),
             model_providers: HashMap::new(),
             tool_permissions: HashMap::new(),
@@ -356,6 +401,8 @@ impl Default for Config {
             tool_script_permissions: ScriptToolPermissions::default(),
             security: SecurityConfig::default(),
             serve: ServeConfig::default(),
+            mime: MimeConfig::default(),
+            mime_types: toml::Table::new(),
             agent_read_paths: HashMap::new(),
         }
     }
@@ -476,12 +523,19 @@ impl Config {
         // steer the process are filtered out, and the credentials this feature
         // exists to load are not. See `leviath_core::dotenv_var_allowed`.
         //
+        // And even filtered it is a stranger's file, so it is read only when
+        // asked for: `load_dotenv = true` in the config, or
+        // `LEVIATH_LOAD_DOTENV=1` for one command. The config file is read
+        // first to find out, and the environment fallbacks are applied after,
+        // so a key the `.env` supplies still fills an unset one.
+        //
         // `LEVIATH_SKIP_DOTENV` lets tests isolate `Config::load()` completely.
-        if std::env::var_os("LEVIATH_SKIP_DOTENV").is_none() {
+        let path = Self::config_path();
+        let config = Self::read_file(&path)?;
+        if dotenv_wanted(config.load_dotenv) {
             load_dotenv_filtered(".env");
         }
-
-        let config = Self::load_from_path_faulted(&Self::config_path())?;
+        let config = config.with_env_fallbacks();
 
         // Check config file permissions on Unix
         check_permissions();
@@ -517,34 +571,58 @@ impl Config {
         }
     }
 
-    /// Say so when `default_model` is written as `provider/model`.
+    /// Say so when `override_model` or `fallback_model` is written as
+    /// `provider/model`.
     ///
-    /// The setting is a bare model id that pairs with `default_provider`, but
+    /// Both settings are bare model ids that pair with `default_provider`, but
     /// `--model` and `[providers] fallback_order` take the qualified form and an
-    /// OpenRouter id already has a slash in it, so `default_model =
+    /// OpenRouter id already has a slash in it, so `override_model =
     /// "ollama/qwen3.8:latest"` gets written. The resolver reads it bare, so
     /// nothing breaks; this names the reading, at the same place the unread-key
     /// warning appears, so the file can be tidied.
-    fn warn_qualified_default_model(&self) {
-        if let Some((written, bare)) = self.qualified_default_model() {
+    fn warn_qualified_user_models(&self) {
+        for (key, written, bare) in self.qualified_user_models() {
             let provider = &self.default_provider;
             tracing::warn!(
-                default_model = %written,
+                key = %key,
+                written = %written,
                 read_as = %bare,
-                "config.toml default_model is written as provider/model; it takes a \
-                 bare model id and pairs with default_provider, so the '{provider}/' \
+                "config.toml {key} is written as provider/model; it takes a bare \
+                 model id and pairs with default_provider, so the '{provider}/' \
                  prefix is dropped. `lev doctor` reports it too, if this scrolls past."
             );
         }
     }
 
-    /// `default_model` when it is written qualified with the default provider's
-    /// own name: the value as written and the bare id it is read as. `None`
-    /// when unset or already bare.
-    pub(crate) fn qualified_default_model(&self) -> Option<(&str, &str)> {
-        let written = self.default_model.as_deref()?;
-        let bare = leviath_runtime::pipeline::bare_default_model(&self.default_provider, written);
-        (bare != written).then_some((written, bare))
+    /// Each of `override_model` and `fallback_model` that is written qualified
+    /// with the default provider's own name: the key, the value as written and
+    /// the bare id it is read as. Empty when both are unset or already bare.
+    pub(crate) fn qualified_user_models(&self) -> Vec<(&'static str, &str, &str)> {
+        [
+            ("override_model", self.override_model.as_deref()),
+            ("fallback_model", self.fallback_model.as_deref()),
+        ]
+        .into_iter()
+        .filter_map(|(key, written)| {
+            let written = written?;
+            let bare = leviath_runtime::pipeline::bare_user_model(&self.default_provider, written);
+            (bare != written).then_some((key, written, bare))
+        })
+        .collect()
+    }
+
+    /// The renamed keys still present in the config file at `path`, for
+    /// `lev doctor`. Read the same way [`unread_keys_at`](Self::unread_keys_at)
+    /// is: an unreadable or absent file has none, because that is a different
+    /// problem.
+    pub(crate) fn renamed_keys_at(path: &std::path::Path) -> Vec<renamed::Renamed> {
+        let Ok(content) = std::fs::read_to_string(path) else {
+            return Vec::new();
+        };
+        let Ok(table) = toml::from_str::<toml::value::Table>(&content) else {
+            return Vec::new();
+        };
+        renamed::legacy_keys_present(&table)
     }
 
     /// Keys in the config file at `path` that nothing reads.
@@ -596,6 +674,10 @@ impl Config {
     /// does not have that problem, because a field they set is a field that
     /// serializes.
     fn unknown_config_keys(content: &str) -> Vec<String> {
+        // A key that moved is read under its new name, so it is not unread;
+        // judging the document as the loader sees it keeps the two agreeing.
+        let (content, _) = renamed::rename_in_text(content);
+        let content = content.as_str();
         let Ok(found) = toml::from_str::<toml::value::Table>(content) else {
             return Vec::new();
         };
@@ -633,11 +715,20 @@ impl Config {
         let content =
             std::fs::read_to_string(path).map_err(|e| Box::new(ConfigFault::read(path, &e)))?;
 
+        // A key that changed name is respelled in the text before serde looks,
+        // so an install that never runs `lev update` keeps working and is told
+        // what its file now means. Done on the text so a parse error still
+        // points at its line.
+        let (content, renamed) = renamed::rename_in_text(&content);
         let c: Self = toml::from_str(&content)
             .map_err(|e| Box::new(ConfigFault::parse(path, &content, &e)))?;
 
+        for r in &renamed {
+            let notice = renamed::notice(r);
+            tracing::warn!(old = %r.key.old, new = %r.key.new, "{notice}");
+        }
         Self::warn_unknown_config_keys(&content);
-        c.warn_qualified_default_model();
+        c.warn_qualified_user_models();
 
         // Catch a malformed MCP server entry here, at load, rather than at
         // the first tool call: a typo that drops a server's tools should
@@ -650,6 +741,24 @@ impl Config {
                     &e.to_string(),
                 ))
             })?;
+        }
+        // Two servers under one name would advertise one set of tool names
+        // between them, and only whichever connected first would be reachable.
+        // `lev mcp add` and the API refuse a duplicate, so this catches a
+        // hand-edited file.
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for server in &c.mcp_servers {
+            if !seen.insert(server.name.as_str()) {
+                return Err(Box::new(ConfigFault::validation(
+                    path,
+                    &format!("mcp_servers.{}", server.name),
+                    &format!(
+                        "two [[mcp_servers]] entries are both named {:?}. Every tool is named \
+                         <server>__<tool>, so the two would claim the same names. Rename one",
+                        server.name
+                    ),
+                )));
+            }
         }
         // An endpoint with no address is the same kind of mistake, and is
         // named against its table for the same reason.
@@ -681,9 +790,14 @@ impl Config {
     /// last good config and has to be able to *say* what is wrong with the
     /// new one, down to the line.
     pub(crate) fn load_from_path_faulted(path: &std::path::Path) -> Result<Self, Box<ConfigFault>> {
-        let mut config = Self::read_file(path)?;
+        Ok(Self::read_file(path)?.with_env_fallbacks())
+    }
 
-        // Env var fallbacks (env vars override config file if set)
+    /// Fill every provider setting the file left unset from the environment,
+    /// then from the credential store. A value in the file wins.
+    fn with_env_fallbacks(self) -> Self {
+        let mut config = self;
+
         if config.providers.anthropic_api_key.is_none() {
             config.providers.anthropic_api_key = std::env::var("ANTHROPIC_API_KEY").ok();
         }
@@ -692,6 +806,31 @@ impl Config {
         }
         if config.providers.google_api_key.is_none() {
             config.providers.google_api_key = std::env::var("GOOGLE_API_KEY").ok();
+        }
+        if config.providers.meshy_api_key.is_none() {
+            config.providers.meshy_api_key = std::env::var("MESHY_API_KEY").ok();
+        }
+        if config.providers.bedrock_api_key.is_none() {
+            config.providers.bedrock_api_key =
+                std::env::var(leviath_providers::bedrock::KEY_ENV).ok();
+        }
+        if config.providers.xai_api_key.is_none() {
+            config.providers.xai_api_key = std::env::var("XAI_API_KEY").ok();
+        }
+        // Not Meta's own `MODEL_API_KEY`: a name that generic could belong to
+        // anything on the machine.
+        if config.providers.meta_api_key.is_none() {
+            config.providers.meta_api_key = std::env::var("META_AI_API_KEY").ok();
+        }
+        // The region AWS's own tooling reads, so a machine set up for the AWS
+        // CLI is set up for this. Blank is unset: an exported empty variable
+        // is not a region.
+        if config.providers.bedrock_region.is_none() {
+            config.providers.bedrock_region = std::env::var("AWS_REGION")
+                .ok()
+                .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok())
+                .map(|r| r.trim().to_string())
+                .filter(|r| !r.is_empty());
         }
         if config.openrouter_api_key.is_none() {
             config.openrouter_api_key = std::env::var("OPENROUTER_API_KEY").ok();
@@ -715,10 +854,22 @@ impl Config {
         if config.providers.openrouter_base_url.is_none() {
             config.providers.openrouter_base_url = std::env::var("OPENROUTER_BASE_URL").ok();
         }
+        if config.providers.meshy_base_url.is_none() {
+            config.providers.meshy_base_url = std::env::var("MESHY_BASE_URL").ok();
+        }
+        if config.providers.bedrock_base_url.is_none() {
+            config.providers.bedrock_base_url = std::env::var("BEDROCK_BASE_URL").ok();
+        }
+        if config.providers.xai_base_url.is_none() {
+            config.providers.xai_base_url = std::env::var("XAI_BASE_URL").ok();
+        }
+        if config.providers.meta_base_url.is_none() {
+            config.providers.meta_base_url = std::env::var("META_AI_BASE_URL").ok();
+        }
 
         config.fill_from_credential_store();
 
-        Ok(config)
+        config
     }
 
     /// Fill any provider key still unset from the configured credential store.
@@ -768,11 +919,17 @@ impl Config {
         let openai = take("openai");
         let google = take("google");
         let openrouter = take("openrouter");
+        let bedrock = take("bedrock");
+        let xai = take("xai");
+        let meta = take("meta");
 
         self.providers.anthropic_api_key = self.providers.anthropic_api_key.take().or(anthropic);
         self.providers.openai_api_key = self.providers.openai_api_key.take().or(openai);
         self.providers.google_api_key = self.providers.google_api_key.take().or(google);
         self.openrouter_api_key = self.openrouter_api_key.take().or(openrouter);
+        self.providers.bedrock_api_key = self.providers.bedrock_api_key.take().or(bedrock);
+        self.providers.xai_api_key = self.providers.xai_api_key.take().or(xai);
+        self.providers.meta_api_key = self.providers.meta_api_key.take().or(meta);
     }
 
     /// This config with every provider API key removed.
@@ -788,6 +945,9 @@ impl Config {
         copy.providers.openai_api_key = None;
         copy.providers.google_api_key = None;
         copy.openrouter_api_key = None;
+        copy.providers.bedrock_api_key = None;
+        copy.providers.xai_api_key = None;
+        copy.providers.meta_api_key = None;
         copy
     }
 
@@ -798,6 +958,9 @@ impl Config {
             ("openai", self.providers.openai_api_key.as_deref()),
             ("google", self.providers.google_api_key.as_deref()),
             ("openrouter", self.openrouter_api_key.as_deref()),
+            ("bedrock", self.providers.bedrock_api_key.as_deref()),
+            ("xai", self.providers.xai_api_key.as_deref()),
+            ("meta", self.providers.meta_api_key.as_deref()),
         ]
         .into_iter()
         .filter_map(|(name, key)| {
@@ -1024,6 +1187,13 @@ const PROVIDER_KEY_ENV_VARS: &[&str] = &[
     "OPENAI_API_KEY",
     "GOOGLE_API_KEY",
     "OPENROUTER_API_KEY",
+    "MESHY_API_KEY",
+    "AWS_BEARER_TOKEN_BEDROCK",
+    // Not keys, but read the same way: a developer with a region exported
+    // would otherwise see it in a config the test expects blank.
+    "AWS_REGION",
+    "AWS_DEFAULT_REGION",
+    "BEDROCK_BASE_URL",
 ];
 
 /// Create a fresh, empty temp directory to stand in for the config directory.
@@ -1055,6 +1225,7 @@ pub(crate) fn config_isolation_vars(
             Some(fake_dir.join("config.toml").into_os_string()),
         ),
         ("LEVIATH_SKIP_DOTENV", Some(std::ffi::OsString::from("1"))),
+        ("LEVIATH_LOAD_DOTENV", None),
     ];
     for &key in PROVIDER_KEY_ENV_VARS {
         vars.push((key, None));
@@ -1075,9 +1246,25 @@ pub(crate) fn with_isolated_config_path<R>(
     f: impl FnOnce(&std::path::Path) -> R,
 ) -> R {
     let fake_dir = make_fake_config_dir(unique);
-    let result = temp_env::with_vars(config_isolation_vars(&fake_dir), || f(&fake_dir));
+    let result = temp_env::with_vars(wrapper_isolation_vars(&fake_dir), || f(&fake_dir));
     let _ = std::fs::remove_dir_all(&fake_dir);
     result
+}
+
+/// [`config_isolation_vars`] plus `LEVIATH_HOME`, for the two wrappers.
+///
+/// A command under test writes more than its config: `lev models` records
+/// each provider's answer in the shared capability cache, which lives under
+/// the home. Pinning the home to the same scratch directory keeps every
+/// home-relative write out of the real `~/.leviath`. Kept out of the base
+/// list because the callers that extend it choose their own home.
+#[cfg(test)]
+fn wrapper_isolation_vars(
+    fake_dir: &std::path::Path,
+) -> Vec<(&'static str, Option<std::ffi::OsString>)> {
+    let mut vars = config_isolation_vars(fake_dir);
+    vars.push(("LEVIATH_HOME", Some(fake_dir.as_os_str().to_os_string())));
+    vars
 }
 
 /// Async counterpart of [`with_isolated_config_path`] for `#[tokio::test]`s.
@@ -1092,14 +1279,82 @@ where
 {
     let fake_dir = make_fake_config_dir(unique);
     let result =
-        temp_env::async_with_vars(config_isolation_vars(&fake_dir), f(fake_dir.clone())).await;
+        temp_env::async_with_vars(wrapper_isolation_vars(&fake_dir), f(fake_dir.clone())).await;
     let _ = std::fs::remove_dir_all(&fake_dir);
     result
+}
+
+/// Whether `./.env` is read: the config's `load_dotenv`, turned on for one
+/// command by `LEVIATH_LOAD_DOTENV` (`1` or `true`), and off whatever either
+/// says while `LEVIATH_SKIP_DOTENV` is set.
+fn dotenv_wanted(configured: bool) -> bool {
+    if std::env::var_os("LEVIATH_SKIP_DOTENV").is_some() {
+        return false;
+    }
+    configured
+        || std::env::var("LEVIATH_LOAD_DOTENV")
+            .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true"))
 }
 
 #[cfg(test)]
 mod dotenv_tests {
     use super::*;
+
+    /// Off by default: a `.env` in the working directory is not read unless
+    /// the config or the environment asks for it, and `load_dotenv = true` in
+    /// the config file is enough to ask.
+    #[test]
+    fn a_dot_env_is_read_only_when_asked_for() {
+        let dir = make_fake_config_dir("dotenv-opt-in");
+        std::fs::write(dir.join(".env"), "LEV_DOTENV_OPT_IN=seen\n").unwrap();
+        {
+            let _cwd = isolate_cwd_for_test();
+            std::env::set_current_dir(&dir).unwrap();
+            let vars = |load: Option<&str>| {
+                [
+                    (
+                        "LEVIATH_CONFIG_PATH",
+                        Some(dir.join("config.toml").into_os_string()),
+                    ),
+                    ("LEVIATH_SKIP_DOTENV", None),
+                    ("LEVIATH_LOAD_DOTENV", load.map(std::ffi::OsString::from)),
+                    ("LEV_DOTENV_OPT_IN", None),
+                ]
+            };
+            temp_env::with_vars(vars(None), || {
+                Config::load().expect("loads");
+                assert!(std::env::var("LEV_DOTENV_OPT_IN").is_err(), "not asked for");
+            });
+            temp_env::with_vars(vars(Some("0")), || {
+                Config::load().expect("loads");
+                assert!(std::env::var("LEV_DOTENV_OPT_IN").is_err(), "0 is not on");
+            });
+            std::fs::write(dir.join("config.toml"), "load_dotenv = true\n").unwrap();
+            temp_env::with_vars(vars(None), || {
+                let config = Config::load().expect("loads");
+                assert!(config.load_dotenv);
+                assert_eq!(
+                    std::env::var("LEV_DOTENV_OPT_IN").ok().as_deref(),
+                    Some("seen")
+                );
+            });
+        }
+        temp_env::with_vars(
+            [
+                ("LEVIATH_SKIP_DOTENV", Some("1")),
+                ("LEVIATH_LOAD_DOTENV", Some("true")),
+            ],
+            || assert!(!dotenv_wanted(true), "skipping wins over both"),
+        );
+        temp_env::with_vars(
+            [
+                ("LEVIATH_SKIP_DOTENV", None),
+                ("LEVIATH_LOAD_DOTENV", Some("TRUE")),
+            ],
+            || assert!(dotenv_wanted(false)),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// `Config::load()` reads `./.env`, and every isolated test sets
     /// `LEVIATH_SKIP_DOTENV` - so that branch would otherwise never run.
@@ -1130,6 +1385,7 @@ mod dotenv_tests {
                         Some(dir.join("config.toml").into_os_string()),
                     ),
                     ("LEVIATH_SKIP_DOTENV", None),
+                    ("LEVIATH_LOAD_DOTENV", Some(std::ffi::OsString::from("1"))),
                     ("LEV_DOTENV_PROBE", None),
                 ],
                 || {
@@ -1176,6 +1432,7 @@ mod dotenv_tests {
                         Some(dir.join("config.toml").into_os_string()),
                     ),
                     ("LEVIATH_SKIP_DOTENV", None),
+                    ("LEVIATH_LOAD_DOTENV", Some(std::ffi::OsString::from("1"))),
                     ("LEVIATH_API_TOKEN", None),
                     ("EDITOR", None),
                     ("LD_PRELOAD", None),
@@ -1238,6 +1495,7 @@ mod dotenv_tests {
                         Some(dir.join("config.toml").into_os_string()),
                     ),
                     ("LEVIATH_SKIP_DOTENV", None),
+                    ("LEVIATH_LOAD_DOTENV", Some(std::ffi::OsString::from("1"))),
                     ("LEV_DOTENV_ORDINARY", None),
                 ],
                 || {
@@ -1298,6 +1556,7 @@ mod dotenv_tests {
                         Some(dir.join("config.toml").into_os_string()),
                     ),
                     ("LEVIATH_SKIP_DOTENV", None),
+                    ("LEVIATH_LOAD_DOTENV", Some(std::ffi::OsString::from("1"))),
                     ("LEV_DOTENV_BACKSLASH", None),
                     ("LEV_DOTENV_AFTER", None),
                 ],
@@ -1341,6 +1600,7 @@ mod dotenv_tests {
                         Some(dir.join("config.toml").into_os_string()),
                     ),
                     ("LEVIATH_SKIP_DOTENV", None),
+                    ("LEVIATH_LOAD_DOTENV", Some(std::ffi::OsString::from("1"))),
                     ("LEV_DOTENV_AWKWARD", None),
                 ],
                 || {
@@ -1574,6 +1834,10 @@ some_custom_thing = \"forwarded to the script\"
     fn every_config_field_is_in_the_published_schema() {
         let schema: serde_json::Value =
             serde_json::from_str(CONFIG_SCHEMA).expect("the schema is JSON");
+        // A key marked `deprecated` is an old name the loader still reads
+        // under its new one, so it is a key the schema allows and no field
+        // declares on purpose. The test below holds every one of them against
+        // the rename table, which is what makes leaving it out here safe.
         let keys_at = |path: &[&str]| -> Vec<String> {
             let mut node = &schema;
             for step in path {
@@ -1582,8 +1846,9 @@ some_custom_thing = \"forwarded to the script\"
             let mut keys: Vec<String> = node
                 .as_object()
                 .expect("an object of properties")
-                .keys()
-                .cloned()
+                .iter()
+                .filter(|(_, spec)| spec["deprecated"] != serde_json::json!(true))
+                .map(|(key, _)| key.clone())
                 .collect();
             keys.sort();
             keys
@@ -1646,6 +1911,12 @@ some_custom_thing = \"forwarded to the script\"
                 "ServeConfig",
                 "src/config/serve.rs",
                 &["properties", "serve", "properties"],
+                true,
+            ),
+            (
+                "MimeConfig",
+                "src/config/mime.rs",
+                &["properties", "mime", "properties"],
                 true,
             ),
             (
@@ -1752,6 +2023,42 @@ some_custom_thing = \"forwarded to the script\"
         assert_eq!(problems, Vec::new());
     }
 
+    /// The schema's deprecated keys and the rename table are the same list.
+    ///
+    /// Both halves are load-bearing. A deprecated key the table does not know
+    /// would validate and then be dropped in silence, and an old name missing
+    /// from the schema would make `lev config check` call a file invalid that
+    /// the loader reads perfectly well.
+    #[test]
+    fn every_deprecated_schema_key_is_a_rename_the_loader_knows() {
+        let schema: serde_json::Value =
+            serde_json::from_str(CONFIG_SCHEMA).expect("the schema is JSON");
+        let deprecated_in = |properties: &serde_json::Value, section: Option<&str>| {
+            properties
+                .as_object()
+                .into_iter()
+                .flatten()
+                .filter(|(_, spec)| spec["deprecated"] == serde_json::json!(true))
+                .map(|(key, _)| (section.map(str::to_owned), key.clone()))
+                .collect::<Vec<_>>()
+        };
+        let mut found = deprecated_in(&schema["properties"], None);
+        for (name, spec) in schema["properties"]
+            .as_object()
+            .expect("the root has properties")
+        {
+            found.extend(deprecated_in(&spec["properties"], Some(name)));
+        }
+        found.sort();
+
+        let mut expected: Vec<_> = renamed::RENAMED_KEYS
+            .iter()
+            .map(|key| (key.section.map(str::to_owned), key.old.to_string()))
+            .collect();
+        expected.sort();
+        assert_eq!(found, expected);
+    }
+
     #[test]
     fn the_config_schema_rejects_a_key_that_is_not_a_setting() {
         // Without `additionalProperties: false` the schema would accept any
@@ -1851,7 +2158,7 @@ some_custom_thing = \"forwarded to the script\"
         let mut config = Config::default();
         config.security.credential_store = leviath_core::CredentialStoreKind::Keychain;
         config.providers.anthropic_api_key = Some("sk-ant-secret".to_string());
-        config.default_model = Some("some-model".to_string());
+        config.override_model = Some("some-model".to_string());
 
         let store = std::sync::Arc::new(leviath_core::MemoryStore::new());
         struct Shared(std::sync::Arc<leviath_core::MemoryStore>);
@@ -2009,11 +2316,11 @@ some_custom_thing = \"forwarded to the script\"
         config.providers.openai_api_key = Some("b".to_string());
         config.providers.google_api_key = Some("c".to_string());
         config.openrouter_api_key = Some("d".to_string());
-        config.default_model = Some("m".to_string());
+        config.override_model = Some("m".to_string());
 
         let stripped = config.without_secrets();
         assert!(stripped.provider_secrets().is_empty(), "no keys survive");
-        assert_eq!(stripped.default_model.as_deref(), Some("m"), "settings do");
+        assert_eq!(stripped.override_model.as_deref(), Some("m"), "settings do");
         assert_eq!(
             config.providers.anthropic_api_key.as_deref(),
             Some("a"),
@@ -2070,37 +2377,90 @@ some_custom_thing = \"forwarded to the script\"
         assert_eq!(config.default_provider, "openai");
     }
 
-    /// `default_model = "ollama/qwen3.8:latest"` next to `default_provider =
+    /// `override_model = "ollama/qwen3.8:latest"` next to `default_provider =
     /// "ollama"` is read as `qwen3.8:latest`; the load names the reading, and
     /// the value in the struct stays as written so `save` does not rewrite a
-    /// file behind the user's back.
+    /// file behind the user's back. `fallback_model` is judged the same way.
     #[test]
-    fn load_from_path_names_a_default_model_qualified_with_its_provider() {
+    fn load_from_path_names_a_user_model_qualified_with_its_provider() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(
             &path,
-            "default_provider = \"ollama\"\ndefault_model = \"ollama/qwen3.8:latest\"\n",
+            "default_provider = \"ollama\"\noverride_model = \"ollama/qwen3.8:latest\"\n\
+             fallback_model = \"ollama/qwen3.5:9b\"\n",
         )
         .unwrap();
         let config = with_tracing(|| Config::load_from_path(&path)).unwrap();
         assert_eq!(
-            config.default_model.as_deref(),
+            config.override_model.as_deref(),
             Some("ollama/qwen3.8:latest")
         );
         assert_eq!(
-            config.qualified_default_model(),
-            Some(("ollama/qwen3.8:latest", "qwen3.8:latest"))
+            config.qualified_user_models(),
+            vec![
+                ("override_model", "ollama/qwen3.8:latest", "qwen3.8:latest"),
+                ("fallback_model", "ollama/qwen3.5:9b", "qwen3.5:9b"),
+            ]
         );
 
-        // A bare id, or no default at all, has nothing to say.
+        // A bare id, or no model at all, has nothing to say.
         let bare = Config {
             default_provider: "ollama".to_string(),
-            default_model: Some("qwen3.8:latest".to_string()),
+            override_model: Some("qwen3.8:latest".to_string()),
             ..Config::default()
         };
-        assert_eq!(bare.qualified_default_model(), None);
-        assert_eq!(Config::default().qualified_default_model(), None);
+        assert!(bare.qualified_user_models().is_empty());
+        assert!(Config::default().qualified_user_models().is_empty());
+    }
+
+    /// A config written before the rename still loads: `default_model` is read
+    /// as `fallback_model`, the load says so, and the old key is not counted
+    /// among the keys nothing reads, because something did.
+    #[test]
+    fn a_legacy_default_model_loads_as_the_fallback_model_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "default_provider = \"ollama\"\ndefault_model = \"qwen3.8:latest\"\n",
+        )
+        .unwrap();
+        let config = with_tracing(|| Config::load_from_path(&path)).unwrap();
+        assert_eq!(config.fallback_model.as_deref(), Some("qwen3.8:latest"));
+        assert_eq!(config.override_model, None);
+        assert!(Config::unread_keys_at(&path).is_empty());
+        let renamed = Config::renamed_keys_at(&path);
+        assert_eq!(renamed.len(), 1);
+        assert_eq!(renamed[0].key.old, "default_model");
+        assert_eq!(renamed[0].value, "\"qwen3.8:latest\"");
+    }
+
+    /// Both names present: the current key is the one the user meant, and the
+    /// old one is reported as unread rather than quietly winning or vanishing.
+    #[test]
+    fn a_legacy_key_beside_its_new_name_is_unread_and_the_new_name_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "default_model = \"old\"\nfallback_model = \"new\"\n").unwrap();
+        let config = with_tracing(|| Config::load_from_path(&path)).unwrap();
+        assert_eq!(config.fallback_model.as_deref(), Some("new"));
+        assert_eq!(
+            Config::unread_keys_at(&path),
+            vec!["default_model".to_string()]
+        );
+        assert_eq!(Config::renamed_keys_at(&path).len(), 1);
+    }
+
+    /// A file that does not read or parse has no renamed keys to report,
+    /// the same way it has no unread ones: that is a different problem.
+    #[test]
+    fn renamed_keys_at_is_empty_for_a_missing_or_broken_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(Config::renamed_keys_at(&dir.path().join("absent.toml")).is_empty());
+        let broken = dir.path().join("broken.toml");
+        std::fs::write(&broken, "default_model = [\n").unwrap();
+        assert!(Config::renamed_keys_at(&broken).is_empty());
     }
 
     #[test]
@@ -2376,6 +2736,39 @@ some_custom_thing = \"forwarded to the script\"
         );
     }
 
+    #[test]
+    fn xai_and_meta_settings_in_the_file_beat_the_environment() {
+        temp_env::with_vars(
+            [
+                ("XAI_API_KEY", Some("xai-env")),
+                ("META_AI_API_KEY", Some("meta-env")),
+                ("XAI_BASE_URL", Some("https://env/xai")),
+                ("META_AI_BASE_URL", Some("https://env/meta")),
+            ],
+            || {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("config.toml");
+                std::fs::write(
+                    &path,
+                    "[providers]\nxai_api_key = \"xai-file\"\nmeta_api_key = \"meta-file\"\n\
+                     xai_base_url = \"https://file/xai\"\nmeta_base_url = \"https://file/meta\"\n",
+                )
+                .unwrap();
+                let config = with_tracing(|| Config::load_from_path(&path)).unwrap();
+                assert_eq!(config.providers.xai_api_key.as_deref(), Some("xai-file"));
+                assert_eq!(config.providers.meta_api_key.as_deref(), Some("meta-file"));
+                assert_eq!(
+                    config.providers.xai_base_url.as_deref(),
+                    Some("https://file/xai")
+                );
+                assert_eq!(
+                    config.providers.meta_base_url.as_deref(),
+                    Some("https://file/meta")
+                );
+            },
+        );
+    }
+
     /// And the file wins over the environment, the same way the keys do - a
     /// checkout that names its gateway is not overruled by whatever the host
     /// happens to export.
@@ -2387,6 +2780,7 @@ some_custom_thing = \"forwarded to the script\"
                 ("OPENAI_BASE_URL", Some("https://gw/from-env")),
                 ("GOOGLE_BASE_URL", Some("https://gw/from-env")),
                 ("OPENROUTER_BASE_URL", Some("https://gw/from-env")),
+                ("MESHY_BASE_URL", Some("https://gw/from-env")),
             ],
             || {
                 let dir = tempfile::tempdir().unwrap();
@@ -2402,6 +2796,7 @@ anthropic_base_url = "https://gw/from-file"
 openai_base_url = "https://gw/from-file"
 google_base_url = "https://gw/from-file"
 openrouter_base_url = "https://gw/from-file"
+meshy_base_url = "https://gw/from-file"
 "#,
                 )
                 .unwrap();
@@ -2413,6 +2808,7 @@ openrouter_base_url = "https://gw/from-file"
                     config.providers.openai_base_url.as_deref(),
                     config.providers.google_base_url.as_deref(),
                     config.providers.openrouter_base_url.as_deref(),
+                    config.providers.meshy_base_url.as_deref(),
                 ] {
                     assert_eq!(got, Some("https://gw/from-file"));
                 }
@@ -2449,6 +2845,7 @@ agent_paths = []
 anthropic_api_key = "sk-ant-existing"
 openai_api_key = "sk-openai-existing"
 google_api_key = "AIza-existing"
+meshy_api_key = "msy-existing"
 "#,
             )
             .unwrap();
@@ -2466,6 +2863,10 @@ google_api_key = "AIza-existing"
             assert_eq!(
                 config.providers.google_api_key.as_deref(),
                 Some("AIza-existing")
+            );
+            assert_eq!(
+                config.providers.meshy_api_key.as_deref(),
+                Some("msy-existing")
             );
             assert_eq!(config.openrouter_api_key.as_deref(), Some("sk-or-existing"));
             assert_eq!(
@@ -2816,6 +3217,10 @@ google_api_key = "AIza-existing"
     fn provider_config_debug_never_prints_the_keys() {
         let providers = ProviderConfig {
             anthropic_api_key: Some("sk-ant-SECRET-VALUE".to_string()),
+            anthropic_headers: std::collections::BTreeMap::from([(
+                "X-Gateway-Token".to_string(),
+                "hdr-SECRET-VALUE".to_string(),
+            )]),
             openai_api_key: Some("sk-openai-SECRET-VALUE".to_string()),
             google_api_key: Some("AIza-SECRET-VALUE".to_string()),
             anthropic_base_url: None,
@@ -2834,6 +3239,9 @@ google_api_key = "AIza-existing"
         // "is it configured" is what a debug line is actually asking.
         assert!(rendered.contains("<set>"), "{rendered}");
         assert!(rendered.contains("claude_code_enabled: true"), "{rendered}");
+        // A header's name says what is configured; its value is a credential
+        // as often as not.
+        assert!(rendered.contains("X-Gateway-Token"), "{rendered}");
 
         let empty = format!(
             "{:?}",
@@ -2854,6 +3262,149 @@ google_api_key = "AIza-existing"
             }
         );
         assert!(empty.contains("<unset>"), "{empty}");
+    }
+
+    /// The Bedrock key rides every keychain path the other keys do, and the
+    /// region, which is not a secret, is printed.
+    #[test]
+    fn the_bedrock_key_travels_through_the_credential_store_like_the_others() {
+        use leviath_core::{CredentialStore, MemoryStore};
+
+        let store = MemoryStore::new();
+        store
+            .set(&leviath_core::provider_account("bedrock"), "ABSK-keychain")
+            .unwrap();
+        let mut config = Config::default();
+        config.apply_credential_store(&store);
+        assert_eq!(
+            config.providers.bedrock_api_key.as_deref(),
+            Some("ABSK-keychain")
+        );
+
+        config.providers.bedrock_region = Some("eu-west-1".to_string());
+        let secrets = config.provider_secrets();
+        assert_eq!(secrets.len(), 1);
+        assert!(secrets.contains(&("provider/bedrock".to_string(), "ABSK-keychain".to_string())));
+        let stripped = config.without_secrets();
+        assert!(stripped.providers.bedrock_api_key.is_none());
+        assert_eq!(
+            stripped.providers.bedrock_region.as_deref(),
+            Some("eu-west-1")
+        );
+        assert!(
+            config.providers.bedrock_api_key.is_some(),
+            "the original keeps its key"
+        );
+
+        let rendered = format!("{:?}", config.providers);
+        assert!(!rendered.contains("ABSK-keychain"), "{rendered}");
+        assert!(
+            rendered.contains("bedrock_api_key: \"<set>\""),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("bedrock_region: Some(\"eu-west-1\")"),
+            "{rendered}"
+        );
+    }
+
+    /// The Bedrock settings follow AWS's own variables when the file is
+    /// silent, the file wins when it is not, and a blank region is no region.
+    #[test]
+    fn bedrock_settings_come_from_the_environment_when_the_file_is_silent() {
+        let dir = tempfile::tempdir().unwrap();
+        let silent = dir.path().join("silent.toml");
+        std::fs::write(
+            &silent,
+            "default_provider = \"anthropic\"\nagent_paths = []\n",
+        )
+        .unwrap();
+        let spoken = dir.path().join("spoken.toml");
+        std::fs::write(
+            &spoken,
+            r#"
+default_provider = "anthropic"
+agent_paths = []
+
+[providers]
+bedrock_api_key = "ABSK-file"
+bedrock_region = "us-west-2"
+bedrock_base_url = "https://gw/from-file"
+"#,
+        )
+        .unwrap();
+
+        temp_env::with_vars(
+            [
+                ("AWS_BEARER_TOKEN_BEDROCK", Some("ABSK-env")),
+                ("AWS_REGION", Some(" eu-central-1 ")),
+                ("AWS_DEFAULT_REGION", Some("ap-south-1")),
+                ("BEDROCK_BASE_URL", Some("https://gw/from-env")),
+            ],
+            || {
+                let config = with_tracing(|| Config::load_from_path(&silent)).unwrap();
+                assert_eq!(
+                    config.providers.bedrock_api_key.as_deref(),
+                    Some("ABSK-env")
+                );
+                assert_eq!(
+                    config.providers.bedrock_region.as_deref(),
+                    Some("eu-central-1")
+                );
+                assert_eq!(
+                    config.providers.bedrock_base_url.as_deref(),
+                    Some("https://gw/from-env")
+                );
+
+                let config = with_tracing(|| Config::load_from_path(&spoken)).unwrap();
+                assert_eq!(
+                    config.providers.bedrock_api_key.as_deref(),
+                    Some("ABSK-file")
+                );
+                assert_eq!(
+                    config.providers.bedrock_region.as_deref(),
+                    Some("us-west-2")
+                );
+                assert_eq!(
+                    config.providers.bedrock_base_url.as_deref(),
+                    Some("https://gw/from-file")
+                );
+            },
+        );
+
+        // `AWS_REGION` set but blank falls through to `AWS_DEFAULT_REGION`;
+        // both blank is no region at all.
+        temp_env::with_vars(
+            [
+                ("AWS_BEARER_TOKEN_BEDROCK", None),
+                ("AWS_REGION", Some("")),
+                ("AWS_DEFAULT_REGION", Some("ap-south-1")),
+                ("BEDROCK_BASE_URL", None),
+            ],
+            || {
+                let config = with_tracing(|| Config::load_from_path(&silent)).unwrap();
+                assert!(config.providers.bedrock_api_key.is_none());
+                // An exported blank `AWS_REGION` is read first and found
+                // empty, so the default-region variable is not consulted;
+                // that matches the AWS tooling, which also stops at the
+                // first variable set.
+                assert_eq!(config.providers.bedrock_region, None);
+                assert!(config.providers.bedrock_base_url.is_none());
+            },
+        );
+        temp_env::with_vars(
+            [
+                ("AWS_REGION", None),
+                ("AWS_DEFAULT_REGION", Some("ap-south-1")),
+            ],
+            || {
+                let config = with_tracing(|| Config::load_from_path(&silent)).unwrap();
+                assert_eq!(
+                    config.providers.bedrock_region.as_deref(),
+                    Some("ap-south-1")
+                );
+            },
+        );
     }
 
     /// A gateway's key and its `extra` table are both credential-carrying:
@@ -2927,6 +3478,7 @@ google_api_key = "AIza-existing"
         for kind in [
             ModelProviderKind::Script,
             ModelProviderKind::OpenaiCompatible,
+            ModelProviderKind::Openai,
         ] {
             assert_eq!(ModelProviderKind::parse(kind.as_str()), Some(kind));
         }
@@ -3051,6 +3603,75 @@ script = \"groq.rhai\"
         assert!(loaded.model_providers["mock"].is_endpoint());
     }
 
+    /// Two Azure resources side by side as `kind = "openai"` entries: each
+    /// loads with its own address, key and auth header, and an entry missing
+    /// either the address or the key is refused naming what to add.
+    #[test]
+    fn openai_host_entries_load_side_by_side_and_refuse_what_they_cannot_use() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[model_providers.azure-east]
+kind = "openai"
+base_url = "https://east.openai.azure.com/openai/v1"
+api_key = "east"
+auth_header = "api-key"
+serves = ["prod-gpt55"]
+
+[model_providers.azure-west]
+kind = "openai"
+base_url = "https://west.azure-api.net/openai/v1"
+api_key = "west"
+headers = { Ocp-Apim-Subscription-Key = "sub" }
+"#,
+        )
+        .unwrap();
+        let loaded = Config::load_from_path(&path).expect("loads");
+        let east = &loaded.model_providers["azure-east"];
+        assert!(east.is_endpoint() && east.is_openai());
+        assert_eq!(east.auth_header().as_deref(), Some("api-key"));
+        assert_eq!(loaded.model_providers["azure-west"].auth_header(), None);
+
+        std::fs::write(
+            &path,
+            "[model_providers.a]\nkind = \"openai\"\napi_key = \"k\"\n",
+        )
+        .unwrap();
+        let err = Config::load_from_path(&path).unwrap_err().to_string();
+        assert!(err.contains("kind = \"openai\" but no base_url"), "{err}");
+
+        std::fs::write(
+            &path,
+            "[model_providers.a]\nkind = \"openai\"\nbase_url = \"https://h/v1\"\n",
+        )
+        .unwrap();
+        let err = Config::load_from_path(&path).unwrap_err().to_string();
+        assert!(err.contains("no api_key"), "{err}");
+
+        std::fs::write(
+            &path,
+            "[model_providers.a]\nkind = \"openai\"\nbase_url = \"https://h/v1\"\n\
+             api_key = \"k\"\nauth_header = \" \"\n",
+        )
+        .unwrap();
+        let err = Config::load_from_path(&path).unwrap_err().to_string();
+        assert!(err.contains("auth_header must name a header"), "{err}");
+
+        std::fs::write(
+            &path,
+            "[model_providers.a]\nkind = \"openai\"\nbase_url = \"https://h/v1\"\n\
+             api_key = \"k\"\nregion = \"east\"\n",
+        )
+        .unwrap();
+        let err = Config::load_from_path(&path).unwrap_err().to_string();
+        assert!(
+            err.contains("kind = \"openai\" and unknown key(s) region"),
+            "{err}"
+        );
+    }
+
     /// An endpoint has no script to forward `extra` to, so a key it does not
     /// read is a misspelling that would otherwise load clean and do nothing:
     /// `modles` leaves the endpoint with no catalogue, `heaeders` sends no
@@ -3085,6 +3706,24 @@ script = \"groq.rhai\"
         assert_eq!(
             loaded.model_providers["groq"].extra["org"],
             toml::Value::String("research".into())
+        );
+
+        // The two retention keys land in `extra` through the flatten and are
+        // read from there, so an endpoint carrying them loads.
+        std::fs::write(
+            &path,
+            "[model_providers.azure]\nkind = \"openai-compatible\"\n\
+             base_url = \"https://r.openai.azure.com/openai/v1\"\n\
+             headers = { api-key = \"k\" }\nretention = \"zero\"\n\
+             zero_retention_request = \"openai\"\n",
+        )
+        .unwrap();
+        let loaded = Config::load_from_path(&path).expect("an endpoint reads its retention keys");
+        let azure = &loaded.model_providers["azure"];
+        assert_eq!(azure.extra["retention"], toml::Value::String("zero".into()));
+        assert_eq!(
+            azure.extra["zero_retention_request"],
+            toml::Value::String("openai".into())
         );
     }
 
@@ -3234,7 +3873,7 @@ script = \"groq.rhai\"
         assert!(config.openrouter_api_key.is_none());
         assert!(config.ollama_base_url.is_none());
         assert!(config.mcp_servers.is_empty());
-        assert!(config.default_model.is_none());
+        assert!(config.override_model.is_none());
         assert!(config.model_capabilities.is_empty());
         assert!(config.tool_permissions.is_empty());
     }
@@ -3301,7 +3940,7 @@ script = \"groq.rhai\"
 default_provider = "openai"
 openrouter_api_key = "sk-or-test"
 ollama_base_url = "http://my-ollama:11434"
-default_model = "gpt-5"
+override_model = "gpt-5"
 agent_paths = []
 
 [providers]
@@ -3334,7 +3973,7 @@ model = "claude-haiku-4-5"
             config.ollama_base_url.as_deref(),
             Some("http://my-ollama:11434")
         );
-        assert_eq!(config.default_model.as_deref(), Some("gpt-5"));
+        assert_eq!(config.override_model.as_deref(), Some("gpt-5"));
         assert!(!config.title.enabled);
         assert_eq!(config.tool_permissions.get("bash"), Some(&ToolPolicy::Deny));
         assert_eq!(
@@ -3365,14 +4004,14 @@ agent_paths = []
         let config: Config = toml::from_str(
             r#"
 default_provider = "openrouter"
-default_model = "openai/gpt-4o-mini"
+override_model = "openai/gpt-4o-mini"
 openrouter_api_key = "sk-or-test"
 "#,
         )
         .expect("a hand-written OpenRouter config parses");
         assert_eq!(config.default_provider, "openrouter");
         assert_eq!(config.openrouter_api_key.as_deref(), Some("sk-or-test"));
-        assert_eq!(config.default_model.as_deref(), Some("openai/gpt-4o-mini"));
+        assert_eq!(config.override_model.as_deref(), Some("openai/gpt-4o-mini"));
     }
 
     #[test]
@@ -3386,7 +4025,8 @@ openrouter_api_key = "sk-or-test"
         assert_eq!(parsed.agent_paths, default.agent_paths);
         assert_eq!(parsed.openrouter_api_key, default.openrouter_api_key);
         assert_eq!(parsed.ollama_base_url, default.ollama_base_url);
-        assert_eq!(parsed.default_model, default.default_model);
+        assert_eq!(parsed.override_model, default.override_model);
+        assert_eq!(parsed.fallback_model, default.fallback_model);
         assert_eq!(parsed.request_timeout_secs, default.request_timeout_secs);
         assert_eq!(
             parsed.providers.anthropic_api_key,
@@ -3440,6 +4080,72 @@ name = "broken"
         let err = Config::load_from_path(&path).expect_err("malformed entry must fail load");
         let msg = err.to_string();
         assert!(msg.contains("broken"), "must name the server: {msg}");
+    }
+
+    /// A server name goes into every one of that server's tool names, so a
+    /// character a provider refuses has to be caught here.
+    ///
+    /// It used to be rewritten instead: `my.tools` became the prefix
+    /// `my_tools`, which is also what a server actually named `my_tools`
+    /// produces. The two servers then fought over one set of tool names and
+    /// the loser's tools were handed a `_2` suffix nobody could predict.
+    #[test]
+    fn load_rejects_an_mcp_server_name_a_provider_would_refuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+default_provider = "anthropic"
+agent_paths = []
+
+[providers]
+
+[[mcp_servers]]
+name = "my.tools"
+command = "echo"
+"#,
+        )
+        .unwrap();
+
+        let err = Config::load_from_path(&path).expect_err("a dotted name must fail load");
+        let msg = err.to_string();
+        assert!(msg.contains("my.tools"), "must name the server: {msg}");
+        assert!(
+            msg.contains("letters, digits"),
+            "must say what is allowed: {msg}"
+        );
+    }
+
+    /// Two entries under one name would claim the same tool names, and only
+    /// whichever connected first would be reachable.
+    #[test]
+    fn load_rejects_two_mcp_servers_with_the_same_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+default_provider = "anthropic"
+agent_paths = []
+
+[providers]
+
+[[mcp_servers]]
+name = "tracker"
+command = "echo"
+
+[[mcp_servers]]
+name = "tracker"
+url = "https://example.com/mcp"
+"#,
+        )
+        .unwrap();
+
+        let err = Config::load_from_path(&path).expect_err("a duplicate name must fail load");
+        let msg = err.to_string();
+        assert!(msg.contains("tracker"), "must name the server: {msg}");
+        assert!(msg.contains("Rename one"), "must say what to do: {msg}");
     }
 
     #[test]
@@ -3847,7 +4553,7 @@ enabled = false
                 ..Default::default()
             },
             openrouter_api_key: Some("sk-or-test".to_string()),
-            default_model: Some("gpt-5".to_string()),
+            override_model: Some("gpt-5".to_string()),
             ..Config::default()
         };
 
@@ -3862,7 +4568,7 @@ enabled = false
             loaded.providers.anthropic_api_key.as_deref(),
             Some("sk-ant-test")
         );
-        assert_eq!(loaded.default_model.as_deref(), Some("gpt-5"));
+        assert_eq!(loaded.override_model.as_deref(), Some("gpt-5"));
     }
 
     #[test]
@@ -3898,6 +4604,9 @@ enabled = false
                 cached_input_per_mtok: Some(0.5),
                 cache_write_per_mtok: Some(6.25),
                 output_per_mtok: Some(25.0),
+                input_types: Some(vec!["text/*".to_string(), "image/*".to_string()]),
+                output_types: None,
+                retention: Some(leviath_providers::retention::Retention::Days(30)),
             },
         );
         let mut tool_perms = HashMap::new();
@@ -3905,6 +4614,9 @@ enabled = false
 
         let config = Config {
             update_check: true,
+            load_dotenv: false,
+            mime: MimeConfig::default(),
+            mime_types: toml::Table::new(),
             default_provider: "anthropic".to_string(),
             providers: ProviderConfig {
                 anthropic_api_key: Some("sk-ant-key".to_string()),
@@ -3925,7 +4637,8 @@ enabled = false
             openrouter_api_key: None,
             ollama_base_url: Some("http://custom:11434".to_string()),
             mcp_servers: vec![],
-            default_model: None,
+            override_model: None,
+            fallback_model: None,
             model_capabilities: model_caps,
             model_providers: HashMap::new(),
             tool_permissions: tool_perms,
@@ -3989,6 +4702,8 @@ enabled = false
                 exporter: TelemetryExporterKind::Stdout,
                 endpoint: Some("http://collector:4318".to_string()),
                 service_name: Some("leviath-prod".to_string()),
+                log_file_max_bytes: leviath_core::config::DEFAULT_LOG_FILE_MAX_BYTES,
+                capture_model_input: false,
             },
             sandbox: Some(leviath_core::ToolSandboxConfig {
                 kind: leviath_core::SandboxKind::Container,
@@ -4014,12 +4729,14 @@ enabled = false
                 read_paths: vec!["~/.leviath/runs".to_string()],
                 credential_store: leviath_core::CredentialStoreKind::Keychain,
                 allow_blueprint_permissions: false,
+                lock_permission_files: false,
                 shell_env: leviath_core::ShellEnvMode::default(),
                 shell_env_withhold: Vec::new(),
             },
             serve: ServeConfig {
                 max_concurrent_requests: 16,
                 request_timeout_secs: 5,
+                max_upload_bytes: crate::config::DEFAULT_MAX_UPLOAD_BYTES,
             },
             agent_read_paths: HashMap::from([(
                 "cto".to_string(),

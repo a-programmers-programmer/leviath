@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Leviath HTTP API",
-    "version": "0.5.8",
+    "version": "0.6.3",
     "description": "The REST and WebSocket surface `lev serve` puts in front of the shared-world daemon. Every route requires a bearer token. Paths here are checked against the router in crates/leviath-cli/src/commands/serve/mod.rs by a test in that file, so a route added without a spec entry fails the build. See https://leviath.dev/docs/api.",
     "license": {
       "name": "MIT"
@@ -49,6 +49,14 @@
     },
     {
       "name": "providers"
+    },
+    {
+      "name": "yolo",
+      "description": "The named profiles behind `lev run --yolo=<name>`."
+    },
+    {
+      "name": "graphql",
+      "description": "One endpoint where the request body names the fields it wants."
     }
   ],
   "paths": {
@@ -262,7 +270,7 @@
           "blueprints"
         ],
         "summary": "Fetch one blueprint",
-        "description": "The catalog entry plus the manifest text, the context regions, and fan_outs: one entry per fan-out stage with its worker source, merge stage and both caps (max_workers, max_items) resolved as the daemon applies them, null meaning unlimited.",
+        "description": "The catalog entry plus the manifest text, the context regions, fan_outs (one entry per fan-out stage with its worker source, merge stage and both caps resolved as the daemon applies them, null meaning unlimited), and stage_routing (one entry per stage that routes the model's produced parts by mime type via output_routing, or empties a region on entry via context.reset).",
         "responses": {
           "200": {
             "$ref": "#/components/responses/Ok"
@@ -378,7 +386,23 @@
             "schema": {
               "type": "string"
             },
-            "description": "Which runs to list by their place in the tree. `none` keeps only runs nobody started, which is what a top-level list wants; a run id keeps that run's direct children. Omitted lists every run, sub-agents included. A run id that names nothing gives an empty page rather than a 404. Announced as `runs.parent`."
+            "description": "Which runs to list by their place in the tree. `none` keeps only runs nobody started, which is what a top-level list wants; `sub` keeps only runs somebody started, at any depth; a run id keeps that run's direct children. Omitted lists every run, sub-agents included. A run id that names nothing gives an empty page rather than a 404. Announced as `runs.parent`."
+          },
+          {
+            "name": "descendant_of",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Every run under this one, at any depth, and not the run itself: the flat read of a whole fan-out, where `parent=` is one level of it. Setting both is a 400, because they name two different sets and the one you meant is not recoverable from the pair."
+          },
+          {
+            "name": "blueprint",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Only runs of this blueprint, by the name each run recorded. A name nothing matches is an empty page rather than an error, because a blueprint with no runs yet is an ordinary answer."
           },
           {
             "name": "sort",
@@ -567,6 +591,89 @@
         }
       }
     },
+    "/api/exports/{id}": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          },
+          "description": "The export job's id, as the `bulkExportRuns` mutation returned it."
+        }
+      ],
+      "get": {
+        "tags": [
+          "runs"
+        ],
+        "summary": "The file one bulk export wrote",
+        "description": "Exports are started over GraphQL, with the `bulkExportRuns` mutation, and this is where the file it writes is fetched. The body is JSONL: one run per line, under the same field names the run listing uses, narrowed to the `fields` the export asked for. One run per line rather than one JSON array so a reader can start on it before the writer has finished, and so neither side ever holds the whole store in memory. A file is kept for one hour and then removed with its job record, so an id that has expired and one that was never started both answer 404. While the export is still queued or running, or after it failed, the answer is 409 and the client polls `bulkExport(id:)` instead. Every response advertises `Accept-Ranges: bytes`; a `Range` header fetches part of the body. Also takes a short-lived signed link in place of the bearer token (`exp` and `sig`, minted as `downloadUrl` on the job), which is what a browser download link needs: a header cannot be set on one.",
+        "parameters": [
+          {
+            "name": "Range",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "A single byte range, `bytes=start-end` (an open end or a `-suffix` too). A well-formed range is answered 206 with `Content-Range`; one past the end is 416. A malformed or multi-range header is ignored and the whole body served."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The export, as `application/jsonl`.",
+            "content": {
+              "application/jsonl": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "206": {
+            "description": "The requested byte range, when a `Range` header asked for one. Carries `Content-Range: bytes start-end/total`.",
+            "content": {
+              "application/jsonl": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "416": {
+            "description": "The `Range` header named bytes the body does not have. Carries `Content-Range: bytes */total`."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "409": {
+            "description": "The export is not ready, or it failed. The message says which, and `bulkExport(id:)` carries the reason.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "500": {
+            "$ref": "#/components/responses/Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/Overloaded"
+          }
+        }
+      }
+    },
     "/api/agents": {
       "get": {
         "tags": [
@@ -613,6 +720,25 @@
               "schema": {
                 "$ref": "#/components/schemas/SpawnAgentReq"
               }
+            },
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "request"
+                ],
+                "properties": {
+                  "request": {
+                    "type": "string",
+                    "description": "The JSON request, as the application/json body would carry it."
+                  },
+                  "part": {
+                    "type": "string",
+                    "format": "binary",
+                    "description": "A file for the task region. Repeatable. Name the field `part:<region>` for another region; the file's `filename` names the part and its `Content-Type` declares the type."
+                  }
+                }
+              }
             }
           }
         },
@@ -641,6 +767,9 @@
           },
           "408": {
             "$ref": "#/components/responses/Timeout"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error"
           },
           "503": {
             "$ref": "#/components/responses/Overloaded"
@@ -707,6 +836,12 @@
         "responses": {
           "204": {
             "description": "Done. No body."
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
@@ -931,6 +1066,302 @@
         }
       }
     },
+    "/api/agents/{id}/files/raw": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/Id"
+        }
+      ],
+      "get": {
+        "tags": [
+          "agents"
+        ],
+        "summary": "A workdir file's bytes, under its own content type",
+        "description": "Where `GET /api/agents/{id}/files?path=` wraps text in JSON, this serves the bytes as they are, typed by the mime registry from the file's bytes and name: an image the run wrote comes back as `image/png`, ready for an `<img>`. Confined to the run's working directory. A path the directory does not hold but the run's result lists as an artifact is served from the run's blob store, so a file a model made and nothing wrote to disk answers here too. `download=1` adds a `Content-Disposition: attachment` naming the file. Every response advertises `Accept-Ranges: bytes`; a `Range` header fetches part of the body. Also takes a short-lived signed link in place of the bearer token (`exp` and `sig`, minted by the GraphQL API), which is what a browser needs for an `<img src>` or a download link: a header cannot be set on either. A signed link opens one path, for five minutes, and nothing else.",
+        "parameters": [
+          {
+            "name": "path",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Workdir-relative path, or an absolute path inside the workdir."
+          },
+          {
+            "name": "download",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
+            },
+            "description": "Ask the browser to save the file rather than show it."
+          },
+          {
+            "name": "Range",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "A single byte range, `bytes=start-end` (an open end or a `-suffix` too), to fetch part of the body for seeking or resuming. A well-formed range is answered 206 with `Content-Range`; one past the end is 416. A malformed or multi-range header is ignored and the whole body served."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The file's bytes, under its mime type.",
+            "content": {
+              "*/*": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "206": {
+            "description": "The requested byte range, when a `Range` header asked for one. Carries `Content-Range: bytes start-end/total`.",
+            "content": {
+              "*/*": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "416": {
+            "description": "The `Range` header named bytes the body does not have. Carries `Content-Range: bytes */total`."
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "503": {
+            "$ref": "#/components/responses/Overloaded"
+          }
+        }
+      }
+    },
+    "/api/agents/{id}/blobs": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/Id"
+        }
+      ],
+      "get": {
+        "tags": [
+          "agents"
+        ],
+        "summary": "The stored parts a run holds",
+        "description": "Every stored part the run's context carries, by sha256: its type, name, size, dimensions, the regions carrying it, and whether the bytes are on disk under the run's `blobs/`. A part a user attached, a file `read_file` stored, an image an MCP tool returned, and an artifact the run submitted all appear here.",
+        "responses": {
+          "200": {
+            "description": "The listing.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BlobListing"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "503": {
+            "$ref": "#/components/responses/Overloaded"
+          }
+        }
+      }
+    },
+    "/api/agents/{id}/blobs/{sha256}": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/Id"
+        },
+        {
+          "name": "sha256",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          },
+          "description": "The part's sha256, 64 lowercase hex characters, as the listing and the run's context give it."
+        }
+      ],
+      "get": {
+        "tags": [
+          "agents"
+        ],
+        "summary": "The bytes of one stored part",
+        "description": "Served under the type the part was stored as, so an image renders in a browser. `download=1` adds a `Content-Disposition: attachment` carrying the part's name. A hash that is not 64 hex characters is refused; one the run does not hold is 404. Every response advertises `Accept-Ranges: bytes`; a `Range` header fetches part of the body. Also takes a short-lived signed link in place of the bearer token (`exp` and `sig`, minted by the GraphQL API), which is what a browser needs for an `<img src>` or a download link: a header cannot be set on either. A signed link opens one path, for five minutes, and nothing else.",
+        "parameters": [
+          {
+            "name": "download",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
+            },
+            "description": "Ask the browser to save the file rather than show it."
+          },
+          {
+            "name": "Range",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "A single byte range, `bytes=start-end` (an open end or a `-suffix` too), to fetch part of the body for seeking or resuming. A well-formed range is answered 206 with `Content-Range`; one past the end is 416. A malformed or multi-range header is ignored and the whole body served."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The bytes, under the part's mime type.",
+            "content": {
+              "*/*": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "206": {
+            "description": "The requested byte range, when a `Range` header asked for one. Carries `Content-Range: bytes start-end/total`.",
+            "content": {
+              "*/*": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "416": {
+            "description": "The `Range` header named bytes the body does not have. Carries `Content-Range: bytes */total`."
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "503": {
+            "$ref": "#/components/responses/Overloaded"
+          }
+        }
+      }
+    },
+    "/api/agents/{id}/artifacts/{name}": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/Id"
+        },
+        {
+          "name": "name",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          },
+          "description": "The artifact's name, as the result route lists it under `final_output.artifacts`."
+        }
+      ],
+      "get": {
+        "tags": [
+          "agents"
+        ],
+        "summary": "The bytes of one file the run handed back",
+        "description": "Follows the artifact the way the runtime does: the run's blob store by hash first, so a file a model made and nothing wrote to the working directory is served, then the working directory. Served under the artifact's own mime type; `download=1` adds a `Content-Disposition: attachment` carrying its file name. A run that has not handed back a result, or one with no artifact of that name, is 404. Every response advertises `Accept-Ranges: bytes`; a `Range` header fetches part of the body. Also takes a short-lived signed link in place of the bearer token (`exp` and `sig`, minted by the GraphQL API), which is what a browser needs for an `<img src>` or a download link: a header cannot be set on either. A signed link opens one path, for five minutes, and nothing else.",
+        "parameters": [
+          {
+            "name": "download",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
+            },
+            "description": "Ask the browser to save the file rather than show it."
+          },
+          {
+            "name": "Range",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "A single byte range, `bytes=start-end` (an open end or a `-suffix` too). A well-formed range is answered 206 with `Content-Range`; one past the end is 416. A malformed or multi-range header is ignored and the whole body served."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The bytes, under the artifact's mime type.",
+            "content": {
+              "*/*": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "206": {
+            "description": "The requested byte range, when a `Range` header asked for one. Carries `Content-Range: bytes start-end/total`.",
+            "content": {
+              "*/*": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "416": {
+            "description": "The `Range` header named bytes the body does not have. Carries `Content-Range: bytes */total`."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "503": {
+            "$ref": "#/components/responses/Overloaded"
+          }
+        }
+      }
+    },
     "/api/agents/{id}/logs": {
       "parameters": [
         {
@@ -1080,6 +1511,12 @@
           "204": {
             "description": "Done. No body."
           },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
           },
@@ -1106,6 +1543,12 @@
         "responses": {
           "204": {
             "description": "Done. No body."
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
@@ -1137,11 +1580,42 @@
               "schema": {
                 "type": "object",
                 "required": [
-                  "content"
+                  "message"
                 ],
                 "properties": {
-                  "content": {
-                    "type": "string"
+                  "message": {
+                    "type": "string",
+                    "description": "The text. A `@path` token attaches that workdir file to the same entry."
+                  },
+                  "target_region": {
+                    "type": "string",
+                    "description": "The region to land in; the conversation when absent."
+                  },
+                  "parts": {
+                    "type": "array",
+                    "items": {
+                      "$ref": "#/components/schemas/PartRef"
+                    },
+                    "description": "Files already inside the run's working directory to send with the message."
+                  }
+                }
+              }
+            },
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "request"
+                ],
+                "properties": {
+                  "request": {
+                    "type": "string",
+                    "description": "The JSON request, as the application/json body would carry it."
+                  },
+                  "part": {
+                    "type": "string",
+                    "format": "binary",
+                    "description": "A file to send beside the message. Repeatable; `part:<region>` aims one at another region."
                   }
                 }
               }
@@ -1152,11 +1626,23 @@
           "202": {
             "description": "Accepted: the daemon holds it, and the work happens after the response."
           },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
           },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
           "408": {
             "$ref": "#/components/responses/Timeout"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error"
           },
           "503": {
             "$ref": "#/components/responses/Overloaded"
@@ -1208,17 +1694,93 @@
           "401": {
             "$ref": "#/components/responses/Unauthorized"
           },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
           "404": {
             "$ref": "#/components/responses/Error"
           },
           "408": {
             "$ref": "#/components/responses/Timeout"
           },
+          "413": {
+            "$ref": "#/components/responses/Error"
+          },
           "503": {
             "$ref": "#/components/responses/Overloaded"
           }
         },
-        "description": "Body: `request_id` (the open request's id) plus one of `value`, `choice_index`, or `approved` with an optional `scope` (`once`, `stage`, `session`). A deny (`approved: false`) may carry `feedback`, a string the model reads inside the tool result for the refused call: `[denied] User declined tool call '<tool>'. Feedback: <text>`. `feedback` beside `approved: true` is a 400. 202 once the daemon holds the answer, 404 when nothing with that id is open. Announced as `interaction.feedback`."
+        "description": "Body: `request_id` (the open request's id) plus one of `value`, `choice_index`, or `approved` with an optional `scope` (`once`, `stage`, `session`). A deny (`approved: false`) may carry `feedback`, a string the model reads inside the tool result for the refused call: `[denied] User declined tool call '<tool>'. Feedback: <text>`. `feedback` beside `approved: true` is a 400. 202 once the daemon holds the answer, 404 when nothing with that id is open. Announced as `interaction.feedback`.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "request_id"
+                ],
+                "properties": {
+                  "request_id": {
+                    "type": "string",
+                    "description": "The interaction to answer, from GET."
+                  },
+                  "value": {
+                    "type": "string",
+                    "description": "A free-text or edited answer. A `@path` token attaches that workdir file."
+                  },
+                  "choice_index": {
+                    "type": "integer",
+                    "description": "The chosen option, zero-based, for a multiple-choice or tool-approval prompt."
+                  },
+                  "approved": {
+                    "type": "boolean",
+                    "description": "Whether a tool approval or a confirmation is granted."
+                  },
+                  "scope": {
+                    "type": "string",
+                    "enum": [
+                      "once",
+                      "stage",
+                      "session"
+                    ],
+                    "description": "How long a grant holds: this call, this stage, or the whole run (`session`)."
+                  },
+                  "feedback": {
+                    "type": "string",
+                    "description": "On a deny, what the model should do instead."
+                  },
+                  "parts": {
+                    "type": "array",
+                    "items": {
+                      "$ref": "#/components/schemas/PartRef"
+                    },
+                    "description": "Files already inside the run's working directory to send with a text answer."
+                  }
+                }
+              }
+            },
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "request"
+                ],
+                "properties": {
+                  "request": {
+                    "type": "string",
+                    "description": "The JSON request, as the application/json body would carry it."
+                  },
+                  "part": {
+                    "type": "string",
+                    "format": "binary",
+                    "description": "A file to send beside a text answer. Repeatable; `part:<region>` aims one at another region."
+                  }
+                }
+              }
+            }
+          }
+        }
       }
     },
     "/api/providers": {
@@ -1227,9 +1789,50 @@
           "providers"
         ],
         "summary": "Providers that sign in with a browser, and whether they are signed in",
+        "parameters": [
+          {
+            "name": "quota",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            },
+            "description": "Read each signed-in subscription's usage too, into its `quota` field."
+          },
+          {
+            "name": "refresh",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            },
+            "description": "Read the accounts again and wait for them, rather than answering from the reading the server keeps. For a console's \"check again\"; means nothing without `quota=true`."
+          }
+        ],
         "responses": {
           "200": {
-            "$ref": "#/components/responses/Ok"
+            "description": "Success. With `quota=true` the reports come from a reading the server keeps: the accounts are asked once, side by side, each given five seconds, and the answer is served for a minute (fifteen seconds when an account could not be read). An account that does not answer carries `{\"error\": ...}` and never holds the response.",
+            "headers": {
+              "X-Leviath-Quota-Age": {
+                "description": "Seconds since the accounts were read. Only with `quota=true`.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "X-Leviath-Quota-Complete": {
+                "description": "Whether every account answered when they were read. `false` names no provider; the per-provider `quota.error` does. Only with `quota=true`.",
+                "schema": {
+                  "type": "boolean"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
@@ -1244,7 +1847,7 @@
             "$ref": "#/components/responses/Overloaded"
           }
         },
-        "description": "Reports `enabled` (what `config.toml` says) and `signed_in` (whether a grant is stored) separately, because either can be true alone and a provider that is enabled without a sign-in fails every run. While a sign-in is in flight `signin` carries `{\"state\": \"waiting\", \"authorize_url\": ...}`; after one fails it carries `{\"state\": \"failed\", \"message\": ...}` until the next attempt, and it is absent when there is neither. Open to any caller: it discloses the account address and plan tier, the same facts `lev auth status` prints, and no token."
+        "description": "Reports `enabled` (what `config.toml` says) and `signed_in` (whether a grant is stored) separately, because either can be true alone and a provider that is enabled without a sign-in fails every run. While a sign-in is in flight `signin` carries `{\"state\": \"waiting\", \"authorize_url\": ...}`; after one fails it carries `{\"state\": \"failed\", \"message\": ...}` until the next attempt, and it is absent when there is neither. Open to any caller: it discloses the account address and plan tier, the same facts `lev auth status` prints, and no token. With `?quota=true`, each enabled, signed-in provider also carries `quota`: `{\"report\": {\"plan\", \"windows\": [{\"label\", \"used_percent\" or \"used\", \"limit\", \"unit\", \"resets_at\"}], \"balance\", \"limit_reached\"}}`, or `{\"error\": ...}` when the account could not be read. Off by default: it is a reading of the accounts rather than of this machine. The reading is kept, so a providers page can ask every time it opens; `X-Leviath-Quota-Age` and `X-Leviath-Quota-Complete` say how old it is and whether every account answered, and `?refresh=1` reads them again. Announced as the `providers.quota` capability."
       }
     },
     "/api/providers/{name}/login": {
@@ -1586,6 +2189,186 @@
         }
       }
     },
+    "/api/mime": {
+      "get": {
+        "tags": [
+          "config"
+        ],
+        "summary": "The effective mime registry",
+        "description": "Every row of the mime registry this server resolves types with, keys sorted, each with where it came from: `builtin`, `config` (`[mime_types]` in config.toml), or the blueprint or provider that added it. A row names only what it sets, so a `family`, `text` or `extensions` that is absent is inherited from the pattern rows above it.",
+        "responses": {
+          "200": {
+            "description": "The listing.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MimeListing"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "503": {
+            "$ref": "#/components/responses/Overloaded"
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "config"
+        ],
+        "summary": "Add or update a mime row",
+        "description": "Write a row into `mime_types.toml` beside the config, or set the given fields on the row already there. Admin-only (needs `--allow-admin`; otherwise 405). Every field but `mime_type` is optional, and only the fields sent are changed. Validated the way `lev mime add` is: a type that is not `type/subtype`, a token rule that names none or more than one of `per_byte`/`per_pixel`/`per_second`/`fixed`, a `magic` that is not hex, or a `check` script that will not compile is a 400 and nothing is written. Announced as `mime.write`.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "mime_type"
+                ],
+                "properties": {
+                  "mime_type": {
+                    "type": "string",
+                    "description": "`type/subtype`, or `type/*` for a whole family."
+                  },
+                  "family": {
+                    "type": "string"
+                  },
+                  "text": {
+                    "type": "boolean"
+                  },
+                  "tokens": {
+                    "type": "object",
+                    "description": "One of `{ per_byte }`, `{ per_pixel, max? }`, `{ per_second }`, `{ per_page }` or `{ fixed }`.",
+                    "properties": {
+                      "per_byte": {
+                        "type": "number"
+                      },
+                      "per_pixel": {
+                        "type": "integer"
+                      },
+                      "per_second": {
+                        "type": "integer"
+                      },
+                      "per_page": {
+                        "type": "integer"
+                      },
+                      "fixed": {
+                        "type": "integer"
+                      },
+                      "max": {
+                        "type": "integer"
+                      }
+                    }
+                  },
+                  "extensions": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "magic": {
+                    "type": "string",
+                    "description": "A hex prefix that identifies the bytes."
+                  },
+                  "stand_in": {
+                    "type": "string"
+                  },
+                  "check": {
+                    "type": "string",
+                    "description": "A Rhai check script path; an empty string lifts a broader row's check."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The row was written.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "mime_type": {
+                      "type": "string"
+                    },
+                    "created": {
+                      "type": "boolean",
+                      "description": "True when the row was new, false when it updated one already there."
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "405": {
+            "$ref": "#/components/responses/NotMounted"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "503": {
+            "$ref": "#/components/responses/Overloaded"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "config"
+        ],
+        "summary": "Remove a mime row",
+        "description": "Take a row out of `mime_types.toml` beside the config. Admin-only (needs `--allow-admin`; otherwise 405). A type with no row there is a 404. Announced as `mime.write`.",
+        "parameters": [
+          {
+            "name": "mime_type",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "`type/subtype` or `type/*`."
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Removed. No body."
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "405": {
+            "$ref": "#/components/responses/NotMounted"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "503": {
+            "$ref": "#/components/responses/Overloaded"
+          }
+        }
+      }
+    },
     "/api/doctor/live": {
       "post": {
         "tags": [
@@ -1605,6 +2388,404 @@
           },
           "409": {
             "description": "Another live doctor run is already in progress"
+          },
+          "503": {
+            "$ref": "#/components/responses/Overloaded"
+          }
+        }
+      }
+    },
+    "/api/yolo": {
+      "get": {
+        "tags": [
+          "yolo"
+        ],
+        "summary": "The profiles behind `--yolo=<name>`",
+        "description": "Lists `yolo.toml` as it stands, the same file a spawn reads: where it is, whether it exists and loads, and each profile's default, its three human knobs (`questions`, `checkpoints`, `gate`) and how many tool and shell rules of each kind it has. A file that does not load comes back with `exists: true`, an `error` naming the line, and no profiles, because that is what a spawn naming one would be refused with.",
+        "responses": {
+          "200": {
+            "description": "The listing.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "path": {
+                      "type": "string",
+                      "description": "The `yolo.toml` the profiles are read from."
+                    },
+                    "exists": {
+                      "type": "boolean"
+                    },
+                    "error": {
+                      "type": "string",
+                      "description": "Why the file does not load, when it does not; the profiles are then empty. Absent while it loads."
+                    },
+                    "profiles": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "name": {
+                            "type": "string"
+                          },
+                          "default": {
+                            "type": "string",
+                            "enum": [
+                              "allow",
+                              "ask"
+                            ]
+                          },
+                          "questions": {
+                            "type": "string",
+                            "enum": [
+                              "ask",
+                              "auto"
+                            ]
+                          },
+                          "checkpoints": {
+                            "type": "string",
+                            "enum": [
+                              "ask",
+                              "auto"
+                            ]
+                          },
+                          "gate": {
+                            "type": "string",
+                            "enum": [
+                              "ask",
+                              "auto"
+                            ]
+                          },
+                          "tool_rules": {
+                            "type": "array",
+                            "items": {
+                              "type": "integer"
+                            },
+                            "description": "`[allow, ask, deny]` entry counts."
+                          },
+                          "shell_rules": {
+                            "type": "array",
+                            "items": {
+                              "type": "integer"
+                            },
+                            "description": "`[allow, ask, deny]` rule counts."
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "503": {
+            "$ref": "#/components/responses/Overloaded"
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "yolo"
+        ],
+        "summary": "Replace `yolo.toml`",
+        "description": "Admin only. Mounted only when `lev serve --allow-admin` is passed: a profile is a grant of permissions, so writing the file is the same category of act as writing the config. The text is parsed and compiled first, and a save that would not load answers 400 with the same message a spawn would give, leaving the file on disk as it was. Answers with the listing `GET` returns.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "text"
+                ],
+                "properties": {
+                  "text": {
+                    "type": "string",
+                    "description": "The whole file, as TOML."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The listing.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "path": {
+                      "type": "string",
+                      "description": "The `yolo.toml` the profiles are read from."
+                    },
+                    "exists": {
+                      "type": "boolean"
+                    },
+                    "error": {
+                      "type": "string",
+                      "description": "Why the file does not load, when it does not; the profiles are then empty. Absent while it loads."
+                    },
+                    "profiles": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "name": {
+                            "type": "string"
+                          },
+                          "default": {
+                            "type": "string",
+                            "enum": [
+                              "allow",
+                              "ask"
+                            ]
+                          },
+                          "questions": {
+                            "type": "string",
+                            "enum": [
+                              "ask",
+                              "auto"
+                            ]
+                          },
+                          "checkpoints": {
+                            "type": "string",
+                            "enum": [
+                              "ask",
+                              "auto"
+                            ]
+                          },
+                          "gate": {
+                            "type": "string",
+                            "enum": [
+                              "ask",
+                              "auto"
+                            ]
+                          },
+                          "tool_rules": {
+                            "type": "array",
+                            "items": {
+                              "type": "integer"
+                            },
+                            "description": "`[allow, ask, deny]` entry counts."
+                          },
+                          "shell_rules": {
+                            "type": "array",
+                            "items": {
+                              "type": "integer"
+                            },
+                            "description": "`[allow, ask, deny]` rule counts."
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "405": {
+            "$ref": "#/components/responses/NotMounted"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "503": {
+            "$ref": "#/components/responses/Overloaded"
+          }
+        }
+      }
+    },
+    "/api/yolo/test": {
+      "post": {
+        "tags": [
+          "yolo"
+        ],
+        "summary": "What a profile would decide for one call",
+        "description": "The same code path a run takes, without running anything, so the answer here is the run's answer. `command` is for the shell; any other tool takes `arguments` as an object. `workdir` is where relative paths resolve, defaulting to the server's own. `configured` (`allow`, `ask`, `deny`) stands in for what the config layers resolve the tool to, otherwise that is read from the config in force; `kind` (`builtin`, `subagent`, `script`, `mcp`) says where the tool comes from for `@group` rules, otherwise it is guessed from the name; `allowed` decides as if `--allow <tool>` had been passed.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "profile",
+                  "tool"
+                ],
+                "properties": {
+                  "profile": {
+                    "type": "string"
+                  },
+                  "tool": {
+                    "type": "string"
+                  },
+                  "command": {
+                    "type": "string"
+                  },
+                  "arguments": {
+                    "type": "object"
+                  },
+                  "workdir": {
+                    "type": "string"
+                  },
+                  "configured": {
+                    "type": "string",
+                    "enum": [
+                      "allow",
+                      "ask",
+                      "deny"
+                    ]
+                  },
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "builtin",
+                      "subagent",
+                      "script",
+                      "mcp"
+                    ]
+                  },
+                  "allowed": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The decision.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "profile": {
+                      "type": "string"
+                    },
+                    "tool": {
+                      "type": "string"
+                    },
+                    "configured": {
+                      "type": "string",
+                      "enum": [
+                        "allow",
+                        "ask",
+                        "deny"
+                      ],
+                      "description": "What the config layers resolved the tool to, before the profile."
+                    },
+                    "policy": {
+                      "type": "string",
+                      "enum": [
+                        "allow",
+                        "ask",
+                        "deny"
+                      ],
+                      "description": "What the run would do: run it unprompted, open the ordinary approval prompt, or refuse it."
+                    },
+                    "reason": {
+                      "type": "string",
+                      "description": "The rule, the config, or the profile default that decided it."
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "503": {
+            "$ref": "#/components/responses/Overloaded"
+          }
+        }
+      }
+    },
+    "/api/yolo/{name}": {
+      "get": {
+        "tags": [
+          "yolo"
+        ],
+        "summary": "One profile in full",
+        "description": "`{\"name\", \"spec\", \"holds\"}`: the profile as parsed (the same keys the file has) and the list of things it still puts to a person, as `lev run` prints before a profiled run starts. 404 for a name the file does not have and for no file at all; 422 when the file does not load.",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The profile.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "name": {
+                      "type": "string"
+                    },
+                    "spec": {
+                      "type": "object"
+                    },
+                    "holds": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
           },
           "503": {
             "$ref": "#/components/responses/Overloaded"
@@ -1653,7 +2834,10 @@
                   "agents": {
                     "type": "boolean"
                   },
-                  "migrations": {
+                  "keys": {
+              "type": "boolean"
+            },
+            "migrations": {
                     "type": "boolean"
                   }
                 },
@@ -1877,24 +3061,59 @@
                   "default_provider": {
                     "type": "string"
                   },
-                  "default_model": {
+                  "override_model": {
                     "type": [
                       "string",
                       "null"
                     ],
-                    "description": "Three states, unlike every other field here. Absent leaves the setting alone; `null` clears it, so each blueprint picks its own model per stage again; a string pins that model across every stage. An empty string is a 400, not a clear: `\"\"` is not a model id, and a form that posts its empty box should be told rather than silently lose the setting."
+                    "description": "Three states, unlike most fields here. Absent leaves the setting alone; `null` clears it, so each blueprint picks its own model per stage again; a string pins that model across every stage that allows a user default. An empty string is a 400, not a clear: `\"\"` is not a model id, and a form that posts its empty box should be told rather than silently lose the setting."
+                  },
+                  "fallback_model": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "description": "The model a stage falls back to when none of the models it names is configured on this machine. Same three states and the same empty-string refusal as `override_model`."
                   },
                   "anthropic_key": {
-                    "type": "string"
+                    "type": ["string", "null"],
+                    "description": "Three states like `override_model`: absent leaves the key alone, null clears it and takes the provider out of this install, a string sets it. An empty string is a 400."
                   },
                   "openai_key": {
-                    "type": "string"
+                    "type": ["string", "null"],
+                    "description": "Same three states as `anthropic_key`."
                   },
                   "google_key": {
-                    "type": "string"
+                    "type": ["string", "null"],
+                    "description": "Same three states as `anthropic_key`."
+                  },
+                  "xai_key": {
+                    "type": ["string", "null"],
+                    "description": "An xAI API key, which starts `xai-`. Same three states as `anthropic_key`."
+                  },
+                  "meta_key": {
+                    "type": ["string", "null"],
+                    "description": "A Meta Model API key. Same three states as `anthropic_key`."
                   },
                   "openrouter_key": {
-                    "type": "string"
+                    "type": ["string", "null"],
+                    "description": "Same three states as `anthropic_key`."
+                  },
+                  "grok_enabled": {
+                    "type": "boolean",
+                    "description": "Bill Grok to a SuperGrok or X Premium+ subscription. Flips the switch only; the sign-in is `POST /api/providers/grok/login`."
+                  },
+                  "file_uploads": {
+                    "type": "boolean",
+                    "description": "Upload large parts to a provider's file storage once and name them by id. Zero data retention turns uploads off whatever this says."
+                  },
+                  "bedrock_key": {
+                    "type": ["string", "null"],
+                    "description": "An AWS Bedrock API key, sent as a bearer token. Not an AWS access key. Same three states as `anthropic_key`."
+                  },
+                  "bedrock_region": {
+                    "type": "string",
+                    "description": "The AWS region Bedrock is called in. An empty string is a 400."
                   },
                   "ollama_base_url": {
                     "type": "string"
@@ -1915,7 +3134,8 @@
                           "type": "string",
                           "enum": [
                             "script",
-                            "openai-compatible"
+                            "openai-compatible",
+                            "openai"
                           ],
                           "description": "Absent leaves the existing kind; an entry created without one is a script."
                         },
@@ -2037,15 +3257,48 @@
               "type": "string"
             },
             "description": "Only models this provider serves. `openai` and `codex` serve the same model ids and bill to different places, so `provider` and `id` together are the key, not `id` alone. A provider this machine has not configured lists nothing rather than 404ing."
+          },
+          {
+            "name": "refresh",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            },
+            "description": "Ask the providers again and wait for them, rather than answering from the catalogue the server keeps. For a settings page that has just changed something."
           }
         ],
         "tags": [
           "config"
         ],
-        "summary": "Models this install can reach",
+        "summary": "Models this install can reach, from the server's catalogue",
         "responses": {
           "200": {
-            "$ref": "#/components/responses/Ok"
+            "description": "Success. The listing comes from a catalogue the server keeps; the providers are asked once per config and then behind the answer. A model's `pricing` may carry `long_context` (`threshold_tokens` and the rates a whole request is billed at once its prompt reaches it) and, for an image, video or speech model, `unit` (`usd` per `image`, `video_second`, `audio_hour`, `million_chars` or `clip`).",
+            "headers": {
+              "X-Leviath-Catalog-Age": {
+                "description": "Seconds since the listing was built.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "X-Leviath-Catalog-Complete": {
+                "description": "Whether every provider answered when the listing was built. `false` means one timed out, errored or could not be built, and its models are absent.",
+                "schema": {
+                  "type": "boolean"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "object"
+                  }
+                }
+              }
+            }
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
@@ -2088,6 +3341,60 @@
         }
       }
     },
+    "/graphql": {
+      "post": {
+        "tags": [
+          "graphql"
+        ],
+        "summary": "Run a GraphQL query",
+        "description": "The GraphQL surface of this server. It runs over the same core the REST routes call, so it is not a wrapper around them. One request names exactly the fields it wants, at every depth: a view that costs a listing plus one request per run over REST is a single request here, and a field nobody selected is never read from disk. The schema is published beside this spec as `leviath.graphql`, and introspection answers the same thing live. A failure inside a field answers 200 with an `errors` array, each entry carrying `extensions.code` (`BAD_USER_INPUT`, `NOT_FOUND`, `CONFLICT`, `DAEMON_UNAVAILABLE`, `DAEMON_INCOMPATIBLE`, `INTERNAL`) and `extensions.httpStatus`, the status the matching REST route answers with. The statuses below are the transport ones, answered by the layers around the handler before any query runs.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "query"
+                ],
+                "properties": {
+                  "query": {
+                    "type": "string",
+                    "description": "The GraphQL document to run."
+                  },
+                  "operationName": {
+                    "type": ["string", "null"],
+                    "description": "Which operation to run, for a document carrying several."
+                  },
+                  "variables": {
+                    "type": ["object", "null"],
+                    "additionalProperties": true,
+                    "description": "Values for the document's variables."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Ok"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "503": {
+            "$ref": "#/components/responses/Overloaded"
+          }
+        }
+      }
+    },
     "/ws": {
       "get": {
         "tags": [
@@ -2095,6 +3402,33 @@
         ],
         "summary": "Event stream for every run",
         "description": "A WebSocket upgrade, not a JSON response. Authenticate with `?token=` since a browser cannot set a header on the handshake. Each frame is a ServerEvent. Frames about the machine rather than a run - `daemon_link` and `config_health` - arrive here. `config_health` is sent when `config.toml` stops loading, when it loads again, and when it is still broken for a different reason than the last frame gave, carrying the same error shape `GET /api/config` reports.",
+        "parameters": [
+          {
+            "name": "token",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "101": {
+            "description": "Switching protocols."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/ws/graphql": {
+      "get": {
+        "tags": [
+          "graphql"
+        ],
+        "summary": "Subscribe to the live frames over GraphQL",
+        "description": "A WebSocket upgrade speaking `graphql-transport-ws` (the older `graphql-ws` protocol is accepted too), not a JSON response. Authenticate with `?token=` since a browser cannot set a header on the handshake. The difference from `/ws`: a subscription names the frame types it wants and the runs it is about, and the filtering happens on the server, before a frame is serialized. `includeDescendants` widens a run-scoped subscription to the sub-agents of those runs as they spawn, so a fan-out needs no re-subscribe. A subscription that falls behind receives an `EventsDropped` frame saying how many frames it missed, rather than silently skipping them.",
         "parameters": [
           {
             "name": "token",
@@ -2198,7 +3532,7 @@
           "scripts"
         ],
         "summary": "Tools an agent on this machine can call",
-        "description": "Built-ins, sub-agent tools, the named agent's own `tools/*.rhai` and the global ones, each with a `source`. `skipped` carries the `.rhai` files that were found and could not be offered, with the reason. MCP tools are not included; `/api/mcp/servers/{name}` answers for those.",
+        "description": "Built-ins, sub-agent tools, the named agent's own `tools/*.rhai` and the global ones, each with a `source`. `groups` lists the tokens `available_tools` accepts in place of names (`@all`, `@builtin`, `@subagent`, `@scripts`, `@mcp`), each with a one-line description, so a picker can offer a whole kind at once. `skipped` carries the `.rhai` files that were found and could not be offered, with the reason. MCP tools are not included; `/api/mcp/servers/{name}` answers for those.",
         "parameters": [
           {
             "name": "agent",
@@ -2231,7 +3565,7 @@
           "scripts"
         ],
         "summary": "Rhai scripts this scope can see",
-        "description": "Script tools from the agent's `tools/` and the global directory, the region hooks, stage hooks and output validators the agent's manifest declares, and the model providers in `~/.leviath/providers`. Each entry carries its kind, its source (`agent` or `global`), a `declared` flag and whether it compiles right now; an agent-scoped entry also carries `relative_path`, where the file sits relative to the agent's own directory, which is the spelling a manifest wants. A provider also carries a `provider` object with what its `// @` annotations declare. Providers are listed with or without `agent`, since nothing scopes one to an agent.",
+        "description": "Script tools from the agent's `tools/` and the global directory, the region hooks, stage hooks, output validators and mime checks the agent's manifest declares, the mime checks the operator's `mime_types.toml` and `[mime_types]` rows name (resolved against the config's directory), and the model providers in `~/.leviath/providers`. Each entry carries its kind, its source (`agent` or `global`), a `declared` flag and whether it compiles right now; an agent-scoped entry also carries `relative_path`, where the file sits relative to the agent's own directory, which is the spelling a manifest wants. A provider also carries a `provider` object with what its `// @` annotations declare. Providers are listed with or without `agent`, since nothing scopes one to an agent.",
         "parameters": [
           {
             "name": "agent",
@@ -2316,6 +3650,7 @@
                 "region_hook",
                 "stage_hook",
                 "output_validator",
+                "mime_check",
                 "provider"
               ]
             }
@@ -2371,6 +3706,7 @@
                 "region_hook",
                 "stage_hook",
                 "output_validator",
+                "mime_check",
                 "provider"
               ]
             }
@@ -2432,6 +3768,7 @@
                 "region_hook",
                 "stage_hook",
                 "output_validator",
+                "mime_check",
                 "provider"
               ]
             }
@@ -2601,6 +3938,11 @@
             "type": "boolean",
             "default": false
           },
+          "capture_model_input": {
+            "type": "boolean",
+            "default": false,
+            "description": "Write this run's exact requests into its journal, once per provider attempt, whatever the machine's own [observability] capture_model_input says. A captured request is the whole prompt and there is no size cap, so the journal grows by roughly the context size per attempt. Read it back on InferenceAttempt.modelInput over GraphQL."
+          },
           "workdir": {
             "type": "string",
             "description": "Confined to --workdir-root when the server sets one."
@@ -2637,6 +3979,13 @@
           "callback_secret": {
             "type": "string",
             "description": "Shared secret for the HMAC-SHA256 signature on that callback."
+          },
+          "parts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PartRef"
+            },
+            "description": "Files already inside the working directory to attach as typed parts. A `multipart/form-data` body carries files instead: a `request` field holding this JSON, then any number of file fields named `part` (bound for the task region) or `part:<region>`, each with a `filename` and a `Content-Type`. A `@path` token inside `task` or a region's text attaches that file too, resolved inside the working directory, and the text keeps the token."
           }
         }
       },
@@ -2727,7 +4076,7 @@
               "string",
               "null"
             ],
-            "description": "Whatever shape was asked for: \"markdown\", \"json\", \"a2ui\", a media type, anything. Not a closed set."
+            "description": "Whatever shape was asked for: \"markdown\", \"json\", \"a2ui\", a mime type, anything. Not a closed set."
           },
           "stage": {
             "type": "string",
@@ -2745,9 +4094,40 @@
           "artifacts": {
             "type": "array",
             "items": {
-              "type": "string"
+              "$ref": "#/components/schemas/Artifact"
             },
-            "description": "Files the run produced, as workdir-relative paths. An answer is one model response, so anything larger is a file named here. Fetch one with GET /api/agents/{id}/files?path=."
+            "description": "Files the run produced, typed and hashed. An answer is one model response, so anything larger is a file named here. Fetch one with GET /api/agents/{id}/files?path=."
+          }
+        }
+      },
+      "Artifact": {
+        "type": "object",
+        "required": [
+          "name",
+          "path",
+          "mime_type",
+          "size"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The name the stage declared for it, or the file name."
+          },
+          "path": {
+            "type": "string",
+            "description": "The file, relative to the run's working directory."
+          },
+          "mime_type": {
+            "type": "string",
+            "description": "Its mime type, from the registry or as declared."
+          },
+          "size": {
+            "type": "integer",
+            "description": "Size in bytes."
+          },
+          "sha256": {
+            "type": "string",
+            "description": "The hash the run's blob store holds the bytes under. Absent when the file was too large to store."
           }
         }
       },
@@ -2883,6 +4263,13 @@
             "type": "number",
             "description": "The priced subtotal, kept even while cost_usd is null so a resumed run does not restart from zero. Not a substitute for cost_usd: showing it while calls went unpriced is the partial total that looks authoritative and is not."
           },
+          "models": {
+            "type": "array",
+            "description": "Every provider and model this stage ran an inference on, in the order it first reached each. A list because a stage that fails over runs on more than one: the first entry is where it started, the last is where it ended up, and one entry means it never moved. Each pair appears once however many calls it served, so this says what ran rather than how often. Absent on a stage that has run no inference - one the run never entered, one whose first call has not come back, one whose only provider could not be reached - and on every stage of a run recorded before Leviath kept it. Absent too on a daemon without the runs.stages.models capability, which is why an empty array is never written here.",
+            "items": {
+              "$ref": "#/components/schemas/StageModelUse"
+            }
+          },
           "visit_count": {
             "type": "integer",
             "minimum": 0,
@@ -2948,6 +4335,24 @@
                 "description": "Unix seconds when the span in progress began, or null while the clock is stopped. The working total is banked_secs plus now - since when since is set."
               }
             }
+          }
+        }
+      },
+      "StageModelUse": {
+        "type": "object",
+        "description": "One provider and model a stage ran an inference on. Both halves, because neither identifies what ran on its own: one provider serves many models, and one model is spelled differently by each provider that routes to it.",
+        "required": [
+          "provider",
+          "model"
+        ],
+        "properties": {
+          "provider": {
+            "type": "string",
+            "description": "The registered provider that served the call."
+          },
+          "model": {
+            "type": "string",
+            "description": "The model the call named, spelled as that provider spells it. The same model reached through two providers is two different strings here."
           }
         }
       },
@@ -3090,7 +4495,8 @@
           "max_history_limit",
           "max_tracked_modified_files",
           "max_concurrent_requests",
-          "request_timeout_secs"
+          "request_timeout_secs",
+          "max_upload_bytes"
         ],
         "properties": {
           "max_limit": {
@@ -3132,6 +4538,10 @@
           "request_timeout_secs": {
             "type": "integer",
             "description": "Seconds before a request is dropped with a 408; 0 is no deadline."
+          },
+          "max_upload_bytes": {
+            "type": "integer",
+            "description": "Bytes one request body may carry, which bounds a multipart upload. `[serve] max_upload_bytes`."
           }
         }
       },
@@ -3158,9 +4568,10 @@
             "type": "string",
             "enum": [
               "script",
-              "openai-compatible"
+              "openai-compatible",
+              "openai"
             ],
-            "description": "How the entry reaches its provider: a Rhai script, or an OpenAI-compatible endpoint spoken to directly."
+            "description": "How the entry reaches its provider: a Rhai script, an OpenAI-compatible endpoint spoken to directly, or OpenAI's own API at another host."
           },
           "script": {
             "type": "string",
@@ -3187,12 +4598,15 @@
         "description": "The active configuration with every credential reduced to whether one is set, plus what this server can do and how much it accepts.",
         "required": [
           "default_provider",
-          "default_model",
+          "override_model",
+          "fallback_model",
           "provider_order",
           "has_anthropic_key",
           "has_openai_key",
           "has_google_key",
           "has_openrouter_key",
+          "has_bedrock_key",
+          "bedrock_region",
           "gateways",
           "agent_paths",
           "mcp_server_count",
@@ -3204,12 +4618,19 @@
           "default_provider": {
             "type": "string"
           },
-          "default_model": {
+          "override_model": {
             "type": [
               "string",
               "null"
             ],
-            "description": "The model every stage runs on while it is set, as a bare model id on `default_provider`. `null` when nothing is pinned, which is the usual and generally better state: each blueprint then picks its own model per stage. Always sent, so a missing key means the server predates this field rather than meaning nothing is set."
+            "description": "The model every stage that allows a user default starts on while it is set, ahead of what its blueprint names, as a bare model id on `default_provider`. `null` when nothing is pinned, which is the usual and generally better state: each blueprint then picks its own model per stage. Always sent, so a missing key means the server predates this field rather than meaning nothing is set."
+          },
+          "fallback_model": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The model a stage falls back to when none of the models it names is configured here, never ahead of them, as a bare model id on `default_provider`. `null` when unset. Always sent."
           },
           "provider_order": {
             "type": "array",
@@ -3229,6 +4650,30 @@
           },
           "has_openrouter_key": {
             "type": "boolean"
+          },
+          "has_xai_key": {
+            "type": "boolean"
+          },
+          "has_meta_key": {
+            "type": "boolean"
+          },
+          "grok_enabled": {
+            "type": "boolean",
+            "description": "Whether Grok is billed to a subscription. Whether a sign-in is stored is `GET /api/providers`."
+          },
+          "file_uploads": {
+            "type": "boolean",
+            "description": "Whether large parts upload to a provider's file storage. Zero data retention turns uploads off whatever this says."
+          },
+          "has_bedrock_key": {
+            "type": "boolean"
+          },
+          "bedrock_region": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The AWS region Bedrock is called in, when the config pins one. `null` when unset, in which case the daemon follows AWS_REGION, then AWS_DEFAULT_REGION, then us-east-1. Always sent."
           },
           "ollama_base_url": {
             "type": [
@@ -3264,6 +4709,174 @@
           },
           "limits": {
             "$ref": "#/components/schemas/ApiLimits"
+          }
+        }
+      },
+      "PartRef": {
+        "type": "object",
+        "required": [
+          "path"
+        ],
+        "description": "A file inside the run's working directory, to attach as a typed part.",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "The file, relative to the working directory."
+          },
+          "region": {
+            "type": "string",
+            "description": "The region to put it in; the task region when absent."
+          },
+          "name": {
+            "type": "string",
+            "description": "The name the part carries; the file name when absent."
+          },
+          "mime_type": {
+            "type": "string",
+            "description": "Its mime type, when the bytes and name do not say."
+          },
+          "deliver": {
+            "type": "string",
+            "enum": [
+              "native",
+              "text",
+              "stand_in"
+            ],
+            "description": "How it reaches the model: as its own type, as text, or as a one-line stand-in."
+          },
+          "caption": {
+            "type": "string",
+            "description": "Text stored beside it."
+          }
+        }
+      },
+      "BlobEntry": {
+        "type": "object",
+        "required": [
+          "sha256",
+          "mime_type",
+          "size",
+          "tokens",
+          "regions",
+          "stored"
+        ],
+        "properties": {
+          "sha256": {
+            "type": "string",
+            "description": "The store's key: the bytes' sha256."
+          },
+          "mime_type": {
+            "type": "string",
+            "description": "The type the bytes were stored as."
+          },
+          "name": {
+            "type": "string",
+            "description": "The name the part carries, when the context gave it one."
+          },
+          "size": {
+            "type": "integer",
+            "description": "Size in bytes."
+          },
+          "width": {
+            "type": "integer",
+            "description": "Pixel width, when known."
+          },
+          "height": {
+            "type": "integer",
+            "description": "Pixel height, when known."
+          },
+          "duration_ms": {
+            "type": "integer",
+            "description": "Duration in milliseconds, when known."
+          },
+          "tokens": {
+            "type": "integer",
+            "description": "The token estimate the region was charged."
+          },
+          "regions": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The regions whose entries carry this part, in layout order."
+          },
+          "stored": {
+            "type": "boolean",
+            "description": "Whether the bytes are on disk under the run's blobs directory."
+          }
+        }
+      },
+      "BlobListing": {
+        "type": "object",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BlobEntry"
+            },
+            "description": "Every stored part, first appearance first."
+          }
+        }
+      },
+      "MimeTypeEntry": {
+        "type": "object",
+        "required": [
+          "mime_type",
+          "source"
+        ],
+        "properties": {
+          "mime_type": {
+            "type": "string",
+            "description": "The row's key: a type, or a pattern such as image/*."
+          },
+          "source": {
+            "type": "string",
+            "description": "Where the row came from: builtin, config, or a blueprint or provider name."
+          },
+          "family": {
+            "type": "string",
+            "description": "The family: resolved through broader rows for a type, as written for a pattern."
+          },
+          "text": {
+            "type": "boolean",
+            "description": "Whether the bytes are text: resolved for a type, as written for a pattern."
+          },
+          "tokens": {
+            "type": "object",
+            "description": "How the bytes are counted in tokens, the same way: one of per_byte, per_pixel, per_second or fixed, with an optional max."
+          },
+          "extensions": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The extensions the type is known by, the same way."
+          },
+          "stand_in": {
+            "type": "string",
+            "description": "The stand-in template a row set, when one applies."
+          },
+          "check": {
+            "type": "string",
+            "description": "The check script the bytes must pass, when one applies."
+          }
+        }
+      },
+      "MimeListing": {
+        "type": "object",
+        "required": [
+          "types"
+        ],
+        "properties": {
+          "types": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MimeTypeEntry"
+            },
+            "description": "Every row, keys sorted."
           }
         }
       }

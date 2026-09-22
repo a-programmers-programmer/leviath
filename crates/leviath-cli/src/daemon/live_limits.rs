@@ -38,6 +38,14 @@ use crate::config::Config;
 struct Applied {
     limits: crate::config::LimitsConfig,
     title: leviath_core::config::TitleConfig,
+    mime: crate::config::MimeConfig,
+    mime_types: toml::Table,
+    /// `mime_types.toml` as it read last time, so an edit to the file is a
+    /// change to apply the way an edit to the config is.
+    mime_types_file: Option<String>,
+    /// The data retention settings, so `lev providers retention set zero`
+    /// reaches the registry every request is built against.
+    retention: leviath_providers::retention::RetentionSettings,
 }
 
 impl Applied {
@@ -45,6 +53,10 @@ impl Applied {
         Self {
             limits: config.limits.clone(),
             title: config.title.clone(),
+            mime: config.mime.clone(),
+            mime_types: config.mime_types.clone(),
+            mime_types_file: std::fs::read_to_string(crate::config::mime_types_path()).ok(),
+            retention: crate::commands::run::session::retention_settings(config),
         }
     }
 }
@@ -116,6 +128,14 @@ impl LiveLimits {
             max_attempts: config.limits.inference_retry_attempts,
             base_delay_ms: config.limits.inference_retry_base_ms,
         });
+        // The registry every request is built against carries the retention
+        // settings: the per-request fields (OpenAI's `store`, OpenRouter's
+        // `provider.zdr`) go out only while zero retention is asked for, and
+        // the ask is a config key, so it follows the file like the limits.
+        // Every world is built with a registry, so this is a plain read.
+        ecs.resource_mut::<leviath_runtime::pipeline::Providers>()
+            .0
+            .set_retention(crate::commands::run::session::retention_settings(config));
         // Read at every fan-out split, so a ceiling lowered mid-run stops the
         // next split rather than waiting for the next run.
         ecs.insert_resource(leviath_runtime::fanout::FanOutBudget(
@@ -124,6 +144,24 @@ impl LiveLimits {
         // The dispatcher's half of the title split; the spawner reads the same
         // document a moment later.
         ecs.insert_resource(leviath_runtime::title::TitleSettings(config.title.clone()));
+        // Typed parts: the operator's registry rows and size ceilings. The
+        // world's registry is what the next spawn layers its blueprint over,
+        // and every run already under way is rebuilt over it here, so a row
+        // added while the daemon runs types the next file rather than the
+        // next run.
+        let registry = std::sync::Arc::new(config.mime_registry_or_defaults());
+        let refreshed = leviath_runtime::blob_store::refresh_run_registries(ecs, &registry);
+        if refreshed > 0 {
+            tracing::info!(runs = refreshed, "[mime] live runs re-read the mime types");
+        }
+        ecs.insert_resource(leviath_runtime::blob_store::MimeRegistryHandle(registry));
+        ecs.insert_resource(leviath_runtime::blob_store::MimeLimits {
+            max_part_bytes: config.max_part_bytes(),
+            inline_text_bytes: config.mime.inline_text_bytes,
+            max_media_bytes_per_request: config.mime.max_media_bytes_per_request,
+            provider_file_ttl_secs: config.mime.provider_file_ttl_secs,
+            overwrite_artifacts: config.mime.overwrite_artifacts,
+        });
 
         // Read when a prompt opens, so a prompt already waiting keeps the
         // deadline it opened with.
@@ -170,17 +208,70 @@ mod tests {
         LiveLimits::new(InteractionHub::new(), HostSettings::default())
     }
 
+    /// The applier reads `mime_types.toml` next to the config, so the config
+    /// path is pinned for both applies: a neighbouring test moving the home
+    /// between them would otherwise read as a changed file.
     #[test]
     fn the_first_apply_installs_everything_and_a_repeat_does_nothing() {
+        let home = tempfile::tempdir().unwrap();
+        let config_path = home.path().join("config.toml");
+        temp_env::with_var("LEVIATH_CONFIG_PATH", Some(&config_path), || {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let mut world = world(&runtime, 8);
+            let live = applier();
+            let config = Config::default();
+            assert!(live.apply(&config, &mut world), "boot applies");
+            assert!(
+                !live.apply(&config, &mut world),
+                "an unchanged config must not touch the pools of a running daemon"
+            );
+        });
+    }
+
+    /// `zero_retention` flipped in the file reaches the world's registry on
+    /// the next pass, and counts as a change on its own.
+    #[test]
+    fn the_retention_settings_follow_the_config() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let mut world = world(&runtime, 8);
         let live = applier();
-        let config = Config::default();
-        assert!(live.apply(&config, &mut world), "boot applies");
-        assert!(
-            !live.apply(&config, &mut world),
-            "an unchanged config must not touch the pools of a running daemon"
-        );
+        let mut config = Config::default();
+        assert!(live.apply(&config, &mut world));
+        let asked = |world: &PipelineWorld| {
+            world
+                .world()
+                .get_resource::<leviath_runtime::pipeline::Providers>()
+                .expect("the world has a registry")
+                .0
+                .retention_settings()
+                .zero_requested
+        };
+        assert!(!asked(&world));
+        config.providers.zero_retention = true;
+        assert!(live.apply(&config, &mut world), "the switch is a change");
+        assert!(asked(&world));
+    }
+
+    /// `[mime] overwrite_artifacts` flipped in the file reaches the runs on the
+    /// next pass without a restart.
+    #[test]
+    fn the_artifact_overwrite_policy_follows_the_config() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut world = world(&runtime, 8);
+        let live = applier();
+        let mut config = Config::default();
+        assert!(live.apply(&config, &mut world));
+        let overwrite = |world: &PipelineWorld| {
+            world
+                .world()
+                .get_resource::<leviath_runtime::blob_store::MimeLimits>()
+                .expect("the world has limits")
+                .overwrite_artifacts
+        };
+        assert!(!overwrite(&world));
+        config.mime.overwrite_artifacts = true;
+        assert!(live.apply(&config, &mut world), "the switch is a change");
+        assert!(overwrite(&world));
     }
 
     #[test]
@@ -378,6 +469,46 @@ mod tests {
         config.limits.stream_inference = false;
         assert!(live.apply(&config, &mut world));
         assert!(!world.stream_inference());
+    }
+
+    /// An edited mime row reaches a run already under way: the world's
+    /// registry is rebuilt and every live run's registry is rebuilt over it,
+    /// keeping the run's own blueprint rows on top.
+    #[test]
+    fn an_edited_mime_row_reaches_a_run_already_under_way() {
+        crate::config::with_isolated_config_path("live-limits-mime-rows", |_| {
+            use leviath_runtime::blob_store::{MimeRegistryHandle, RunMimeRegistry};
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let mut world = world(&runtime, 1);
+            let live = applier();
+            let mut config = Config::default();
+            live.apply(&config, &mut world);
+            let base = world
+                .world()
+                .get_resource::<MimeRegistryHandle>()
+                .unwrap()
+                .0
+                .clone();
+            let rows: toml::Table =
+                toml::from_str("[\"application/x-acme-scene\"]\nfamily = \"model\"\n").unwrap();
+            let run = RunMimeRegistry::new(&base, rows, Default::default()).unwrap();
+            let held = run.cell();
+            world.spawn_agent(run);
+            let obj: leviath_core::mime::MimeType = "model/obj".parse().unwrap();
+            let scene: leviath_core::mime::MimeType = "application/x-acme-scene".parse().unwrap();
+            assert_eq!(held.load().info(&obj).family, "model");
+
+            config.mime_types = toml::from_str("[\"model/obj\"]\nfamily = \"scene\"\n").unwrap();
+            assert!(live.apply(&config, &mut world));
+            let now = held.load();
+            assert_eq!(
+                now.info(&obj).family,
+                "scene",
+                "the edit reached the live run"
+            );
+            assert_eq!(now.info(&scene).family, "model", "its own rows stay on top");
+            assert!(!live.apply(&config, &mut world), "nothing changed since");
+        });
     }
 
     #[test]

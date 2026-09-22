@@ -89,7 +89,7 @@ pub(crate) fn match_transition_choice(
     // models that reason first and answer last without matching a stage name
     // buried in a prose summary ("the approved plan was implemented").
     let words_in = |line: &str| {
-        line.split(|c: char| !c.is_alphanumeric() && c != '_')
+        line.split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
             .filter(|w| !w.is_empty())
             .count()
     };
@@ -99,7 +99,7 @@ pub(crate) fn match_transition_choice(
         .copied()
         .filter(|l| lines.len() > 1 && words_in(l) <= 3);
     for line in first.into_iter().chain(last) {
-        for word in line.split(|c: char| !c.is_alphanumeric() && c != '_') {
+        for word in line.split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-') {
             if word.is_empty() {
                 continue;
             }
@@ -157,10 +157,13 @@ type TransitionChoiceQuery = (
 fn routing_tool_choice(provider: &str) -> Option<serde_json::Value> {
     match provider {
         "anthropic" => Some(serde_json::json!({ "type": "none" })),
-        // Codex speaks the Responses API, which takes the same bare string.
-        // Without an arm here the fallback clears the tool array instead,
-        // which cold-reads the whole window on every stage transition.
-        "openai" | "openrouter" | "gemini" | "codex" => Some(serde_json::json!("none")),
+        // The Responses providers (Codex, xAI and Grok, Meta) take the same
+        // bare string. Without an arm here the fallback clears the tool array
+        // instead, which cold-reads the whole window on every stage
+        // transition.
+        "openai" | "openrouter" | "gemini" | "codex" | "xai" | "grok" | "meta" => {
+            Some(serde_json::json!("none"))
+        }
         _ => None,
     }
 }
@@ -249,14 +252,15 @@ pub(crate) fn dispatch_transition_choice(
         let current = &bp.0.stages[cursor.index];
         let prompt = build_transition_prompt(current, &choice.0);
         let tokens = leviath_core::estimate_tokens(&prompt);
-        let _ = window.add_typed_entry(
+        let _ = window.add_typed_entry_caused(
+            leviath_core::ContextCause::Framework,
             "conversation",
             leviath_core::EntryKind::UserMessage,
             prompt,
             tokens,
         );
 
-        let request = routing_request(
+        let mut request = routing_request(
             &window,
             config,
             si,
@@ -271,8 +275,14 @@ pub(crate) fn dispatch_transition_choice(
             },
         );
 
+        // The routing question carries the stage's context, so it is held to
+        // the same retention rule and sent the same request fields.
+        providers
+            .0
+            .apply_retention_knobs(&si.provider_name, &mut request.extra);
         let job = InferenceJob {
             entity,
+            refused: providers.0.retention_refusal(&si.provider_name, &si.model),
             provider,
             request,
             permit,
@@ -284,6 +294,15 @@ pub(crate) fn dispatch_transition_choice(
             // long silent generation from being mistaken for a dead socket, and
             // this call is never long enough for that to arise.
             stream: false,
+            hydration: None,
+            // The routing question's attempts are not journaled, and the stage
+            // lane's are. A routing call is one deterministic sentence with a
+            // 256-token budget and no fallbacks to move to, so its retries are
+            // measured in seconds and the run's provider never changes under it.
+            // An attempt record exists to explain a turn that took a long time
+            // or ended up on a different model, and neither is a thing this call
+            // does.
+            journal: None,
         };
         let cancel = crate::cancel::CancelToken::new();
         // Supervised for the same reason as the inference lane: the agent is
@@ -304,6 +323,7 @@ pub(crate) fn dispatch_transition_choice(
             move |message| {
                 let _ = lost_outcomes.send(crate::inference_bridge::InferenceOutcome {
                     entity,
+                    attempt_id: String::new(),
                     result: Err(leviath_providers::ProviderError::Other(message)),
                     latency: std::time::Duration::ZERO,
                     // A job that never reached a provider has no rates and no
@@ -340,6 +360,8 @@ type CollectTransitionChoiceQuery = (
     Option<&'static crate::persistence::RunMetadata>,
     Option<&'static mut crate::persistence::TokenTotals>,
     Option<&'static mut StageLedger>,
+    Option<&'static StageInference>,
+    Option<&'static mut crate::pipeline::StageIoBuffer>,
 );
 
 /// Transition-choice collect: drain completed routing inferences, match each to a
@@ -369,6 +391,8 @@ pub(crate) fn collect_transition_choice(
             metadata,
             mut totals,
             mut ledger,
+            called,
+            buffer,
         )) = agents.get_mut(outcome.entity)
         else {
             continue; // stale: agent cancelled/despawned since dispatch
@@ -406,9 +430,14 @@ pub(crate) fn collect_transition_choice(
                 // for a resume. Landing it at a stage boundary parks it too:
                 // failing here throws away every completed stage over a blip
                 // that is usually gone in seconds.
-                let provider = &stage_infs.0[cursor.index].provider_name;
-                if let Some((blocker, message)) =
-                    crate::pipeline::response::setup_park(&err, provider)
+                //
+                // The provider named is the one this call went to: the live
+                // component, which a failover earlier in the stage moved on
+                // from the one the stage resolved to.
+                let provider = called
+                    .map(|si| si.provider_name.as_str())
+                    .unwrap_or(&stage_infs.0[cursor.index].provider_name);
+                if let Some((blocker, message)) = crate::pipeline::park::setup_park(&err, provider)
                 {
                     tracing::warn!(
                         provider = %provider,
@@ -416,6 +445,11 @@ pub(crate) fn collect_transition_choice(
                         error = %err,
                         "pausing the run until the machine is fixed"
                     );
+                    if let Some(mut buffer) = buffer {
+                        buffer
+                            .logs
+                            .push((cursor.index, format!("[paused] {message}")));
+                    }
                     state.status = AgentStatus::Paused;
                     commands
                         .entity(outcome.entity)
@@ -479,7 +513,10 @@ pub(crate) fn collect_transition_choice(
 
         let choice = response.content.trim().to_string();
         let tokens = leviath_core::estimate_tokens(&choice);
-        let _ = window.add_typed_entry(
+        // The framework's own phrasing of the decision, not the model's text:
+        // the reply was a bare stage name.
+        let _ = window.add_typed_entry_caused(
+            leviath_core::ContextCause::Framework,
             "conversation",
             leviath_core::EntryKind::AssistantTurn { tool_calls: vec![] },
             format!("Transitioning to: {choice}"),

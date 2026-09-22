@@ -51,6 +51,25 @@ pub(crate) fn parse_tool_arguments(raw: &str) -> serde_json::Value {
     serde_json::from_str(raw).unwrap_or_else(|_| serde_json::Value::String(raw.to_string()))
 }
 
+/// A tool call's input as a request may carry it: always an object.
+///
+/// An object goes out as it is. Anything else becomes `{"_raw": <value>}`.
+/// The usual case is a call the output cap cut off: `parse_tool_arguments`
+/// keeps its partial text as a string, and the conversation stores it that
+/// way, because the string is how the runtime knows the call was cut off.
+/// Anthropic, Bedrock and Ollama all refuse a string where tool input goes,
+/// and the refusal is not transient: every later request of the run, resumed
+/// or not, carried the same text and got the same answer. Wrapping it here,
+/// where a request is built, leaves the stored call untouched and still
+/// shows the model what it sent, next to the refusal that says why it did
+/// not run.
+pub fn tool_input_object(input: &serde_json::Value) -> serde_json::Value {
+    match input {
+        serde_json::Value::Object(_) => input.clone(),
+        other => serde_json::json!({ "_raw": other }),
+    }
+}
+
 /// Model names remembered for the life of the process.
 ///
 /// What a provider learns about a model by being refused (no temperature,
@@ -95,6 +114,155 @@ pub(crate) fn retry_after_secs(headers: &reqwest::header::HeaderMap) -> Option<u
         .get("retry-after")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.trim().parse::<u64>().ok())
+}
+
+/// GET a `/models` listing at `url` with `headers`, within `timeout_secs`.
+///
+/// One function for every OpenAI-shaped provider, so a listing failure reads
+/// the same wherever it happens: a transport error is transient, a non-2xx is
+/// its status and capped body, and a body is decoded through [`decode_json`].
+pub(crate) async fn fetch_listing(
+    client: &reqwest::Client,
+    url: &str,
+    headers: &[(&str, String)],
+    timeout_secs: Option<u64>,
+) -> Result<serde_json::Value> {
+    let mut builder = crate::provider::apply_request_timeout(client.get(url), timeout_secs);
+    for (name, value) in headers {
+        builder = builder.header(*name, value.as_str());
+    }
+    let response = builder
+        .send()
+        .await
+        .map_err(|e| ProviderError::transport("listing models", &e))?;
+    let status = response.status();
+    if !status.is_success() {
+        let error_body = read_text_capped(response, JSON_BODY_CAP)
+            .await
+            .unwrap_or_else(|_| "unknown error".to_string());
+        return Err(ProviderError::ApiError(format!(
+            "HTTP {status}: {error_body}"
+        )));
+    }
+    decode_json(response).await
+}
+
+/// Take `temperature` out of a request body.
+///
+/// "Not supported" is not a value: a model that takes only its default
+/// rejects `0.0` exactly as firmly as `0.7`, so the field has to be absent
+/// rather than zeroed. A body that is not an object is left alone: no caller
+/// builds one, and dropping a field is not worth a panic.
+pub(crate) fn drop_temperature(body: &mut serde_json::Value) {
+    if let Some(fields) = body.as_object_mut() {
+        fields.remove("temperature");
+    }
+}
+
+/// Where a chat request goes and how it is paced: everything about a send
+/// except the body, so a retry can send the same request again.
+pub(crate) struct ChatTarget<'a> {
+    /// The shared outbound client.
+    pub client: &'a reqwest::Client,
+    /// The provider's name, for errors and logs.
+    pub provider: &'a str,
+    /// The chat completions URL.
+    pub url: &'a str,
+    /// The headers every attempt carries.
+    pub headers: &'a [(&'a str, String)],
+    /// The provider's limiter, when it has one.
+    pub limiter: Option<&'a crate::rate_limit::RateLimiter>,
+    /// The per-request timeout the caller asked for.
+    pub timeout_secs: Option<u64>,
+}
+
+impl ChatTarget<'_> {
+    /// POST `body` once.
+    pub(crate) async fn send(&self, body: &serde_json::Value) -> Result<reqwest::Response> {
+        crate::openai_compat::send_chat_request(
+            self.client,
+            self.provider,
+            self.url,
+            self.headers,
+            body,
+            self.limiter,
+            self.timeout_secs,
+        )
+        .await
+    }
+
+    /// POST `body`, and when the API refuses the temperature it carries,
+    /// remember that for `model` in `memo`, take the field out and send once
+    /// more. The refusal is the initial HTTP response in both the buffered and
+    /// the streaming path, so both catch it here; a model already in `memo`
+    /// never arrives with a temperature to refuse.
+    pub(crate) async fn send_dropping_refused_temperature(
+        &self,
+        body: &mut serde_json::Value,
+        model: &str,
+        memo: &ModelMemo,
+    ) -> Result<reqwest::Response> {
+        self.send_adapting(body, model, memo, None).await
+    }
+
+    /// POST `body`, fixing what the API refuses and sending again: a
+    /// temperature it will not take (remembered in `temperature`), and, when
+    /// `token_limit` is given, a `max_tokens` it wants as
+    /// `max_completion_tokens` (remembered there).
+    ///
+    /// Each refusal names one field, so a model refusing both answers twice.
+    /// A fix is only tried while the body still carries the refused field,
+    /// which bounds the loop: every retry removes one, and an answer the body
+    /// no longer explains comes back as it was.
+    pub(crate) async fn send_adapting(
+        &self,
+        body: &mut serde_json::Value,
+        model: &str,
+        temperature: &ModelMemo,
+        token_limit: Option<&ModelMemo>,
+    ) -> Result<reqwest::Response> {
+        loop {
+            let detail = match self.send(body).await {
+                Err(ProviderError::ApiError(detail)) => detail,
+                other => return other,
+            };
+            if body.get("temperature").is_some()
+                && crate::openai_compat::temperature_refused(&detail)
+            {
+                tracing::debug!(
+                    provider = self.provider,
+                    model,
+                    "the API refused the temperature we sent; retrying without it"
+                );
+                temperature.insert(model);
+                drop_temperature(body);
+            } else if let Some(memo) = token_limit
+                && body.get("max_tokens").is_some()
+                && crate::openai_compat::token_limit_refused(&detail)
+            {
+                tracing::debug!(
+                    provider = self.provider,
+                    model,
+                    "the API refused max_tokens; retrying with max_completion_tokens"
+                );
+                memo.insert(model);
+                use_max_completion_tokens(body);
+            } else {
+                return Err(ProviderError::ApiError(detail));
+            }
+        }
+    }
+}
+
+/// Move a body's output cap from `max_tokens` to `max_completion_tokens`,
+/// the name OpenAI's reasoning models take. A `max_completion_tokens` the
+/// stage's parameters already set is kept: it is what the author asked for.
+pub(crate) fn use_max_completion_tokens(body: &mut serde_json::Value) {
+    if let Some(fields) = body.as_object_mut()
+        && let Some(cap) = fields.remove("max_tokens")
+    {
+        fields.entry("max_completion_tokens").or_insert(cap);
+    }
 }
 
 /// Check an HTTP response for errors and return it on success.

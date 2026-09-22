@@ -9,11 +9,14 @@
 //!    see rather than inspecting this process, because the daemon's environment
 //!    is fixed at exec time and is not the shell `doctor` was typed in.
 //! 3. `resolve` - the user's defaults pick a provider that is actually
-//!    registered. This is the check that catches a stage resolving to
-//!    `anthropic/claude-sonnet-4-6` (the hard-coded last resort in
-//!    [`ModelConfig::provider`](leviath_core::blueprint::ModelConfig::provider))
-//!    on a machine with no Anthropic key - the root cause of a fleet of runs
-//!    that spawned, sat at iteration 0, and never took a turn.
+//!    registered: the model the config names when it names one, otherwise
+//!    the first configured provider in the preference, with the model to
+//!    probe picked from its catalogue. Fails, naming the provider the config
+//!    asked for, when nothing in the preference is configured. The placeholder
+//!    a model-less stage carries
+//!    ([`ModelConfig::provider`](leviath_core::blueprint::ModelConfig::provider))
+//!    is the resolver's last resort, not a finding, and is never reported as
+//!    one.
 //! 4. `inference` - one real call to that provider, straight through
 //!    [`Provider::infer`]. No world, no run, nothing on disk.
 //! 5. `daemon` - a throwaway one-stage agent spawned over the control socket
@@ -39,11 +42,9 @@ use leviath_runtime::ProviderRegistry;
 use leviath_runtime::control_socket::{
     ControlClient, ControlRequest, ControlResponse, DaemonIdentity,
 };
-use leviath_runtime::pipeline::{bare_default_model, providers_tried, resolve_stage_model};
 
 use crate::commands::run::session::build_provider_registry_from_config;
 use crate::config::Config;
-use crate::daemon::spawn::model_defaults;
 
 /// `lev doctor --help`. What each check proves, and what a failure at it means.
 pub const DOCTOR_LONG_ABOUT: &str = "\
@@ -61,9 +62,11 @@ fails is the diagnosis:
              is missing from [security] allow_env_vars - each of which silently
              downgrades every web_search to a keyless Wikipedia lookup.
   resolve    your default provider/model picks a provider that is actually
-             registered. Fails when a key is missing or misspelled - and
-             catches the case where a blueprint with no model falls back to
-             anthropic on a machine that has no Anthropic key.
+             registered. With no override_model or fallback_model set it
+             passes on the first configured provider in your preference and
+             the next check probes a model from its catalogue. Fails when
+             nothing in default_provider or provider_order is configured: a
+             key missing or misspelled, or lev setup never run.
   inference  one real call to that provider. Fails on a bad key, an unknown
              model id, or a billing problem; the provider's own error is
              printed verbatim, status line and response body included.
@@ -278,39 +281,6 @@ const SEARCH_KEY: &str = "BRAVE_API_KEY";
 ///
 /// Warns rather than fails: an install with no search key is perfectly good for
 /// everyone not running a research agent.
-/// Whether the Codex transport can actually answer.
-///
-/// `None` when it is not enabled, so the report says nothing about a provider
-/// nobody asked for. The failure this exists to name is "enabled but never
-/// signed in": without it the first inference fails with a bare HTTP 401 and
-/// nothing pointing at the one command that fixes it.
-fn codex_check(config: &Config) -> Option<Check> {
-    if !config.providers.codex_enabled {
-        return None;
-    }
-    let grant = leviath_providers::codex::ProviderAuthStore::default_path()
-        .and_then(|path| leviath_providers::codex::ProviderAuthStore::load(&path).ok())
-        .and_then(|store| store.get(leviath_providers::codex::PROVIDER_NAME).cloned());
-
-    Some(match grant {
-        None => Check::warn(
-            "codex",
-            "enabled but not signed in; run `lev auth login codex`".to_string(),
-        ),
-        Some(grant) => {
-            let claims = grant.claims();
-            let who = grant
-                .email
-                .or(claims.email)
-                .unwrap_or_else(|| "signed in".to_string());
-            match grant.plan_type.or(claims.plan_type) {
-                Some(plan) => Check::ok("codex", format!("{who} (ChatGPT {plan} plan)")),
-                None => Check::ok("codex", who),
-            }
-        }
-    })
-}
-
 fn search_check(config: &Config, daemon: Option<&DaemonIdentity>) -> Check {
     let allowlisted = leviath_core::script_env_allowed(SEARCH_KEY, &config.security.allow_env_vars);
     let grant_fix = format!(
@@ -528,6 +498,15 @@ pub(crate) fn missing_script_providers(
 /// Only native providers can be listed - a Rhai script provider is resolved by
 /// name on demand and never enumerated - so the line says so rather than
 /// implying the user's `.rhai` providers are missing.
+/// The mime rows the daemon cannot load, in the config or in
+/// `mime_types.toml`, as one note.
+fn malformed_mime_types(config: &Config) -> Vec<String> {
+    match config.mime_registry() {
+        Ok(_) => Vec::new(),
+        Err(e) => vec![format!("mime rows are ignored until fixed: {e}")],
+    }
+}
+
 fn config_check(config: &Config, registry: &ProviderRegistry) -> Check {
     let mut names = registry.provider_names();
     names.sort_unstable();
@@ -545,6 +524,14 @@ fn config_check(config: &Config, registry: &ProviderRegistry) -> Check {
     // note on an OK line rather than a failure, matching how the `resolve`
     // check reports a config that works but probably is not what was meant:
     // the rest of the file still applies, so this is not broken wiring.
+    // A key that changed name is read under its new one, and the file still
+    // says the old thing. That is worth a warning rather than a note: the
+    // value's meaning changed with the name, and `lev update` rewrites it.
+    let renamed = Config::renamed_keys_at(&Config::config_path());
+    if !renamed.is_empty() {
+        let notices: Vec<String> = renamed.iter().map(crate::config::renamed::notice).collect();
+        return Check::warn("config", format!("{detail}  ({})", notices.join("; ")));
+    }
     let mut unread = Config::unread_keys_at(&Config::config_path());
     unread.extend(misdirected_rate_limits(config));
     // Same posture as the unread keys, and reported beside them: the config
@@ -557,6 +544,9 @@ fn config_check(config: &Config, registry: &ProviderRegistry) -> Check {
     // A provider_order entry that names nothing configured never wins a route
     // and says nothing about it, the same silent kind of misconfiguration.
     notes.extend(misdirected_provider_order(config));
+    // A `[mime_types]` row that will not load is skipped by the daemon, which
+    // then types that file by the built-in table instead of the operator's.
+    notes.extend(malformed_mime_types(config));
     if !unread.is_empty() {
         let subject = match unread.len() {
             1 => "1 key in config.toml is".to_string(),
@@ -574,6 +564,30 @@ fn config_check(config: &Config, registry: &ProviderRegistry) -> Check {
         return Check::ok("config", detail);
     }
     Check::ok("config", format!("{detail}  (note: {})", notes.join("; ")))
+}
+
+/// The `yolo` check: whether `yolo.toml` loads, when there is one.
+///
+/// No file is no finding - most installs never write one - so the check is
+/// absent rather than a line saying nothing is wrong. A file that will not
+/// load is a failure, because every `--yolo=<name>` is refused until it does,
+/// and a file that loads lists the names a run can use.
+fn yolo_check() -> Option<Check> {
+    match crate::yolo::load_current() {
+        Ok(file) if !file.exists() => None,
+        Ok(file) => {
+            let names = file.names();
+            let detail = match names.is_empty() {
+                true => "yolo.toml defines no profiles".to_string(),
+                false => format!("profiles: {}", names.join(", ")),
+            };
+            Some(Check::ok("yolo", detail))
+        }
+        Err(e) => Some(Check::fail(
+            "yolo",
+            format!("{e}; every `lev run --yolo=<name>` is refused until it loads"),
+        )),
+    }
 }
 
 /// The `config` check for a file that will not load.
@@ -596,152 +610,17 @@ fn broken_config_check(fault: &crate::config::ConfigFault) -> Check {
     )
 }
 
-// ─── Check 2: resolve ─────────────────────────────────────────────────────────
-
-/// What check 2 settled on, when it settled on something usable. The handle is
-/// carried rather than looked up again so the later checks cannot disagree with
-/// the one that reported.
-struct Resolved {
-    provider_name: String,
-    model: String,
-    provider: Arc<dyn Provider>,
-}
-
-/// Run the real stage-model fallback chain against an **empty** [`ModelConfig`],
-/// so what comes back is what the user's config alone would pick for a stage
-/// that states no preference of its own.
-///
-/// The guard afterwards is the one [`leviath_runtime::pipeline::resolve_stages`]
-/// applies at spawn: the last resort in the chain is unchecked and hands back
-/// `anthropic`/`claude-sonnet-4-6` whether or not anything answers to that name.
-/// Resolving through [`ProviderRegistry::get`] rather than `has` makes the same
-/// decision (native first, then the script layer) while keeping the handle, so
-/// the provider cannot go missing between deciding to use it and using it.
-fn resolve_check(
-    config: &Config,
-    model_override: Option<&str>,
-    registry: &ProviderRegistry,
-) -> (Check, Option<Resolved>) {
-    let empty = ModelConfig {
-        models: Vec::new(),
-        allow_user_default: true,
-        parameters: std::collections::HashMap::new(),
-        request_timeout_secs: None,
-    };
-    let defaults = model_defaults(config);
-    let (provider_name, model) = resolve_stage_model(&empty, model_override, &defaults, registry);
-
-    match registry.get(&provider_name) {
-        Some(provider) => (
-            Check::ok(
-                "resolve",
-                format!(
-                    "{provider_name} / {model}{}{}",
-                    default_provider_note(config, &provider_name, model_override, registry),
-                    qualified_default_model_note(config, model_override),
-                ),
-            ),
-            Some(Resolved {
-                provider_name,
-                model,
-                provider,
-            }),
-        ),
-        None => (
-            Check::fail(
-                "resolve",
-                format!(
-                    "resolved to '{provider_name}', which is not configured (tried: {}). \
-                     Configure it with `lev setup`, or add it to config.toml.",
-                    providers_tried(&empty, model_override, &defaults)
-                ),
-            ),
-            None,
-        ),
-    }
-}
-
-/// The note appended when the resolved provider is not the one the user named
-/// as their default.
-///
-/// This check resolves an empty `ModelConfig`, so `default_provider` really
-/// does lose here without a `default_model`: there is no blueprint entry to
-/// promote and no model to send. A real run is the opposite case, so the note
-/// must not say the default provider "is never chosen": that reads as a
-/// statement about the reader's runs.
-///
-/// It is not. `resolve_stage_candidates` moves every registered candidate on
-/// the default provider to the front of the blueprint's list, so
-/// `default_provider = "openrouter"` sends every stage of every bundled
-/// blueprint to that blueprint's OpenRouter entry. Said the other way, a run
-/// quietly executing on a fallback model for weeks would look, from here, like
-/// a config line that did nothing at all.
-///
-/// Not a failure: the resolution is legitimate and the run will work. It is
-/// only worth saying because it is not what the config appears to ask for.
-/// Silent while `--model` is in play, which is the caller overriding on purpose.
-fn default_provider_note(
-    config: &Config,
-    resolved: &str,
-    model_override: Option<&str>,
-    registry: &ProviderRegistry,
-) -> String {
-    if model_override.is_some() || resolved == config.default_provider {
-        return String::new();
-    }
-    // The missing model is the only reason a registered default provider loses
-    // from here: this check resolves an empty `ModelConfig`, so one with a
-    // model set has no competition to lose to. An *unregistered* default
-    // provider is a different complaint, and one the `config` line already
-    // makes by listing what is registered.
-    if config.default_model.is_some() || !registry.has(&config.default_provider) {
-        return String::new();
-    }
-    let named = &config.default_provider;
-    format!(
-        "  (note: this check resolves no blueprint, so with no `default_model` \
-         set there is nothing to send to '{named}' and it loses here. A real run \
-         is different: a blueprint that lists '{named}' has that entry moved to \
-         the front, so your runs use '{named}' with whatever model the blueprint \
-         names for each stage. Set `default_model` only to pin one model across \
-         every stage, which overrides the per-stage choices a blueprint makes.)"
-    )
-}
-
-/// The note appended when `default_model` is written as `provider/model`.
-///
-/// `default_model` is a bare model id that pairs with `default_provider`, but
-/// `--model` and `fallback_order` take the qualified form and an OpenRouter id
-/// already contains a slash, so `default_model = "ollama/qwen3.8:latest"` is
-/// an easy thing to write. The resolver drops the redundant prefix, so the run
-/// works; this says what it was read as, so the config can be tidied and so
-/// the line above is not a mystery. Silent under `--model`, when the default
-/// is not in play at all.
-fn qualified_default_model_note(config: &Config, model_override: Option<&str>) -> String {
-    if model_override.is_some() {
-        return String::new();
-    }
-    let Some(written) = config.default_model.as_deref() else {
-        return String::new();
-    };
-    let bare = bare_default_model(&config.default_provider, written);
-    if bare == written {
-        return String::new();
-    }
-    let provider = &config.default_provider;
-    format!(
-        "  (note: default_model is written as '{written}', but it takes a bare model id \
-         and pairs with default_provider - it is read as '{bare}'; drop the '{provider}/' \
-         in config.toml)"
-    )
-}
+// ─── Check 2: resolve: see `resolve.rs` ─────────────────────────────────────
 
 // ─── Check 3: inference ───────────────────────────────────────────────────────
 
 /// One real call to the resolved provider. No context window, no blueprint, no
 /// world: the point is to isolate "can this credential reach this model" from
 /// everything the framework layers on top of it.
-async fn inference_check(provider: &dyn Provider, model: &str) -> Check {
+///
+/// `extra` is the request's extra parameters: the zero-retention fields, when
+/// they apply, so the probe goes out the way a run's call would.
+async fn inference_check(provider: &dyn Provider, model: &str, extra: serde_json::Value) -> Check {
     let caps = provider.capabilities(model);
     let request = InferenceRequest {
         system: Vec::new(),
@@ -757,7 +636,7 @@ async fn inference_check(provider: &dyn Provider, model: &str) -> Check {
         // parameter outright get the same value and ignore it.
         temperature: 0.0,
         tools: Vec::new(),
-        extra: serde_json::Value::Null,
+        extra,
         request_timeout_secs: Some(60),
     };
 
@@ -834,6 +713,7 @@ conversation = {{ kind = "sliding_window", max_items = 4, max_tokens = 2000 }}
 /// one nobody will ever collect.
 fn cleanup_run(run_id: &str) {
     let _ = crate::runstate::force_cancel(run_id);
+    crate::runstate::forget_provider_files(run_id);
     let _ = std::fs::remove_dir_all(crate::runstate::run_dir(run_id));
     let _ = leviath_core::paths::data_dir().map(|d| {
         let _ = std::fs::remove_dir_all(d.join("state").join(run_id));
@@ -908,11 +788,13 @@ async fn spawn_and_wait(
         model: None,
         workdir: &workdir.to_string_lossy(),
         yolo: true,
+        yolo_profile: None,
         allow: Vec::new(),
         max_depth: None,
         regions: std::collections::HashMap::new(),
         no_seed_commands: false,
         output_request: None,
+        parts: Vec::new(),
     });
     let args = match args {
         Ok(args) => args,
@@ -1095,14 +977,16 @@ pub(crate) async fn run_checks_with(
         }
     };
     checks.push(config_check(&config, &registry));
-    // Ask the daemon who it is before judging its environment. `List` is
-    // idempotent and local, and it is only sent to force the handshake that
-    // fills `link().daemon` - the reply itself is not the point, and a daemon
-    // that will not answer just leaves the identity unknown, which the check
-    // reports as such rather than guessing.
+    checks.extend(yolo_check());
+    // Ask the daemon who it is, and how it is, before judging its environment.
+    // `List` is idempotent and local: it forces the handshake that fills
+    // `link().daemon`, and its reply carries the daemon's own health. A daemon
+    // that will not answer leaves both unknown, which the checks report as such
+    // rather than guessing.
+    let mut reported = None;
     let identity = match &daemon {
         DaemonTarget::Client(client) => {
-            let _ = client.request(&ControlRequest::List).await;
+            reported = reported_health(client.request(&ControlRequest::List).await);
             client.link().daemon
         }
         DaemonTarget::Skip | DaemonTarget::Unavailable(_) => None,
@@ -1112,7 +996,14 @@ pub(crate) async fn run_checks_with(
     checks.push(search_check(&config, identity.as_ref()));
     // Same shape and the same reason: it warns rather than failing, and it
     // runs before anything that could stop the report early.
-    checks.extend(codex_check(&config));
+    checks.extend(signin_checks(&config));
+    // Whether what the daemon has already done was recorded. Here rather than
+    // beside the `daemon` check because it costs nothing and bills nothing, and
+    // a report cut short by a billing failure should still carry it.
+    checks.extend(journal_check(reported.as_ref()));
+    if !args.offline {
+        checks.extend(quota_checks(&config, &registry).await);
+    }
 
     let (check, resolved) = resolve_check(&config, args.model.as_deref(), &registry);
     checks.push(check);
@@ -1124,7 +1015,52 @@ pub(crate) async fn run_checks_with(
         return checks;
     }
 
-    let check = inference_check(resolved.provider.as_ref(), &resolved.model).await;
+    // A config that names no model of its own is probed with one from the
+    // provider's catalogue, and the line says which, since nothing else does.
+    let (model, picked) = match resolved.model.clone() {
+        Some(model) => (model, false),
+        None => match probe_model(resolved.provider.as_ref()).await {
+            Ok(Some(model)) => (model, true),
+            // The listing is how a model is found, so a listing that failed
+            // is the inference check's answer: the same words `lev setup` and
+            // `lev models list` print for it.
+            Err(e) => {
+                checks.push(Check::fail(
+                    "inference",
+                    format!(
+                        "'{}' could not list its models to pick one to probe: {}",
+                        resolved.provider_name,
+                        e.describe()
+                    ),
+                ));
+                return checks;
+            }
+            Ok(None) => {
+                checks.push(Check::warn(
+                    "inference",
+                    format!(
+                        "skipped: '{}' lists no model to probe with. Set `override_model` \
+                         in config.toml, or pass `--model`, to check one.",
+                        resolved.provider_name
+                    ),
+                ));
+                return checks;
+            }
+        },
+    };
+    // Zero retention holds for the probe the way it holds for a run: a model
+    // that keeps something is not sent even the one-word prompt, and the line
+    // says why in the words the spawn gate uses.
+    if let Some(refusal) = registry.retention_refusal(&resolved.provider_name, &model) {
+        checks.push(Check::fail("inference", format!("not sent: {refusal}")));
+        return checks;
+    }
+    let mut extra = serde_json::Value::Null;
+    registry.apply_retention_knobs(&resolved.provider_name, &mut extra);
+    let mut check = inference_check(resolved.provider.as_ref(), &model, extra).await;
+    if picked {
+        check.detail = format!("{model}: {}", check.detail);
+    }
     let inference_failed = check.status == CheckStatus::Fail;
     checks.push(check);
     if inference_failed {
@@ -1149,7 +1085,7 @@ pub(crate) async fn run_checks_with(
                 daemon_check(
                     client,
                     &resolved.provider_name,
-                    &resolved.model,
+                    &model,
                     DAEMON_TIMEOUT,
                     DAEMON_POLL,
                     stage.path(),
@@ -1197,6 +1133,15 @@ async fn execute_with_registry(
 pub async fn execute(args: DoctorArgs, daemon: DaemonTarget<'_>) -> anyhow::Result<()> {
     execute_with_registry(args, &build_provider_registry_from_config, daemon).await
 }
+
+mod journal;
+mod resolve;
+mod signin;
+use journal::{journal_check, reported_health};
+use resolve::{probe_model, resolve_check};
+use signin::{quota_checks, signin_checks};
+mod resolve_notes;
+use resolve_notes::*;
 
 #[cfg(test)]
 mod tests;

@@ -182,7 +182,7 @@ impl Dashboard {
         // in place rather than in the bottom input bar.
         if self.editing_document() {
             let view = MdEditView::new(
-                " ✎ Editing this document - your changes replace it  ·  [^Enter] save  \
+                " ✎ Editing this document - your changes replace it  ·  [^S] save  \
                  [Enter] newline  [Tab] Save button  [Esc] cancel ",
                 C_SUCCESS,
                 !self.response_focus_send,
@@ -885,6 +885,30 @@ fn final_output_lines(answer: &leviath_core::FinalOutput, width: u16) -> Vec<Lin
         Line::from(""),
     ];
     lines.extend(crate::render::markdown_to_text(&answer.content, width).lines);
+    if !answer.artifacts.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!(" Files produced ({}):", answer.artifacts.len()),
+            Style::default().fg(C_DIM).add_modifier(Modifier::BOLD),
+        )));
+        for artifact in &answer.artifacts {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("   {}", artifact.name),
+                    Style::default().fg(C_WHITE),
+                ),
+                Span::styled(
+                    format!("  {}", artifact.detail_columns()),
+                    Style::default().fg(C_DIM),
+                ),
+            ]));
+        }
+        lines.push(Line::from(Span::styled(
+            " lev result <run> --artifact <name> fetches one; in the Context view, v opens a \
+             final_output part and w writes it into the workdir.",
+            Style::default().fg(C_MUTED),
+        )));
+    }
     lines
 }
 
@@ -923,7 +947,7 @@ mod tests {
             pending_request: None,
             last_answered_request_id: None,
             context_snapshot: None,
-            stages: vec![],
+            stages: Default::default(),
             workdir: "/tmp/test".to_string(),
             task: "test task".to_string(),
             title: Some("My Test".to_string()),
@@ -1042,7 +1066,7 @@ mod tests {
                 },
                 runstate::RegionSnapshot {
                     name: "history".to_string(),
-                    // The word a snapshot writes. The legacy `sliding` spelling
+                    // The word a snapshot writes. The older `sliding` spelling
                     // has to draw the same letter, which
                     // `render_context_bar_regions_string_with_many_region_types`
                     // covers.
@@ -1552,6 +1576,28 @@ mod tests {
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
         assert!(body.contains("body"), "{body}");
+
+        // The files the run produced, under the answer, hashed when stored.
+        answer.artifacts = vec![
+            leviath_core::output::Artifact::from_path("out/notes.md"),
+            leviath_core::output::Artifact {
+                name: "final".to_string(),
+                path: "out/final.mp4".to_string(),
+                mime_type: leviath_core::mime::MimeType::parse("video/mp4").unwrap(),
+                size: 3 * 1024 * 1024,
+                sha256: "abcdef0123456789".repeat(4),
+            },
+        ];
+        let body: String = final_output_lines(&answer, 80)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(body.contains("Files produced (2):"), "{body}");
+        assert!(body.contains("   notes.md  out/notes.md"), "{body}");
+        assert!(
+            body.contains("   final  out/final.mp4  video/mp4  3.0 MB  sha256:abcdef012345"),
+            "{body}"
+        );
     }
 
     /// A minimal stage record carrying just the name the final-output fallback
@@ -1744,7 +1790,7 @@ mod tests {
                     "present",
                     "# The Answer\n\nall done",
                 );
-                agent.stages = vec![make_stage_record("present")];
+                agent.stages = vec![make_stage_record("present")].into();
 
                 let dash = make_test_dashboard();
                 let (lines, showing_final) = dash.build_output_lines(&agent, true, 100);
@@ -1772,7 +1818,7 @@ mod tests {
                     setup_run_state_agent_with_final_output(run_id, "present", "the answer");
                 // The selected stage (index 0) is not the one that submitted,
                 // so its Output pane keeps the honest empty state.
-                agent.stages = vec![make_stage_record("draft")];
+                agent.stages = vec![make_stage_record("draft")].into();
 
                 let backend = TestBackend::new(120, 40);
                 let mut terminal = Terminal::new(backend).unwrap();
@@ -1826,7 +1872,7 @@ mod tests {
                 let run_id = "test-content-final-output-tail-wins";
                 let mut agent =
                     setup_run_state_agent_with_final_output(run_id, "present", "the answer");
-                agent.stages = vec![make_stage_record("present")];
+                agent.stages = vec![make_stage_record("present")].into();
                 // The stage also wrote real output, which always wins over the
                 // final-answer fallback.
                 runstate::append_stage_output(run_id, 0, "streamed stage output");
@@ -1855,7 +1901,7 @@ mod tests {
                 let run_id = "test-content-final-output-hint";
                 let mut agent =
                     setup_run_state_agent_with_final_output(run_id, "present", "the answer");
-                agent.stages = vec![make_stage_record("present")];
+                agent.stages = vec![make_stage_record("present")].into();
 
                 let backend = TestBackend::new(HINT_PANE_WIDTH, 40);
                 let mut terminal = Terminal::new(backend).unwrap();
@@ -1927,7 +1973,8 @@ hint = "after plan"
             completion_tokens: 50,
             started_at: Some(chrono::Utc::now().timestamp() - 30),
             ..crate::runstate::StageRecord::new("main".to_string(), 0)
-        }];
+        }]
+        .into();
         let (lines, _rows) = dash.build_context_lines(&agent, 80);
         let text: String = lines
             .iter()
@@ -1952,7 +1999,7 @@ name = "g"
 [stages.implement]
 "#,
         );
-        agent.stages = vec![]; // no stage records at all -> .get(0) is None
+        agent.stages = vec![].into(); // no stage records at all -> .get(0) is None
 
         let (lines, _rows) = dash.build_context_lines(&agent, 80);
         let text: String = lines
@@ -1976,7 +2023,7 @@ name = "g"
             started_at: Some(chrono::Utc::now().timestamp() - 30),
             ..crate::runstate::StageRecord::new("main".to_string(), 0)
         };
-        agent.stages = vec![rec.clone(), rec];
+        agent.stages = vec![rec.clone(), rec].into();
 
         let (lines, _rows) = dash.build_context_lines(&agent, 80);
         let text: String = lines
@@ -2006,7 +2053,8 @@ condition = "error"
             entered: true,
             started_at: Some(chrono::Utc::now().timestamp() - 30),
             ..crate::runstate::StageRecord::new("main".to_string(), 0)
-        }];
+        }]
+        .into();
 
         let (lines, _rows) = dash.build_context_lines(&agent, 80);
         let text: String = lines
@@ -2041,7 +2089,7 @@ condition = "error"
                 current_tokens: 2000,
                 max_tokens: 4000,
                 entries: vec![runstate::RegionEntrySnapshot {
-                    content: "Hello world".to_string(),
+                    content: "Hello world".to_string().into(),
                     tokens: 5,
                     kind: Default::default(),
                     metadata: None,
@@ -2111,7 +2159,8 @@ transform = "clear"
             completion_tokens: 50,
             started_at: Some(chrono::Utc::now().timestamp() - 30),
             ..crate::runstate::StageRecord::new("implement".to_string(), 1)
-        }];
+        }]
+        .into();
         // selected_stage = 0, so we look up index 0 in stages which is "implement"
         let (lines, _rows) = dash.build_context_lines(&agent, 80);
         let text: String = lines
@@ -2141,7 +2190,8 @@ transform = "clear"
             started_at: Some(chrono::Utc::now().timestamp() - 60),
             ended_at: Some(chrono::Utc::now().timestamp() - 10),
             ..crate::runstate::StageRecord::new("plan".to_string(), 0)
-        }];
+        }]
+        .into();
         let (lines, _rows) = dash.build_context_lines(&agent, 80);
         let text: String = lines
             .iter()
@@ -2165,7 +2215,8 @@ transform = "clear"
             completion_tokens: 50,
             started_at: Some(chrono::Utc::now().timestamp() - 30),
             ..crate::runstate::StageRecord::new("main".to_string(), 0)
-        }];
+        }]
+        .into();
         let (lines, _rows) = dash.build_context_lines(&agent, 80);
         let text: String = lines
             .iter()
@@ -2341,7 +2392,7 @@ transform = "clear"
                 current_tokens: 2000,
                 max_tokens: 4000,
                 entries: vec![runstate::RegionEntrySnapshot {
-                    content: "hello token world".to_string(),
+                    content: "hello token world".to_string().into(),
                     tokens: 5,
                     kind: Default::default(),
                     metadata: None,
@@ -2435,7 +2486,7 @@ transform = "clear"
         // Make snapshot with many entries to exceed screen height
         let entries: Vec<runstate::RegionEntrySnapshot> = (0..50)
             .map(|i| runstate::RegionEntrySnapshot {
-                content: format!("content line {}", i),
+                content: format!("content line {}", i).into(),
                 tokens: 10,
                 kind: Default::default(),
                 metadata: None,
@@ -2492,7 +2543,8 @@ transform = "clear"
             status: crate::runstate::StageRunStatus::Active,
             entered: true,
             ..crate::runstate::StageRecord::new("analyze".to_string(), 0)
-        }];
+        }]
+        .into();
         terminal
             .draw(|f| {
                 let area = Rect::new(0, 0, 100, 10);
@@ -2637,7 +2689,8 @@ transform = "clear"
             run_id: run_id.to_string(),
             visits: crate::commands::dashboard::history::derive_visits(&points),
             points,
-            loaded_at_tick: u64::MAX, // never considered stale by the TTL
+            checked_at_tick: u64::MAX, // never considered stale by the TTL
+            stamp: None,
         });
     }
 
@@ -2785,7 +2838,7 @@ transform = "clear"
     /// A context window with more rows than a short pane can show.
     fn tall_context_agent(id: &str) -> DashboardAgent {
         let entry = |text: &str| runstate::RegionEntrySnapshot {
-            content: text.to_string(),
+            content: text.to_string().into(),
             tokens: 5,
             kind: Default::default(),
             metadata: None,

@@ -8,9 +8,9 @@ order: 5
 
 # Agent blueprints (`agent.leviath`)
 
-An agent is a directory with an `agent.leviath` file, a TOML **blueprint** describing a
-multi-stage [workflow graph](/docs/stages). The [agent catalog](/docs/agent-catalog) has eight
-complete ones worth stealing from.
+A **blueprint** is a multi-stage [workflow graph](/docs/stages): a directory holding an
+`agent.leviath` TOML file and the blueprint's own tools and scripts. Each `lev run` of it is a run.
+The [agent catalog](/docs/agent-catalog) has seven complete ones worth stealing from.
 
 New to this? [Build your first agent](/docs/first-agent) walks through writing one stage by
 stage; this page is the reference for every field it uses.
@@ -109,7 +109,8 @@ provider serves wins), tools, iteration cap, and context layout. Transitions for
 
 ```toml
 [stages.analyze.model]
-allow_user_default = true          # fall back to the user's default model, else fail closed
+allow_user_default = true          # let the host's override_model and fallback_model apply;
+                                   # false keeps this list exactly as written
 models = ["claude-sonnet-5", "gpt-5.4-mini"]
                                    # name models, not routes: whichever provider
                                    # the user configured is asked which it serves.
@@ -138,8 +139,16 @@ that silently becomes "no limit" is the kind of typo that only shows up as a bil
 
 Prefer a relative cap for a stage that writes something whose size follows the material (a report,
 a rewrite of a file). A fixed number is easy to set smaller than the thing being written, and a
-reply cut off by its cap is not an answer: the runtime sends it back with the reason and retries
+reply cut off by its cap is not an answer. The runtime sends it back with the reason and retries
 once at the model's maximum, but the first attempt is still paid for.
+
+A tool call cut off halfway through its arguments is not run. The model is shown what arrived and
+told how to split the call. For `write_file` that means writing the first part, then adding each
+later part with `"append": true`. From the second cut-off in a row the model is also told not to
+resend the call and how many tries it has left. If a fourth reply in a row is cut off in a tool call,
+the stage ends with an error. It takes the stage's `error` edge when there is one, and the run fails
+when there is not. Replies that are not cut off, however many tool calls they make, start the count
+again.
 
 Model selection is per stage, and only per stage. Two mistakes here are quiet ones. A top-level
 `[model]` block parses and is read by nothing, and a stage naming no model takes the host default
@@ -148,29 +157,15 @@ without saying so. `lev validate` reports both. See
 
 ### Which tools a stage gets
 
-`available_tools` lists what the stage may call. The match is exact, so a tool that is not named is
-not offered, however useful it might be.
-
-`available_global_tools = true` widens that list to every Rhai tool installed in the global
-`~/.leviath/tools/` directory at the moment the run spawns. It exists for tools nobody wrote into
-the blueprint: a run that persisted a mechanical step with `install_tool` last week, say. The stage
-still gets everything in `available_tools`; the global tools are appended after them. Only a script
-whose file lives in the global directory counts. A same-named script in the agent's own `tools/`
-or in the run's working directory wins discovery, as it always has, but it is never granted this
-way, because that file is repository content and a global grant should not be a way for a checkout
-to put its own code behind a trusted name. Each call is still policy-gated like any other tool, and
-`lev validate` marks the stage `(global tools)` so a reader of the report knows the advertised set
-is wider than the manifest says.
-
-```toml
-[stages.implement]
-available_tools        = ["read_file", "edit_file", "shell"]
-available_global_tools = true
-```
+`available_tools` lists what the stage may call, by name or by kind. `@builtin`, `@subagent`,
+`@scripts`, `@mcp` and `@all` each grant every tool of that kind, so `["@builtin", "@scripts"]`
+is every built-in and every Rhai tool with nothing to keep in step. See
+[tool groups](/docs/tools#tool-groups) for what each reaches and what none of them grant.
 
 `required_tools` is the exception to the unattended cut. A [`--yolo`](/docs/glossary) run drops
-every tool that waits on a person, and this is where a stage names the ones it wants kept anyway. Every entry must also
-appear in `available_tools`.
+every tool that waits on a person, and this is where a stage names the ones it wants kept anyway.
+Every entry must also appear in `available_tools`, by name or through a group that reaches it;
+`lev validate` checks the group case against the tools this install has.
 
 Naming a tool here also settles the `blocking-tool-in-autonomous-stage` lint for it, since listing
 it is how you say you meant it. See
@@ -178,15 +173,15 @@ it is how you say you meant it. See
 
 #### Naming a tool from an MCP server
 
-An MCP tool is always named `<server>__<tool>` - the server it came from, two underscores, the tool
-the server calls it:
+An MCP tool is always named `<server>__<tool>`: the server it came from, two underscores, then
+the tool the server calls it:
 
 ```toml
-available_tools = ["read_file", "github__create_issue"]
+available_tools = ["read_file", "tracker__create_issue"]
 ```
 
-The server is part of the name whether or not anything would have collided, so two servers that both
-offer `search` are `github__search` and `gitlab__search`, and a grant means the same thing however
+The server is part of the name whether or not anything would have collided. Two servers that both
+offer `search` are `tracker__search` and `wiki__search`, and a grant means the same thing however
 your `config.toml` is ordered.
 
 The separator is `__` rather than a dot because the name is passed to the model provider, and
@@ -240,13 +235,13 @@ Providers cache the prompt by prefix, so a region that changes invalidates the c
 region assembled behind it. `volatility` is what orders them: `stable` first, `grows` next and
 split so its settled part still caches, `rewritten` last where it invalidates only itself.
 
-The kind cannot answer this, which is why the setting exists. Every region above is `pinned` -
-that means "never evicted", not "never written", and `context_write` into a findings region is an
+The kind cannot answer this, which is why the setting exists. Every region above is `pinned`.
+That means "never evicted", not "never written", and `context_write` into a findings region is an
 ordinary move. Only the blueprint knows which is which.
 
 Leaving it out is safe: an unclassified region is assumed to change and placed last, so declaring
 can only improve matters. A region that claims `stable` and then keeps changing is named in the
-log, because a wrong declaration is worse than none - it puts churn at the front of the prompt,
+log, because a wrong declaration is worse than none. It puts churn at the front of the prompt,
 where it costs the most. See [what caching costs](/docs/context#what-caching-costs).
 
 A stage can override the whole layout for itself alone with `[stages.<name>.context.regions]`. The
@@ -258,8 +253,8 @@ kind = "pinned"
 budget = "10%"
 ```
 
-**A region the stage leaves out is hidden, not destroyed.** It keeps its contents, is left out of
-that stage's prompt, and comes back with everything in it as soon as a later stage declares it
+**A region the stage leaves out is hidden, not destroyed.** It keeps its contents and is left out
+of that stage's prompt. It comes back with everything in it as soon as a later stage declares it
 again. That is what makes this usable for narrowing: a compute stage need not carry a large data
 preview through every one of its calls, and a summary stage further on can still read it.
 
@@ -315,6 +310,104 @@ The declarations do nothing on their own: the user's config must grant them, the
 read-only, and every access is checked against the symlink-resolved real path. Run
 `lev validate` to see which of them the config on this machine actually grants. See
 [Security](/docs/security) for the grant stanzas and the full matching rules.
+
+## Mime types the agent brings
+
+An agent whose tools make or take a format nothing else knows can describe it itself:
+
+```toml
+[mime_types."application/x-acme-scene"]
+family = "model"
+extensions = ["scene"]
+magic = "41434D45"
+check = "checks/scene.rhai"      # relative to this directory; refuses bytes that are not a scene
+```
+
+The rows are the same shape as the operator's
+[`mime_types.toml`](/docs/configuration#mime_typestoml) and layer over it for this agent's
+runs only, so a blueprint travels with the types it needs and never changes what another agent
+sees. They are checked when the manifest is parsed, so a misspelled field fails `lev validate`
+and the spawn. A `check` script is compiled beside the agent's other scripts with the same
+fence: it has to live inside the blueprint's directory. [Mime](/docs/mime#the-registry) has
+every field and [Rhai mime checks](/docs/rhai-mime-checks) the script.
+
+## Dependencies
+
+An agent can say what has to be in place on the machine before it runs, as a top-level
+`[[dependencies]]` array. This is a declaration, never a grant: Leviath shows the operator what is
+missing and how to fix it, and a run whose required dependency is unmet fails to spawn before any
+model is billed. `lev deps check <agent>` reports the same findings, and `lev deps install <agent>`
+sets them up after asking.
+
+Each entry has a `name`, a `kind`, an optional `required` (true by default), a human `remedy`
+shown when it is missing, and an optional `description`. The kind chooses what must be present:
+
+```toml
+# An MCP server that must be configured, plus the secret it needs.
+[[dependencies]]
+name = "meshy"
+kind = "mcp_server"
+server = "meshy"
+env = ["MESHY_API_KEY"]
+remedy = "Run: lev deps install my-agent, then set MESHY_API_KEY"
+
+# What lev deps install writes into the user's config for that server. Secrets
+# are never stored here: they are named in env above and prompted for.
+[dependencies.install.server]
+transport = "http"
+url = "https://www.meshy.ai/mcp"
+[dependencies.install.server.headers]
+Authorization = "Bearer ${MESHY_API_KEY}"
+
+# A program that must be on PATH, with how to install it.
+[[dependencies]]
+name = "blender"
+kind = "binary"
+command = "blender"
+[dependencies.install]
+command = "brew install blender"          # or per-OS:
+[dependencies.install.commands]
+linux = "apt-get install -y blender"
+
+# An environment variable that must be set and non-empty.
+[[dependencies]]
+name = "token"
+kind = "env"
+var = "ACME_TOKEN"
+
+# A condition a Rhai script decides.
+[[dependencies]]
+name = "acme-setup"
+kind = "script"
+check = "deps/check.rhai"                  # returns () when satisfied, else a remedy string
+[dependencies.install]
+script = "deps/install.rhai"               # optional; runs only via lev deps install
+```
+
+A `check` script runs on a hardened engine with three read-only probes and nothing else:
+`has_env(name)`, `env(name)` and `path_exists(path)`. It returns `()` when the dependency is in
+place, or a string remedy when it is not. An `install` script gets one host function, `sh(command)`,
+and runs only when the user asks for it with `lev deps install`. Checking never changes the machine;
+only install does, and only after a confirmation.
+
+The bundled `sprite-to-3d` agent declares the Meshy dependency above: it turns a sprite sheet or
+character image into a rigged, game-ready model, and a run refuses to start until Meshy is set up.
+Set it up with `lev deps install sprite-to-3d`, then run it with `lev run sprite-to-3d`.
+
+It works in stages. First it renders a clean front T-pose from the sprite, then back and side views
+that match it, drawing more than one where it is unsure. A filter stage deletes the bad renders
+(off-model, pixel-art, or a multi-angle turnaround sheet) and keeps the good single views. A critique
+stage, on a second model chosen for a sharp eye, then compares each kept view against the source
+part by part. It records anything missing or wrong into a dedicated region, such as an absent arm
+cannon or a shoulder pad on the wrong side. It is the only stage that clears an item, and only
+after confirming on the images that the detail is now there. A coverage stage decides whether the
+angles are covered and that list is clear. If not, a generation pass redraws the views to fix
+exactly those items, conditioned on both the sprite sheet and the good views already in hand. The
+whole filter to critique to generate loop is bounded. Meshy then builds one model from the chosen
+views, with
+symmetry turned off so a one-sided detail like an arm cannon survives instead of being mirrored away.
+A final stage compares the model against the views and, if it drifted, sends it back to be rebuilt a
+bounded number of times before finishing.
 
 ## How the coding agent verifies its work
 
@@ -391,23 +484,35 @@ registered.
 ## Discovering tools mid-run
 
 By default a stage advertises a fixed tool set resolved at spawn, and a tool that appears later is
-invisible to it. `dynamic_tools` opts an agent in to re-advertising:
+invisible to it. `tool_rescan` says when a run looks again:
 
 ```toml
 [agent]
-dynamic_tools = true
+tool_rescan = "after_writes"   # at_spawn | after_writes | before_dispatch
 ```
 
-With it on, a script tool written into the run's own `tools/` directory becomes callable on the
-next inference. Off (the default) is the safer choice, since it means an agent cannot grow its own
-capabilities mid-run.
+| Value | When it looks | What that catches |
+|---|---|---|
+| `at_spawn` | Once, at spawn | The default. An agent cannot grow its own capabilities mid-run |
+| `after_writes` | Before the next turn, when the agent writes a script | A tool this agent installed, from its next turn on |
+| `before_dispatch` | Also at the directories, before each batch | A tool that arrived without this agent writing it |
 
-The re-scan advertises a new tool only to a stage whose `available_tools` names it, with one
-exception: a stage that set `available_global_tools` also picks up whatever has landed in
-`~/.leviath/tools/` since spawn, by the same rule as at spawn (the file has to be in the global
-directory, not merely share a name with one that is). A tool the run itself installs with
-`install_tool` therefore reaches an opted-in stage in the same run, and every stage that opted in
-from the next run onwards whether or not `dynamic_tools` is set.
+Anything but `at_spawn` puts the run's own `tools/` directory in the scan set. The directory is the
+workdir's, so anything else running there sees the same tools and a sub-agent inherits it.
+
+The difference between the last two is what they notice. `after_writes` is told about a tool when
+the agent writes one with `write_file` or `edit_file`, or installs one. A tool that arrives any
+other way sets nothing, and stays invisible for the rest of the run: one written by a shell command,
+one written by a script tool, one dropped in by a sub-agent or fan-out worker sharing the workdir,
+or one a person adds while the run is going. `before_dispatch` looks at the directories rather than
+waiting to be told, so it sees those, and sees a tool that was edited or removed too. The cost is
+one `stat` per scanned directory per batch, and a re-scan only when something changed.
+
+Neither value makes a tool callable in the batch that creates it. Every call in a batch is checked
+before any of them runs, so a batch that writes a script and calls it has the call refused either
+way.
+
+`dynamic_tools = true` is the older spelling of `after_writes` and still reads as it.
 
 ## Handing context to a sub-agent
 

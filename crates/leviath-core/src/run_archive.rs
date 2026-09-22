@@ -38,9 +38,6 @@
 //! region). [`diff_context`]/[`apply_delta`] compute and replay those diffs, and
 //! [`fold`] reconstructs the current state from the whole journal.
 
-use std::io::{self, Read};
-use std::ops::ControlFlow;
-
 use serde::{Deserialize, Serialize};
 
 use crate::run_meta::{ContextSnapshot, RegionEntrySnapshot, RegionSnapshot, RunMeta, RunStatus};
@@ -75,14 +72,28 @@ pub struct MessageRecord {
 /// A single tool call and (once executed) its result.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCallRecord {
-    /// The tool-call id.
+    /// The tool-call id, as the provider assigned it.
+    ///
+    /// Correlation, not identity: a provider may reuse one across a retry or a
+    /// reissue, so two attempts can arrive under one id. What tells them apart
+    /// is [`execution_id`](Self::execution_id).
     pub id: String,
+    /// This attempt's own id, minted at dispatch.
+    ///
+    /// Empty in a journal written before executions had identity, where the
+    /// provider's id was all there was: a reader treats an empty one as "this
+    /// attempt was not identified" rather than as an attempt with a blank name.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub execution_id: String,
     /// The tool name.
     pub name: String,
     /// The JSON arguments, stringified.
     pub arguments: String,
-    /// The result text, once the tool has run (`None` while pending).
-    pub result: Option<String>,
+    /// The result, once the tool has run (`None` while pending). Text and
+    /// any stored parts the tool produced; a plain string on the wire when
+    /// it is text alone, which is what every journal written before parts
+    /// existed holds.
+    pub result: Option<crate::region::EntryContent>,
     /// Opaque provider token that must be replayed with this call (Gemini's
     /// `thought_signature`). Carried so a restored batch can rebuild the exact
     /// assistant turn.
@@ -312,6 +323,24 @@ pub enum RunRecord {
         /// (one batch per iteration).
         #[serde(default)]
         iteration: usize,
+        /// The stay in that stage the batch was dispatched during, as minted
+        /// when the run entered it.
+        ///
+        /// The correlation key a reader wants, where the index and the iteration
+        /// are only where it sat: a stage entered three times has three stays,
+        /// and the index is the same for all of them. Empty in a journal written
+        /// before visits had identity, and in a world with no stage ledger.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        visit_id: String,
+        /// The provider attempt whose answer asked for these calls, as minted
+        /// before that request went out.
+        ///
+        /// Empty in a journal written before attempts had identity, and on a
+        /// batch no answer asked for. A reader must not fall back to the nearest
+        /// attempt in time: a failover means the answer came from a different
+        /// provider than the attempt before it went to.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        requested_by: String,
         /// The assistant text of the turn that issued the calls.
         #[serde(default)]
         response: String,
@@ -320,17 +349,143 @@ pub enum RunRecord {
     ToolCallDone {
         /// The iteration of the [`RunRecord::ToolBatch`] this belongs to.
         iteration: usize,
-        /// The tool-call id.
+        /// The tool-call id, as the provider assigned it. Correlation; see
+        /// [`ToolCallRecord::id`].
         call_id: String,
-        /// The result text.
-        result: String,
+        /// The attempt this completes, as minted at dispatch. Empty in a journal
+        /// written before executions had identity.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        execution_id: String,
+        /// The result: text and any stored parts.
+        ///
+        /// For an indeterminate outcome this is the stand-in a resume put in the
+        /// window, not something the tool returned. The outcome is what tells
+        /// the two apart, and a reader showing this text as the tool's answer
+        /// would be inventing one.
+        result: crate::region::EntryContent,
+        /// How the attempt ended.
+        ///
+        /// `None` in a journal written before outcomes were recorded, where a
+        /// completion record said only that the call finished and a failure was
+        /// text inside the result. A reader must not invent one of the five
+        /// states for such a record.
+        ///
+        /// Recorded so far only where it cannot be read off the result at all:
+        /// an execution a resume gave up on, which no later reader could
+        /// distinguish from one that finished.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        outcome: Option<crate::execution::ToolOutcome>,
         /// Unix seconds.
         at: i64,
     },
+    /// Files one tool execution produced, recorded as it produced them.
+    ///
+    /// `output.json` holds the artifacts of the run's *latest* answer, and a
+    /// later submission replaces it whole: a file an earlier submission produced
+    /// leaves no trace there at all, and nothing in that file says which call
+    /// made any of it. This record is written by the dispatcher that was handling
+    /// the call, so an artifact is attributable for as long as the journal
+    /// exists, superseded submissions included.
+    ArtifactsProduced {
+        /// The execution that produced them, as minted at dispatch.
+        execution_id: String,
+        /// The files, exactly as the answer recorded them.
+        artifacts: Vec<crate::output::Artifact>,
+        /// Unix seconds.
+        at: i64,
+    },
+    /// A question this run put to a person, and what came back.
+    ///
+    /// The only record that a run stopped for someone. Without it an approved
+    /// call is indistinguishable from one no policy ever stopped, and the scope
+    /// a person chose - this call, this stage, the rest of the run - is gone the
+    /// moment the tool reads its answer.
+    Interaction {
+        /// The request id the hub minted, which is what an answer arriving over
+        /// the API or from `lev respond` carries.
+        request_id: String,
+        /// What was asked for.
+        kind: crate::interaction::InteractionKind,
+        /// The tool an approval was for. `None` for every other kind.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool: Option<String>,
+        /// The question as the person saw it.
+        prompt: String,
+        /// The stage the run was in when it asked.
+        stage: String,
+        /// How it ended.
+        settlement: crate::interaction::Settlement,
+        /// Unix seconds when the question was asked.
+        asked_at: i64,
+        /// Unix seconds when it settled.
+        at: i64,
+    },
+    /// One trip to a provider, whether or not it produced an answer.
+    ///
+    /// The usage records say what the calls that worked cost. These say what the
+    /// run spent getting them, which is the half a retry or a failover otherwise
+    /// leaves no trace of at all.
+    InferenceAttempt(AttemptRecord),
+    /// One provider judged unusable, and the model being tried instead.
+    InferenceFailover(FailoverRecord),
     /// A full context-window snapshot that subsequent diffs rebase on.
     ContextCheckpoint {
         /// The full window snapshot.
         snapshot: ContextSnapshot,
+        /// Unix seconds.
+        at: i64,
+    },
+    /// Why a region changed, recorded as it changed.
+    ///
+    /// The snapshots beside this say what the window held; they cannot say what
+    /// moved it, and a region that lost its plan looks identical whether a
+    /// compaction took it, a stage-edge transform cleared it, or the model
+    /// called `context_delete`. Carries no content: the snapshot recorded on the
+    /// same tick already holds the window, so repeating the text here would
+    /// double the journal to say nothing new.
+    ContextChange {
+        /// The region that changed.
+        region: String,
+        /// What changed it.
+        cause: crate::ContextCause,
+        /// Entries the change added.
+        entries_added: usize,
+        /// Entries it removed, the eviction the change itself triggered
+        /// included.
+        entries_removed: usize,
+        /// How the region's token count moved; negative when it shrank.
+        token_delta: i64,
+        /// Unix seconds.
+        at: i64,
+    },
+    /// One committed transaction against the context window: what moved it, the
+    /// window it started from and the window it produced, and every region it
+    /// touched.
+    ///
+    /// The record a debugger joins on. A change carries the window's
+    /// [revision](crate::run_meta::revision) either side, so it is anchored to
+    /// exact content rather than to a moment, and it carries every region of the
+    /// transaction at once - a compaction that summarised one region and emptied
+    /// another is one record, not two events that share a second.
+    ///
+    /// Carries no content, for the reason [`RunRecord::ContextChange`] gives:
+    /// the snapshot recorded on the same tick holds the text, and the per-region
+    /// digests here are what tell a reader whether it needs to go and read it.
+    ContextTransaction {
+        /// The window's revision before the transaction.
+        revision_before: String,
+        /// The window's revision after it.
+        revision_after: String,
+        /// What made the change.
+        cause: crate::ContextCause,
+        /// Every region the transaction touched, in the order the write path
+        /// named them.
+        regions: Vec<RegionCommit>,
+        /// The tool execution that committed it, as minted at dispatch. Empty
+        /// where nothing knew of one: a write outside any tool call, and a tool
+        /// whose results the batch applies rather than the call itself.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        execution_id: String,
         /// Unix seconds.
         at: i64,
     },
@@ -505,6 +660,27 @@ pub struct ContextDigest {
     pub regions: Vec<RegionDigest>,
 }
 
+impl ContextDigest {
+    /// This fingerprint folded into one opaque hex string, for a record that
+    /// needs to name a window rather than compare it region by region.
+    ///
+    /// Folded from the per-entry hashes the coalescing lane already computes, so
+    /// two windows that this digest calls identical fold to the same string and
+    /// nothing hashes the context twice.
+    pub fn fingerprint(&self) -> String {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for region in &self.regions {
+            region.name.hash(&mut hasher);
+            region.kind.hash(&mut hasher);
+            region.current_tokens.hash(&mut hasher);
+            region.max_tokens.hash(&mut hasher);
+            region.entries.hash(&mut hasher);
+        }
+        format!("{:016x}", hasher.finish())
+    }
+}
+
 /// Hash one region entry. Every field participates: two entries that differ
 /// anywhere must digest differently, or a real change would be recorded as
 /// "unchanged" and the folded archive would silently drift from the run.
@@ -624,11 +800,23 @@ pub fn apply_delta(base: &mut ContextSnapshot, delta: &ContextDelta) {
     }
 }
 
+mod attempt;
 mod codec;
+mod executions;
+mod points;
+mod transaction;
 
+pub use attempt::{
+    AttemptOutcome, AttemptRecord, CaptureStatus, FailoverRecord, ModelInput, RequestDigest, Retry,
+};
 pub use codec::{
-    Frame, RUN_ARCHIVE_MAGIC, RUN_ARCHIVE_VERSION, read_archive, read_archive_lenient,
+    Frame, Frames, RUN_ARCHIVE_MAGIC, RUN_ARCHIVE_VERSION, read_archive, read_archive_lenient,
     read_archive_start, read_frame, read_record, write_archive_start, write_record,
+};
+pub use executions::{Execution, SeekRead, read_archive_executions, read_result_at};
+pub use points::{PointRef, RunPoint, replay_points, visit_archive_points, visit_points};
+pub use transaction::{
+    ContextChangeRecord, IndexedChange, RegionCommit, RegionTransition, read_archive_changes,
 };
 
 // ─── fold ───────────────────────────────────────────────────────────────────
@@ -637,6 +825,12 @@ pub use codec::{
 /// window - what a crash-resume must replay instead of re-running. `calls` carry
 /// every result recorded before the crash ([`RunRecord::ToolCallDone`] merged
 /// in); a call still at `result: None` genuinely never finished.
+///
+/// Only a batch that had work in the tool lane becomes one. A batch the
+/// dispatcher resolved entirely by itself - context tools, refusals, gate
+/// denials - is re-issued instead: a replay lands recorded results in the
+/// conversation without redoing a context tool's write, so replaying one would
+/// put `context_write: ok` over a region that never received the content.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PendingToolBatch {
     /// The stage index the batch was dispatched in.
@@ -652,6 +846,31 @@ pub struct PendingToolBatch {
 /// One provider call's cost, as folded out of the journal.
 ///
 /// The flattened form of [`RunRecord::InferenceUsage`], so a consumer walking a
+/// One question this run asked a person, folded out of the journal.
+///
+/// The record that a run stopped for somebody. A reader listing these can say
+/// which calls a person allowed, at what scope, and which ones nobody answered
+/// - none of which is recoverable from the tool results alone.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InteractionRecord {
+    /// The request id the hub minted.
+    pub request_id: String,
+    /// What was asked for.
+    pub kind: crate::interaction::InteractionKind,
+    /// The tool an approval was for.
+    pub tool: Option<String>,
+    /// The question as the person saw it.
+    pub prompt: String,
+    /// The stage the run was in when it asked.
+    pub stage: String,
+    /// How it ended.
+    pub settlement: crate::interaction::Settlement,
+    /// Unix seconds when it was asked.
+    pub asked_at: i64,
+    /// Unix seconds when it settled.
+    pub at: i64,
+}
+
 /// folded run does not have to match the record enum to read a number.
 // `Eq` is not derivable once a cost is present: `f64` has no total equality.
 // `PartialEq` is what the tests compare with anyway.
@@ -707,6 +926,21 @@ pub struct FoldedRun {
     pub inference_usage: Vec<InferenceUsageRecord>,
     /// Number of tool calls recorded.
     pub tool_call_count: usize,
+    /// Every question this run put to a person, in the order it asked them.
+    pub interactions: Vec<InteractionRecord>,
+    /// Every trip this run made to a provider, in order, the failed ones
+    /// included. Read beside `inference_usage`, which holds only the calls that
+    /// produced an answer, this is what the retries cost.
+    pub attempts: Vec<AttemptRecord>,
+    /// Every move from one provider to another, in order.
+    pub failovers: Vec<FailoverRecord>,
+    /// Every committed change to the window, in the order they landed.
+    ///
+    /// Read beside the window itself, this is the half a snapshot cannot carry:
+    /// which path in the runtime moved a region, rather than only what it holds
+    /// now. Empty for a journal that records no causes, and for the write paths
+    /// that cannot name one.
+    pub context_changes: Vec<ContextChangeRecord>,
     /// A dispatched tool batch whose results never made it into the context
     /// window (the run crashed mid-batch). `None` when the run has no batch in
     /// flight or the batch's turn already landed in `context`.
@@ -752,6 +986,10 @@ pub fn fold(records: &[RunRecord]) -> Option<FoldedRun> {
         inference_count: 0,
         inference_usage: Vec::new(),
         tool_call_count: 0,
+        interactions: Vec::new(),
+        attempts: Vec::new(),
+        failovers: Vec::new(),
+        context_changes: Vec::new(),
         pending_batch: None,
     };
     for record in iter {
@@ -769,6 +1007,31 @@ pub fn fold(records: &[RunRecord]) -> Option<FoldedRun> {
                 folded.identity.world_id = world_id.clone();
             }
             RunRecord::Inference { .. } => folded.inference_count += 1,
+            // A folded run carries the state a resume needs and the totals a
+            // reader asks for; which execution made which file is neither, and
+            // the executions listing is where it is answered.
+            RunRecord::ArtifactsProduced { .. } => {}
+            RunRecord::InferenceAttempt(attempt) => folded.attempts.push(attempt.clone()),
+            RunRecord::InferenceFailover(failover) => folded.failovers.push(failover.clone()),
+            RunRecord::Interaction {
+                request_id,
+                kind,
+                tool,
+                prompt,
+                stage,
+                settlement,
+                asked_at,
+                at,
+            } => folded.interactions.push(InteractionRecord {
+                request_id: request_id.clone(),
+                kind: kind.clone(),
+                tool: tool.clone(),
+                prompt: prompt.clone(),
+                stage: stage.clone(),
+                settlement: settlement.clone(),
+                asked_at: *asked_at,
+                at: *at,
+            }),
             RunRecord::InferenceUsage {
                 kind,
                 stage,
@@ -812,12 +1075,24 @@ pub fn fold(records: &[RunRecord]) -> Option<FoldedRun> {
                 folded.tool_call_count += calls.len();
                 // A later batch replaces an earlier one - only the newest can
                 // still be in flight.
-                folded.pending_batch = Some(PendingToolBatch {
-                    stage_index: *stage_index,
-                    iteration: *iteration,
-                    response: response.clone(),
-                    calls: calls.clone(),
-                });
+                //
+                // A batch whose every call already carried a result at dispatch
+                // had nothing in the tool lane, so there is nothing a resume
+                // could finish: it is re-issued, and re-issuing is the only
+                // correct thing to do with it. Replaying it instead would land a
+                // turn saying `context_write: ok` over a region the write never
+                // reached, because a replay puts recorded results in the
+                // conversation and does not redo a context tool's write.
+                folded.pending_batch =
+                    calls
+                        .iter()
+                        .any(|call| call.result.is_none())
+                        .then(|| PendingToolBatch {
+                            stage_index: *stage_index,
+                            iteration: *iteration,
+                            response: response.clone(),
+                            calls: calls.clone(),
+                        });
             }
             RunRecord::ToolCallDone {
                 iteration,
@@ -835,6 +1110,15 @@ pub fn fold(records: &[RunRecord]) -> Option<FoldedRun> {
                 {
                     call.result = Some(result.clone());
                 }
+            }
+            RunRecord::ContextChange { .. } | RunRecord::ContextTransaction { .. } => {
+                // Both record a committed change, and a reader asking why a
+                // region moved should not have to know which shape the build
+                // that wrote the journal used. `change_of` is the one place that
+                // knows, so the two can never be folded into different stories.
+                folded
+                    .context_changes
+                    .extend(transaction::change_of(record));
             }
             RunRecord::ContextCheckpoint { snapshot, .. } => folded.context = snapshot.clone(),
             RunRecord::ContextDiff { delta, .. } => apply_delta(&mut folded.context, delta),
@@ -863,221 +1147,15 @@ pub fn fold(records: &[RunRecord]) -> Option<FoldedRun> {
     Some(folded)
 }
 
-/// A run's context window at one recorded point in time, with the metadata
-/// (stage, iteration, status, …) in effect then. Produced by [`replay_points`].
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RunPoint {
-    /// The run metadata at this point.
-    pub meta: RunMeta,
-    /// The full context window at this point.
-    pub context: ContextSnapshot,
-    /// Unix seconds this point was recorded.
-    pub at: i64,
-}
-
-/// One replayed point, lent to a [`visit_points`] visitor rather than handed
-/// over. Borrowing is the whole purpose: see that function.
-#[derive(Debug)]
-pub struct PointRef<'a> {
-    /// Position in the timeline, counting only records that produce a point.
-    /// Stable for a given journal prefix, because the journal is append-only -
-    /// which is what makes it usable as a pagination cursor.
-    pub index: usize,
-    /// Unix seconds this point was recorded.
-    pub at: i64,
-    /// The run metadata in effect at this point.
-    pub meta: &'a RunMeta,
-    /// The full context window at this point.
-    pub context: &'a ContextSnapshot,
-}
-
-/// Replay a run journal, calling `visit` once per record that changes the
-/// context (a checkpoint, diff, or progress step), in order. Stops early if the
-/// visitor returns [`ControlFlow::Break`]. Does nothing if the records don't
-/// start with a [`RunRecord::Header`].
-///
-/// The point of lending each point instead of collecting them: replaying a run
-/// means carrying one running window and mutating it, so materializing the
-/// timeline costs a **full deep copy of the context window per point** - and a
-/// window holds every region's entry text. On a megabyte-scale journal that is
-/// hundreds of whole-window clones, which is why anything that wants a slice of
-/// the timeline, or just an answer to "does any point contain this text",
-/// should come through here rather than [`replay_points`].
-///
-/// `&mut dyn FnMut` rather than a generic parameter, deliberately: this is
-/// called from a handful of places with unrelated closure types, and one
-/// monomorphization keeps both the compiled size and the coverage instantiation
-/// count at one - the same reasoning `execute_with_shutdown` documents in the
-/// serve module.
-pub fn visit_points(records: &[RunRecord], visit: &mut dyn FnMut(PointRef<'_>) -> ControlFlow<()>) {
-    let mut iter = records.iter();
-    let Some(mut folder) = (match iter.next() {
-        Some(first) => PointFolder::start(first),
-        None => None,
-    }) else {
-        return;
-    };
-    for record in iter {
-        if folder.push(record, visit).is_break() {
-            return;
-        }
-    }
-}
-
-/// Streaming [`visit_points`] over a framed archive: validate the preamble,
-/// then read one record at a time and fold it into the running window - so a
-/// multi-megabyte `run.lvr` is walked holding one record and one window in
-/// memory, instead of the whole parsed journal (`read_archive` materializes
-/// every record first, typically 2-4x the file's bytes as structs).
-///
-/// Errors only on a bad preamble. Like [`read_archive_lenient`], a torn or
-/// unreadable frame ends the walk with the points already visited: the tail of
-/// a live run's journal can legitimately be mid-append.
-pub fn visit_archive_points(
-    r: &mut dyn Read,
-    visit: &mut dyn FnMut(PointRef<'_>) -> ControlFlow<()>,
-) -> io::Result<()> {
-    read_archive_start(r)?;
-    // The first record has to be a Header, and a Header is a kind every build
-    // knows - so an unreadable frame here means this is not a foldable archive.
-    let mut folder = match read_frame(r) {
-        Ok(Some(Frame::Record(first))) => match PointFolder::start(&first) {
-            Some(folder) => folder,
-            None => return Ok(()),
-        },
-        _ => return Ok(()),
-    };
-    // A record kind from a later build is stepped over rather than ending the
-    // walk: it carries no context change this build can apply, and everything
-    // after it still does.
-    while let Ok(Some(frame)) = read_frame(r) {
-        let Frame::Record(record) = frame else {
-            continue;
-        };
-        if folder.push(&record, visit).is_break() {
-            return Ok(());
-        }
-    }
-    Ok(())
-}
-
-/// The running state of a point replay: the metadata and window in effect,
-/// folded record by record. Shared by [`visit_points`] (in-memory records) and
-/// [`visit_archive_points`] (streamed records) so the two can never disagree
-/// about what a record means.
-struct PointFolder {
-    meta: RunMeta,
-    context: ContextSnapshot,
-    index: usize,
-}
-
-impl PointFolder {
-    /// Start a replay from the first record, which must be the Header -
-    /// anything else means this isn't a run journal, and the replay visits
-    /// nothing (`None`).
-    fn start(first: &RunRecord) -> Option<Self> {
-        match first {
-            RunRecord::Header { meta, .. } => Some(Self {
-                meta: (**meta).clone(),
-                context: ContextSnapshot {
-                    stage_name: String::new(),
-                    total_tokens: 0,
-                    max_tokens: 0,
-                    regions: Vec::new(),
-                },
-                index: 0,
-            }),
-            _ => None,
-        }
-    }
-
-    /// Fold one record; when it produces a timeline point, lend it to `visit`.
-    fn push(
-        &mut self,
-        record: &RunRecord,
-        visit: &mut dyn FnMut(PointRef<'_>) -> ControlFlow<()>,
-    ) -> ControlFlow<()> {
-        let at = match record {
-            RunRecord::Header { meta: m, .. } => {
-                self.meta = (**m).clone();
-                return ControlFlow::Continue(());
-            }
-            RunRecord::StatusChanged { status, .. } => {
-                self.meta.status = status.clone();
-                return ControlFlow::Continue(());
-            }
-            RunRecord::ContextCheckpoint { snapshot, at } => {
-                self.context = snapshot.clone();
-                *at
-            }
-            RunRecord::ContextDiff { delta, at } => {
-                apply_delta(&mut self.context, delta);
-                *at
-            }
-            RunRecord::Checkpoint {
-                meta: m,
-                context: c,
-                at,
-            } => {
-                self.meta = (**m).clone();
-                self.context = c.clone();
-                *at
-            }
-            RunRecord::Progress { meta: m, delta, at } => {
-                self.meta = (**m).clone();
-                apply_delta(&mut self.context, delta);
-                *at
-            }
-            // Non-context records don't add a timeline point. Usage included:
-            // it says what a call cost, not what the window then held, and
-            // emitting a point per call would double the timeline with entries
-            // whose context is identical to their neighbour's.
-            RunRecord::OwnershipChanged { .. }
-            | RunRecord::Inference { .. }
-            | RunRecord::InferenceUsage { .. }
-            | RunRecord::ToolBatch { .. }
-            | RunRecord::ToolCallDone { .. }
-            | RunRecord::Message { .. } => return ControlFlow::Continue(()),
-        };
-        let flow = visit(PointRef {
-            index: self.index,
-            at,
-            meta: &self.meta,
-            context: &self.context,
-        });
-        self.index += 1;
-        flow
-    }
-}
-
-/// Replay a run journal into the sequence of context-window snapshots over time,
-/// one [`RunPoint`] per record that changes the context (a checkpoint, diff, or
-/// progress step). This is what the context-history views (TUI/CLI/API) consume
-/// to show the window "at each stage and point". Returns an empty vec if the
-/// records don't start with a [`RunRecord::Header`].
-///
-/// Materializes every point, so it deep-copies the whole context window once per
-/// point. Prefer [`visit_points`] when only part of the timeline is wanted, or
-/// when the answer is a predicate rather than the points themselves.
-pub fn replay_points(records: &[RunRecord]) -> Vec<RunPoint> {
-    let mut points = Vec::new();
-    visit_points(records, &mut |point| {
-        points.push(RunPoint {
-            meta: point.meta.clone(),
-            context: point.context.clone(),
-            at: point.at,
-        });
-        ControlFlow::Continue(())
-    });
-    points
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Only the tests write through the trait now; the codec moved out.
+    // The tests are the only writers through the trait; the codec is its own
+    // module and writes through its own.
+    use crate::ContextCause;
     use crate::run_meta::RunStatus;
-    use std::io::Write;
+    use std::io::{self, Read, Write};
+    use std::ops::ControlFlow;
 
     fn identity() -> RunIdentity {
         RunIdentity {
@@ -1132,7 +1210,7 @@ mod tests {
 
     fn entry(content: &str, tokens: usize) -> RegionEntrySnapshot {
         RegionEntrySnapshot {
-            content: content.to_string(),
+            content: content.into(),
             tokens,
             kind: crate::region::EntryKind::Text,
             metadata: None,
@@ -1404,6 +1482,28 @@ mod tests {
         assert_eq!(&base, b);
     }
 
+    /// The folded fingerprint says the same thing the digest does, in one
+    /// string: two windows the digest calls identical fold together, and any
+    /// change the digest notices moves it.
+    #[test]
+    fn the_folded_fingerprint_follows_the_digest_it_is_folded_from() {
+        let a = snapshot("s1", vec![region("conv", vec![entry("hi", 1)])]);
+        let same = snapshot("s1", vec![region("conv", vec![entry("hi", 1)])]);
+        let grown = snapshot(
+            "s1",
+            vec![region("conv", vec![entry("hi", 1), entry("there", 2)])],
+        );
+        let renamed = snapshot("s1", vec![region("plan", vec![entry("hi", 1)])]);
+        let print = |snap: &ContextSnapshot| digest_context(snap).fingerprint();
+        assert_eq!(print(&a).len(), 16);
+        assert_eq!(print(&a), print(&same));
+        assert_ne!(print(&a), print(&grown));
+        assert_ne!(print(&a), print(&renamed));
+        // An empty window still fingerprints, so a record never has to choose
+        // between a fingerprint and a window that held nothing.
+        assert_eq!(ContextDigest::default().fingerprint().len(), 16);
+    }
+
     #[test]
     fn digest_diff_append_only_growth_is_compact() {
         let a = snapshot("s1", vec![region("conv", vec![entry("hi", 1)])]);
@@ -1594,23 +1694,77 @@ mod tests {
                 cost_reported_by_provider: None,
                 at: 102,
             },
+            RunRecord::InferenceAttempt(AttemptRecord {
+                id: "a0001".to_string(),
+                stage: "plan".to_string(),
+                attempt: 1,
+                provider: "anthropic".to_string(),
+                model: "claude-sonnet-5".to_string(),
+                outcome: AttemptOutcome::Failed {
+                    kind: "server-error".to_string(),
+                    transient: true,
+                    capacity: false,
+                    next: Retry::SameModel,
+                },
+                duration_ms: 1_200,
+                backoff_ms: 0,
+                digest: RequestDigest {
+                    system_hash: 99,
+                    messages: 4,
+                    tools: 1,
+                    max_tokens: 1024,
+                    temperature: 0.7,
+                },
+                model_input: Some(ModelInput {
+                    capture_status: CaptureStatus::Retained,
+                    request: Some(serde_json::json!({ "model": "claude-sonnet-5" })),
+                    bytes: 31,
+                    source_context_digest: "0123456789abcdef".to_string(),
+                    parameters: [("temperature".to_string(), serde_json::json!(0.7))]
+                        .into_iter()
+                        .collect(),
+                    tool_catalog_version: "fedcba9876543210".to_string(),
+                    assembly_version: "1".to_string(),
+                }),
+                at: 102,
+            }),
+            RunRecord::InferenceFailover(FailoverRecord {
+                stage: "plan".to_string(),
+                iteration: 2,
+                from_provider: "anthropic".to_string(),
+                from_model: "claude-sonnet-5".to_string(),
+                to_provider: "openai".to_string(),
+                to_model: "gpt-5.5".to_string(),
+                reason: "unreachable".to_string(),
+                kind: "timeout".to_string(),
+                at: 102,
+            }),
             RunRecord::ToolBatch {
+                // Dispatched to the lane, so it goes out pending and the
+                // completion record below is what fills it. A call the
+                // dispatcher had already answered would not be waiting on
+                // anything, and a resume has nothing to finish for one.
                 calls: vec![ToolCallRecord {
+                    execution_id: String::new(),
                     id: "c1".to_string(),
                     name: "read_file".to_string(),
                     arguments: "{}".to_string(),
-                    result: Some("body".to_string()),
+                    result: None,
                     thought_signature: Some("sig".to_string()),
                 }],
                 at: 103,
                 stage_index: 0,
                 iteration: 0,
+                visit_id: String::new(),
+                requested_by: String::new(),
                 response: "reading".to_string(),
             },
             RunRecord::ToolCallDone {
+                execution_id: String::new(),
+                outcome: None,
                 iteration: 0,
                 call_id: "c1".to_string(),
-                result: "body".to_string(),
+                result: "body".to_string().into(),
                 at: 103,
             },
             RunRecord::ContextCheckpoint {
@@ -1921,6 +2075,15 @@ mod tests {
         assert_eq!(folded.inference_count, 2);
         assert_eq!(folded.inference_usage.len(), 1);
         assert_eq!(folded.tool_call_count, 1);
+        // The trips to the provider, and the one move to another. Kept beside
+        // the usage rather than merged into it: the usage record is the invoice
+        // for the call that worked, and these are what it took to get it.
+        assert_eq!(folded.attempts.len(), 1);
+        assert_eq!(folded.attempts[0].attempt, 1);
+        assert_eq!(folded.attempts[0].digest.messages, 4);
+        assert_eq!(folded.failovers.len(), 1);
+        assert_eq!(folded.failovers[0].from_provider, "anthropic");
+        assert_eq!(folded.failovers[0].to_provider, "openai");
         // One inbound message recorded.
         assert_eq!(folded.messages.len(), 1);
         assert_eq!(folded.messages[0].content, "another");
@@ -2066,10 +2229,11 @@ mod tests {
 
     fn call(id: &str, result: Option<&str>) -> ToolCallRecord {
         ToolCallRecord {
+            execution_id: String::new(),
             id: id.to_string(),
             name: "shell".to_string(),
             arguments: "{}".to_string(),
-            result: result.map(str::to_string),
+            result: result.map(Into::into),
             thought_signature: None,
         }
     }
@@ -2080,6 +2244,8 @@ mod tests {
             at: 10,
             stage_index: 0,
             iteration,
+            visit_id: String::new(),
+            requested_by: String::new(),
             response: "running tools".to_string(),
         }
     }
@@ -2118,9 +2284,11 @@ mod tests {
                 ],
             ),
             RunRecord::ToolCallDone {
+                execution_id: String::new(),
+                outcome: None,
                 iteration: 0,
                 call_id: "c1".to_string(),
-                result: "ran".to_string(),
+                result: "ran".to_string().into(),
                 at: 11,
             },
         ];
@@ -2132,6 +2300,191 @@ mod tests {
         assert_eq!(pending.calls[1].result.as_deref(), Some("inline"));
         assert_eq!(pending.calls[2].result, None);
         assert_eq!(folded.tool_call_count, 3);
+    }
+
+    /// Folding a journal gathers why each region moved, in order.
+    ///
+    /// The snapshots beside these say what a region held; only this says what
+    /// moved it, and a reader asking "what emptied the plan" has nothing else
+    /// to go on.
+    #[test]
+    fn folding_gathers_why_each_region_moved() {
+        use crate::ContextCause;
+
+        let moved = |region: &str, before: usize, after: usize, added| RegionCommit {
+            region: region.to_string(),
+            digest_before: format!("rg1-{before:032x}"),
+            digest_after: format!("rg1-{after:032x}"),
+            tokens_before: before * 10,
+            tokens_after: after * 10,
+            entries_before: before,
+            entries_after: after,
+            entries_added: added,
+        };
+        let committed = |cause, regions, at| RunRecord::ContextTransaction {
+            revision_before: format!("cw1-{at:032x}"),
+            revision_after: format!("cw1-{:032x}", at + 1),
+            cause,
+            regions,
+            execution_id: String::new(),
+            at,
+        };
+        let records = vec![
+            header(),
+            committed(ContextCause::Seed, vec![moved("plan", 0, 1, 1)], 20),
+            committed(
+                ContextCause::ToolResult,
+                vec![moved("conversation", 0, 2, 2)],
+                21,
+            ),
+            // A compaction is the case the record exists for: it summarises one
+            // region into another and empties the first, and the two halves are
+            // one transaction rather than two events that share a second.
+            committed(
+                ContextCause::Compaction,
+                vec![moved("plan", 6, 0, 0), moved("plan_history", 0, 1, 1)],
+                22,
+            ),
+        ];
+        let folded = fold(&records).expect("a journal with a header folds");
+
+        assert_eq!(folded.context_changes.len(), 3);
+        assert_eq!(folded.context_changes[0].regions[0].region, "plan");
+        assert_eq!(folded.context_changes[0].cause, ContextCause::Seed);
+        assert_eq!(folded.context_changes[0].regions[0].entries_added, 1);
+        assert_eq!(folded.context_changes[0].regions[0].token_delta, 10);
+        assert_eq!(folded.context_changes[0].at, 20);
+        assert_eq!(
+            folded.context_changes[0].revision_after.as_deref(),
+            Some(format!("cw1-{:032x}", 21).as_str()),
+            "a transaction names the window it produced"
+        );
+        assert_eq!(folded.context_changes[1].cause, ContextCause::ToolResult);
+        let compacted = &folded.context_changes[2];
+        assert_eq!(compacted.cause, ContextCause::Compaction);
+        assert_eq!(compacted.regions.len(), 2, "both halves, in one record");
+        assert_eq!(compacted.regions[0].entries_removed, 6);
+        assert_eq!(
+            compacted.regions[0].token_delta, -60,
+            "a region that shrank reads as a loss, not as an absence"
+        );
+        assert_eq!(compacted.regions[1].region, "plan_history");
+        // A change is not a turn: neither counter above moves for one.
+        assert_eq!(folded.inference_count, 0);
+        assert_eq!(folded.tool_call_count, 0);
+    }
+
+    /// Folding a journal gathers every question the run asked, in order.
+    ///
+    /// The fold is how a reader lists them, and the only reason the record is
+    /// worth writing: a granted approval leaves nothing else behind.
+    #[test]
+    fn folding_gathers_every_question_the_run_asked() {
+        use crate::interaction::{ApprovalScope, InteractionKind, Settlement};
+
+        let asked = |id: &str, settlement: Settlement, at: i64| RunRecord::Interaction {
+            request_id: id.to_string(),
+            kind: InteractionKind::ToolApproval,
+            tool: Some("shell".to_string()),
+            prompt: format!("Run {id}?"),
+            stage: "plan".to_string(),
+            settlement,
+            asked_at: at,
+            at: at + 1,
+        };
+        let records = vec![
+            header(),
+            asked(
+                "approve-1",
+                Settlement::Answered {
+                    approved: Some(true),
+                    scope: Some(ApprovalScope::Stage),
+                    choice: Some(0),
+                    text: None,
+                    feedback: None,
+                },
+                20,
+            ),
+            asked("approve-2", Settlement::TimedOut, 30),
+            asked("approve-3", Settlement::Cancelled, 40),
+        ];
+        let folded = fold(&records).expect("a journal with a header folds");
+
+        assert_eq!(folded.interactions.len(), 3);
+        assert_eq!(folded.interactions[0].request_id, "approve-1");
+        assert_eq!(folded.interactions[0].tool.as_deref(), Some("shell"));
+        assert_eq!(folded.interactions[0].stage, "plan");
+        assert_eq!(folded.interactions[0].prompt, "Run approve-1?");
+        assert_eq!(folded.interactions[0].asked_at, 20);
+        assert_eq!(folded.interactions[0].at, 21);
+        assert!(matches!(
+            folded.interactions[0].settlement,
+            Settlement::Answered {
+                approved: Some(true),
+                scope: Some(ApprovalScope::Stage),
+                ..
+            }
+        ));
+        // The three ways one can end stay three, because a caller cannot tell
+        // them apart from the answer it was handed.
+        assert_eq!(folded.interactions[1].settlement, Settlement::TimedOut);
+        assert_eq!(folded.interactions[2].settlement, Settlement::Cancelled);
+        // And a question is not a tool call, however much it looks like one.
+        assert_eq!(folded.tool_call_count, 0);
+    }
+
+    /// A journal of single-region change records folds, in order, with the
+    /// causes intact.
+    ///
+    /// This is the shape a journal written before transactions holds, and the
+    /// fold has to keep reading it: a run paused by one build and resumed by
+    /// another has a journal of both shapes, and a reader that understood only
+    /// the newer one would report a run whose history began halfway through.
+    #[test]
+    fn folding_reads_a_journal_of_single_region_changes() {
+        let changed = |region: &str, cause: ContextCause, added, removed, delta, at| {
+            RunRecord::ContextChange {
+                region: region.to_string(),
+                cause,
+                entries_added: added,
+                entries_removed: removed,
+                token_delta: delta,
+                at,
+            }
+        };
+        let records = vec![
+            header(),
+            changed("plan", ContextCause::Seed, 1, 0, 40, 10),
+            changed("plan", ContextCause::ContextTool, 1, 1, -5, 20),
+            changed("plan", ContextCause::Compaction, 0, 3, -120, 30),
+        ];
+        let folded = fold(&records).expect("a journal with a header folds");
+
+        let causes: Vec<ContextCause> = folded.context_changes.iter().map(|c| c.cause).collect();
+        assert_eq!(
+            causes,
+            vec![
+                ContextCause::Seed,
+                ContextCause::ContextTool,
+                ContextCause::Compaction
+            ]
+        );
+        let compaction = &folded.context_changes[2];
+        assert_eq!(compaction.regions.len(), 1, "one region is all it recorded");
+        assert_eq!(compaction.regions[0].region, "plan");
+        assert_eq!(compaction.regions[0].entries_added, 0);
+        assert_eq!(compaction.regions[0].entries_removed, 3);
+        assert_eq!(compaction.regions[0].token_delta, -120);
+        assert_eq!(compaction.at, 30);
+        // And nothing is invented around them: these records named no window and
+        // digested no region, so a reader is told so rather than guessing.
+        assert_eq!(compaction.revision_before, None);
+        assert_eq!(compaction.revision_after, None);
+        assert_eq!(compaction.regions[0].digest_after, None);
+        assert_eq!(compaction.regions[0].tokens_after, None);
+        // A change is not a point in the timeline: the snapshot beside it
+        // already carries the window it produced.
+        assert!(replay_points(&records).is_empty());
     }
 
     #[test]
@@ -2155,15 +2508,19 @@ mod tests {
             },
             batch(1, vec![call("c2", None)]),
             RunRecord::ToolCallDone {
+                execution_id: String::new(),
+                outcome: None,
                 iteration: 0,
                 call_id: "c1".to_string(),
-                result: "stale".to_string(),
+                result: "stale".to_string().into(),
                 at: 12,
             },
             RunRecord::ToolCallDone {
+                execution_id: String::new(),
+                outcome: None,
                 iteration: 1,
                 call_id: "unknown".to_string(),
-                result: "nowhere to land".to_string(),
+                result: "nowhere to land".to_string().into(),
                 at: 13,
             },
         ];
@@ -2175,6 +2532,60 @@ mod tests {
         assert_eq!(pending.calls[0].result, None, "stale/unknown dones ignored");
     }
 
+    /// A folded run carries no artifact records.
+    ///
+    /// They are neither state a resume needs nor a total anyone asks a folded run
+    /// for: which execution made which file is a question about the run's
+    /// executions, and the executions listing is where it is answered. Folding
+    /// them into anything here would be a second answer to disagree with that one.
+    #[test]
+    fn folding_passes_over_the_files_an_execution_produced() {
+        let records = vec![
+            header(),
+            RunRecord::ArtifactsProduced {
+                execution_id: "x1".to_string(),
+                artifacts: vec![crate::output::Artifact {
+                    name: "report".to_string(),
+                    path: "out/report.md".to_string(),
+                    mime_type: crate::mime::MimeType::parse("text/markdown").expect("a type"),
+                    size: 12,
+                    sha256: "beef".to_string(),
+                }],
+                at: 30,
+            },
+        ];
+        let folded = fold(&records).expect("a journal with a header folds");
+        assert_eq!(folded.tool_call_count, 0, "a file is not a call");
+        assert!(folded.context_changes.is_empty());
+        assert!(folded.pending_batch.is_none());
+    }
+
+    /// A batch every call of which was resolved at dispatch is not pending.
+    ///
+    /// It had nothing in the tool lane, so a resume has nothing to finish - and
+    /// replaying it would be worse than re-issuing it. A replay lands the
+    /// recorded results in the conversation without redoing a context tool's
+    /// write, so the restored turn would say `context_write: ok` over a region
+    /// that never received the content.
+    #[test]
+    fn fold_does_not_make_a_batch_it_resolved_itself_pending() {
+        let records = vec![header(), batch(0, vec![call("c1", Some("wrote the plan"))])];
+        assert_eq!(fold(&records).unwrap().pending_batch, None);
+        assert_eq!(
+            fold(&records).unwrap().tool_call_count,
+            1,
+            "it is still a call the run made"
+        );
+        // And such a batch retires the one before it: only the newest batch can
+        // still be in flight, however the newest one was resolved.
+        let after = vec![
+            header(),
+            batch(0, vec![call("c1", None)]),
+            batch(0, vec![call("c2", Some("wrote the plan"))]),
+        ];
+        assert_eq!(fold(&after).unwrap().pending_batch, None);
+    }
+
     #[test]
     fn fold_clears_a_batch_once_the_iteration_moves_on() {
         // A later inference bumped meta.iteration past the batch: the batch was
@@ -2183,7 +2594,15 @@ mod tests {
         advanced.iteration = 1;
         let records = vec![
             header(),
-            batch(0, vec![call("c1", Some("done"))]),
+            batch(0, vec![call("c1", None)]),
+            RunRecord::ToolCallDone {
+                execution_id: String::new(),
+                outcome: None,
+                iteration: 0,
+                call_id: "c1".to_string(),
+                result: "done".to_string().into(),
+                at: 10,
+            },
             RunRecord::Progress {
                 meta: Box::new(advanced),
                 delta: ContextDelta {
@@ -2204,7 +2623,15 @@ mod tests {
         // turn: apply_tool_results ran before the crash, nothing to replay.
         let records = vec![
             header(),
-            batch(0, vec![call("c1", Some("done"))]),
+            batch(0, vec![call("c1", None)]),
+            RunRecord::ToolCallDone {
+                execution_id: String::new(),
+                outcome: None,
+                iteration: 0,
+                call_id: "c1".to_string(),
+                result: "done".to_string().into(),
+                at: 10,
+            },
             RunRecord::ContextCheckpoint {
                 snapshot: snapshot("plan", vec![region("conv", vec![turn_entry(&["c1"])])]),
                 at: 11,
@@ -2255,6 +2682,8 @@ mod tests {
                 at: 9,
                 stage_index: 0,
                 iteration: 0,
+                visit_id: String::new(),
+                requested_by: String::new(),
                 response: String::new(),
             }
         );
@@ -2444,9 +2873,11 @@ mod tests {
             },
             batch(0, vec![call("c1", None)]),
             RunRecord::ToolCallDone {
+                execution_id: String::new(),
+                outcome: None,
                 iteration: 0,
                 call_id: "c1".to_string(),
-                result: "ran".to_string(),
+                result: "ran".to_string().into(),
                 at: 1,
             },
             RunRecord::ContextCheckpoint {
@@ -2672,6 +3103,46 @@ mod tests {
         );
     }
 
+    /// Every way an attempt can end, and every way the loop can follow a
+    /// failure, under the name a reader outside this build actually sees. These
+    /// names are the archive's wire format, so they are pinned here rather than
+    /// left to whatever the variant happens to be called in Rust.
+    #[test]
+    fn an_attempts_outcomes_and_follow_ups_keep_their_wire_names() {
+        for (outcome, json) in [
+            (AttemptOutcome::Succeeded, "\"succeeded\"".to_string()),
+            (
+                AttemptOutcome::Failed {
+                    kind: "timeout".to_string(),
+                    transient: true,
+                    capacity: false,
+                    next: Retry::Reported,
+                },
+                "{\"failed\":{\"kind\":\"timeout\",\"transient\":true,\"capacity\":false,\
+                 \"next\":\"reported\"}}"
+                    .to_string(),
+            ),
+        ] {
+            let wire = serde_json::to_string(&outcome).expect("an outcome serializes");
+            assert_eq!(wire, json);
+            assert_eq!(
+                serde_json::from_str::<AttemptOutcome>(&wire).expect("and reads back"),
+                outcome
+            );
+        }
+        for (next, json) in [
+            (Retry::Reported, "\"reported\""),
+            (Retry::SameModel, "\"same_model\""),
+            (Retry::RenewedFiles, "\"renewed_files\""),
+        ] {
+            assert_eq!(serde_json::to_string(&next).expect("serializes"), json);
+            assert_eq!(
+                serde_json::from_str::<Retry>(json).expect("and reads back"),
+                next
+            );
+        }
+    }
+
     /// The heavy variant and the light one both name one provider call, so a
     /// consumer counting calls should not have to know which the writer chose.
     #[test]
@@ -2710,7 +3181,7 @@ mod tests {
                 entries: entries
                     .iter()
                     .map(|(c, t)| RegionEntrySnapshot {
-                        content: c.to_string(),
+                        content: (*c).into(),
                         tokens: *t,
                         key: None,
                         kind: crate::region::EntryKind::Text,

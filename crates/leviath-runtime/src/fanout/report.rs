@@ -90,7 +90,13 @@ pub(super) fn build_report(
 /// the region would leave the merge stage with nothing at all. Trimming first
 /// means the merge always receives *something*, and a report that had to be cut
 /// says so where the model will read it.
-pub(super) fn inject_results(world: &mut World, parent: Entity, region: &str, text: &str) {
+pub(super) fn inject_results(
+    world: &mut World,
+    parent: Entity,
+    region: &str,
+    text: &str,
+    parts: Vec<leviath_core::mime::Part>,
+) {
     let Some(mut window) = world.get_mut::<ContextWindow>(parent) else {
         return;
     };
@@ -122,8 +128,20 @@ pub(super) fn inject_results(world: &mut World, parent: Entity, region: &str, te
             )
         }
     };
-    let tokens = leviath_core::estimate_tokens(&fitted);
-    let _ = window.add_typed_entry(region, leviath_core::EntryKind::UserMessage, fitted, tokens);
+    // The workers' files ride on the same entry as the report, after it, so a
+    // pinned results region lifts them into the merge model's first user turn
+    // and a sliding one renders them beside the text they belong to. Each is
+    // charged its stand-in, like every stored part.
+    let content = leviath_core::region::EntryContent::text(fitted).with_parts(parts);
+    let tokens = content.tokens(None);
+    let _ = window.add_turn(
+        Some(leviath_core::ContextCause::FanOut),
+        region,
+        leviath_core::EntryKind::UserMessage,
+        content,
+        tokens,
+        None,
+    );
 }
 
 /// An agent's status, if it still exists.

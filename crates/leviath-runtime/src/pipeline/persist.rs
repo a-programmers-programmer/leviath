@@ -105,6 +105,37 @@ impl PersistWatermark {
 #[derive(Resource)]
 pub(crate) struct PersistenceStage(pub UnboundedSender<PersistMsg>);
 
+/// Put every settled interaction in the journal.
+///
+/// The hub is answered from outside the tick - over the control socket, by `lev
+/// respond`, by a dashboard - so it cannot reach the lane itself; it buffers
+/// what settled and this drains the buffer. Every tick, unconditionally: an
+/// append is never coalesced, and a run whose last act was answering a prompt
+/// must not lose the record because nothing else about it changed.
+///
+/// The record carries the run it belongs to, so this needs no per-agent query
+/// and works for an agent that has already gone.
+pub(crate) fn journal_interactions(hub: Option<Res<InteractionHub>>, stage: Res<PersistenceStage>) {
+    crate::tick_scope::clear();
+    let Some(hub) = hub else { return };
+    for (run_id, record) in hub.take_settled() {
+        let _ = stage.0.send(PersistMsg::Append {
+            run_id,
+            record: Box::new(leviath_core::run_archive::RunRecord::Interaction {
+                request_id: record.request_id,
+                kind: record.kind,
+                tool: record.tool,
+                prompt: record.prompt,
+                stage: record.stage,
+                settlement: record.settlement,
+                asked_at: record.asked_at,
+                at: record.at,
+            }),
+            ack: None,
+        });
+    }
+}
+
 /// What `reflect_interaction_status` selects.
 ///
 /// `&'static` is bevy's `WorldQuery` convention, not a claim about
@@ -535,6 +566,13 @@ pub(crate) fn dispatch_persistence(
                 .find(|(agent_id, _)| *agent_id == state.agent_id)
                 .map(|(_, req)| req.kind)
         });
+        // Rolled up from the ledger rather than tracked separately, so the set
+        // on `meta.json` and the per-stage lists in `stages.json` are the same
+        // fact written twice and cannot drift into two answers.
+        let stage_models = ledger
+            .as_deref()
+            .map(|l| leviath_core::run_meta::stage_models_of(&l.0))
+            .unwrap_or_default();
         let meta = build_run_meta(
             crate::persistence::RunMetaSources {
                 md,
@@ -542,6 +580,7 @@ pub(crate) fn dispatch_persistence(
                 totals,
                 flags: &flags,
                 final_output,
+                stage_models,
                 parked,
             },
             crate::persistence::RunPosition {
@@ -602,11 +641,15 @@ pub(crate) fn dispatch_persistence(
         // flipped the agent to `Waiting`. If the request isn't registered yet, skip
         // this tick; the next persist captures it (removing any stale sidecar).
         let interactions = awaiting_point.and_then(|_| {
+            // By prefix rather than by substring: every id this run raises
+            // starts with the run id, and a blueprint whose name holds `point`
+            // would let an approval request read as a point.
+            let point_ids = leviath_core::interaction::request_id_prefix(&state.agent_id, "point");
             let request = hub
                 .as_ref()?
                 .pending()
                 .into_iter()
-                .find(|(aid, req)| aid == &state.agent_id && req.id.contains("-point-"))?;
+                .find(|(aid, req)| aid == &state.agent_id && req.id.starts_with(&point_ids))?;
             let ip_state = crate::interaction_points::InteractionPointState {
                 cursor: ip_cursor.map_or(0, |c| c.0),
                 round: ip_rounds.map_or(0, |r| r.0),

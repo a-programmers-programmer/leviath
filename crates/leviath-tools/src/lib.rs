@@ -2,6 +2,7 @@
 //!
 //! Provides file system and shell tools sandboxed to a working directory.
 
+use leviath_core::region::EntryContent;
 use leviath_core::resolves_within;
 use leviath_providers::Tool;
 use serde_json::{Value, json};
@@ -20,12 +21,17 @@ mod exec;
 pub use exec::is_null_device;
 pub use exec::resolve_within;
 mod install;
+pub mod mime;
+pub use mime::ToolMime;
 mod platform;
 pub mod validate;
 pub use context::*;
-pub use defs::{SUBAGENT_TOOLS, is_subagent_tool, submit_output_description};
+pub use defs::{
+    BUILTIN_TOOL_NAMES, STAGE_CONTROL_TOOLS, SUBAGENT_TOOLS, is_builtin_tool, is_subagent_tool,
+    submit_output_description,
+};
 pub use install::{
-    InstallProbes, InstalledTool, MAX_TOOL_SOURCE_BYTES, install_script_tool,
+    InstallProbes, InstalledFor, InstalledTool, MAX_TOOL_SOURCE_BYTES, install_script_tool,
     install_script_tool_with,
 };
 pub use platform::*;
@@ -191,6 +197,24 @@ mod tests {
         assert!(!is_subagent_tool("read_file"));
     }
 
+    /// The static list is the catalog `tool_defs` ships, one name per def:
+    /// a built-in added to one and not the other would make `@builtin` miss it.
+    #[test]
+    fn builtin_name_list_matches_the_catalog() {
+        let tools = make_tools(&std::env::temp_dir());
+        let defs: Vec<String> = tools.tool_defs().into_iter().map(|d| d.name).collect();
+        for name in BUILTIN_TOOL_NAMES {
+            assert!(defs.contains(&name.to_string()), "{name} has no def");
+            assert!(is_builtin_tool(name));
+        }
+        assert_eq!(defs.len(), BUILTIN_TOOL_NAMES.len());
+        assert!(!is_builtin_tool("bash"), "an alias is not a canonical name");
+        assert!(!is_builtin_tool("spawn_agent"));
+        for name in STAGE_CONTROL_TOOLS {
+            assert!(is_builtin_tool(name));
+        }
+    }
+
     // ── Tool definitions ──────────────────────────────────────────────────
 
     #[test]
@@ -198,7 +222,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let tools = make_tools(&dir);
         let defs = tools.tool_defs();
-        assert_eq!(defs.len(), 28);
+        assert_eq!(defs.len(), 31);
     }
 
     #[test]
@@ -222,37 +246,61 @@ mod tests {
         assert!(names.contains(&"context_read".to_string()));
         assert!(names.contains(&"context_delete".to_string()));
         assert!(names.contains(&"context_list".to_string()));
-        assert!(names.contains(&"install_tool".to_string()));
+        assert!(names.contains(&"install_self_tool".to_string()));
+        assert!(names.contains(&"install_global_tool".to_string()));
     }
 
-    /// The def a model reads before deciding to persist a learning: `name`
-    /// and `source` are required, `overwrite` is not, and the description
-    /// says what gets refused so the model can write a script that is not.
+    /// The defs a model reads before deciding to keep a learning: both halves
+    /// take the same three arguments, both say what gets refused so the model
+    /// can write a script that is not, and each says who will see the result.
     #[test]
-    fn tool_defs_install_tool_requires_name_and_source() {
+    fn both_installers_require_name_and_source_and_say_who_sees_the_tool() {
         let dir = std::env::temp_dir();
         let tools = make_tools(&dir);
-        let def = tools
-            .tool_defs()
-            .into_iter()
-            .find(|t| t.name == "install_tool")
-            .expect("install_tool tool def must exist");
-        let required = def.parameters["required"].as_array().unwrap();
-        assert!(required.iter().any(|v| v == "name"));
-        assert!(required.iter().any(|v| v == "source"));
-        assert!(!required.iter().any(|v| v == "overwrite"));
-        assert_eq!(def.parameters["properties"]["overwrite"]["type"], "boolean");
+        for name in ["install_self_tool", "install_global_tool"] {
+            let def = tools
+                .tool_defs()
+                .into_iter()
+                .find(|t| t.name == name)
+                .expect("both installers are in the catalog");
+            let required = def.parameters["required"].as_array().unwrap();
+            assert!(required.iter().any(|v| v == "name"), "{name}");
+            assert!(required.iter().any(|v| v == "source"), "{name}");
+            assert!(!required.iter().any(|v| v == "overwrite"), "{name}");
+            assert_eq!(
+                def.parameters["properties"]["overwrite"]["type"], "boolean",
+                "{name}"
+            );
+            assert!(def.description.contains("@description"), "{name}");
+            assert!(def.description.contains("never for judgement"), "{name}");
+            assert!(tools.names().contains(&name.to_string()), "{name}");
+        }
+
+        // Each one names the other, because choosing between them is the whole
+        // decision and a model reading one def has to know the other exists.
+        let describe = |name: &str| {
+            tools
+                .tool_defs()
+                .into_iter()
+                .find(|t| t.name == name)
+                .expect("the def")
+                .description
+        };
         assert!(
-            def.description.contains("@description"),
-            "{}",
-            def.description
+            describe("install_self_tool").contains("install_global_tool"),
+            "the narrow one says what the wide one is"
         );
         assert!(
-            def.description.contains("never for judgement"),
-            "{}",
-            def.description
+            describe("install_global_tool").contains("install_self_tool"),
+            "and the wide one points back at the narrow one"
         );
-        assert!(tools.names().contains(&"install_tool".to_string()));
+    }
+
+    /// The name the pair replaced still resolves, to the half that means what
+    /// it meant: machine-wide.
+    #[test]
+    fn the_old_installer_name_still_resolves_to_the_global_half() {
+        assert_eq!(canonical_tool_name("install_tool"), "install_global_tool");
     }
 
     #[test]
@@ -496,7 +544,8 @@ mod tests {
     fn names_returns_every_tool_and_alias() {
         let dir = std::env::temp_dir();
         let tools = make_tools(&dir);
-        assert_eq!(tools.names().len(), 29);
+        // Every def, plus every alias: `bash` and `install_tool`.
+        assert_eq!(tools.names().len(), 33);
     }
 
     /// The taint gate's fallback arm is the third-party default: outbound,
@@ -1091,6 +1140,69 @@ mod tests {
             );
         }
         assert!(!workdir.exists(), "the workspace must stay gone");
+    }
+
+    /// A file too large for one reply is written in parts: the first part
+    /// creates it (append creates a missing file too), each later part goes on
+    /// the end, and a plain write still replaces the whole file.
+    #[tokio::test]
+    async fn write_file_appends_parts_and_a_plain_write_replaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let tools = make_tools(dir.path());
+
+        let first = tools
+            .execute(
+                "write_file",
+                json!({"path": "doc/report.md", "content": "# Title\n", "append": true}),
+            )
+            .await;
+        assert_eq!(first, "Successfully appended 8 bytes to 'doc/report.md'");
+        let second = tools
+            .execute(
+                "write_file",
+                json!({"path": "doc/report.md", "content": "Body.\n", "append": true}),
+            )
+            .await;
+        assert!(
+            second.starts_with("Successfully appended 6 bytes"),
+            "{second}"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("doc/report.md")).unwrap(),
+            "# Title\nBody.\n"
+        );
+
+        let replaced = tools
+            .execute(
+                "write_file",
+                json!({"path": "doc/report.md", "content": "new", "append": false}),
+            )
+            .await;
+        assert!(
+            replaced.starts_with("Successfully wrote 3 bytes"),
+            "{replaced}"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("doc/report.md")).unwrap(),
+            "new"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_file_append_fails_when_path_is_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let tools = make_tools(dir.path());
+        fs::create_dir(dir.path().join("adir")).unwrap();
+        let result = tools
+            .execute(
+                "write_file",
+                json!({"path": "adir", "content": "x", "append": true}),
+            )
+            .await;
+        assert!(
+            result.starts_with("[error] Failed to write 'adir'"),
+            "{result}"
+        );
     }
 
     #[tokio::test]
@@ -2244,12 +2356,15 @@ mod tests {
             tool_required_capabilities("read_file"),
             &[ToolCapability::FileSystem]
         );
-        // Writing the global tools directory is a filesystem write like any
-        // other, so the tool disappears with the rest of them.
-        assert_eq!(
-            tool_required_capabilities("install_tool"),
-            &[ToolCapability::FileSystem]
-        );
+        // Installing a tool is a filesystem write like any other, whichever
+        // directory it writes to, so both disappear with the rest of them.
+        for installer in ["install_self_tool", "install_global_tool"] {
+            assert_eq!(
+                tool_required_capabilities(installer),
+                &[ToolCapability::FileSystem],
+                "{installer}"
+            );
+        }
         // Runtime-handled / platform-agnostic tools require nothing.
         assert!(tool_required_capabilities("context_write").is_empty());
         assert!(tool_required_capabilities("present_for_review").is_empty());
@@ -2262,19 +2377,20 @@ mod tests {
         let tools = make_mobile_tools(&dir);
         let names: Vec<String> = tools.tool_defs().iter().map(|t| t.name.clone()).collect();
         assert!(!names.contains(&"shell".to_string()));
-        // The rest remain, `install_tool` included: mobile has a filesystem.
-        assert_eq!(tools.tool_defs().len(), 27);
+        // The rest remain, both installers included: mobile has a filesystem.
+        assert_eq!(tools.tool_defs().len(), 30);
         assert!(names.contains(&"read_file".to_string()));
-        assert!(names.contains(&"install_tool".to_string()));
+        assert!(names.contains(&"install_self_tool".to_string()));
+        assert!(names.contains(&"install_global_tool".to_string()));
         assert!(names.contains(&"context_write".to_string()));
         assert!(names.contains(&"present_for_review".to_string()));
     }
 
-    /// A platform without a filesystem loses `install_tool` with the file
-    /// tools: it is neither advertised nor recognized, and a direct dispatch
-    /// is refused before any argument is read.
+    /// A platform without a filesystem loses both installers with the file
+    /// tools: neither is advertised or recognized, and a direct dispatch is
+    /// refused before any argument is read.
     #[tokio::test]
-    async fn a_platform_without_a_filesystem_has_no_install_tool() {
+    async fn a_platform_without_a_filesystem_has_no_installer() {
         let dir = tempfile::tempdir().unwrap();
         let tools = BuiltinTools::with_capabilities(
             ToolContext::new(dir.path().to_path_buf()),
@@ -2284,10 +2400,20 @@ mod tests {
             ]),
         );
         let defs: Vec<String> = tools.tool_defs().into_iter().map(|t| t.name).collect();
-        assert!(!defs.contains(&"install_tool".to_string()));
+        for installer in ["install_self_tool", "install_global_tool"] {
+            assert!(!defs.contains(&installer.to_string()), "{installer}");
+            assert!(
+                !tools.names().contains(&installer.to_string()),
+                "{installer}"
+            );
+            let out = tools
+                .execute(installer, json!({"name": "x", "source": "// @tool x\n1"}))
+                .await;
+            assert!(out.contains("not available on this platform"), "{out}");
+        }
         assert!(!defs.contains(&"write_file".to_string()));
         assert!(defs.contains(&"shell".to_string()));
-        assert!(!tools.names().contains(&"install_tool".to_string()));
+        // And by the old name, which resolves to one of them.
         let out = tools
             .execute(
                 "install_tool",
@@ -2447,5 +2573,73 @@ mod tests {
             result.contains("inside the workspace"),
             "says what to do instead: {result}"
         );
+    }
+}
+
+#[cfg(test)]
+mod binary_read_tests {
+    use super::*;
+    use leviath_core::mime::{BlobStore, MemoryBlobStore};
+    use serde_json::json;
+    use std::sync::Arc;
+
+    fn png_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("hero.png"), b"\x89PNG\r\n\x1a\n\xff\xfe").unwrap();
+        std::fs::write(dir.path().join("big.bin"), vec![0xff; 40]).unwrap();
+        dir
+    }
+
+    fn mime(store: Arc<MemoryBlobStore>, max: u64) -> Arc<ToolMime> {
+        Arc::new(ToolMime {
+            store,
+            registry: Arc::new(leviath_core::mime::RegistryCell::default()),
+            run_id: "run-1".to_string(),
+            max_part_bytes: max,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_binary_file_becomes_a_stored_part() {
+        let dir = png_dir();
+        let store = Arc::new(MemoryBlobStore::new());
+        let tools = BuiltinTools::new(
+            ToolContext::new(dir.path().to_path_buf()).with_mime(mime(store.clone(), 16)),
+        );
+        assert!(tools.mime().is_some());
+        let out = tools
+            .execute("read_file", json!({"path": "hero.png"}))
+            .await;
+        assert!(out.has_stored(), "{out}");
+        assert!(out.as_str().starts_with("'hero.png' is not text."), "{out}");
+        assert!(out.as_str().contains("[image/png, 10 B] hero.png"), "{out}");
+        let sha = &out.stored().next().unwrap().blob().unwrap().sha256;
+        assert!(store.has("run-1", sha));
+
+        // Over the ceiling: refused by name.
+        let out = tools.execute("read_file", json!({"path": "big.bin"})).await;
+        assert!(
+            out.as_str()
+                .starts_with("[error] 'big.bin' is 40 bytes, over the 16 byte ceiling"),
+            "{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_a_store_the_model_is_told() {
+        let dir = png_dir();
+        let tools = BuiltinTools::new(ToolContext::new(dir.path().to_path_buf()));
+        assert!(tools.mime().is_none());
+        let out = tools
+            .execute("read_file", json!({"path": "hero.png"}))
+            .await;
+        assert_eq!(
+            out.as_str(),
+            "[error] 'hero.png' is not a text file (10 B), and this run has no blob store to hold it as a part"
+        );
+        // Text files read as they always did.
+        std::fs::write(dir.path().join("a.txt"), "hello").unwrap();
+        let out = tools.execute("read_file", json!({"path": "a.txt"})).await;
+        assert_eq!(out, "hello");
     }
 }

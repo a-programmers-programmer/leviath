@@ -168,8 +168,19 @@ pub(super) fn resolve_seeds(
         match seed {
             RegionSeed::CallerInput { name } => {
                 let value = caller.get(name).map(|s| s.as_str()).unwrap_or("");
-                if value.trim().is_empty() {
-                    if region.required {
+                // A part attached to this region provides it as surely as
+                // text does: `--mockup @./m.png` carries no text at all.
+                let has_part = args
+                    .parts
+                    .iter()
+                    .any(|p| p.region.as_deref() == Some(name.as_str()));
+                if value.trim().is_empty() && !has_part {
+                    // A worker spawned by its own blueprint's fan-out carries
+                    // its input in the task; the region a caller must fill
+                    // (`--diff`) was filled by the caller of the parent. The
+                    // reviewer's workers were refused here for as long as
+                    // they were spawned at all.
+                    if region.required && args.worker_stage.is_none() {
                         return Err(region.required_message.clone().unwrap_or_else(|| {
                             format!(
                                 "required region '{}' was not provided; supply it via \
@@ -180,6 +191,11 @@ pub(super) fn resolve_seeds(
                         }));
                     }
                     // Optional and unprovided - leave the region empty.
+                    continue;
+                }
+                // Provided by a part alone: the part is written after the
+                // seeds, and an empty seed would be an empty entry before it.
+                if value.trim().is_empty() {
                     continue;
                 }
                 seeds.insert(region.name.clone(), value.to_string());

@@ -164,7 +164,14 @@ flowchart LR
 
 ```bash
 lev run reviewer --task "Review the changes on the feature/auth branch"
+lev run reviewer --diff @change.patch --criteria "does the code produce what after.png shows?" \
+  --attach before.png:screenshots --attach after.png:screenshots
 ```
+
+Screenshots are a typed input: the `screenshots` region accepts `image/*` and holds six, so a
+mockup or a before-and-after reaches the model. A model that can see gets it as pixels, and any
+other gets a line naming the file. A `@path` in `--criteria` attaches the same way. See
+[Mime](/docs/mime).
 
 The two-pass split is deliberate: `scan` runs on Sonnet to flag areas, then the review itself
 escalates to Opus to scrutinize only what was flagged, which keeps the expensive model focused.
@@ -258,9 +265,9 @@ rather than stages of this blueprint. Every thread the survey found is researche
 each with its own clean context window, and their findings merge into `compare`. A worker that finds
 its thread is really several independent subjects can split again, one level further.
 
-`challenge` and `polish` work as they do in [deep-researcher](#deep-researcher): every route to the
-writing stage passes through an adversary that can send the survey back for more evidence, and the
-finished overview is rewritten in plain language without any fact, number, citation or caveat
+`challenge` and `polish` work as they do in [deep-researcher](#deep-researcher). Every route to the
+writing stage passes through an adversary that can send the survey back for more evidence. The
+finished overview is rewritten in plain language, without any fact, number, citation or caveat
 changing.
 
 `compare` is then the hub: widen coverage (back to `survey`), pull one thread for a focused
@@ -309,7 +316,7 @@ feels confident will not elect to be attacked, and confidence is the failure it 
 caveat. It exists because the stage that gathers the most evidence is not the one that writes the
 clearest prose, and asking one model for both gets a worse version of each.
 
-Per stage, the models are chosen on measurement rather than by defaulting to one family: a fast
+Per stage, the models are chosen on measurement rather than by defaulting to one family. A fast
 broad-search model gathers, a cheaper reasoning model analyses, a strong writer synthesises, a
 different vendor challenges, and a plain-language model polishes. See
 [providers](/docs/providers) for how a stage picks its model and falls back.
@@ -344,14 +351,37 @@ work item, so a single file does not pay for a fan-out.
 can refine itself before returning results. Findings persist in a [context region](/docs/context)
 across passes so the report ranks them by severity.
 
+## 3D models (Meshy)
+
+Four agents build 3D assets through the [Meshy provider](/docs/providers#meshy).
+Configure Meshy (set `MESHY_API_KEY`, or `lev setup` and choose Meshy) and hand each one its input.
+
+- **`sprite-to-3d`** turns a sprite sheet or character image into a rigged, game-ready model: it
+  draws clean multi-view references, critiques them against the source, builds the mesh, rigs it,
+  and checks the result. `lev run sprite-to-3d --task "the character on the left" --attach sheet.png:source`.
+- **`image-to-model`** turns one image straight into a textured model, no reference-drawing step.
+  `lev run image-to-model --task "matte plastic" --attach toy.png:image`. Pure Meshy: it needs no
+  text provider at all.
+- **`text-to-image-to-model`** draws a reference image from a description, then builds a model from
+  it. `lev run text-to-image-to-model --task "a stout clay teapot"`. The draw step needs an
+  image-capable provider (OpenRouter's image model by default); the build needs only Meshy.
+- **`model-to-animated-model`** rigs an existing mesh and applies an animation from Meshy's library.
+  `lev run model-to-animated-model --task "run" --attach hero.glb:source_model`. Pure Meshy, no
+  text provider.
+
+Each hands the finished model back as a `model/gltf-binary` artifact; `lev result <run> --out .`
+writes it out. A single-provider agent like `image-to-model` or `model-to-animated-model` records
+that mesh as its answer directly, with no `submit_output` turn, so a pure "bytes in, bytes out"
+pipeline runs with only Meshy configured.
+
 ## Running one
 
-Every agent runs the same way, name it and hand it a task:
+Every agent runs the same way. Name it and hand it a task:
 
 ```bash
 lev run deep-researcher --task "Survey the state of solid-state batteries"
 ```
 
-To build your own, read how blueprints are structured in [Agents](/docs/agents), how the stage
-graph routes and recovers in [Multi-stage workflows](/docs/stages), and how the parallel agents
-split work in [Sub-agents and fan-out](/docs/sub-agents).
+To build your own, read how blueprints are structured in [Agents](/docs/agents).
+[Multi-stage workflows](/docs/stages) covers how the stage graph routes and recovers, and
+[Sub-agents and fan-out](/docs/sub-agents) covers how the parallel agents split work.

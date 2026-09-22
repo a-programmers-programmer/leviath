@@ -35,7 +35,8 @@ cd release-notes
 ```
 
 That writes a directory with an `agent.leviath` file in it, plus a `.gitignore` and a
-`.env.example`. The blueprint it generates is a working one-stage agent. You are going to replace
+`.env.example`. Leviath reads a `.env` only when `load_dotenv = true` is in your config (see
+[environment variables](/docs/configuration#environment-variables)). The blueprint it generates is a working one-stage agent. You are going to replace
 it, so open it and delete everything. (There is also a graph editor for this in the
 [dashboard](/docs/dashboard#agent-editor): `lev dash`, then `a`, then `n`. This page writes the file
 by hand so every key is explained.)
@@ -84,9 +85,9 @@ past 100%: regions rarely all fill at once.
 holding your commit log instead of spending a turn fetching it.
 
 **`volatility` says how much a region moves, and it is worth real money.** Providers cache the
-prompt by *prefix*: they store everything up to a marker and reuse it next turn only if every byte
-in front of that marker is identical. So one region that changes invalidates the cache for every
-region behind it, and the order the prompt is assembled in decides the bill.
+prompt by *prefix*. They store everything up to a marker, and reuse it next turn only if every
+byte in front of that marker is identical. So one region that changes invalidates the cache for
+every region behind it, and the order the prompt is assembled in decides the bill.
 
 Here `task` and `commits` are seeded once and never written again, so they are `stable` and go
 first, forming the prefix everything else caches behind. `notes` is written to as the run goes, so
@@ -94,7 +95,7 @@ it is `grows`: it sits after the stable content and is split so its settled part
 only the newest note is re-sent.
 
 The value cannot be guessed from `kind`. All three of these are `pinned`, which sounds immutable
-and says nothing about whether the agent writes to them - only you know that `notes` is the one it
+and says nothing about whether the agent writes to them. Only you know that `notes` is the one it
 adds to. Leaving it out is safe: an undeclared region is assumed to change, which is the pessimistic
 placement, so declaring can only improve things. On a twenty-turn run of this shape, declaring took
 the cache hit rate from 0% to 84% and the cost per turn down by roughly two thirds.
@@ -245,7 +246,7 @@ including `stuck` and `max_iterations`.
 lev validate .
 ```
 
-`lev validate` reads the blueprint the way the runtime will, then says what it found:
+`lev validate` reads the blueprint the way the runtime will. It then says what it found:
 
 ```console
 ✓ Blueprint 'release-notes' is valid.
@@ -379,7 +380,7 @@ the person running this can decide what to do.
 
 ## Make it yours
 
-Small changes worth trying, each of which reaches for one more idea:
+Small changes worth trying. Each reaches for one more idea:
 
 - **Point it at a range.** Change the seed to `git log --oneline $(git describe --tags --abbrev=0)..HEAD` so it reads only what is genuinely unreleased.
 - **Make the shape strict.** Add a `schema` to `[stages.publish.output]` and the answer is validated against it before the run is allowed to finish. See [final outputs](/docs/outputs).
@@ -388,6 +389,8 @@ Small changes worth trying, each of which reaches for one more idea:
 
 ## Where to go next
 
+- [Build an advanced agent](/docs/advanced-agent) builds one whose stages hand pictures and video
+  to each other: an idea, concept art, and a short film.
 - [Agent blueprints](/docs/agents) is the field-by-field reference for everything used here.
 - [Multi-stage workflows](/docs/stages) covers the rest of the graph: conditions, gates, revisit
   limits, and what happens at a dead end.

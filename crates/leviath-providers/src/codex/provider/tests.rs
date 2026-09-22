@@ -6,8 +6,8 @@
 //! assumed.
 
 use super::*;
-use crate::codex::store::{ProviderAuthStore, ProviderGrant};
-use crate::codex::token::RefreshError;
+use crate::oauth::store::{ProviderAuthStore, ProviderGrant};
+use crate::oauth::token::RefreshError;
 use crate::provider::{Message, MessageContent, SystemBlock};
 use leviath_testkit::{spawn_mock_sequence, spawn_mock_server};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -485,13 +485,6 @@ fn a_subscription_call_costs_a_known_zero_rather_than_an_unknown() {
 }
 
 #[test]
-fn this_provider_never_wins_a_bare_model_name() {
-    // Enabling a subscription transport must not silently re-route existing
-    // stages onto the subscription.
-    assert!(provider("http://x", Static::new("t")).explicit_route_only());
-}
-
-#[test]
 fn no_model_is_offered_with_a_temperature() {
     let p = provider("http://x", Static::new("t"));
     assert!(!p.capabilities("gpt-5.6-sol").supports_temperature);
@@ -897,4 +890,33 @@ fn an_empty_usage_url_leaves_the_default_alone() {
     assert_eq!(p.usage_url, crate::codex::USAGE_URL);
     let p = provider("http://x", Static::new("t")).with_usage_url(None);
     assert_eq!(p.usage_url, crate::codex::USAGE_URL);
+}
+
+#[test]
+fn codex_takes_images_until_an_override_says_otherwise() {
+    let mut p = provider("http://x", Static::new("t"));
+    let png = leviath_core::mime::MimeType::parse("image/png").unwrap();
+    assert!(p.mime("gpt-5.5-codex").accepts(&png));
+    p.capability_overrides.insert(
+        "gpt-5.5-codex".to_string(),
+        crate::capabilities::ModelCapabilityOverride {
+            input_types: Some(vec!["text/*".into()]),
+            ..Default::default()
+        },
+    );
+    assert!(!p.mime("gpt-5.5-codex").accepts(&png));
+}
+
+#[tokio::test]
+async fn the_quota_answers_through_the_provider_trait() {
+    let body = br#"{"plan_type":"plus","rate_limit":{"primary_window":
+        {"used_percent":10,"limit_window_seconds":18000,"reset_at":99}}}"#
+        .to_vec();
+    let url = spawn_mock_server(200, "OK", body).await;
+    let p = provider("http://x", Static::new("t")).with_usage_url(Some(url));
+    let report = Provider::quota(&p)
+        .await
+        .expect("a subscription")
+        .expect("read");
+    assert_eq!(report.plan.as_deref(), Some("plus"));
 }

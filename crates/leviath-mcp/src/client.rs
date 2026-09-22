@@ -100,7 +100,7 @@ pub enum ToolResultContent {
     Image {
         /// Base64-encoded bytes.
         data: String,
-        /// The media type those bytes are in.
+        /// The mime type those bytes are in.
         #[serde(rename = "mimeType")]
         mime_type: String,
     },
@@ -109,7 +109,7 @@ pub enum ToolResultContent {
     Audio {
         /// Base64-encoded bytes.
         data: String,
-        /// The media type those bytes are in.
+        /// The mime type those bytes are in.
         #[serde(rename = "mimeType")]
         mime_type: String,
     },
@@ -124,7 +124,7 @@ pub enum ToolResultContent {
         /// A longer description, when the server supplied one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         description: Option<String>,
-        /// The media type behind the link, when the server declared it.
+        /// The mime type behind the link, when the server declared it.
         #[serde(rename = "mimeType", default, skip_serializing_if = "Option::is_none")]
         mime_type: Option<String>,
     },
@@ -263,7 +263,22 @@ impl MCPClient {
         match config.resolve()? {
             ResolvedTransport::Stdio { command, args, env } => {
                 let args: Vec<&str> = args.iter().map(String::as_str).collect();
-                Self::spawn(command, &args, env).await
+                // Expand `${VAR}` in the child's env, the same way an http
+                // server's headers are expanded, so a stdio server can take a
+                // secret from the environment (`MESHY_API_KEY = "${MESHY_API_KEY}"`)
+                // rather than having it written into the config file. A
+                // credential-shaped name is only substituted when it is on the
+                // allowlist; an unset or refused one drops to empty.
+                let expanded: std::collections::HashMap<String, String> = env
+                    .iter()
+                    .map(|(k, v)| {
+                        (
+                            k.clone(),
+                            crate::transport::http::expand_env_allowing(v, allow_env),
+                        )
+                    })
+                    .collect();
+                Self::spawn(command, &args, &expanded).await
             }
             ResolvedTransport::Http { url, headers } => {
                 let mut headers = headers.clone();
@@ -1596,6 +1611,24 @@ for line in sys.stdin:
         let mut client = MCPClient::from_config(&config)
             .await
             .expect("stdio config should connect");
+        client.connect().await.expect("handshake should succeed");
+        assert_eq!(client.list_tools().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn from_config_expands_env_for_a_stdio_server() {
+        let _guard = always_on_tracing_guard();
+        let mut config =
+            MCPServerConfig::stdio("s", "python3", vec!["-c".into(), echo_tool_stub().source()]);
+        // A `${VAR}` in the child's env is expanded at connect time (unset here,
+        // so it resolves to empty); the python stub ignores it and still serves.
+        config.env.insert(
+            "SOME_VAR".to_string(),
+            "${LEVIATH_MCP_TEST_UNSET}".to_string(),
+        );
+        let mut client = MCPClient::from_config_with_auth(&config, None, &[])
+            .await
+            .expect("stdio config with env should connect");
         client.connect().await.expect("handshake should succeed");
         assert_eq!(client.list_tools().await.unwrap().len(), 1);
     }

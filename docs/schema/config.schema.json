@@ -11,9 +11,18 @@
       "default": "anthropic",
       "description": "Which provider a stage falls back to when it states no preference of its own. `lev setup` points this at a provider you configured; leaving it on one you did not is what makes `lev doctor` report a resolve failure."
     },
+    "override_model": {
+      "type": "string",
+      "description": "One model every stage that allows a user default starts on, ahead of the models its blueprint names: a bare model id on default_provider. Unset, the usual state, lets each blueprint pick per stage. Was `default_model` before 0.6; that key now loads as `fallback_model`."
+    },
+    "fallback_model": {
+      "type": "string",
+      "description": "The model a stage falls back to when none of the models it names is configured here, tried after all of them and before [providers] fallback_order: a bare model id on default_provider. Never moves a stage off a model its blueprint names."
+    },
     "default_model": {
       "type": "string",
-      "description": "The model to pair with default_provider. Without it a stage naming no model falls through to a hard-coded last resort, which fails on a machine with no Anthropic key."
+      "deprecated": true,
+      "description": "Renamed to `fallback_model`, which is what it loads as. Still read, and rewritten by `lev update`."
     },
     "agent_paths": {
       "type": "array",
@@ -58,6 +67,81 @@
         "google_api_key": {
           "type": "string"
         },
+        "meshy_api_key": {
+          "type": "string"
+        },
+        "xai_api_key": {
+          "description": "xAI API key, for Grok models billed to an xAI API balance. Env fallback XAI_API_KEY.",
+          "type": "string"
+        },
+        "meta_api_key": {
+          "description": "Meta Model API key, for Muse models. Env fallback META_AI_API_KEY.",
+          "type": "string"
+        },
+        "bedrock_api_key": {
+          "description": "AWS Bedrock API key, sent as a bearer token. Env fallback AWS_BEARER_TOKEN_BEDROCK.",
+          "type": "string"
+        },
+        "bedrock_region": {
+          "description": "The AWS region whose Bedrock endpoints are called. Unset falls back to AWS_REGION, then AWS_DEFAULT_REGION, then us-east-1.",
+          "type": "string"
+        },
+        "anthropic_headers": {
+          "type": "object",
+          "description": "Extra headers on every request Anthropic's provider makes to its host, after the provider's own: a gateway's token, a tenant tag.",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "openai_headers": {
+          "type": "object",
+          "description": "Extra headers on every request OpenAI's provider makes to its host.",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "google_headers": {
+          "type": "object",
+          "description": "Extra headers on every request Google's provider makes to its host.",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "openrouter_headers": {
+          "type": "object",
+          "description": "Extra headers on every request OpenRouter's provider makes to its host.",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "meshy_headers": {
+          "type": "object",
+          "description": "Extra headers on Meshy's API calls, not on asset downloads.",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "bedrock_headers": {
+          "type": "object",
+          "description": "Extra headers on Bedrock inference calls to the runtime origin, not on the AWS control-plane, price-file or count routes.",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "xai_headers": {
+          "type": "object",
+          "description": "Extra headers on every request xAI's provider makes to its host, and a Grok subscription's too.",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "meta_headers": {
+          "type": "object",
+          "description": "Extra headers on every request Meta's provider makes to its host.",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
         "anthropic_base_url": {
           "type": "string"
         },
@@ -67,7 +151,22 @@
         "google_base_url": {
           "type": "string"
         },
+        "meshy_base_url": {
+          "type": "string"
+        },
+        "bedrock_base_url": {
+          "description": "Host to reach the Bedrock runtime on instead of https://bedrock-runtime.<region>.amazonaws.com. With it set the live listing, price file and token-count routes are not read.",
+          "type": "string"
+        },
         "openrouter_base_url": {
+          "type": "string"
+        },
+        "xai_base_url": {
+          "description": "Host to reach xAI on instead of https://api.x.ai/v1. A Grok subscription's requests go here too.",
+          "type": "string"
+        },
+        "meta_base_url": {
+          "description": "Host to reach Meta's Model API on instead of https://api.meta.ai/v1.",
           "type": "string"
         },
         "claude_code_enabled": {
@@ -90,6 +189,16 @@
           "description": "Offer Ollama. Opt-in like every other provider: it needs no key and answers on a well-known local port, so registering it unasked made a bare model name resolvable against whatever happened to be running on the machine. A config that sets `ollama_base_url` counts as having chosen it.",
           "type": "boolean",
           "default": false
+        },
+        "grok_enabled": {
+          "description": "Offer Grok billed to a SuperGrok or X Premium+ subscription instead of an xAI API balance. Sign in from `lev setup`, or with `lev auth login grok` on a headless machine.",
+          "type": "boolean",
+          "default": false
+        },
+        "file_uploads": {
+          "description": "Upload media parts to a provider's own file storage once and send the id after, on the providers that have file storage. Off keeps every part inline. Zero data retention turns uploads off whatever this says.",
+          "type": "boolean",
+          "default": true
         },
         "codex_enabled": {
           "description": "Offer the Codex transport, which bills inference to a ChatGPT subscription. Sign in from `lev setup`, or with `lev auth login codex` on a headless machine.",
@@ -140,6 +249,17 @@
         "provider_order": {
           "type": "array",
           "description": "Ordered provider preference for a bare model name, best first, as plain provider names. Decides which configured provider serves a model a blueprint lists with no provider; generalizes default_provider into a full ordering. Naming a subscription transport here opts it into bare-name routing at that priority.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "zero_retention": {
+          "type": "boolean",
+          "description": "Ask every provider for zero data retention (OpenAI store=false, OpenRouter zdr routing) and refuse a stage whose model cannot give it. `lev providers retention` shows what each provider keeps."
+        },
+        "zero_retention_agreements": {
+          "type": "array",
+          "description": "Providers this organisation holds a zero data retention agreement with, by registry name (openai, anthropic, google). No API can read such a contract, so it is declared here.",
           "items": {
             "type": "string"
           }
@@ -326,6 +446,11 @@
           "default": false,
           "description": "Honour every blueprint's own [tool_permissions] even where it exceeds the built-in default for a tool you have not configured. Off by default: a blueprint may still pre-approve web_search and web_fetch, and anything else is clamped to the default."
         },
+        "lock_permission_files": {
+          "type": "boolean",
+          "default": true,
+          "description": "Refuse any tool call from a run that would write config.toml, yolo.toml, the taint policy and its rules, or the providers/ and tools/ script directories, whatever the run's permissions. On by default; turn off only for an agent that manages this install."
+        },
         "shell_env": {
           "type": "string",
           "enum": [
@@ -376,6 +501,12 @@
           "minimum": 0,
           "default": 30,
           "description": "Seconds a request may take before it is answered 408. `0` disables the deadline. Websocket routes are not timed."
+        },
+        "max_upload_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 33554432,
+          "description": "Bytes one request body may carry: the ceiling on a multipart upload to POST /api/agents or POST /api/agents/{id}/message. 32 MiB by default."
         }
       }
     },
@@ -425,6 +556,17 @@
         },
         "service_name": {
           "type": "string"
+        },
+        "log_file_max_bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 5242880,
+          "description": "Bytes a log file Leviath writes for itself (daemon.log, serve-<name>.log) may reach before it is rolled to <name>.1. 0 never rolls. 5 MiB by default."
+        },
+        "capture_model_input": {
+          "type": "boolean",
+          "default": false,
+          "description": "Write the exact request each run sends the model into its journal, once per provider attempt. Off by default: a captured request is the whole prompt, holding whatever the run's context held, and there is no size cap, so a captured run's journal grows by roughly the context size per attempt."
         }
       }
     },
@@ -491,8 +633,14 @@
             "type": "string"
           }
         },
+        "keep_warm": {
+          "type": "boolean",
+          "description": "Keep one container warm across the run's stages instead of building one per call. It is torn down when the run ends."
+        },
         "persist": {
-          "type": "boolean"
+          "type": "boolean",
+          "deprecated": true,
+          "description": "Renamed to `keep_warm`. Still read, and rewritten by `lev update`."
         },
         "on_unavailable": {
           "enum": [
@@ -685,13 +833,31 @@
             "type": "number",
             "minimum": 0,
             "description": "USD per million output tokens."
+          },
+          "input_types": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Mime type patterns the model accepts in a request, text/* included: [\"text/*\", \"image/*\"] for a local vision model. Replaces what the provider reports."
+          },
+          "output_types": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Mime type patterns the model can hand back in a reply."
+          },
+          "retention": {
+            "type": "string",
+            "description": "What the provider keeps of this model's requests, replacing the compiled-in answer: zero, <N>d (30d), indefinite or unknown."
           }
         }
       }
     },
     "model_providers": {
       "type": "object",
-      "description": "Custom providers, keyed by the name an agent references. Without a kind, overrides for a Rhai script provider (any key not listed here is forwarded verbatim to the script's initialize()); with kind = \"openai-compatible\", a native provider for the server at base_url.",
+      "description": "Custom providers, keyed by the name an agent references. Without a kind, overrides for a Rhai script provider (any key not listed here is forwarded verbatim to the script's initialize()); with kind = \"openai-compatible\", a native provider for the server at base_url; with kind = \"openai\", OpenAI's own API at another host (an Azure resource or a gateway).",
       "additionalProperties": {
         "type": "object",
         "additionalProperties": true,
@@ -699,9 +865,14 @@
           "kind": {
             "enum": [
               "script",
-              "openai-compatible"
+              "openai-compatible",
+              "openai"
             ],
-            "description": "What backs the entry. Absent means script. openai-compatible requires base_url."
+            "description": "What backs the entry. Absent means script. openai-compatible requires base_url; openai requires base_url and api_key."
+          },
+          "auth_header": {
+            "type": "string",
+            "description": "The header the api_key is sent in instead of Authorization: Bearer, such as api-key for an Azure key or Ocp-Apim-Subscription-Key for an API Management gateway."
           },
           "script": {
             "type": "string"
@@ -718,6 +889,15 @@
             "additionalProperties": {
               "type": "string"
             }
+          },
+          "retention": {
+            "type": "string",
+            "description": "What this host keeps of its requests, which Leviath cannot know: zero, <N>d (30d), indefinite or unknown."
+          },
+          "zero_retention_request": {
+            "type": "string",
+            "enum": ["openai", "openrouter"],
+            "description": "The built-in provider whose per-request zero-retention fields this host takes with zero_retention on: openai sends store = false, openrouter the provider.zdr routing fields."
           },
           "models": {
             "type": "array",
@@ -761,7 +941,9 @@
         ],
         "properties": {
           "name": {
-            "type": "string"
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{1,63}$",
+            "description": "Used verbatim in every one of this server's tool names (<server>__<tool>), so it has to be a name a model provider accepts: letters, digits, _ or -. A dot is refused rather than rewritten."
           },
           "transport": {
             "enum": [
@@ -801,6 +983,104 @@
       "type": "boolean",
       "default": true,
       "description": "Whether lev asks GitHub for a newer release once a day and says so under a command's output. Set false where reaching out is the problem rather than the answer."
+    },
+    "load_dotenv": {
+      "type": "boolean",
+      "default": false,
+      "description": "Read a .env file from the directory lev runs in. Off by default, since that directory is often a repository someone else wrote. Only ./.env is read, a variable already set keeps its value, and names that steer lev (LEVIATH_*, PATH, EDITOR and the like) are skipped."
+    },
+    "mime": {
+      "type": "object",
+      "description": "Limits on typed mime parts: how large one may be, how much text stays inline, how many stored parts one request carries.",
+      "additionalProperties": false,
+      "properties": {
+        "max_part_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Bytes one part may be. Unset, the largest part a configured provider takes by file upload or inline (1 GiB with Meta, 500 MiB with Anthropic), or 33554432 (32 MiB) when none documents one."
+        },
+        "inline_text_bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Bytes of text kept inline in an entry before the part is stored by hash. Default 1048576."
+        },
+        "max_media_bytes_per_request": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Bytes of stored media one model request carries before the oldest parts are sent as stand-ins, for a provider that documents no request limit of its own; a backstop for vendor request-size limits a token budget cannot see. Default 20971520 (20 MiB)."
+        },
+        "provider_file_ttl_secs": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Seconds a part uploaded to a provider's file storage lives there before the vendor deletes it, clamped to what each vendor takes (at least an hour). A run's uploads are also deleted when it finishes. Default 86400 (a day)."
+        },
+        "overwrite_artifacts": {
+          "type": "boolean",
+          "default": false,
+          "description": "Whether a part a run produced, handed back as an artifact, may replace a different file already at the path it names in the working directory. Off, that file is left alone and the part is written beside it as <stem>-<sha8>.<ext>, which is the path the answer records. A blueprint's output overwrite_artifacts wins over this."
+        }
+      }
+    },
+    "mime_types": {
+      "type": "object",
+      "description": "Rows added to the mime registry, keyed by type/subtype or type/*. A row names only the fields it changes; the rest resolve from the built-in table. Such rows belong in mime_types.toml beside this file, whose rows layer over these; a table here still loads.",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "family": {
+            "type": "string",
+            "description": "What providers key their encoders on: text, image, audio, video, document, model, binary, or a name of your own."
+          },
+          "text": {
+            "type": "boolean",
+            "description": "The bytes are UTF-8 and may travel inline and reach a text model as text."
+          },
+          "tokens": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "How to estimate the part's tokens: exactly one of per_byte, per_pixel (with max), per_second, fixed.",
+            "properties": {
+              "per_byte": {
+                "type": "number",
+                "minimum": 0
+              },
+              "per_pixel": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "max": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "per_second": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "fixed": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          },
+          "extensions": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "File extensions, without the dot, that imply this type."
+          },
+          "magic": {
+            "type": "string",
+            "pattern": "^[0-9A-Fa-f]+$",
+            "description": "A hex prefix that identifies the bytes."
+          },
+          "stand_in": {
+            "type": "string",
+            "description": "The text a consumer that cannot take the type sees; supports {type} {name} {size} {dims} {duration}."
+          }
+        }
+      }
     }
   },
   "$defs": {

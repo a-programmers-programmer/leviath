@@ -109,6 +109,7 @@ fn every_kind_round_trips_through_its_wire_spelling() {
         ScriptKind::RegionHook,
         ScriptKind::StageHook,
         ScriptKind::OutputValidator,
+        ScriptKind::MimeCheck,
         ScriptKind::Provider,
     ] {
         assert_eq!(ScriptKind::parse(kind.as_str()), Some(kind));
@@ -150,6 +151,136 @@ fn each_kind_is_compiled_by_its_own_compiler() {
         .is_ok()
     );
     assert!(compile_status(ScriptKind::Provider, "p", GOOD_PROVIDER, &[]).is_ok());
+    assert!(
+        compile_status(
+            ScriptKind::MimeCheck,
+            "m",
+            "fn check(bytes, mime_type) { () }",
+            &[]
+        )
+        .is_ok()
+    );
+    let refused =
+        compile_status(ScriptKind::MimeCheck, "m", "fn check(bytes) { () }", &[]).unwrap_err();
+    assert!(refused.contains("exactly two parameters"), "{refused}");
+}
+
+/// A mime check resolves beside the agent that names it in its manifest,
+/// and beside the config for the operator's rows, since a row's `check` is
+/// relative to the file that names it.
+#[tokio::test]
+async fn a_mime_check_resolves_beside_the_manifest_or_the_config() {
+    with_home(|home| async move {
+        let agent = agent_root(&home, "scenes");
+        write(&agent.join("agent.leviath"), "[agent]\nname = \"scenes\"\n");
+        let target = resolve(
+            &Config::default(),
+            "mime_check",
+            "checks/scene",
+            Some("scenes"),
+        )
+        .expect("an agent scope");
+        assert_eq!(target.dir, agent);
+        assert_eq!(target.path, agent.join("checks").join("scene.rhai"));
+        assert_eq!(target.scope, "agent");
+
+        let global = resolve(&Config::default(), "mime_check", "checks/scene", None)
+            .expect("the config's directory");
+        assert_eq!(global.dir, config_dir());
+        assert_eq!(global.scope, "global");
+        assert!(global.agent.is_none());
+    })
+    .await;
+}
+
+/// The operator's rows put their checks in the global listing, compiled or
+/// not; a blueprint's rows put theirs beside the agent's other scripts.
+#[tokio::test]
+async fn mime_checks_are_listed_from_the_rows_that_name_them() {
+    with_home(|home| async move {
+        // Where the daemon reads the rows from under this home.
+        let config_dir = config_dir();
+        assert!(config_dir.starts_with(&home), "{}", config_dir.display());
+        std::fs::create_dir_all(config_dir.join("checks")).unwrap();
+        write(
+            &config_dir.join("checks").join("scene.rhai"),
+            "fn check(bytes, mime_type) { () }",
+        );
+        write(
+            &config_dir.join("mime_types.toml"),
+            "[\"application/x-acme-scene\"]\ncheck = \"checks/scene.rhai\"\n\
+             [\"model/obj\"]\ncheck = \"checks/gone.rhai\"\n\
+             [\"x/y\"]\ncheck = \"notes.txt\"\n",
+        );
+        let agent = agent_root(&home, "scenes");
+        write(
+            &agent.join("agent.leviath"),
+            "[agent]\nname = \"scenes\"\n\n[mime_types.\"image/*\"]\ncheck = \"checks/image.rhai\"\n",
+        );
+        write(
+            &agent.join("checks").join("image.rhai"),
+            "fn check(bytes, mime_type) { \"never\" }",
+        );
+        let (status, body) = call_with_paths(
+            Vec::new(),
+            Request::builder()
+                .uri("/api/scripts?agent=scenes")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let scripts = body["scripts"].as_array().unwrap();
+        let checks: Vec<&serde_json::Value> = scripts
+            .iter()
+            .filter(|s| s["kind"] == "mime_check")
+            .collect();
+        let find = |name: &str| {
+            checks
+                .iter()
+                .find(|s| s["name"] == name)
+                .unwrap_or_else(|| panic!("{name} listed: {checks:?}"))
+        };
+        assert_eq!(find("checks/scene")["source"], "global");
+        assert_eq!(find("checks/scene")["compiles"], true);
+        assert_eq!(find("checks/scene")["relative_path"], "checks/scene.rhai");
+        assert_eq!(find("checks/gone")["compiles"], false);
+        assert!(
+            find("checks/gone")["error"]
+                .as_str()
+                .unwrap()
+                .contains("cannot read")
+        );
+        assert_eq!(find("checks/image")["source"], "agent");
+        assert_eq!(find("checks/image")["agent"], "scenes");
+        assert_eq!(find("checks/image")["compiles"], true);
+        assert!(
+            !checks.iter().any(|s| s["name"] == "notes.txt"),
+            "a check that is not a .rhai file cannot be addressed"
+        );
+        // Without an agent, only the operator's checks.
+        let (_, body) = get_json("/api/scripts").await;
+        let names: Vec<String> = body["scripts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|s| s["kind"] == "mime_check")
+            .map(|s| s["name"].as_str().unwrap().to_string())
+            .collect();
+        // In row order: the registry lists its keys sorted.
+        assert_eq!(names, vec!["checks/scene", "checks/gone"]);
+        // A file of rows the registry refuses names no checks.
+        write(&config_dir.join("mime_types.toml"), "[png]\ncheck = \"x.rhai\"\n");
+        let (_, body) = get_json("/api/scripts").await;
+        assert!(
+            !body["scripts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s["kind"] == "mime_check")
+        );
+    })
+    .await;
 }
 
 /// The other half of the same claim: a refusal carries the words of the
@@ -271,9 +402,9 @@ async fn a_name_that_already_carries_the_extension_is_the_same_file() {
 #[tokio::test]
 async fn an_unknown_kind_is_refused() {
     with_home(|_home| async move {
-        let (status, _) =
+        let refused =
             resolve(&Config::default(), "model_provider", "x", None).expect_err("no such kind");
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(refused.code(), "BAD_USER_INPUT");
     })
     .await;
 }
@@ -281,9 +412,9 @@ async fn an_unknown_kind_is_refused() {
 #[tokio::test]
 async fn a_traversing_script_name_is_refused() {
     with_home(|_home| async move {
-        let (status, _) =
+        let refused =
             resolve(&Config::default(), "tool", "../../evil", None).expect_err("a traversal");
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(refused.code(), "BAD_USER_INPUT");
     })
     .await;
 }
@@ -291,9 +422,9 @@ async fn a_traversing_script_name_is_refused() {
 #[tokio::test]
 async fn a_traversing_agent_name_is_refused() {
     with_home(|_home| async move {
-        let (status, _) =
+        let refused =
             resolve(&Config::default(), "tool", "x", Some("../../etc")).expect_err("a traversal");
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(refused.code(), "BAD_USER_INPUT");
     })
     .await;
 }
@@ -330,10 +461,9 @@ async fn an_agent_from_a_configured_path_resolves_to_its_own_directory() {
 #[tokio::test]
 async fn a_hook_without_an_agent_is_refused() {
     with_home(|_home| async move {
-        let (status, body) =
-            resolve(&Config::default(), "region_hook", "x", None).expect_err("no scope");
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(body.0.error.contains("?agent="), "{}", body.0.error);
+        let refused = resolve(&Config::default(), "region_hook", "x", None).expect_err("no scope");
+        assert_eq!(refused.code(), "BAD_USER_INPUT");
+        assert!(refused.to_string().contains("?agent="), "{refused}");
     })
     .await;
 }
@@ -354,8 +484,8 @@ fn a_path_that_cannot_be_shown_to_be_contained_is_refused() {
         scope: "global",
         agent: None,
     };
-    let (status, _) = guard(&target, Presence::Optional).expect_err("nothing contains it");
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    let refused = guard(&target, Presence::Optional).expect_err("nothing contains it");
+    assert_eq!(refused.code(), "FORBIDDEN");
 }
 
 // ─── the fallible filesystem helpers ────────────────────────────────────────
@@ -378,12 +508,17 @@ async fn a_write_the_filesystem_refuses_is_reported() {
             scope: "global",
             agent: None,
         };
-        let (status, _) = write_script(&target, GOOD_TOOL).expect_err("no such directory");
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let refused = write_script(&target, GOOD_TOOL).expect_err("no such directory");
+        assert_eq!(refused.code(), "INTERNAL");
     })
     .await;
 }
 
+/// A delete the filesystem refuses is reported rather than reading as done.
+///
+/// Reached with a directory standing where the script should be, which the
+/// routes never create but which stands in for any removal the filesystem
+/// refuses: a file somebody else owns, a read-only volume.
 #[tokio::test]
 async fn a_delete_the_filesystem_refuses_is_reported() {
     with_home(|home| async move {
@@ -399,8 +534,9 @@ async fn a_delete_the_filesystem_refuses_is_reported() {
             scope: "global",
             agent: None,
         };
-        let (status, _) = remove_script(&target).expect_err("a directory is not a file");
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let refused = remove_script(&target).expect_err("a directory is not a file");
+        assert_eq!(refused.code(), "INTERNAL");
+        assert!(refused.to_string().contains("cannot delete"), "{refused}");
     })
     .await;
 }
@@ -1517,10 +1653,10 @@ async fn a_provider_resolves_into_the_providers_directory() {
 #[tokio::test]
 async fn a_provider_with_an_agent_is_refused() {
     with_home(|_home| async move {
-        let (status, body) = resolve(&Config::default(), "provider", "groq", Some("researcher"))
+        let refused = resolve(&Config::default(), "provider", "groq", Some("researcher"))
             .expect_err("global");
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(body.0.error.contains("?agent="), "{}", body.0.error);
+        assert_eq!(refused.code(), "BAD_USER_INPUT");
+        assert!(refused.to_string().contains("?agent="), "{refused}");
     })
     .await;
 }

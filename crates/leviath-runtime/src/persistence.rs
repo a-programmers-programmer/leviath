@@ -47,6 +47,14 @@ pub struct RunMetadata {
     pub callback_secret: Option<String>,
     /// Short human-readable title (None until generated).
     pub title: Option<String>,
+    /// The SHA-256 of the manifest this run executed, in lowercase hex.
+    ///
+    /// Carried on the run rather than recomputed on read, because the file it
+    /// came from may have been edited or deleted since. It identifies the
+    /// snapshot in the run's own directory, which is the copy a reader should
+    /// trust about what ran. `None` for a run whose manifest could not be read
+    /// back at spawn.
+    pub blueprint_digest: Option<String>,
     /// Why [`Self::title`] is still `None`, once titling has given up.
     ///
     /// `None` means titling has not finished (or was never asked for), which is
@@ -63,6 +71,11 @@ pub struct RunMetadata {
     /// hardcode "attended", which stranded unattended runs on prompts no one was
     /// there to answer.
     pub unattended: bool,
+    /// The named yolo profile the run was launched under (`--yolo=<name>`),
+    /// carried beside `unattended` for the same two readers: a child of a
+    /// profiled run is spawned under the same profile, not under bare
+    /// `--yolo`, and a daemon restart resumes it under the same rules.
+    pub yolo_profile: Option<String>,
     /// How much of the blueprint's `[read_paths]` the config granted, resolved
     /// once at spawn (see [`ReadPathGrantCounts`]). `None` when the blueprint
     /// declares none, which is nearly every agent.
@@ -169,6 +182,9 @@ pub struct FinalOutput(pub leviath_core::output::FinalOutput);
 ///
 /// [`MODIFYING_TOOLS`]: leviath_core::blueprint::MODIFYING_TOOLS
 fn stage_can_modify(stage: &leviath_core::Stage) -> bool {
+    if stage.grants_all_builtins() {
+        return true;
+    }
     stage.available_tools.iter().any(|t| {
         let canonical = leviath_tools::canonical_tool_name(t);
         leviath_core::blueprint::MODIFYING_TOOLS.contains(&canonical)
@@ -358,6 +374,13 @@ pub(crate) struct RunMetaSources<'a> {
     pub flags: &'a RunOutcomeFlags,
     /// The submitted answer, when the run has produced one.
     pub final_output: Option<&'a FinalOutput>,
+    /// Every provider and model the run's stages have run on, rolled up from
+    /// the stage ledger by the caller.
+    ///
+    /// Taken already rolled up rather than as the ledger itself, because the
+    /// ledger is held mutably where this is built and the roll-up is the only
+    /// part of it `meta.json` carries.
+    pub stage_models: Vec<leviath_core::run_meta::StageModelUse>,
     /// The parking markers the agent is carrying, read off the entity by the
     /// caller, which is where they are queryable.
     pub parked: WaitMarkers,
@@ -402,6 +425,7 @@ pub(crate) fn build_run_meta(sources: RunMetaSources<'_>, at: RunPosition) -> Ru
         totals,
         flags,
         final_output,
+        stage_models,
         parked,
     } = sources;
     let RunPosition {
@@ -424,6 +448,7 @@ pub(crate) fn build_run_meta(sources: RunMetaSources<'_>, at: RunPosition) -> Ru
         agent_path: md.agent_path.clone(),
         task: md.task.clone(),
         model: md.model.clone(),
+        stage_models,
         pid: 0, // no per-run worker process in the shared world; see RunMeta::pid
         status,
         current_stage: state.current_stage.clone(),
@@ -452,6 +477,10 @@ pub(crate) fn build_run_meta(sources: RunMetaSources<'_>, at: RunPosition) -> Ru
         },
         title: md.title.clone(),
         title_error: md.title_error.clone(),
+        // Carried through every write: the persistence lane rebuilds the whole
+        // record each tick, so a field it forgets is a field that exists only
+        // until the run first moves.
+        blueprint_digest: md.blueprint_digest.clone(),
         metadata: md.metadata.clone(),
         callback_url: md.callback_url.clone(),
         callback_secret: md.callback_secret.clone(),
@@ -462,6 +491,7 @@ pub(crate) fn build_run_meta(sources: RunMetaSources<'_>, at: RunPosition) -> Ru
         max_child_depth,
         flags,
         yolo: md.unattended,
+        yolo_profile: md.yolo_profile.clone(),
         read_paths: md.read_paths,
         final_output: final_output.map(|o| o.0.descriptor()),
         // Paused counts as parked here, not just Waiting: a run held until the
@@ -487,6 +517,7 @@ mod tests {
     fn state(status: AgentStatus) -> AgentState {
         AgentState {
             agent_id: "a".to_string(),
+            current_visit: String::new(),
             current_stage: "plan".to_string(),
             iteration: 4,
             status,
@@ -512,7 +543,9 @@ mod tests {
             callback_secret: Some("sekret".to_string()),
             title: Some("Do It".to_string()),
             title_error: None,
+            blueprint_digest: None,
             unattended: false,
+            yolo_profile: None,
             read_paths: None,
             output_request: None,
             model_override: None,
@@ -578,6 +611,9 @@ mod tests {
         // leaves no record, so silence from it stays suspicious rather than
         // excused. The alias resolves, so `bash` is judged as `shell`.
         assert!(no_output_tools(vec![stage_with(&["bash"], None)]));
+        // A built-in group carries `write_file` and `edit_file` unnamed.
+        assert!(!no_output_tools(vec![stage_with(&["@builtin"], None)]));
+        assert!(no_output_tools(vec![stage_with(&["@scripts"], None)]));
         // A built-in modifying tool, under either name.
         assert!(!no_output_tools(vec![stage_with(&["write_file"], None)]));
         assert!(!no_output_tools(vec![stage_with(&["edit_file"], None)]));
@@ -833,6 +869,7 @@ mod tests {
                 totals: &TokenTotals::default(),
                 flags: &RunOutcomeFlags::default(),
                 final_output: None,
+                stage_models: Vec::new(),
                 parked: WaitMarkers {
                     children_outstanding: Some(2),
                     ..Default::default()
@@ -874,6 +911,7 @@ mod tests {
                 totals: &totals,
                 flags: &RunOutcomeFlags::default(),
                 final_output: None,
+                stage_models: Vec::new(),
                 parked: WaitMarkers::default(),
             },
             RunPosition {
@@ -912,6 +950,36 @@ mod tests {
         assert!(!meta.yolo);
     }
 
+    /// The roll-up of what the run's stages ran on reaches `meta.json`, which
+    /// is the file a listing has already parsed when it filters by model.
+    #[test]
+    fn build_run_meta_carries_the_stage_model_rollup() {
+        let used = vec![leviath_core::run_meta::StageModelUse {
+            provider: "anthropic".to_string(),
+            model: "claude-opus-5".to_string(),
+        }];
+        let meta = build_run_meta(
+            RunMetaSources {
+                md: &metadata(),
+                state: &state(AgentStatus::Active),
+                totals: &TokenTotals::default(),
+                flags: &RunOutcomeFlags::default(),
+                final_output: None,
+                stage_models: used.clone(),
+                parked: WaitMarkers::default(),
+            },
+            RunPosition {
+                stage_index: 0,
+                now_secs: 0,
+                last_progress_at: None,
+                depth: 0,
+                max_child_depth: 0,
+                active: Default::default(),
+            },
+        );
+        assert_eq!(meta.stage_models, used);
+    }
+
     /// The snapshot carries `unattended` through to `meta.json`, which is what a
     /// daemon restart reads back to resume the run the way it was launched.
     #[test]
@@ -925,6 +993,7 @@ mod tests {
                 totals: &TokenTotals::default(),
                 flags: &RunOutcomeFlags::default(),
                 final_output: None,
+                stage_models: Vec::new(),
                 parked: WaitMarkers::default(),
             },
             RunPosition {
@@ -951,6 +1020,7 @@ mod tests {
                 totals: &TokenTotals::default(),
                 flags: &flags,
                 final_output: None,
+                stage_models: Vec::new(),
                 parked: WaitMarkers::default(),
             },
             RunPosition {
@@ -980,6 +1050,7 @@ mod tests {
                     totals: &TokenTotals::default(),
                     flags: &flags,
                     final_output: None,
+                    stage_models: Vec::new(),
                     parked: WaitMarkers::default(),
                 },
                 RunPosition {
@@ -1004,6 +1075,7 @@ mod tests {
                 totals: &TokenTotals::default(),
                 flags: &wrote,
                 final_output: None,
+                stage_models: Vec::new(),
                 parked: WaitMarkers::default(),
             },
             RunPosition {
@@ -1029,6 +1101,7 @@ mod tests {
                 totals: &TokenTotals::default(),
                 flags: &incapable,
                 final_output: None,
+                stage_models: Vec::new(),
                 parked: WaitMarkers::default(),
             },
             RunPosition {
@@ -1055,6 +1128,7 @@ mod tests {
                 totals: &TokenTotals::default(),
                 flags: &RunOutcomeFlags::default(),
                 final_output: None,
+                stage_models: Vec::new(),
                 parked: WaitMarkers::default(),
             },
             RunPosition {
@@ -1090,6 +1164,7 @@ mod tests {
                 totals: &TokenTotals::default(),
                 flags: &RunOutcomeFlags::default(),
                 final_output: Some(&submitted),
+                stage_models: Vec::new(),
                 parked: WaitMarkers::default(),
             },
             RunPosition {
@@ -1126,6 +1201,7 @@ mod tests {
                 totals: &TokenTotals::default(),
                 flags: &RunOutcomeFlags::default(),
                 final_output: None,
+                stage_models: Vec::new(),
                 parked: WaitMarkers::default(),
             },
             RunPosition {
@@ -1179,7 +1255,7 @@ mod tests {
             "brain".to_string(),
             RegionKind::Custom {
                 script: "b.rhai".to_string(),
-                persistent: false,
+                pinned: false,
             },
             100,
         ));

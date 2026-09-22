@@ -213,6 +213,12 @@ impl Dashboard {
                         if node.self_loop {
                             facts.push("may repeat itself".to_string());
                         }
+                        if !node.inputs.is_empty() {
+                            facts.push(format!("takes {}", node.inputs.join(" ")));
+                        }
+                        if !node.outputs.is_empty() {
+                            facts.push(format!("hands back {}", node.outputs.join(" ")));
+                        }
                         if let Some(description) = &node.description {
                             facts.push(description.clone());
                         }
@@ -251,6 +257,13 @@ impl Dashboard {
                 text.push_str(&format!(" · transform {}", edge.transform));
                 if let Some(hint) = &edge.hint {
                     text.push_str(&format!(" · {hint}"));
+                }
+                if !edge.unseen.is_empty() {
+                    text.push_str(&format!(
+                        " · ! {} not taken by {}: crosses as a stand-in",
+                        edge.unseen.join(" "),
+                        edge.to
+                    ));
                 }
                 Line::from(Span::styled(text, Style::default().fg(C_MUTED)))
             }
@@ -352,6 +365,8 @@ max_iterations = 5
 [stages.plan.transitions.implement]
 hint = "ready"
 [stages.implement]
+[stages.implement.context.regions]
+notes = { kind = "pinned", accepts = ["text/*"] }
 [stages.implement.transitions.review]
 [stages.implement.transitions.recover]
 condition = "error"
@@ -362,9 +377,14 @@ condition = "llm_choice"
 [stages.review.transitions.review]
 [stages.review.transitions.island]
 [stages.recover]
+[[stages.recover.output.artifacts]]
+name = "log"
+type = "application/json"
 [stages.recover.transitions.implement]
 [stages.island]
 mode = "output"
+[stages.island.context.regions]
+brief = { kind = "pinned", accepts = ["application/pdf"] }
 [stages.island.transitions]
 "#,
             )
@@ -390,7 +410,7 @@ mode = "output"
             pending_request: None,
             last_answered_request_id: None,
             context_snapshot: None,
-            stages: vec![],
+            stages: Default::default(),
             workdir: "/tmp".to_string(),
             task: "t".to_string(),
             title: None,
@@ -440,7 +460,8 @@ mode = "output"
             run_id: "run-1".to_string(),
             visits: derive_visits(&points),
             points,
-            loaded_at_tick: u64::MAX,
+            checked_at_tick: u64::MAX,
+            stamp: None,
         });
     }
 
@@ -479,7 +500,7 @@ mode = "output"
         );
         dash.stage_explorer = Some(explorer());
 
-        let (terminal, text) = rendered_at(&mut dash, 200, 50);
+        let (terminal, text) = rendered_at(&mut dash, 320, 60);
         assert!(text.contains("Stage explorer"), "{text}");
         // By default the canvas is the path and the options: the stages the
         // run has been through and where it can go from implement. Island
@@ -501,7 +522,7 @@ mode = "output"
         assert_eq!(style_at_text(&terminal, "implement ×2").fg, Some(C_ACTIVE));
         // `t` brings the whole graph back, pending stages dim.
         dash.stage_explorer.as_mut().unwrap().view.toggle_all();
-        let (terminal, text) = rendered_at(&mut dash, 200, 50);
+        let (terminal, text) = rendered_at(&mut dash, 320, 60);
         for stage in ["plan", "implement", "review", "recover", "island"] {
             assert!(text.contains(stage), "{stage}: {text}");
         }
@@ -557,8 +578,34 @@ mode = "output"
             .view
             .select_stage("island");
         let text = rendered(&mut dash);
-        assert!(text.contains("island output"), "{text}");
-        assert!(!text.contains("island output  →"), "{text}");
+        assert!(
+            text.contains("island output · takes application/pdf"),
+            "{text}"
+        );
+        assert!(!text.contains("application/pdf  →"), "{text}");
+        // A stage that hands a file back says so, and the path it leaves by
+        // says when the next stage cannot take the file.
+        dash.stage_explorer
+            .as_mut()
+            .unwrap()
+            .view
+            .select_stage("recover");
+        let text = rendered(&mut dash);
+        assert!(
+            text.contains("recover autonomous · hands back application/json  → implement"),
+            "{text}"
+        );
+        let mut dropped = explorer();
+        dropped.view.select_edge_for_test(5);
+        dash.stage_explorer = Some(dropped);
+        let text = rendered(&mut dash);
+        assert!(
+            text.contains(
+                "recover → implement · transform direct · ! application/json not taken by implement: crosses as a stand-in"
+            ),
+            "{text}"
+        );
+        dash.stage_explorer = Some(explorer());
         dash.stage_explorer
             .as_mut()
             .unwrap()
