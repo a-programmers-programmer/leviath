@@ -245,6 +245,16 @@ pub(super) fn parse_region_layout(
         if let Some(seed) = seed {
             def = def.with_seed(seed);
         }
+
+        // Content-format / draft JSON Schema for writes into this region.
+        // `format` alone is format-level (parseable JSON, mermaid, …).
+        // `schema` is either an inline TOML table (converted to JSON), a JSON
+        // object string, or a path to a `.json` file resolved at spawn against
+        // the blueprint directory. Without either key the region stays open.
+        if let Some(schema) = parse_region_schema(region_name, region_value)? {
+            def = def.with_schema(schema);
+        }
+
         regions.push(def);
     }
 
@@ -449,6 +459,79 @@ pub(super) fn parse_pattern_list(
     Ok(out)
 }
 
+
+/// Parse a region's `format` / `schema` keys into a [`crate::region::RegionSchema`].
+///
+/// Returns `Ok(None)` when neither key is set. A `schema` without `format`
+/// defaults the format to JSON, because a draft JSON Schema only makes sense
+/// against JSON text. A `format` without `schema` still attaches a format-only
+/// schema (parseable JSON, mermaid, …) the way `RegionSchema` always did.
+fn parse_region_schema(
+    region_name: &str,
+    region_value: &toml::Value,
+) -> Result<Option<crate::region::RegionSchema>> {
+    let format_str = str_of(region_value, "format");
+    let schema_val = region_value.get("schema");
+    if format_str.is_none() && schema_val.is_none() {
+        return Ok(None);
+    }
+
+    let format = match format_str {
+        Some(s) => crate::region::ContentFormat::from_blueprint_str(s).map_err(|e| {
+            Error::Other(format!("region '{region_name}': format: {e}"))
+        })?,
+        // A content schema without an explicit format is JSON content.
+        None => crate::region::ContentFormat::Json,
+    };
+
+    let mut schema = crate::region::RegionSchema::new(format);
+
+    if let Some(v) = schema_val {
+        match v {
+            toml::Value::Table(_) | toml::Value::Array(_) => {
+                let json = serde_json::to_value(v).map_err(|e| {
+                    Error::Other(format!(
+                        "region '{region_name}': schema could not convert to JSON: {e}"
+                    ))
+                })?;
+                // Compile at load so a bad inline schema fails `lev validate`
+                // instead of accepting every write at runtime.
+                if let Err(e) = jsonschema::validator_for(&json) {
+                    return Err(Error::Other(format!(
+                        "region '{region_name}': schema does not compile: {e}"
+                    )));
+                }
+                schema.content_schema = Some(json);
+            }
+            toml::Value::String(s) => {
+                let trimmed = s.trim();
+                if trimmed.starts_with('{') || trimmed.starts_with('[') {
+                    let json: serde_json::Value = serde_json::from_str(trimmed).map_err(|e| {
+                        Error::Other(format!(
+                            "region '{region_name}': schema string is not valid JSON: {e}"
+                        ))
+                    })?;
+                    if let Err(e) = jsonschema::validator_for(&json) {
+                        return Err(Error::Other(format!(
+                            "region '{region_name}': schema does not compile: {e}"
+                        )));
+                    }
+                    schema.content_schema = Some(json);
+                } else if !trimmed.is_empty() {
+                    schema.schema_path = Some(trimmed.to_string());
+                }
+            }
+            other => {
+                return Err(Error::Other(format!(
+                    "region '{region_name}': schema must be a table, JSON string, or path, got {other}"
+                )));
+            }
+        }
+    }
+
+    Ok(Some(schema))
+}
+
 #[cfg(test)]
 pub(super) const REGION_KEYS: &[&str] = &[
     "accepts",
@@ -458,6 +541,7 @@ pub(super) const REGION_KEYS: &[&str] = &[
     "compact_count",
     "describe_in_prompt",
     "description",
+    "format",
     "kind",
     "max_entries",
     "max_items",
@@ -470,6 +554,7 @@ pub(super) const REGION_KEYS: &[&str] = &[
     "persistent",
     "required",
     "required_message",
+    "schema",
     "script",
     "seed",
     "source_region",

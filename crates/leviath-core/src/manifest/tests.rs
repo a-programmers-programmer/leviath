@@ -6982,3 +6982,96 @@ fn each_rescan_value_says_what_it_turns_on() {
     }
     assert_eq!(ToolRescan::parse("dynamic"), None);
 }
+
+
+#[test]
+fn region_schema_inline_and_format_are_parsed() {
+    let bp = parse_manifest(
+        r#"
+[agent]
+name = "schema-wire"
+version = "0.0.1"
+entry_stage = "main"
+
+[stages.main]
+mode = "autonomous"
+model = "gpt-5.4-mini"
+available_tools = ["context_write"]
+
+[context]
+token_budget = 8000
+
+[context.regions.task_plans]
+kind = "hashmap"
+max_entries = 40
+format = "json"
+schema = { type = "object", required = ["steps", "current_step_id"] }
+"#,
+    )
+    .expect("parses");
+    let region = bp
+        .context_layout
+        .regions
+        .iter()
+        .find(|r| r.name == "task_plans")
+        .expect("task_plans");
+    let schema = region.schema.as_ref().expect("schema attached");
+    assert_eq!(schema.format, crate::region::ContentFormat::Json);
+    let cs = schema.content_schema.as_ref().expect("content schema");
+    assert_eq!(cs["type"], "object");
+    assert!(cs["required"].as_array().unwrap().iter().any(|v| v == "steps"));
+}
+
+#[test]
+fn region_schema_path_is_deferred_until_resolve() {
+    let dir = tempfile::tempdir().unwrap();
+    let schema_path = dir.path().join("task_plan.schema.json");
+    std::fs::write(
+        &schema_path,
+        r#"{"type":"object","required":["steps","current_step_id"]}"#,
+    )
+    .unwrap();
+    let manifest = dir.path().join("agent.leviath");
+    std::fs::write(
+        &manifest,
+        r#"
+[agent]
+name = "schema-path"
+version = "0.0.1"
+entry_stage = "main"
+
+[stages.main]
+mode = "autonomous"
+model = "gpt-5.4-mini"
+
+[context.regions.task_plans]
+kind = "hashmap"
+format = "json"
+schema = "task_plan.schema.json"
+"#,
+    )
+    .unwrap();
+    let content = std::fs::read_to_string(&manifest).unwrap();
+    let mut bp = parse_manifest(&content).expect("parses");
+    let region = bp
+        .context_layout
+        .regions
+        .iter()
+        .find(|r| r.name == "task_plans")
+        .unwrap();
+    let schema = region.schema.as_ref().unwrap();
+    assert_eq!(schema.schema_path.as_deref(), Some("task_plan.schema.json"));
+    assert!(schema.content_schema.is_none());
+    bp.resolve_region_content_schemas(&manifest).expect("resolve");
+    let schema = bp
+        .context_layout
+        .regions
+        .iter()
+        .find(|r| r.name == "task_plans")
+        .unwrap()
+        .schema
+        .as_ref()
+        .unwrap();
+    assert!(schema.schema_path.is_none());
+    assert!(schema.content_schema.is_some());
+}

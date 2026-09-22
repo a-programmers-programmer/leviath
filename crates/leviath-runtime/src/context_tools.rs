@@ -225,12 +225,14 @@ pub(crate) fn handle_context_tool(
                 let result = if let Some(existing) = region.get_by_key(k) {
                     let new_content = format!("{}\n{}", existing.content, content);
                     let new_tokens = leviath_core::estimate_tokens(&new_content);
-                    // Upserting an already-present key updates in place with no
-                    // budget check, so this cannot fail.
-                    region
-                        .upsert_by_key(k, new_content, new_tokens)
-                        .expect("infallible: existing HashMap key updates in place");
-                    format!("Appended to '{region_name}' section under key '{k}'.")
+                    // In-place update skips the token budget, but still runs
+                    // content-schema validation when the region has one.
+                    match region.upsert_by_key(k, new_content, new_tokens) {
+                        Ok(()) => {
+                            format!("Appended to '{region_name}' section under key '{k}'.")
+                        }
+                        Err(e) => format!("[error] {e}"),
+                    }
                 } else {
                     match region.upsert_by_key(k, content.to_string(), tokens) {
                         Ok(()) => {

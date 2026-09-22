@@ -875,6 +875,22 @@
             "type": "string"
           },
           "description": "Mime types this region takes, each type/subtype or type/*. Absent means anything. A write carrying a part outside the list is refused with the list."
+        },
+        "format": {
+          "type": "string",
+          "description": "Content format enforced on writes into this region (json, mermaid, markdown, text, code:<lang>, or a custom name). Combined with `schema` for draft JSON Schema checks on JSON bodies."
+        },
+        "schema": {
+          "description": "Draft JSON Schema for entry content (typically hashmap JSON values). Inline TOML table, JSON object string, or a path to a `.json` file beside the blueprint (resolved at spawn/validate).",
+          "oneOf": [
+            {
+              "type": "object"
+            },
+            {
+              "type": "string",
+              "minLength": 1
+            }
+          ]
         }
       }
     },
@@ -1047,7 +1063,10 @@
               "type": "object",
               "description": "A region that must hold at least so many entries before this edge is taken. The gate holds the stage and re-runs it with the message until the count is met, so a stage whose model cannot call tools (an image model) draws until its set is complete.",
               "additionalProperties": false,
-              "required": ["region", "at_least"],
+              "required": [
+                "region",
+                "at_least"
+              ],
               "properties": {
                 "region": {
                   "type": "string"

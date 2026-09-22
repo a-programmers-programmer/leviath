@@ -58,8 +58,11 @@ pub(crate) fn load_agent_source(path: &str) -> anyhow::Result<AgentSource> {
         .to_string();
     let content = std::fs::read_to_string(&manifest)
         .map_err(|e| anyhow::anyhow!("read manifest '{}': {e}", manifest.display()))?;
-    let blueprint = leviath_core::manifest::parse_manifest(&content)
+    let mut blueprint = leviath_core::manifest::parse_manifest(&content)
         .map_err(|e| anyhow::anyhow!("parse manifest: {e}"))?;
+    blueprint
+        .resolve_region_content_schemas(&manifest)
+        .map_err(|e| anyhow::anyhow!("resolve region schemas: {e}"))?;
     Ok(AgentSource {
         manifest,
         run_stem,
