@@ -2,17 +2,14 @@
   "base_commit": "d22a2ebc3f19ffbcf54ebe0785e98e37ac3898b4",
   "commands": [
     "git merge --no-edit fleet/T01M34W830V3KGC208HVTTKW98A",
-    "CARGO_TARGET_DIR=/data/work/leviath/target cargo test -p leviath-core --no-run 2>&1 | grep -B3 -A14 'error\\[E0063\\]' | head -60"
+    "CARGO_TARGET_DIR=/data/work/leviath/target cargo test -p leviath-core --no-run 2>&1 | grep -B3 -A14 'error\\[E0063\\]' | head -60",
+    "CARGO_TARGET_DIR=/data/work/leviath/target cargo test -p leviath-runtime --no-run 2>&1 | grep -E '^error' -A18 | head -80",
+    "CARGO_TARGET_DIR=/data/work/leviath/target cargo test --workspace --no-run"
   ],
   "artifacts": [
     "REPORT.md",
     "EVIDENCE.json",
-    "crates/leviath-core/src/blueprint/mod.rs"
-  ],
-  "error": "error[E0063]: missing field `items_region` in initializer of `blueprint::stage::FanOutConfig` at crates/leviath-core/src/blueprint/mod.rs:2446",
-  "fix": {
-    "file": "crates/leviath-core/src/blueprint/mod.rs",
-    "line": 2446,
-    "field_added": "items_region: None"
-  }
+    "crates/leviath-core/src/blueprint/mod.rs",
+    "crates/leviath-runtime/src/fanout.rs"
+  ]
 }
