@@ -1,0 +1,78 @@
+{
+  "base_commit": "15dc182e0bc6c28dfa93f4b8dd3c423372808f61",
+  "commands": [
+    {
+      "cmd": "python3 repo/docs/workflow/check-workflow-contract.py",
+      "cwd": ".",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "python3 repo/docs/workflow/check-workflow-contract.py --expected-fingerprint ff9df4e32b05747ee3605042407dcc7e17a347f41bc1464ce567c2f484813559",
+      "cwd": ".",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "python3 repo/docs/workflow/edge_invariants.py --self-test",
+      "cwd": ".",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "python3 repo/crates/leviath-cli/agents/bake-off/hooks/validate_schema.py repo/docs/workflow/schema-workflow.graphql",
+      "cwd": ".",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "python3 negative_matrix.py repo",
+      "cwd": ".",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "test ! -s evidence/negative-matrix.txt && exit 1; grep -q 'negative_matrix: PASS' evidence/negative-matrix.txt",
+      "cwd": ".",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "test -z \"$(git -C repo diff --name-only 15dc182e0bc6c28dfa93f4b8dd3c423372808f61 HEAD -- '*.rs')\"",
+      "cwd": ".",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "test \"$(git -C repo rev-parse --abbrev-ref HEAD)\" = fleet/gql-01",
+      "cwd": ".",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "git -C repo merge-base --is-ancestor 15dc182e0bc6c28dfa93f4b8dd3c423372808f61 HEAD",
+      "cwd": ".",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "grep -qF '### 3a. Choice set vs outcome set (added by GQL-01)' repo/crates/leviath-cli/agents/bake-off/references/composition-guide.md && grep -qF '### 4a. A domain port is not an input object (added by GQL-01)' repo/crates/leviath-cli/agents/bake-off/references/composition-guide.md && grep -qF '### 7a. Severity is not enforcement location (added by GQL-01)' repo/crates/leviath-cli/agents/bake-off/references/composition-guide.md && grep -qF '### 7b. An `ERROR` is not waivable (added by GQL-01)' repo/crates/leviath-cli/agents/bake-off/references/composition-guide.md",
+      "cwd": ".",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "python3 -c 'from graphql import build_schema; s=build_schema(open(\"repo/docs/workflow/schema-workflow.graphql\").read()); t=s.type_map[\"EdgeInvariant\"]; assert \"severity\" in t.fields and \"enforcedAt\" in t.fields; assert s.type_map[\"EdgeInvariantSeverity\"].values and s.type_map[\"InvariantEnforcement\"].values; assert set(s.type_map[\"EdgeKind\"].values)=={\"BRANCH\",\"GATE\",\"JOIN\",\"PARALLEL\"}; assert \"StepContract\" not in s.type_map; r=s.type_map[\"InvariantRejection\"]; assert \"reason\" in r.fields and not any((\"waiv\" in f.lower() or \"overrid\" in f.lower()) for f in r.fields); assert \"PortValue\" in s.type_map; assert \"EXPIRED\" not in s.type_map[\"GateDecision\"].values; print(\"ASSERT_OK\")'",
+      "cwd": ".",
+      "expect_rc": 0
+    },
+    {
+      "cmd": "test -s REPORT.md",
+      "cwd": ".",
+      "expect_rc": 0
+    }
+  ],
+  "artifacts": [
+    "REPORT.md",
+    "EVIDENCE.json",
+    "negative_matrix.py",
+    "evidence/negative-matrix.txt",
+    "repo/docs/workflow/schema-workflow.graphql",
+    "repo/docs/workflow/workflow-reconciliation-v1.md",
+    "repo/docs/workflow/edge-invariant-rules.json",
+    "repo/docs/workflow/edge_invariants.py",
+    "repo/docs/workflow/check-workflow-contract.py",
+    "repo/docs/workflow/workflow-schema-decisions.md",
+    "repo/crates/leviath-cli/agents/bake-off/references/composition-guide.md"
+  ]
+}
