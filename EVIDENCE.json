@@ -1,5 +1,8 @@
 {
-  "base_commit": "d22a2ebc3f19ffbcf54ebe0785e98e37ac3898b4",
-  "commands": [],
-  "artifacts": []
+  "base_commit": "origin/master",
+  "commands": [
+    "git merge --no-edit fleet/T01M34W830V3XQZ3PEWMFMJ9T5Y  # Already up to date, no conflicts",
+    "CARGO_TARGET_DIR=/data/work/leviath/target cargo build --workspace --tests 2>&1 | grep -B3 -A16 -E 'error\\[E0061\\]|error\\[E0063\\]' | head -90  # prints nothing after the fix"
+  ],
+  "artifacts": ["REPORT.md", "EVIDENCE.json"]
 }

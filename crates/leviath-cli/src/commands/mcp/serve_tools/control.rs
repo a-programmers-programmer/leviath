@@ -76,6 +76,7 @@ pub(crate) async fn message(shared: &Shared, args: &Args) -> CallOutcome {
         agent_id: run_id.clone(),
         content,
         target_region,
+        parts: Vec::new(),
     };
     match bool_request(
         shared,

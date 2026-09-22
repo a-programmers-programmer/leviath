@@ -292,6 +292,8 @@ pub(crate) async fn run(
                 schema: output_schema,
                 validator: None,
                 on_validator_error: None,
+                overwrite_artifacts: None,
+                artifacts: Vec::new(),
             });
 
     let workdir = match std::fs::canonicalize(&workdir_raw) {
@@ -370,6 +372,8 @@ pub(crate) async fn run(
         regions,
         no_seed_commands,
         output_request,
+        yolo_profile: None,
+        parts: Vec::new(),
     }) {
         Ok(spawn_args) => spawn_args,
         Err(e) => {

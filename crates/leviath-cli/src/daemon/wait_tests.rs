@@ -226,6 +226,7 @@ pub(crate) fn stage_transition() -> WorldEvent {
 
 pub(crate) fn tool_finished_for(run_id: &str, tool: &str, ok: bool, summary: &str) -> WorldEvent {
     WorldEvent::ToolCallFinished {
+        execution_id: "x1".to_string(),
         run_id: run_id.to_string(),
         agent_id: run_id.to_string(),
         call_id: "c1".to_string(),

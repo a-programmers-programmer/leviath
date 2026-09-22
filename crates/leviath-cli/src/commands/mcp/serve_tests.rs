@@ -2129,6 +2129,7 @@ async fn list_runs_merges_the_daemons_view_with_the_records_on_disk() {
         broken_scripts: vec![],
         read_paths: None,
         has_final_output: false,
+        yolo_profile: None,
     };
     let daemon = ScriptedDaemon::new(vec![], move |_| ControlResponse::List {
         runs: vec![entry("live-1", 300)],
