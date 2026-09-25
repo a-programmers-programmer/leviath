@@ -158,7 +158,7 @@ pub(crate) fn run_stage_enter_hooks(
         };
 
         let ctx = stage_ctx(&entered.name, entered.index, &window);
-        let outcome = match run(&script, "on_stage_enter", ctx) {
+        let outcome = match run(&script, "on_stage_enter", ctx, None) {
             Ok(o) => o,
             Err(e) => {
                 // A hook that fails is not a hook that allowed. Failing the run
@@ -248,7 +248,7 @@ pub(crate) fn run_before_inference_hooks(
         };
 
         let ctx = stage_ctx(&stage.name, cursor.index, &window);
-        match run(&script, "before_inference", ctx) {
+        match run(&script, "before_inference", ctx, None) {
             Err(e) => refuse(&mut state, "before_inference", format!("hook failed: {e}")),
             Ok(HookOutcome::Allow) => {}
             Ok(HookOutcome::Modify(value)) => {
@@ -344,7 +344,7 @@ pub(crate) fn run_after_inference_hooks(
             ),
         );
 
-        match run(&script, "after_inference", ctx) {
+        match run(&script, "after_inference", ctx, None) {
             Err(e) => refuse_after_inference(
                 &mut commands,
                 entity,
@@ -505,7 +505,7 @@ pub(crate) fn run_tool_call_hooks(mut agents: Query<ToolCallHookQuery, With<Read
             ),
         );
 
-        match run(&script, "on_tool_call", ctx) {
+        match run(&script, "on_tool_call", ctx, None) {
             Err(e) => refuse(&mut state, "on_tool_call", format!("hook failed: {e}")),
             Ok(HookOutcome::Allow) => {}
             Ok(HookOutcome::Modify(value)) => match tool_calls_from(&value) {
@@ -612,7 +612,7 @@ pub(crate) fn run_terminal_hooks(
             "error": if hook == "on_error" { subject.clone() } else { String::new() },
         });
 
-        match run(&script, hook, ctx) {
+        match run(&script, hook, ctx, None) {
             Err(e) => refuse(&mut state, hook, format!("hook failed: {e}")),
             Ok(HookOutcome::Allow) => {}
             Ok(HookOutcome::Modify(value)) => {
@@ -698,7 +698,7 @@ pub(crate) fn run_stage_exit_hooks(
         };
 
         let ctx = stage_ctx(&stage.name, cursor.index, &window);
-        match run(&script, "on_stage_exit", ctx) {
+        match run(&script, "on_stage_exit", ctx, None) {
             Err(e) => {
                 refuse(&mut state, "on_stage_exit", format!("hook failed: {e}"));
                 commands.entity(entity).remove::<ResolveTransition>();

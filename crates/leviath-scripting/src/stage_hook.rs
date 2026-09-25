@@ -39,7 +39,9 @@
 //! typo'd `"modfiy"` must not read as `Allow`) while an unhonourable one is
 //! reported by the caller.
 
+use crate::tool::ScriptHost;
 use rhai::{AST, Dynamic, Engine, Scope};
+use std::sync::Arc;
 
 /// Operation budget for stage hooks.
 ///
@@ -109,11 +111,14 @@ impl HookScript {
 }
 
 /// Build the hardened engine every stage-hook call runs on.
-fn build_engine() -> Engine {
+fn build_engine(host: Option<Arc<dyn ScriptHost>>) -> Engine {
     let mut engine = Engine::new();
     crate::harden(&mut engine, STAGE_HOOK_MAX_OPERATIONS);
     crate::functions::register_functions(&mut engine);
     crate::types::register_types(&mut engine);
+    if let Some(h) = host {
+        crate::tool::register_host_functions(&mut engine, h);
+    }
     engine
 }
 
@@ -127,7 +132,7 @@ fn build_engine() -> Engine {
 /// Every hook takes exactly one parameter (`ctx`); a different arity is
 /// rejected here rather than failing at the first call, mid-run.
 pub fn compile(path: &str, source: &str, wanted: &[&str]) -> crate::Result<HookScript> {
-    let engine = build_engine();
+    let engine = build_engine(None);
     let ast = engine
         .compile(source)
         .map_err(|e| crate::Error::CompilationFailed(format!("{path}: {e}")))?;
@@ -171,8 +176,13 @@ pub fn compile(path: &str, source: &str, wanted: &[&str]) -> crate::Result<HookS
 ///
 /// The caller supplies `ctx` as JSON and gets a [`HookOutcome`]; nothing about
 /// `rhai` crosses this boundary.
-pub fn run(script: &HookScript, hook: &str, ctx: serde_json::Value) -> crate::Result<HookOutcome> {
-    let engine = build_engine();
+pub fn run(
+    script: &HookScript,
+    hook: &str,
+    ctx: serde_json::Value,
+    host: Option<Arc<dyn ScriptHost>>,
+) -> crate::Result<HookOutcome> {
+    let engine = build_engine(host);
     // Total conversion: every JSON value has a Dynamic representation, so a
     // failure here is a programmer error, not a script error (same stance as
     // the region hooks and the provider layer).
@@ -318,7 +328,12 @@ mod tests {
 
     fn run_returning(body: &str) -> crate::Result<HookOutcome> {
         let s = script(&format!("fn on_stage_enter(ctx) {{ {body} }}"));
-        run(&s, "on_stage_enter", serde_json::json!({"stage": "main"}))
+        run(
+            &s,
+            "on_stage_enter",
+            serde_json::json!({"stage": "main"}),
+            None,
+        )
     }
 
     #[test]
@@ -374,7 +389,13 @@ mod tests {
     #[test]
     fn the_ctx_reaches_the_script() {
         let s = script(r#"fn on_stage_enter(ctx) { #{ action: "modify", value: ctx.stage } }"#);
-        let got = run(&s, "on_stage_enter", serde_json::json!({"stage": "review"})).unwrap();
+        let got = run(
+            &s,
+            "on_stage_enter",
+            serde_json::json!({"stage": "review"}),
+            None,
+        )
+        .unwrap();
         assert_eq!(got, HookOutcome::Modify(serde_json::json!("review")));
     }
 
@@ -407,6 +428,7 @@ mod tests {
                 "truncated": false,
                 "cut_off_at": null,
             }),
+            None,
         )
         .expect("oracle decision parses");
         assert_eq!(after, HookOutcome::Allow);
@@ -421,6 +443,7 @@ mod tests {
                     "run_id": "",
                 },
             }),
+            None,
         )
         .expect("controller receipt parses and serializes");
         let HookOutcome::Modify(value) = exit else {
@@ -475,7 +498,7 @@ mod tests {
     #[test]
     fn calling_a_hook_the_script_lacks_is_an_execution_error() {
         let s = script("fn on_stage_enter(ctx) { () }");
-        assert!(run(&s, "on_stage_exit", serde_json::json!({})).is_err());
+        assert!(run(&s, "on_stage_exit", serde_json::json!({}), None).is_err());
     }
 
     /// A value with no JSON representation cannot cross the boundary. The
@@ -493,13 +516,13 @@ mod tests {
     #[test]
     fn a_hook_cannot_reach_the_host() {
         let s = script(r#"fn on_stage_enter(ctx) { open_file("/etc/passwd") }"#);
-        assert!(run(&s, "on_stage_enter", serde_json::json!({})).is_err());
+        assert!(run(&s, "on_stage_enter", serde_json::json!({}), None).is_err());
     }
 
     #[test]
     fn a_runaway_hook_is_stopped_by_the_operation_budget() {
         let s = script("fn on_stage_enter(ctx) { let i = 0; while true { i += 1; } }");
-        let err = run(&s, "on_stage_enter", serde_json::json!({}))
+        let err = run(&s, "on_stage_enter", serde_json::json!({}), None)
             .unwrap_err()
             .to_string();
         assert!(!err.is_empty(), "a runaway must fail, not hang");

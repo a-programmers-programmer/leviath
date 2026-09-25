@@ -715,7 +715,7 @@ fn headers_from_map(map: &Map) -> BTreeMap<String, String> {
 /// of unwinding into Rhai and aborting the process. The pure
 /// helpers are guarded too - they run on untrusted, model- and network-supplied
 /// input, so "this one can't panic" is not a property worth betting the daemon on.
-fn register_host_functions(engine: &mut Engine, host: Arc<dyn ScriptHost>) {
+pub(crate) fn register_host_functions(engine: &mut Engine, host: Arc<dyn ScriptHost>) {
     // http_get(url) / http_get(url, headers)
     let h = host.clone();
     engine.register_fn("http_get", move |url: &str| {
