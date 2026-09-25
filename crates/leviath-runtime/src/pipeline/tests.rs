@@ -16622,12 +16622,34 @@ fn entering_a_stage_clears_the_output_reentry_count() {
 #[test]
 fn the_ctx_carries_the_five_run_facts() {
     let state = AgentState { iteration: 7, ..agent_state() };
-    let facts = crate::pipeline::hooks::run_facts(&state, None, None, None, Some(&crate::pipeline::hooks::InferenceAttempt(std::sync::Arc::new(std::sync::atomic::AtomicU32::new(2)))));
+    let progress = StageProgress { iterations: 3, ..Default::default() };
+    let clock = crate::persistence::RunClock(leviath_core::run_meta::ActiveClock {
+        banked_secs: 42,
+        since: None,
+    });
+    let totals = crate::persistence::TokenTotals {
+        cost: leviath_providers::CostTotals {
+            priced_usd: 0.25,
+            reported_calls: 1,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let attempt = crate::pipeline::hooks::InferenceAttempt(
+        std::sync::Arc::new(std::sync::atomic::AtomicU32::new(2)),
+    );
+    let facts = crate::pipeline::hooks::run_facts(
+        &state,
+        Some(&progress),
+        Some(&clock),
+        Some(&totals),
+        Some(&attempt),
+    );
     let ctx = crate::pipeline::hooks::stage_ctx("main", 0, &conv_window(), &facts);
-    assert_eq!(ctx["cost_usd"].as_f64(), Some(0.0));
+    assert_eq!(ctx["cost_usd"].as_f64(), Some(0.25));
     assert_eq!(ctx["iterations"].as_i64(), Some(7));
-    assert_eq!(ctx["stage_iterations"].as_i64(), Some(0));
-    assert_eq!(ctx["elapsed_secs"].as_i64().unwrap(), 0);
+    assert_eq!(ctx["stage_iterations"].as_i64(), Some(3));
+    assert_eq!(ctx["elapsed_secs"].as_i64(), Some(42));
     assert_eq!(ctx["attempt"].as_i64(), Some(2));
 }
 
@@ -16653,22 +16675,102 @@ fn the_ctx_reaches_a_real_hook() {
 
 #[test]
 fn every_hook_kind_gets_the_five_facts() {
-    let mut world = World::new();
-    let src = r#"
-        fn check(ctx) {
-            if !(ctx.contains("cost_usd") && ctx.contains("iterations") && ctx.contains("stage_iterations") && ctx.contains("elapsed_secs") && ctx.contains("attempt")) {
-                #{ action: "refuse", reason: "missing" }
-            } else { #{ action: "allow" } }
-        }
-        fn on_stage_enter(ctx) { check(ctx) }
-        fn before_inference(ctx) { check(ctx) }
-        fn after_inference(ctx) { check(ctx) }
-        fn on_tool_call(ctx) { check(ctx) }
-        fn on_stage_exit(ctx) { check(ctx) }
-        fn on_terminal(ctx) { check(ctx) }
-    "#;
-    let e = spawn_before(&mut world, src);
-    assert!(status_message(&world, e).is_none());
+    let names = [
+        "on_stage_enter",
+        "before_inference",
+        "after_inference",
+        "on_tool_call",
+        "on_stage_exit",
+        "on_completion",
+        "on_error",
+        "on_terminal",
+    ];
+    for name in names {
+        let mut world = World::new();
+        let template = r#"
+            fn __HOOK__(ctx) {
+                if ctx.contains("cost_usd") && ctx.contains("iterations") && ctx.contains("stage_iterations") && ctx.contains("elapsed_secs") && ctx.contains("attempt") {
+                    #{ action: "cancel", reason: "facts-ok-__HOOK__" }
+                } else {
+                    #{ action: "cancel", reason: "missing-__HOOK__" }
+                }
+            }
+        "#;
+        let src = template.replace("__HOOK__", name);
+        let e = match name {
+            "on_stage_enter" => {
+                let e = spawn_hooked(&mut world, &src);
+                run_stage_hooks(&mut world);
+                e
+            }
+            "before_inference" => {
+                let e = spawn_before(&mut world, &src);
+                run_before_hooks(&mut world);
+                e
+            }
+            "after_inference" => {
+                let e = spawn_after(&mut world, &src);
+                run_after_hooks(&mut world);
+                e
+            }
+            "on_tool_call" => {
+                let e = spawn_tool_hooked(
+                    &mut world,
+                    &src,
+                    vec![call("shell", serde_json::json!({}))],
+                );
+                run_tool_hooks(&mut world);
+                e
+            }
+            "on_stage_exit" => {
+                let e = spawn_exiting(&mut world, &src);
+                run_exit_hooks(&mut world);
+                e
+            }
+            "on_completion" => {
+                let e = spawn_terminal(
+                    &mut world,
+                    &src,
+                    "on_completion",
+                    AgentStatus::Complete,
+                    Some("answer"),
+                );
+                run_terminal(&mut world);
+                e
+            }
+            "on_error" => {
+                let e = spawn_terminal(
+                    &mut world,
+                    &src,
+                    "on_error",
+                    AgentStatus::Error { message: "seed".into() },
+                    None,
+                );
+                run_terminal(&mut world);
+                e
+            }
+            "on_terminal" => {
+                let e = world
+                    .spawn((
+                        stage_hooked(|h, p| h.on_terminal = Some(p)),
+                        AgentState { status: AgentStatus::Cancelled, ..agent_state() },
+                        StageCursor { index: 0 },
+                        hook_scripts(&src, &["on_terminal"]),
+                    ))
+                    .id();
+                run_terminal(&mut world);
+                e
+            }
+            _ => unreachable!(),
+        };
+        assert!(
+            status_message(&world, e)
+                .unwrap()
+                .contains(&format!("facts-ok-{}", name)),
+            "hook {} did not report its facts",
+            name,
+        );
+    }
 }
 
 // ─── on_stage_enter ──────────────────────────────────────────────────────────
