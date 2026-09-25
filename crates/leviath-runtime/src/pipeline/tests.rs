@@ -17995,21 +17995,22 @@ fn on_completion_can_veto_the_answer() {
     );
 }
 
-/// A cancelled run was stopped from outside. Narrating that back to the
-/// operator who stopped it is not useful, so neither hook fires.
+/// A cancelled run still fires on_terminal once, but not on_completion/on_error.
 #[test]
-fn a_cancelled_run_fires_no_terminal_hook() {
+fn a_cancelled_run_fires_terminal_hook_once() {
     let mut world = World::new();
     let e = spawn_terminal(
         &mut world,
-        r#"fn on_completion(ctx) { #{ action: "cancel", reason: "should not run" } }"#,
-        "on_completion",
+        r#"fn on_terminal(ctx) { #{ action: "allow" } }"#,
+        "on_terminal",
         AgentStatus::Cancelled,
         Some("x"),
     );
     run_terminal(&mut world);
     assert!(status_message(&world, e).is_none());
-    assert!(world.get::<TerminalHookFired>(e).is_none());
+    assert!(world.get::<TerminalHookFired>(e).is_some());
+    run_terminal(&mut world);
+    assert!(world.get::<TerminalHookFired>(e).is_some());
 }
 
 /// A run still going fires nothing, and is not marked - it has not finished.

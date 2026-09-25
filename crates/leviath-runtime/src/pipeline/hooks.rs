@@ -592,6 +592,8 @@ pub fn release_waits(
     }
 }
 
+const TERMINAL_HOOK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Marks an agent whose terminal hook has already run.
 ///
 /// A terminal status is not an event - it stays true for every tick until the
@@ -632,105 +634,73 @@ pub(crate) fn run_terminal_hooks(
     mut commands: Commands,
 ) {
     crate::tick_scope::clear();
-    for (entity, cursor, bp, scripts, mut state, output) in agents.iter_mut() {
-        let (hook, subject) = match &state.status {
-            AgentStatus::Complete => (
-                "on_completion",
-                output
-                    .as_ref()
-                    .map(|o| o.0.content.clone())
-                    .unwrap_or_default(),
-            ),
-            AgentStatus::Error { message } => ("on_error", message.clone()),
-            // Cancelled is terminal and gets a hook of its own. The three
-            // terminal variants are named here rather than delegating to
-            // `is_terminal_status`, because this match also has to produce
-            // the hook *name*, and naming them keeps the two in one place
-            // instead of a predicate plus a lookup that can disagree.
-            AgentStatus::Cancelled => ("on_terminal", String::new()),
-            _ => continue,
-        };
+    for (entity, cursor, bp, scripts, mut state, mut output) in agents.iter_mut() {
+        if !super::transition::is_terminal_status(&state.status) {
+            continue;
+        }
         crate::tick_scope::enter(entity);
-
+        let initial_status = state.status.clone();
         let Some(stage) = bp.0.stages.get(cursor.index) else {
-            // Still mark it fired: without a stage there is no hook to look up
-            // and re-checking every tick would be pure work.
             commands.entity(entity).insert(TerminalHookFired);
             continue;
         };
-        let Some(script) = scripts.script_for(stage, hook) else {
-            commands.entity(entity).insert(TerminalHookFired);
-            continue;
+        let specific = match &initial_status {
+            AgentStatus::Complete => Some(("on_completion", output.as_ref().map(|o| o.0.content.clone()).unwrap_or_default())),
+            AgentStatus::Error { message } => Some(("on_error", message.clone())),
+            _ => None,
         };
-
-        // Marked before running, not after: a hook that fails must not be
-        // retried on the next tick, which would make a throwing script an
-        // infinite loop rather than one error.
-        commands.entity(entity).insert(TerminalHookFired);
-
-        let ctx = serde_json::json!({
-            "stage": stage.name,
-            "stage_index": cursor.index,
-            "status": format!("{}", state.status),
-            // Named for what it is in each case, so a script reads plainly.
-            "output": if hook == "on_completion" { subject.clone() } else { String::new() },
-            "error": if hook == "on_error" { subject.clone() } else { String::new() },
-            // The word `ctx.status` is written from, and the same word
-            // `lev ps` and the run record use - `complete`, `error`,
-            // `cancelled`. A script branches on this, so it comes from the
-            // one label table rather than from the variant's Debug form.
-            "status_label": state.status.label(),
-        });
-
-        match run(&script, hook, ctx, scripts.host.clone()) {
-            Err(e) => refuse(&mut state, hook, format!("hook failed: {e}")),
-            Ok(HookOutcome::Allow) => {}
-            Ok(HookOutcome::Wait { .. }) => {
-                tracing::warn!("wait is only honoured by before_inference");
-            }
-            Ok(HookOutcome::Modify(value)) => {
-                let Some(text) = value.as_str() else {
-                    refuse(
-                        &mut state,
-                        hook,
-                        format!("'value' must be replacement text, got: {value}"),
-                    );
-                    continue;
-                };
-                match hook {
-                    // Rewriting the answer is the point: a completion hook can
-                    // reshape what `lev result` hands back.
-                    // Refused rather than dropped when there is no answer to
-                    // rewrite: the hook asked to change something that is not
-                    // there, and a silently-ignored rewrite reads exactly like
-                    // one that happened.
-                    "on_completion" => match output {
-                        Some(mut o) => o.0.content = text.to_string(),
-                        None => refuse(
-                            &mut state,
-                            hook,
-                            "asked to rewrite the answer, but this run submitted none".to_string(),
-                        ),
-                    },
-                    _ => {
-                        state.status = AgentStatus::Error {
-                            message: text.to_string(),
-                        }
+        let hooks = specific.into_iter().chain(std::iter::once(("on_terminal", String::new())));
+        for (hook, subject) in hooks {
+            let Some(script) = scripts.script_for(stage, hook) else { continue };
+            let ctx = serde_json::json!({
+                "stage": stage.name,
+                "stage_index": cursor.index,
+                "status": state.status.label(),
+                "status_label": state.status.label(),
+                "output": if hook == "on_completion" { subject.clone() } else { String::new() },
+                "error": if hook == "on_error" { subject.clone() } else { String::new() },
+            });
+            let result = if hook == "on_terminal" {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let host = scripts.host.clone();
+                std::thread::spawn(move || { let _ = tx.send(run(&script, hook, ctx, host)); });
+                match rx.recv_timeout(TERMINAL_HOOK_TIMEOUT) {
+                    Ok(result) => Some(result),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        tracing::warn!("on_terminal hook exceeded 5s; ignoring");
+                        Some(Ok(HookOutcome::Allow))
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Some(Ok(HookOutcome::Allow)),
+                }
+            } else {
+                Some(run(&script, hook, ctx, scripts.host.clone()))
+            };
+            match result {
+                None => unreachable!(),
+                Some(Err(e)) => refuse(&mut state, hook, format!("hook failed: {e}")),
+                Some(Ok(HookOutcome::Allow)) => {}
+                Some(Ok(HookOutcome::Wait { .. })) => tracing::warn!("wait is only honoured by before_inference"),
+                Some(Ok(HookOutcome::Modify(value))) => {
+                    let Some(text) = value.as_str() else {
+                        refuse(&mut state, hook, format!("'value' must be replacement text, got: {value}"));
+                        continue;
+                    };
+                    if hook == "on_completion" {
+                        if let Some(ref mut o) = output { o.0.content = text.to_string(); }
+                        else { refuse(&mut state, hook, "asked to rewrite the answer, but this run submitted none".to_string()); }
+                    } else if hook != "on_terminal" {
+                        state.status = AgentStatus::Error { message: text.to_string() };
                     }
                 }
+                Some(Ok(HookOutcome::Cancel(reason))) => {
+                    let why = reason.unwrap_or_else(|| "no reason given".to_string());
+                    refuse(&mut state, hook, format!("rejected the result: {why}"));
+                }
+                Some(Ok(HookOutcome::Retry)) => refuse(&mut state, hook,
+                    "returned 'retry', which this hook cannot honour (the run has finished)".to_string()),
             }
-            Ok(HookOutcome::Cancel(reason)) => {
-                let why = reason.unwrap_or_else(|| "no reason given".to_string());
-                refuse(&mut state, hook, format!("rejected the result: {why}"));
-            }
-            // The run is over; there is nothing left to do again.
-            Ok(HookOutcome::Retry) => refuse(
-                &mut state,
-                hook,
-                "returned 'retry', which this hook cannot honour (the run has finished)"
-                    .to_string(),
-            ),
         }
+        commands.entity(entity).insert(TerminalHookFired);
     }
 }
 

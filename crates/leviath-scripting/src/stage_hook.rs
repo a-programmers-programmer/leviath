@@ -287,10 +287,23 @@ mod tests {
 
     #[test]
     fn a_script_records_every_hook_it_defines() {
-        let s = script("fn on_stage_enter(ctx) { () } fn on_stage_exit(ctx) { () }");
+        let s = script("fn on_stage_enter(ctx) { () } fn on_stage_exit(ctx) { () } fn on_terminal(ctx) { #{ action: \"allow\" } }");
         assert!(s.defines("on_stage_enter"));
         assert!(s.defines("on_stage_exit"));
-        assert_eq!(s.defined(), ["on_stage_enter", "on_stage_exit"]);
+        assert!(s.defines("on_terminal"));
+        assert_eq!(s.defined(), ["on_stage_enter", "on_stage_exit", "on_terminal"]);
+    }
+
+    #[test]
+    fn an_on_terminal_hook_is_recognised_by_compile() {
+        let s = compile(
+            "terminal.rhai",
+            "fn on_terminal(ctx) { #{ action: \"allow\" } }",
+            &["on_terminal"],
+        )
+        .expect("on_terminal compiles");
+        assert!(s.defines("on_terminal"));
+        assert_eq!(s.defined(), ["on_terminal"]);
     }
 
     #[test]

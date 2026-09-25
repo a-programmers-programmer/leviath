@@ -21,6 +21,24 @@ fn stage_with_hooks(body: &str) -> Result<crate::Stage> {
 }
 
 #[test]
+fn on_terminal_round_trips_through_the_manifest() {
+    let manifest = r#"
+[agent]
+name = "terminal-hook"
+
+[stages.main.hooks]
+on_terminal = "t.rhai"
+"#;
+    let bp = parse_manifest(manifest).expect("manifest parses");
+    let stage = bp.find_stage("main").expect("main stage");
+    assert_eq!(stage.hooks.on_terminal.as_deref(), Some("t.rhai"));
+
+    let json = serde_json::to_string(&bp).expect("serializes");
+    let back: crate::Blueprint = serde_json::from_str(&json).expect("deserializes");
+    assert_eq!(back.find_stage("main").unwrap().hooks.on_terminal.as_deref(), Some("t.rhai"));
+}
+
+#[test]
 fn a_stage_declaring_no_hooks_has_none() {
     let stage = stage_with_hooks("mode = \"autonomous\"").expect("parses");
     assert!(stage.hooks.is_empty());
