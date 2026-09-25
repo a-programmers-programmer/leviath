@@ -1163,7 +1163,7 @@ fn collapse_whitespace(s: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::{Mutex, PoisonError};
 
@@ -1182,7 +1182,7 @@ mod tests {
     type PostCall = Option<(String, String, Headers)>;
     type HostResult = std::result::Result<String, String>;
 
-    struct FakeHost {
+    pub(crate) struct FakeHost {
         get_response: Mutex<HostResult>,
         post_response: Mutex<HostResult>,
         shell_response: Mutex<HostResult>,
@@ -1190,6 +1190,8 @@ mod tests {
         env_response: Mutex<HostResult>,
         last_get: Mutex<GetCall>,
         last_post: Mutex<PostCall>,
+        pub(crate) deny_shell: bool,
+        pub(crate) shell_calls: Mutex<Vec<String>>,
     }
 
     /// Larger than the array ceiling the engine used to apply to blobs, and
@@ -1197,7 +1199,7 @@ mod tests {
     const BIG_BODY_BYTES: usize = 300 * 1024;
 
     impl FakeHost {
-        fn arc() -> Arc<FakeHost> {
+        pub(crate) fn arc() -> Arc<FakeHost> {
             Arc::new(FakeHost {
                 get_response: Mutex::new(Ok("GET-OK".to_string())),
                 post_response: Mutex::new(Ok("POST-OK".to_string())),
@@ -1206,6 +1208,8 @@ mod tests {
                 env_response: Mutex::new(Ok("ENV-OK".to_string())),
                 last_get: Mutex::new(None),
                 last_post: Mutex::new(None),
+                deny_shell: false,
+                shell_calls: Mutex::new(Vec::new()),
             })
         }
     }
@@ -1242,7 +1246,11 @@ mod tests {
             *self.last_post.lock().unwrap() = Some((url.to_string(), body.to_string(), headers));
             self.post_response.lock().unwrap().clone()
         }
-        fn shell(&self, _command: &str) -> std::result::Result<String, String> {
+        fn shell(&self, command: &str) -> std::result::Result<String, String> {
+            self.shell_calls.lock().unwrap().push(command.to_string());
+            if self.deny_shell {
+                return Err("[denied] shell".to_string());
+            }
             self.shell_response.lock().unwrap().clone()
         }
         fn read_file(&self, _path: &str) -> std::result::Result<String, String> {

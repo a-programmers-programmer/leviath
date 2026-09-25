@@ -254,6 +254,7 @@ fn outcome_from(path: &str, hook: &str, value: serde_json::Value) -> crate::Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tool::tests::FakeHost;
 
     fn script(src: &str) -> HookScript {
         compile("hooks.rhai", src, &[]).expect("compiles")
@@ -334,6 +335,35 @@ mod tests {
             serde_json::json!({"stage": "main"}),
             None,
         )
+    }
+
+    #[test]
+    fn a_hook_with_a_host_can_call_shell() {
+        let source = r#"fn on_stage_enter(ctx) { let out = shell("echo hi"); #{ action: "allow" } }"#;
+        let s = script(source);
+        let fake = FakeHost::arc();
+        let host: Arc<dyn ScriptHost> = fake.clone();
+        let result = run(&s, "on_stage_enter", serde_json::json!({}), Some(host));
+        assert_eq!(result.unwrap(), HookOutcome::Allow);
+        assert_eq!(*fake.shell_calls.lock().unwrap(), ["echo hi"]);
+    }
+
+    #[test]
+    fn a_hook_without_a_host_cannot_call_shell() {
+        let source = r#"fn on_stage_enter(ctx) { let out = shell("echo hi"); #{ action: "allow" } }"#;
+        let s = script(source);
+        assert!(run(&s, "on_stage_enter", serde_json::json!({}), None).is_err());
+    }
+
+    #[test]
+    fn a_denied_host_error_propagates_as_a_hook_error() {
+        let source = r#"fn on_stage_enter(ctx) { let out = shell("echo hi"); #{ action: "allow" } }"#;
+        let s = script(source);
+        let mut fake = FakeHost::arc();
+        Arc::get_mut(&mut fake).unwrap().deny_shell = true;
+        let host: Arc<dyn ScriptHost> = fake;
+        let err = run(&s, "on_stage_enter", serde_json::json!({}), Some(host)).unwrap_err();
+        assert!(err.to_string().contains("denied"), "{err}");
     }
 
     #[test]

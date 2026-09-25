@@ -1,0 +1,22 @@
+[agent]
+name = "c1-granted"
+version = "0.1.0"
+description = "C1 e2e: a stage hook may call shell when the blueprint grants it"
+entry_stage = "main"
+
+[tool_permissions]
+shell = "allow"
+
+[stages.main]
+mode = "autonomous"
+model = { models = ["deepseek/deepseek-v4.1-flash"], allow_user_default = false }
+description = "single stage"
+available_tools = []
+available_global_tools = false
+max_iterations = 2
+system_prompt = """
+Reply with the single word done.
+"""
+
+[stages.main.hooks]
+on_stage_enter = "h.rhai"
