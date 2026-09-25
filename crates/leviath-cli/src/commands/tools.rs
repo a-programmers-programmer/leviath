@@ -49,6 +49,21 @@ fn scan_tools(dir: Option<&Path>) -> ToolsReport {
     ToolsReport { valid, skipped }
 }
 
+/// The `// installed by leviath: ...` line a script starts with, when it does.
+/// Shared with the MCP server's `list_tools`.
+pub(crate) fn provenance_line(path: &Path) -> Option<String> {
+    std::fs::read_to_string(path).ok().and_then(|text| {
+        text.lines()
+            .next()
+            .filter(|first| first.starts_with("// installed by leviath:"))
+            .map(str::to_string)
+    })
+}
+
+/// What `lev tools` prints under a tool whose file has no provenance line.
+#[allow(dead_code)]
+const NO_PROVENANCE: &str = "no provenance line (hand-written, or written outside install_tool)";
+
 /// A parameter's type label: the scalar `type` for a flat param, or the `type`
 /// inside a raw `schema` fragment (falling back to `schema` when the fragment has
 /// no top-level `type`, e.g. a `oneOf`).
@@ -65,7 +80,7 @@ fn param_type_label(p: &leviath_scripting::ParamSpec) -> String {
 
 /// Render one tool's parameters as a compact `name:type[!]` list (`!` marks a
 /// required parameter).
-fn params_summary(meta: &ScriptToolMeta) -> String {
+pub(crate) fn params_summary(meta: &ScriptToolMeta) -> String {
     meta.params
         .iter()
         .map(|p| {

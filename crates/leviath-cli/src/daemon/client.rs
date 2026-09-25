@@ -362,7 +362,7 @@ fn warn_ungranted_read_paths(spawn_args: &SpawnArgs) {
 /// The warning for a spawn request, read from the real manifest and config.
 /// Empty when there is nothing to say, and empty when either file cannot be
 /// read: see [`warn_ungranted_read_paths`] for why that is not an error here.
-fn read_path_warning_for_spawn(spawn_args: &SpawnArgs) -> Vec<String> {
+pub(crate) fn read_path_warning_for_spawn(spawn_args: &SpawnArgs) -> Vec<String> {
     let Some(blueprint) = crate::commands::run::manifest::blueprint_at(std::path::Path::new(
         &spawn_args.blueprint_path,
     )) else {
@@ -479,7 +479,7 @@ fn warn_held_checkpoints(spawn_args: &SpawnArgs) {
 /// behind is worth saying however the run was launched, and it is the reason
 /// this exists: nothing said it at the moment it mattered, so a run could keep
 /// using an old blueprint long after the fix had shipped.
-fn held_checkpoint_warning_for_spawn(spawn_args: &SpawnArgs) -> Vec<String> {
+pub(crate) fn held_checkpoint_warning_for_spawn(spawn_args: &SpawnArgs) -> Vec<String> {
     let path = std::path::Path::new(&spawn_args.blueprint_path);
     let Some(blueprint) = crate::commands::run::manifest::blueprint_at(path) else {
         return Vec::new();
@@ -653,7 +653,7 @@ pub async fn send_spawn_batch(
 }
 
 /// One spawn exchange with the daemon, warnings and printing left to callers.
-async fn spawn_once(client: &ControlClient, spawn_args: SpawnArgs) -> anyhow::Result<SpawnedRun> {
+pub(crate) async fn spawn_once(client: &ControlClient, spawn_args: SpawnArgs) -> anyhow::Result<SpawnedRun> {
     let blueprint_path = spawn_args.blueprint_path.clone();
     let workdir = spawn_args.workdir.clone();
     let yolo = spawn_args.yolo;

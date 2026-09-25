@@ -569,7 +569,7 @@ fn execute_reporting_outcome(
         let workdir = crate::commands::resolve_cwd().unwrap_or_default();
         if !args.json {
             print_model_resolution(&checked.blueprint, config, registry);
-            print_dependencies(&checked.blueprint, config, &checked.agent_dir);
+            print_dependencies(&checked.blueprint, config, &checked.agent_dir());
         }
         env = env
             .with_providers(&checked.blueprint, config)

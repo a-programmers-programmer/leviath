@@ -33,6 +33,14 @@ pub(crate) fn retired_check_warnings_at(
     }
 }
 
+/// The manifest of an installed agent, `<agents_dir>/<name>/agent.leviath`,
+/// when that file exists.
+pub(crate) fn installed_manifest(name: &str) -> Option<PathBuf> {
+    leviath_core::paths::agents_dir()
+        .map(|d| d.join(name).join(leviath_core::files::MANIFEST_FILENAME))
+        .filter(|p| p.exists())
+}
+
 /// Resolve an agent argument to the `agent.leviath` file it names.
 ///
 /// Accepts the file itself, a directory containing one, or an installed

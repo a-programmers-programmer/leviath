@@ -16,7 +16,7 @@ pub(crate) fn install_tool(shared: &Shared, args: &Args) -> CallOutcome {
         Some(&provenance),
     ) {
         Ok(installed) => ok(
-            installed.summary(),
+            installed.summary_for(leviath_tools::InstalledFor::EveryAgent),
             json!({
                 "name": installed.name,
                 "path": installed.path.display().to_string(),
