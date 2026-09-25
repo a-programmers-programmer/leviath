@@ -282,6 +282,7 @@ pub(crate) fn dispatch_transition_choice(
             .apply_retention_knobs(&si.provider_name, &mut request.extra);
         let job = InferenceJob {
             entity,
+            attempt_counter: None,
             refused: providers.0.retention_refusal(&si.provider_name, &si.model),
             provider,
             request,

@@ -280,6 +280,8 @@ impl JobHydration {
 pub(crate) struct InferenceJob {
     /// The agent this inference is for.
     pub entity: Entity,
+    /// Shared count of provider trips for this agent.
+    pub attempt_counter: Option<Arc<std::sync::atomic::AtomicU32>>,
     /// Why this call may not be sent, decided where the job was built: zero
     /// data retention is on and the model keeps something. The job reports
     /// it as its outcome without touching the provider.
@@ -663,6 +665,7 @@ pub(crate) async fn run_inference_job(
 ) {
     let InferenceJob {
         entity,
+        attempt_counter,
         refused,
         provider,
         mut request,
@@ -735,6 +738,9 @@ pub(crate) async fn run_inference_job(
             // name the attempt that carried it, and a run that keeps no history
             // still has to hand its tool batches a consistent one.
             let id = leviath_core::execution::mint_attempt_id();
+            if let Some(counter) = &attempt_counter {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             // Both arms produce the same finished `InferenceResponse`; the
             // difference is entirely in how the bytes crossed the wire. A
             // stream that dies part-way through reports a dropped connection,
@@ -961,8 +967,8 @@ mod tests {
     fn job(provider: Arc<dyn Provider>) -> InferenceJob {
         let pools = InferencePools::new(InferencePoolConfig::new());
         InferenceJob {
-            entity: Entity::from_raw_u32(7)
-                .expect("a small literal index is always a valid entity id"),
+            entity: Entity::from_raw_u32(7).expect("a small literal index is always a valid entity id"),
+            attempt_counter: None,
             refused: None,
             provider,
             request: test_request(),
@@ -992,8 +998,8 @@ mod tests {
             calls: std::sync::Mutex::new(0),
         });
         let job = InferenceJob {
-            entity: Entity::from_raw_u32(7)
-                .expect("a small literal index is always a valid entity id"),
+            entity: Entity::from_raw_u32(7).expect("a small literal index is always a valid entity id"),
+            attempt_counter: None,
             refused: None,
             provider,
             request: test_request(),
@@ -1076,8 +1082,8 @@ mod tests {
             calls: std::sync::Mutex::new(0),
         });
         let job = InferenceJob {
-            entity: Entity::from_raw_u32(7)
-                .expect("a small literal index is always a valid entity id"),
+            entity: Entity::from_raw_u32(7).expect("a small literal index is always a valid entity id"),
+            attempt_counter: None,
             refused: None,
             provider,
             request: test_request(),
@@ -1226,8 +1232,8 @@ mod tests {
     ) -> InferenceJob {
         let pools = InferencePools::new(InferencePoolConfig::new());
         InferenceJob {
-            entity: Entity::from_raw_u32(7)
-                .expect("a small literal index is always a valid entity id"),
+            entity: Entity::from_raw_u32(7).expect("a small literal index is always a valid entity id"),
+            attempt_counter: None,
             refused: None,
             provider,
             request: sized_request(prompt_bytes), // max_tokens: 100
@@ -1564,8 +1570,8 @@ mod tests {
     async fn a_job_marked_to_stream_takes_the_streaming_path() {
         let pools = InferencePools::new(InferencePoolConfig::new());
         let job = InferenceJob {
-            entity: Entity::from_raw_u32(7)
-                .expect("a small literal index is always a valid entity id"),
+            entity: Entity::from_raw_u32(7).expect("a small literal index is always a valid entity id"),
+            attempt_counter: None,
             refused: None,
             // `infer` is scripted to fail outright, so an `Ok` below can only
             // have come through `infer_stream`.
@@ -1604,8 +1610,8 @@ mod tests {
     async fn a_job_not_marked_to_stream_calls_infer() {
         let pools = InferencePools::new(InferencePoolConfig::new());
         let job = InferenceJob {
-            entity: Entity::from_raw_u32(7)
-                .expect("a small literal index is always a valid entity id"),
+            entity: Entity::from_raw_u32(7).expect("a small literal index is always a valid entity id"),
+            attempt_counter: None,
             refused: None,
             provider: Arc::new(Scripted {
                 steps: std::sync::Mutex::new(vec![Step::Permanent].into()),
@@ -1656,7 +1662,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_job_retries_transient_then_succeeds() {
+    async fn hook_attempt_counts_provider_retries() {
         let provider = Arc::new(Scripted {
             steps: std::sync::Mutex::new(
                 vec![
@@ -1668,9 +1674,12 @@ mod tests {
             ),
             calls: std::sync::Mutex::new(0),
         });
+        let counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let mut inference_job = job(provider.clone());
+        inference_job.attempt_counter = Some(counter.clone());
         let (tx, mut rx) = mpsc::unbounded_channel();
         run_inference_job(
-            job(provider.clone()),
+            inference_job,
             tx,
             Arc::new(Notify::new()),
             no_delay(4),
@@ -1680,6 +1689,7 @@ mod tests {
         let outcome = rx.try_recv().expect("outcome sent");
         assert_eq!(outcome.result.unwrap().content, "done");
         assert_eq!(*provider.calls.lock().unwrap(), 3); // two retries then success
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 3);
     }
 
     #[tokio::test]

@@ -819,6 +819,7 @@ pub(crate) fn dispatch_inference(
                 });
                 let job = InferenceJob {
                     entity,
+                    attempt_counter: None,
                     // Checked here, against the registry's live settings,
                     // as well as at spawn: zero retention switched on under
                     // a running daemon holds from the next call.

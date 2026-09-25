@@ -21,8 +21,8 @@
 use super::*;
 use crate::components::StageHookScripts;
 use leviath_scripting::stage_hook::{HookOutcome, run};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Hook-generated tool calls do not carry a provider ID. Keep their IDs unique
@@ -50,8 +50,8 @@ fn next_hook_tool_id(name: &str) -> String {
 /// Deliberately a snapshot rather than a handle: Rhai passes by value, so a
 /// script could not mutate a live window even if it were given one, and
 /// building the map is what makes the contract inspectable.
-#[derive(Component, Debug, Default, Clone, Copy)]
-pub struct InferenceAttempt(pub u32);
+#[derive(Component, Debug, Default, Clone)]
+pub struct InferenceAttempt(pub Arc<AtomicU32>);
 
 pub(crate) struct RunFacts {
     pub cost_usd: f64,
@@ -77,7 +77,7 @@ pub(crate) fn run_facts(
         iterations: state.iteration as i64,
         stage_iterations: progress.map_or(0, |p| p.iterations as i64),
         elapsed_secs: clock.map_or(0, |c| c.0.total_secs(now) as i64),
-        attempt: attempt.map_or(0, |a| a.0 as i64),
+        attempt: attempt.map_or(0, |a| a.0.load(Ordering::Relaxed) as i64),
     }
 }
 

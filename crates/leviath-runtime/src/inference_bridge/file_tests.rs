@@ -106,6 +106,7 @@ fn setup(lost: usize, with_route: bool) -> Setup {
     let (lane, journal) = mpsc::unbounded_channel();
     let job = InferenceJob {
         entity: Entity::from_raw_u32(7).expect("a small literal index is a valid entity id"),
+        attempt_counter: None,
         refused: None,
         provider: vendor.clone(),
         request: InferenceRequest {

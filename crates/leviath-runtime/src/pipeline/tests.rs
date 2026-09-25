@@ -16596,7 +16596,7 @@ fn entering_a_stage_clears_the_output_reentry_count() {
 #[test]
 fn the_ctx_carries_the_five_run_facts() {
     let state = AgentState { iteration: 7, ..agent_state() };
-    let facts = crate::pipeline::hooks::run_facts(&state, None, None, None, Some(&crate::pipeline::hooks::InferenceAttempt(2)));
+    let facts = crate::pipeline::hooks::run_facts(&state, None, None, None, Some(&crate::pipeline::hooks::InferenceAttempt(std::sync::Arc::new(std::sync::atomic::AtomicU32::new(2)))));
     let ctx = crate::pipeline::hooks::stage_ctx("main", 0, &conv_window(), &facts);
     assert_eq!(ctx["cost_usd"].as_f64(), Some(0.0));
     assert_eq!(ctx["iterations"].as_i64(), Some(7));
@@ -16619,7 +16619,7 @@ fn the_ctx_facts_default_safely_when_the_components_are_absent() {
 fn the_ctx_reaches_a_real_hook() {
     let mut world = World::new();
     let e = spawn_before(&mut world, r#"fn before_inference(ctx) { if ctx.iterations < 0 { #{ action: "refuse", reason: "neg" } } else { #{ action: "allow" } } }"#);
-    world.entity_mut(e).insert(crate::pipeline::hooks::InferenceAttempt(2));
+    world.entity_mut(e).insert(crate::pipeline::hooks::InferenceAttempt(std::sync::Arc::new(std::sync::atomic::AtomicU32::new(2))));
     run_before_hooks(&mut world);
     assert!(status_message(&world, e).is_none());
     assert!(world.get::<ReadyToInfer>(e).is_some());
