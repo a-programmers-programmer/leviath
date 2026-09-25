@@ -19,7 +19,7 @@
 //!
 //! # The outcome contract
 //!
-//! Every hook returns one of four things, and the same four everywhere, so a
+//! Every hook returns one of five things, and the same five everywhere, so a
 //! reader does not have to learn a vocabulary per hook:
 //!
 //! | script returns | meaning |
@@ -30,6 +30,7 @@
 //! | `#{ action: "modify", value: ... }` | [`HookOutcome::Modify`] - proceed with `value` |
 //! | `#{ action: "cancel", reason: "..." }` | [`HookOutcome::Cancel`] |
 //! | `#{ action: "retry" }` | [`HookOutcome::Retry`] |
+//! | `#{ action: "wait", secs: 30, reason: "..." }` | [`HookOutcome::Wait`] |
 //!
 //! What `Modify` and `Retry` *mean* is the calling hook's business - the shape
 //! of `value` differs between "the regions to write" and "the request to send",
@@ -83,6 +84,8 @@ pub enum HookOutcome {
     /// Do the thing again. Not every caller can honour this; one that cannot
     /// says so rather than silently treating it as `Allow`.
     Retry,
+    /// Ask the runtime to park the run for `secs` seconds without spending an inference call.
+    Wait { secs: u64, reason: Option<String> },
 }
 
 /// A compiled stage-hook script, ready to call.
@@ -231,6 +234,21 @@ fn outcome_from(path: &str, hook: &str, value: serde_json::Value) -> crate::Resu
     match action {
         "allow" => Ok(HookOutcome::Allow),
         "retry" => Ok(HookOutcome::Retry),
+        "wait" => {
+            let secs = obj
+                .get("secs")
+                .and_then(|s| s.as_i64())
+                .filter(|secs| *secs >= 0)
+                .ok_or_else(|| bad("wait requires a non-negative integer secs".to_string()))?
+                as u64;
+            Ok(HookOutcome::Wait {
+                secs,
+                reason: obj
+                    .get("reason")
+                    .and_then(|r| r.as_str())
+                    .map(str::to_string),
+            })
+        }
         "cancel" => Ok(HookOutcome::Cancel(
             obj.get("reason")
                 .and_then(|r| r.as_str())
@@ -414,6 +432,27 @@ mod tests {
             run_returning(r#"#{ action: "retry" }"#).unwrap(),
             HookOutcome::Retry
         );
+    }
+
+    #[test]
+    fn wait_carries_its_secs_and_reason() {
+        assert_eq!(
+            run_returning(r#"#{ action: "wait", secs: 30, reason: "rate limited" }"#).unwrap(),
+            HookOutcome::Wait {
+                secs: 30,
+                reason: Some("rate limited".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn wait_without_secs_is_an_error() {
+        assert!(run_returning(r#"#{ action: "wait" }"#).is_err());
+    }
+
+    #[test]
+    fn wait_with_a_non_numeric_secs_is_an_error() {
+        assert!(run_returning(r#"#{ action: "wait", secs: "soon" }"#).is_err());
     }
 
     #[test]

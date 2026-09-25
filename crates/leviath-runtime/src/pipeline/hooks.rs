@@ -173,6 +173,9 @@ pub(crate) fn run_stage_enter_hooks(
 
         match outcome {
             HookOutcome::Allow => {}
+            HookOutcome::Wait { .. } => {
+                tracing::warn!("wait is only honoured by before_inference");
+            }
             HookOutcome::Modify(value) => {
                 if let Err(e) = apply_modify(&mut window, &value) {
                     state.status = AgentStatus::Error { message: e };
@@ -251,6 +254,9 @@ pub(crate) fn run_before_inference_hooks(
         match run(&script, "before_inference", ctx, scripts.host.clone()) {
             Err(e) => refuse(&mut state, "before_inference", format!("hook failed: {e}")),
             Ok(HookOutcome::Allow) => {}
+            Ok(HookOutcome::Wait { .. }) => {
+                tracing::warn!("wait outcome not yet wired; treating as allow");
+            }
             Ok(HookOutcome::Modify(value)) => {
                 if let Err(e) = apply_modify(&mut window, &value) {
                     refuse(&mut state, "before_inference", e);
@@ -353,6 +359,9 @@ pub(crate) fn run_after_inference_hooks(
                 format!("hook failed: {e}"),
             ),
             Ok(HookOutcome::Allow) => {}
+            Ok(HookOutcome::Wait { .. }) => {
+                tracing::warn!("wait is only honoured by before_inference");
+            }
             Ok(HookOutcome::Modify(value)) => match value.as_str() {
                 Some(text) => result.response = text.to_string(),
                 None => refuse_after_inference(
@@ -508,6 +517,9 @@ pub(crate) fn run_tool_call_hooks(mut agents: Query<ToolCallHookQuery, With<Read
         match run(&script, "on_tool_call", ctx, scripts.host.clone()) {
             Err(e) => refuse(&mut state, "on_tool_call", format!("hook failed: {e}")),
             Ok(HookOutcome::Allow) => {}
+            Ok(HookOutcome::Wait { .. }) => {
+                tracing::warn!("wait is only honoured by before_inference");
+            }
             Ok(HookOutcome::Modify(value)) => match tool_calls_from(&value) {
                 Ok(calls) => result.tool_calls = calls,
                 Err(e) => refuse(&mut state, "on_tool_call", e),
@@ -615,6 +627,9 @@ pub(crate) fn run_terminal_hooks(
         match run(&script, hook, ctx, scripts.host.clone()) {
             Err(e) => refuse(&mut state, hook, format!("hook failed: {e}")),
             Ok(HookOutcome::Allow) => {}
+            Ok(HookOutcome::Wait { .. }) => {
+                tracing::warn!("wait is only honoured by before_inference");
+            }
             Ok(HookOutcome::Modify(value)) => {
                 let Some(text) = value.as_str() else {
                     refuse(
@@ -704,6 +719,9 @@ pub(crate) fn run_stage_exit_hooks(
                 commands.entity(entity).remove::<ResolveTransition>();
             }
             Ok(HookOutcome::Allow) => {}
+            Ok(HookOutcome::Wait { .. }) => {
+                tracing::warn!("wait is only honoured by before_inference");
+            }
             Ok(HookOutcome::Modify(value)) => {
                 if let Err(e) = apply_modify(&mut window, &value) {
                     refuse(&mut state, "on_stage_exit", e);
