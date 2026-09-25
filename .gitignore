@@ -60,3 +60,4 @@ plans/
 __pycache__/
 
 meshy_output/
+*.log

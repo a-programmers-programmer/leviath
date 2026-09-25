@@ -1,1 +1,0 @@
-{"commands": [{"cmd": "cd repo && git log -1 --format=%H", "cwd": ".", "expect_rc": 0}]}
