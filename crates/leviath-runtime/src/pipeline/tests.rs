@@ -21210,3 +21210,116 @@ mod model_parts {
         assert_eq!(artwork.content[0].content.stored_count(), 1);
     }
 }
+
+#[test]
+fn on_terminal_fires_once_for_a_cancelled_run() {
+    let mut world = World::new();
+    let mut state = agent_state();
+    state.status = AgentStatus::Cancelled;
+    let bp = stage_hooked(|h, p| h.on_terminal = Some(p));
+    let e = world.spawn((
+        bp,
+        state,
+        StageCursor { index: 0 },
+        hook_scripts(
+            r#"fn on_terminal(ctx) { #{ action: "cancel", reason: "saw-" + ctx.status } }"#,
+            &["on_terminal"],
+        ),
+    )).id();
+
+    run_terminal(&mut world);
+    run_terminal(&mut world);
+    assert_eq!(status_message(&world, e).as_deref(), Some("on_terminal: rejected the result: saw-cancelled"));
+    assert!(world.get::<TerminalHookFired>(e).is_some());
+}
+
+#[test]
+fn on_terminal_fires_for_complete_and_error() {
+    for (initial, wanted, specific) in [
+        (AgentStatus::Complete, "complete", "on_completion"),
+        (AgentStatus::Error { message: "raw failure".into() }, "error", "on_error"),
+    ] {
+        let mut world = World::new();
+        let mut stage = leviath_core::Stage::new(
+            "main".to_string(),
+            leviath_core::blueprint::ModelConfig::new("p".to_string(), "m".to_string()),
+        );
+        stage.hooks.on_completion = Some("h.rhai".into());
+        stage.hooks.on_error = Some("h.rhai".into());
+        stage.hooks.on_terminal = Some("h.rhai".into());
+        let mut state = agent_state();
+        state.status = initial;
+        let expected_script = format!(
+            r#"
+            fn on_completion(ctx) {{ #{{ action: "modify", value: "completion-ran" }} }}
+            fn on_error(ctx) {{ #{{ action: "modify", value: "error-ran" }} }}
+            fn on_terminal(ctx) {{
+                if ctx.status == "{wanted}" {{ #{{ action: "allow" }} }}
+                else {{ #{{ action: "cancel", reason: "wrong-status-" + ctx.status }} }}
+            }}
+            "#,
+        );
+        let e = world.spawn((
+            AgentBlueprint(blueprint(vec![stage])),
+            state,
+            StageCursor { index: 0 },
+            hook_scripts(
+                &expected_script,
+                &["on_completion", "on_error", "on_terminal"],
+            ),
+            crate::persistence::FinalOutput(
+                leviath_core::output::FinalOutput::new("raw", None, "s".to_string(), 10),
+            ),
+        )).id();
+
+        run_terminal(&mut world);
+        assert!(world.get::<TerminalHookFired>(e).is_some());
+        if specific == "on_completion" {
+            assert_eq!(status_message(&world, e), None);
+            assert_eq!(answer_of(&world, e), "completion-ran");
+        } else {
+            assert_eq!(status_message(&world, e).as_deref(), Some("error-ran"));
+        }
+    }
+}
+
+#[test]
+#[ignore = "Rhai operation limits may stop an infinite loop before the five-second hook timeout can be tested safely"]
+fn a_terminal_hook_that_hangs_does_not_block_past_the_timeout() {
+    let mut world = World::new();
+    let mut state = agent_state();
+    state.status = AgentStatus::Cancelled;
+    let e = world.spawn((
+        stage_hooked(|h, p| h.on_terminal = Some(p)),
+        state,
+        StageCursor { index: 0 },
+        hook_scripts(
+            r#"fn on_terminal(ctx) { while true { } #{ action: "allow" } }"#,
+            &["on_terminal"],
+        ),
+    )).id();
+    let start = std::time::Instant::now();
+    run_terminal(&mut world);
+    assert!(start.elapsed() < std::time::Duration::from_secs(6));
+    assert!(world.get::<TerminalHookFired>(e).is_some());
+}
+
+#[test]
+fn a_cancelled_run_still_reaches_its_terminal_hook_after_the_status_is_set() {
+    let mut world = World::new();
+    let mut state = agent_state();
+    state.status = AgentStatus::Cancelled;
+    let e = world.spawn((
+        stage_hooked(|h, p| h.on_terminal = Some(p)),
+        state,
+        StageCursor { index: 0 },
+        hook_scripts(
+            r#"fn on_terminal(ctx) { #{ action: "cancel", reason: "status-" + ctx.status } }"#,
+            &["on_terminal"],
+        ),
+    )).id();
+
+    run_terminal(&mut world);
+    assert_eq!(status_message(&world, e).as_deref(), Some("on_terminal: rejected the result: status-cancelled"));
+    assert!(world.get::<TerminalHookFired>(e).is_some());
+}

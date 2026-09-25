@@ -1,0 +1,28 @@
+[agent]
+name = "c3-on-terminal"
+version = "0.1.0"
+description = "Test the on_terminal stage hook"
+entry_stage = "main"
+
+[context.regions.task]
+kind = "pinned"
+budget = "20%"
+
+[context.regions.conversation]
+kind = "sliding_window"
+max_items = 8
+max_tokens = 4000
+budget = "20%"
+
+[stages.main]
+mode = "output"
+
+[stages.main.model]
+allow_user_default = false
+
+[[stages.main.model.models]]
+provider = "openrouter"
+model = "deepseek/deepseek-v4.1-flash"
+
+[stages.main.hooks]
+on_terminal = "t.rhai"
