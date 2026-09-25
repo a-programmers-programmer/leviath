@@ -328,6 +328,7 @@ impl StageHookScripts {
             "on_tool_call" => stage.hooks.on_tool_call.as_deref(),
             "on_completion" => stage.hooks.on_completion.as_deref(),
             "on_error" => stage.hooks.on_error.as_deref(),
+            "on_terminal" => stage.hooks.on_terminal.as_deref(),
             _ => None,
         }?;
         self.scripts.get(path).cloned()

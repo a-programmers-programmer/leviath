@@ -64,6 +64,11 @@ pub(crate) const HOOK_NAMES: &[&str] = &[
     "on_tool_call",
     "on_completion",
     "on_error",
+    // Fires once on *every* terminal status - complete, error and cancelled -
+    // with `ctx.status` naming which. `on_completion` and `on_error` each
+    // name one outcome; a hook that wants to observe the run ending whichever
+    // way it ended names this one.
+    "on_terminal",
 ];
 
 /// What a hook decided.

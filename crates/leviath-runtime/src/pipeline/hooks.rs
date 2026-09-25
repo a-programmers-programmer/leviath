@@ -615,10 +615,13 @@ type TerminalHookQuery = (
 
 /// Run `on_completion` or `on_error` once, as the run finishes.
 ///
-/// Which one fires is the run's own outcome: a completed run gets
-/// `on_completion` with its answer, an errored one gets `on_error` with the
-/// message. A cancelled run gets neither - it was stopped from outside, and a
-/// hook narrating that would be reporting the operator's decision back to them.
+/// Which of `on_completion` / `on_error` fires is the run's own outcome: a
+/// completed run gets `on_completion` with its answer, an errored one gets
+/// `on_error` with the message. On top of that, and after them, a stage that
+/// declares `on_terminal` gets it on **every** terminal status - including
+/// `Cancelled`, which no other hook observes - with `ctx.status` naming the
+/// outcome. The order matters: a rewriting `on_completion` changes the answer
+/// that `on_terminal` is then shown.
 ///
 /// `modify` replaces what the hook was shown: the final output for a
 /// completion, the message for an error. `cancel` on a completion is a
@@ -630,7 +633,6 @@ pub(crate) fn run_terminal_hooks(
 ) {
     crate::tick_scope::clear();
     for (entity, cursor, bp, scripts, mut state, output) in agents.iter_mut() {
-        // `Cancelled` is deliberately not here: see the doc comment.
         let (hook, subject) = match &state.status {
             AgentStatus::Complete => (
                 "on_completion",
@@ -640,6 +642,12 @@ pub(crate) fn run_terminal_hooks(
                     .unwrap_or_default(),
             ),
             AgentStatus::Error { message } => ("on_error", message.clone()),
+            // Cancelled is terminal and gets a hook of its own. The three
+            // terminal variants are named here rather than delegating to
+            // `is_terminal_status`, because this match also has to produce
+            // the hook *name*, and naming them keeps the two in one place
+            // instead of a predicate plus a lookup that can disagree.
+            AgentStatus::Cancelled => ("on_terminal", String::new()),
             _ => continue,
         };
         crate::tick_scope::enter(entity);
@@ -667,6 +675,11 @@ pub(crate) fn run_terminal_hooks(
             // Named for what it is in each case, so a script reads plainly.
             "output": if hook == "on_completion" { subject.clone() } else { String::new() },
             "error": if hook == "on_error" { subject.clone() } else { String::new() },
+            // The word `ctx.status` is written from, and the same word
+            // `lev ps` and the run record use - `complete`, `error`,
+            // `cancelled`. A script branches on this, so it comes from the
+            // one label table rather than from the variant's Debug form.
+            "status_label": state.status.label(),
         });
 
         match run(&script, hook, ctx, scripts.host.clone()) {
