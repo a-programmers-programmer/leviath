@@ -419,6 +419,13 @@ pub struct StageHooks {
     /// Fires once when the run finishes in error.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_error: Option<String>,
+    /// Fires once on every terminal status: complete, error **and**
+    /// cancelled, with `ctx.status` saying which. `on_completion` and
+    /// `on_error` each observe one outcome; this observes the run ending
+    /// whichever way it ended, which is the only way a blueprint can hear
+    /// that its run was cancelled from outside.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_terminal: Option<String>,
 }
 
 impl StageHooks {
@@ -432,6 +439,7 @@ impl StageHooks {
             && self.on_tool_call.is_none()
             && self.on_completion.is_none()
             && self.on_error.is_none()
+            && self.on_terminal.is_none()
     }
 
     /// Every script path this stage declares, with the hook it backs.
@@ -460,6 +468,9 @@ impl StageHooks {
         }
         if let Some(p) = self.on_error.as_deref() {
             out.push(("on_error", p));
+        }
+        if let Some(p) = self.on_terminal.as_deref() {
+            out.push(("on_terminal", p));
         }
         out
     }
