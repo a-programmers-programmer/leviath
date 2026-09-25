@@ -21504,3 +21504,71 @@ fn a_cancelled_run_still_reaches_its_terminal_hook_after_the_status_is_set() {
     assert_eq!(status_message(&world, e).as_deref(), Some("on_terminal: rejected the result: status-cancelled"));
     assert!(world.get::<TerminalHookFired>(e).is_some());
 }
+
+#[tokio::test]
+async fn a_wait_outcome_parks_the_agent_and_spends_no_inference() {
+    let (mut world, mut rx) = build_world(InferencePools::new(InferencePoolConfig::new()));
+    let entity = spawn_before(
+        &mut world,
+        r#"fn before_inference(ctx) { #{ action: "wait", secs: 3600, reason: "test" } }"#,
+    );
+    world.entity_mut(entity).insert(stage("m", vec![], None));
+
+    run_before_hooks(&mut world);
+    run(&mut world);
+
+    let wait = world.get::<crate::pipeline::hooks::WaitUntil>(entity).unwrap();
+    assert_eq!(wait.secs, 3600);
+    assert!(world.get::<ReadyToInfer>(entity).is_none());
+    assert_eq!(world.get::<AgentState>(entity).unwrap().status, AgentStatus::Waiting);
+    assert!(world.get::<AwaitingInference>(entity).is_none());
+    assert!(world.get::<crate::pipeline::hooks::InferenceAttempt>(entity).is_none());
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
+fn an_elapsed_wait_rearms_the_agent() {
+    let mut world = World::new();
+    let mut state = agent_state();
+    state.status = AgentStatus::Waiting;
+    let entity = world
+        .spawn((
+            state,
+            crate::pipeline::hooks::WaitUntil {
+                until_unix: 0,
+                secs: 1,
+                reason: None,
+            },
+        ))
+        .id();
+    let mut schedule = Schedule::default();
+    schedule.add_systems(crate::pipeline::hooks::release_waits);
+    schedule.run(&mut world);
+
+    assert!(world
+        .get::<crate::pipeline::hooks::WaitUntil>(entity)
+        .is_none());
+    assert!(world.get::<ReadyToInfer>(entity).is_some());
+    assert_eq!(world.get::<AgentState>(entity).unwrap().status, AgentStatus::Active);
+}
+
+#[tokio::test]
+async fn a_wait_does_not_advance_the_stage_clock() {
+    let (mut world, _rx) = build_world(InferencePools::new(InferencePoolConfig::new()));
+    let entity = spawn_before(
+        &mut world,
+        r#"fn before_inference(ctx) { #{ action: "wait", secs: 3600, reason: "test" } }"#,
+    );
+    let mut state = agent_state();
+    state.iteration = 7;
+    world.entity_mut(entity).insert(state);
+    let mut progress = StageProgress::default();
+    progress.iterations = 3;
+    world.entity_mut(entity).insert((stage("m", vec![], None), progress));
+
+    run_before_hooks(&mut world);
+    run(&mut world);
+
+    assert_eq!(world.get::<AgentState>(entity).unwrap().iteration, 7);
+    assert_eq!(world.get::<StageProgress>(entity).unwrap().iterations, 3);
+}
