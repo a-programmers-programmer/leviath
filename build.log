@@ -1,7 +1,7 @@
 warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
-package:   /data/wt/T01M3CXQRT7ASBEJMPQ9CBD84MZ-a1/repo/crates/leviath-cli/Cargo.toml
-workspace: /data/wt/T01M3CXQRT7ASBEJMPQ9CBD84MZ-a1/repo/Cargo.toml
-   Compiling leviath-core v0.6.3 (/data/wt/T01M3CXQRT7ASBEJMPQ9CBD84MZ-a1/repo/crates/leviath-core)
+package:   /data/wt/T01M3CXT378C00W1JXQXK9FRK29-a1/repo/crates/leviath-cli/Cargo.toml
+workspace: /data/wt/T01M3CXT378C00W1JXQXK9FRK29-a1/repo/Cargo.toml
+   Compiling leviath-core v0.6.3 (/data/wt/T01M3CXT378C00W1JXQXK9FRK29-a1/repo/crates/leviath-core)
 warning: missing documentation for a method
    --> crates/leviath-core/src/blueprint/mod.rs:609:5
     |
@@ -10,240 +10,240 @@ warning: missing documentation for a method
     |
     = note: requested on the command line with `-W missing-docs`
 
-   Compiling leviath-scripting v0.6.3 (/data/wt/T01M3CXQRT7ASBEJMPQ9CBD84MZ-a1/repo/crates/leviath-scripting)
+   Compiling leviath-scripting v0.6.3 (/data/wt/T01M3CXT378C00W1JXQXK9FRK29-a1/repo/crates/leviath-scripting)
 warning: missing documentation for a struct field
-  --> crates/leviath-scripting/src/stage_hook.rs:88:12
+  --> crates/leviath-scripting/src/stage_hook.rs:93:12
    |
-88 |     Wait { secs: u64, reason: Option<String> },
+93 |     Wait { secs: u64, reason: Option<String> },
    |            ^^^^^^^^^
    |
    = note: requested on the command line with `-W missing-docs`
 
 warning: missing documentation for a struct field
-  --> crates/leviath-scripting/src/stage_hook.rs:88:23
+  --> crates/leviath-scripting/src/stage_hook.rs:93:23
    |
-88 |     Wait { secs: u64, reason: Option<String> },
+93 |     Wait { secs: u64, reason: Option<String> },
    |                       ^^^^^^^^^^^^^^^^^^^^^^
 
-warning: `leviath-scripting` (lib) generated 2 warnings
 warning: `leviath-core` (lib) generated 1 warning
+warning: `leviath-scripting` (lib) generated 2 warnings
 warning: `leviath-scripting` (lib test) generated 2 warnings (2 duplicates)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.75s
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.06s
      Running unittests src/lib.rs (/data/work/lev-sync-main/target/debug/deps/leviath_scripting-2e1bb1c85481e050)
 
 running 215 tests
-test engine::tests::default_builds_an_engine ... ok
-test engine::tests::test_execute_returns_dynamic_value ... ok
-test engine::tests::test_gate_rule_no_target_uses_empty_string ... ok
-test engine::tests::test_engine_creation ... ok
-test functions::tests::contains_empty_pattern_always_matches ... ok
 test engine::tests::test_transform_success ... ok
+test engine::tests::test_execute_returns_dynamic_value ... ok
+test engine::tests::test_print_and_debug_statements_invoke_noop_callbacks ... ok
+test engine::tests::test_engine_creation ... ok
+test engine::tests::test_gate_rule_script_error ... ok
+test functions::tests::contains_empty_pattern_always_matches ... ok
+test engine::tests::test_gate_rule_allows_matching_tool ... ok
 test functions::tests::contains_returns_true_when_pattern_present ... ok
+test engine::tests::default_builds_an_engine ... ok
+test engine::tests::test_gate_rule_no_target_uses_empty_string ... ok
+test functions::tests::count_tokens_approximate ... ok
 test engine::tests::test_execute_script_error_returns_execution_failed ... ok
 test engine::tests::test_gate_rule_blocks_external_email ... ok
-test engine::tests::test_gate_rule_blocks_wrong_tool ... ok
-test engine::tests::test_transform_script_error_returns_execution_failed ... ok
-test functions::tests::contains_returns_false_when_pattern_absent ... ok
-test engine::tests::test_gate_rule_allows_matching_tool ... ok
-test engine::tests::test_print_and_debug_statements_invoke_noop_callbacks ... ok
-test functions::tests::count_tokens_empty ... ok
 test functions::tests::ends_with_false ... ok
-test dependency_check::tests::an_unmet_check_returns_its_remedy ... ok
+test functions::tests::is_empty_true_for_empty ... ok
+test engine::tests::test_gate_rule_blocks_wrong_tool ... ok
+test functions::tests::count_tokens_empty ... ok
+test functions::tests::is_empty_false_for_content ... ok
+test functions::tests::contains_returns_false_when_pattern_absent ... ok
 test engine::tests::test_transform_wrong_return_type_returns_execution_failed ... ok
 test functions::tests::ends_with_true ... ok
-test functions::tests::count_tokens_approximate ... ok
-test dependency_check::tests::the_shape_is_checked_at_compile_time ... ok
-test engine::tests::test_gate_rule_script_error ... ok
-test functions::tests::is_empty_true_for_empty ... ok
-test functions::tests::is_empty_true_for_whitespace_only ... ok
-test functions::tests::is_markdown_with_bold ... ok
-test functions::tests::is_json_invalid ... ok
-test functions::tests::is_empty_false_for_content ... ok
-test functions::tests::is_json_valid_object ... ok
 test functions::tests::is_json_valid_array ... ok
-test functions::tests::is_markdown_with_code_fence ... ok
-test functions::tests::is_mermaid_false_for_plain_text ... ok
+test engine::tests::test_transform_script_error_returns_execution_failed ... ok
+test functions::tests::is_empty_true_for_whitespace_only ... ok
+test functions::tests::is_json_invalid ... ok
+test functions::tests::is_json_valid_object ... ok
+test functions::tests::is_markdown_with_bold ... ok
 test functions::tests::is_mermaid_with_flowchart ... ok
-test functions::tests::json_helpers_round_trip_arrays_maps_and_unicode_strictly ... ok
-test functions::tests::is_markdown_with_heading ... ok
-test dependency_check::tests::path_exists_probe_answers_both_ways ... ok
-test functions::tests::is_mermaid_with_graph_keyword ... ok
-test functions::tests::starts_with_false ... ok
+test functions::tests::is_markdown_with_code_fence ... ok
+test functions::tests::is_markdown_plain_nonempty_text_returns_true_via_nonempty_fallback ... ok
+test functions::tests::is_mermaid_false_for_plain_text ... ok
+test dependency_check::tests::an_unmet_check_returns_its_remedy ... ok
 test functions::tests::join_empty_array ... ok
-test functions::tests::starts_with_true ... ok
 test functions::tests::is_mermaid_with_sequence_diagram ... ok
-test functions::tests::join_with_comma ... ok
+test dependency_check::tests::path_exists_probe_answers_both_ways ... ok
+test dependency_check::tests::the_shape_is_checked_at_compile_time ... ok
+test functions::tests::is_mermaid_with_graph_keyword ... ok
+test functions::tests::trim_removes_whitespace ... ok
 test functions::tests::split_by_comma ... ok
+test functions::tests::is_markdown_with_heading ... ok
+test functions::tests::starts_with_false ... ok
+test functions::tests::trim_no_op_on_clean_string ... ok
 test functions::tests::join_single_element ... ok
 test functions::tests::split_no_separator_found ... ok
-test functions::tests::is_markdown_plain_nonempty_text_returns_true_via_nonempty_fallback ... ok
-test functions::tests::trim_removes_whitespace ... ok
-test functions::tests::trim_no_op_on_clean_string ... ok
-test parts::tests::summaries_carry_what_a_script_needs ... ok
-test parts::tests::matching_is_by_name_or_hash_prefix ... ok
-test output_validator::tests::a_script_that_does_not_compile_is_refused ... ok
+test functions::tests::join_with_comma ... ok
+test functions::tests::starts_with_true ... ok
 test output_validator::tests::a_script_without_validate_is_refused ... ok
-test dependency_check::tests::a_satisfied_check_returns_unit_or_empty ... ok
+test output_validator::tests::a_script_that_does_not_compile_is_refused ... ok
+test functions::tests::json_helpers_round_trip_arrays_maps_and_unicode_strictly ... ok
 test output_validator::tests::a_validate_with_the_wrong_arity_is_refused ... ok
-test region_hook::tests::compile_detects_optional_hooks ... ok
-test output_validator::tests::a_returned_string_is_the_reason_the_agent_sees ... ok
-test region_hook::tests::compile_accepts_render_only_script ... ok
-test region_hook::tests::compile_rejects_missing_render ... ok
-test output_validator::tests::a_validator_that_throws_is_unusable_rather_than_a_rejection ... ok
-test output_validator::tests::a_validator_that_returns_unit_accepts ... ok
+test parts::tests::matching_is_by_name_or_hash_prefix ... ok
+test parts::tests::summaries_carry_what_a_script_needs ... ok
 test output_validator::tests::a_validator_cannot_reach_the_filesystem ... ok
-test region_hook::tests::calling_a_missing_hook_is_an_execution_error ... ok
-test region_hook::tests::compile_rejects_syntax_errors ... ok
-test region_hook::tests::hooks_cannot_reach_disabled_engine_surface ... ok
 test output_validator::tests::a_validator_returning_the_wrong_type_is_unusable ... ok
+test region_hook::tests::compile_accepts_render_only_script ... ok
+test output_validator::tests::a_validator_that_returns_unit_accepts ... ok
+test dependency_check::tests::a_satisfied_check_returns_unit_or_empty ... ok
+test region_hook::tests::compile_detects_optional_hooks ... ok
+test region_hook::tests::compile_rejects_syntax_errors ... ok
+test output_validator::tests::a_returned_string_is_the_reason_the_agent_sees ... ok
+test region_hook::tests::compile_rejects_missing_render ... ok
+test region_hook::tests::hooks_cannot_reach_disabled_engine_surface ... ok
+test region_hook::tests::calling_a_missing_hook_is_an_execution_error ... ok
 test region_hook::tests::compile_rejects_wrong_render_arity ... ok
-test mime_check::tests::the_shape_is_checked_at_compile_time ... ok
-test region_hook::tests::compile_rejects_wrong_optional_hook_arity ... ok
-test output_validator::tests::an_empty_reason_accepts ... ok
+test output_validator::tests::a_validator_that_throws_is_unusable_rather_than_a_rejection ... ok
 test output_validator::tests::a_validator_can_inspect_the_content_it_is_given ... ok
-test stage_hook::tests::a_file_named_for_a_hook_it_does_not_define_is_rejected ... ok
-test region_hook::tests::render_returns_string ... ok
-test region_hook::tests::on_overflow_returns_index_array ... ok
-test mime_check::tests::a_check_sees_the_bytes_as_a_blob_and_the_type_as_a_string ... ok
-test stage_hook::tests::a_file_that_defines_what_was_asked_for_compiles ... ok
-test region_hook::tests::render_returns_unit_as_null ... ok
-test stage_hook::tests::a_bare_scalar_is_an_error ... ok
+test mime_check::tests::the_shape_is_checked_at_compile_time ... ok
 test mime_check::tests::a_check_that_returns_unit_or_an_empty_string_accepts ... ok
-test region_hook::tests::on_write_returns_replacement_string ... ok
-test region_hook::tests::render_runtime_throw_is_execution_error ... ok
-test stage_hook::tests::a_hook_cannot_reach_the_host ... ok
-test region_hook::tests::render_sees_full_ctx ... ok
-test stage_hook::tests::a_hook_with_the_wrong_arity_is_rejected_at_compile ... ok
-test region_hook::tests::render_infinite_loop_hits_operation_limit ... ok
-test stage_hook::tests::a_denied_host_error_propagates_as_a_hook_error ... ok
+test stage_hook::tests::a_file_named_for_a_hook_it_does_not_define_is_rejected ... ok
+test stage_hook::tests::a_file_that_defines_what_was_asked_for_compiles ... ok
 test stage_hook::tests::a_hook_the_script_does_not_define_is_not_claimed ... ok
-test region_hook::tests::render_unrepresentable_return_is_validation_error ... ok
-test stage_hook::tests::a_script_records_every_hook_it_defines ... ok
-test region_hook::tests::on_write_returns_maps_as_plain_objects ... ok
-test stage_hook::tests::a_map_without_an_action_is_an_error ... ok
-test stage_hook::tests::a_syntax_error_names_the_file ... ok
-test mime_check::tests::the_core_trait_turns_verdicts_into_results ... ok
+test region_hook::tests::on_overflow_returns_index_array ... ok
+test stage_hook::tests::a_bare_scalar_is_an_error ... ok
+test region_hook::tests::compile_rejects_wrong_optional_hook_arity ... ok
 test dependency_check::tests::probes_read_the_machine_read_only ... ok
-test stage_hook::tests::a_return_that_is_not_plain_data_is_rejected ... ok
-test stage_hook::tests::a_hook_without_a_host_cannot_call_shell ... ok
+test region_hook::tests::render_sees_full_ctx ... ok
+test region_hook::tests::render_runtime_throw_is_execution_error ... ok
+test stage_hook::tests::a_denied_host_error_propagates_as_a_hook_error ... ok
+test region_hook::tests::render_unrepresentable_return_is_validation_error ... ok
+test region_hook::tests::render_returns_string ... ok
+test region_hook::tests::render_returns_unit_as_null ... ok
+test region_hook::tests::render_infinite_loop_hits_operation_limit ... ok
+test stage_hook::tests::a_hook_with_the_wrong_arity_is_rejected_at_compile ... ok
+test region_hook::tests::on_write_returns_replacement_string ... ok
+test output_validator::tests::an_empty_reason_accepts ... ok
+test stage_hook::tests::a_hook_cannot_reach_the_host ... ok
+test stage_hook::tests::a_script_records_every_hook_it_defines ... ok
 test stage_hook::tests::a_hook_with_a_host_can_call_shell ... ok
+test region_hook::tests::on_write_returns_maps_as_plain_objects ... ok
+test mime_check::tests::the_core_trait_turns_verdicts_into_results ... ok
+test stage_hook::tests::a_syntax_error_names_the_file ... ok
+test stage_hook::tests::a_hook_without_a_host_cannot_call_shell ... ok
+test stage_hook::tests::a_map_without_an_action_is_an_error ... ok
 test stage_hook::tests::a_script_that_throws_reports_the_hook_and_file ... ok
-test stage_hook::tests::an_unknown_action_is_an_error_not_an_allow ... ok
-test stage_hook::tests::a_written_out_allow_is_the_same_as_unit ... ok
-test region_hook::tests::on_write_returns_booleans_and_unit ... ok
-test stage_hook::tests::calling_a_hook_the_script_lacks_is_an_execution_error ... ok
-test dependency_check::tests::a_broken_check_is_unusable ... ok
+test mime_check::tests::a_check_sees_the_bytes_as_a_blob_and_the_type_as_a_string ... ok
+test stage_hook::tests::a_return_that_is_not_plain_data_is_rejected ... ok
 test tool::tests::annotations_directive_with_no_arg_is_handled ... ok
-test tool::tests::annotations_empty_tool_name_errors ... ok
-test tool::tests::annotations_full ... ok
-test tool::tests::annotations_missing_tool_name_errors ... ok
 test tool::tests::annotations_declare_what_a_tool_takes_and_makes ... ok
+test tool::tests::annotations_empty_tool_name_errors ... ok
+test region_hook::tests::on_write_returns_booleans_and_unit ... ok
+test stage_hook::tests::a_written_out_allow_is_the_same_as_unit ... ok
+test tool::tests::annotations_full ... ok
 test tool::tests::annotations_ignore_non_comment_and_non_directive_lines ... ok
+test tool::tests::annotations_missing_tool_name_errors ... ok
+test stage_hook::tests::modify_carries_its_value ... ok
 test tool::tests::annotations_requires_capabilities ... ok
+test stage_hook::tests::modify_without_a_value_is_an_error ... ok
 test tool::tests::annotations_unknown_directive_ignored ... ok
 test tool::tests::base64_is_the_standard_padded_alphabet ... ok
+test stage_hook::tests::an_unknown_action_is_an_error_not_an_allow ... ok
 test tool::tests::base64_round_trips_through_both_directions ... ok
-test tool::tests::check_source_rejects_missing_annotations ... ok
-test tool::tests::decode_entities_survives_multibyte_after_an_ampersand ... ok
-test tool::tests::decode_entities_named_numeric_and_unknown ... ok
-test tool::tests::collapse_whitespace_runs_and_trims ... ok
-test tool::tests::decoding_something_that_is_not_base64_says_so ... ok
-test tool::tests::default_set_is_empty ... ok
-test tool::tests::decoding_bytes_that_are_not_text_explains_which_failure_it_was ... ok
-test stage_hook::tests::modify_without_a_value_is_an_error ... ok
-test stage_hook::tests::modify_carries_its_value ... ok
-test stage_hook::tests::false_cancels_with_no_reason ... ok
-test stage_hook::tests::oracle_protocol_compiles_and_round_trips_json_through_hooks ... FAILED
-test tool::tests::encode_uri_non_ascii ... ok
-test stage_hook::tests::wait_with_a_non_numeric_secs_is_an_error ... ok
 test stage_hook::tests::retry_is_its_own_outcome ... ok
-test tool::tests::check_source_rejects_a_script_rhai_will_not_compile ... ok
-test tool::tests::compile_tool_read_error ... ok
-test tool::tests::check_source_accepts_a_script_that_would_become_a_tool ... ok
-test tool::tests::discover_skips_invalid_tool_toml ... ok
-test stage_hook::tests::wait_carries_its_secs_and_reason ... ok
+test tool::tests::collapse_whitespace_runs_and_trims ... ok
+test stage_hook::tests::false_cancels_with_no_reason ... ok
+test stage_hook::tests::calling_a_hook_the_script_lacks_is_an_execution_error ... ok
 test stage_hook::tests::the_ctx_reaches_the_script ... ok
-test tool::tests::discover_skips_uncompilable_but_valid_annotation ... ok
+test stage_hook::tests::oracle_protocol_compiles_and_round_trips_json_through_hooks ... FAILED
+test stage_hook::tests::wait_with_a_non_numeric_secs_is_an_error ... ok
+test tool::tests::decoding_something_that_is_not_base64_says_so ... ok
+test tool::tests::decoding_bytes_that_are_not_text_explains_which_failure_it_was ... ok
+test tool::tests::check_source_rejects_missing_annotations ... ok
+test tool::tests::decode_entities_named_numeric_and_unknown ... ok
+test tool::tests::decode_entities_survives_multibyte_after_an_ampersand ... ok
+test tool::tests::check_source_accepts_a_script_that_would_become_a_tool ... ok
+test tool::tests::compile_tool_read_error ... ok
+test stage_hook::tests::wait_carries_its_secs_and_reason ... ok
+test tool::tests::default_set_is_empty ... ok
+test tool::tests::encode_uri_non_ascii ... ok
 test stage_hook::tests::wait_without_secs_is_an_error ... ok
-test stage_hook::tests::cancel_carries_its_reason ... ok
-test tool::parts_tests::a_script_reads_lists_finds_and_writes_parts ... ok
-test tool::tests::encode_uri_encodes_reserved_and_passes_unreserved ... ok
-test tool::tests::headers_from_map_stringifies_values ... ok
-test stage_hook::tests::unit_and_true_both_allow ... ok
-test tool::tests::guards_pass_through_success_and_convert_panics ... ok
-test tool::tests::hex_digit_covers_both_arms ... ok
-test tool::tests::html_to_text_full_pipeline ... ok
-test tool::parts_tests::the_default_host_holds_no_parts ... ok
-test tool::tests::execute_html_to_text_host_fn_via_script ... ok
-test tool::tests::execute_missing_optional_param_reads_as_unit ... ok
-test tool::tests::execute_print_and_debug_are_noop ... ok
+test dependency_check::tests::a_broken_check_is_unusable ... ok
+test tool::tests::check_source_rejects_a_script_rhai_will_not_compile ... ok
+test tool::tests::discover_skips_invalid_tool_toml ... ok
 test tool::tests::discover_uses_tool_toml_override ... ok
+test stage_hook::tests::cancel_carries_its_reason ... ok
+test tool::tests::discover_skips_uncompilable_but_valid_annotation ... ok
+test tool::tests::headers_from_map_stringifies_values ... ok
+test tool::tests::hex_digit_covers_both_arms ... ok
+test tool::tests::discover_compiles_and_collides ... ok
+test tool::tests::html_to_text_full_pipeline ... ok
+test tool::tests::execute_html_to_text_host_fn_via_script ... ok
+test tool::parts_tests::a_script_reads_lists_finds_and_writes_parts ... ok
+test tool::tests::execute_script_error_is_prefixed ... ok
 test tool::tests::execute_returns_string_verbatim ... ok
-test tool::tests::execute_decode_base64_failure_reaches_the_script ... ok
-test tool::tests::execute_scalar_args_run ... ok
-test tool::tests::param_too_few_tokens_errors ... ok
-test tool::tests::param_bad_requiredness_errors ... ok
-test tool::tests::param_without_description_defaults_empty ... ok
-test tool::tests::param_optional_flag ... ok
-test tool::tests::parameters_schema_shape ... ok
 test tool::tests::execute_base64_round_trip_via_script ... ok
+test tool::tests::execute_scalar_args_run ... ok
+test tool::tests::param_bad_requiredness_errors ... ok
+test tool::tests::param_optional_flag ... ok
+test tool::tests::execute_print_and_debug_are_noop ... ok
+test tool::tests::param_too_few_tokens_errors ... ok
+test tool::tests::param_without_description_defaults_empty ... ok
+test tool::tests::guards_pass_through_success_and_convert_panics ... ok
+test tool::tests::parameters_schema_shape ... ok
 test tool::tests::parse_json_fn_direct_success_and_failure ... ok
 test tool::tests::parameters_schema_uses_raw_fragment_verbatim ... ok
 test tool::tests::execute_serializes_non_string_result ... ok
+test stage_hook::tests::unit_and_true_both_allow ... ok
+test tool::tests::execute_missing_optional_param_reads_as_unit ... ok
+test tool::tests::encode_uri_encodes_reserved_and_passes_unreserved ... ok
 test tool::tests::strip_element_handles_case_unclosed_and_utf8 ... ok
 test tool::tests::strip_tags_edges ... ok
+test tool::tests::execute_decode_base64_failure_reaches_the_script ... ok
+test tool::tests::http_get_error_surfaces ... ok
 test tool::tests::execute_unit_result_is_empty ... ok
-test tool::tests::execute_script_error_is_prefixed ... ok
+test tool::parts_tests::the_default_host_holds_no_parts ... ok
 test tool::tests::tool_toml_defaults ... ok
 test tool::tests::tool_toml_empty_name_errors ... ok
 test tool::tests::tool_toml_full ... ok
 test tool::tests::tool_toml_invalid_syntax_errors ... ok
-test tool::tests::http_get_error_surfaces ... ok
-test tool::tests::http_get_no_headers ... ok
 test tool::tests::execute_unserializable_result_errors ... ok
-test tool::tests::sources_pairs_each_tool_with_the_file_it_came_from ... ok
-test tool::tests::tool_toml_raw_schema_fragment ... ok
 test tool::tests::tool_toml_requires ... ok
+test tool::tests::tool_toml_raw_schema_fragment ... ok
+test tool::tests::to_json_fn_direct_success_and_failure ... ok
+test tool::tests::sources_pairs_each_tool_with_the_file_it_came_from ... ok
+test tool::tests::http_get_no_headers ... ok
 test tool::tests::http_get_bytes_carries_a_body_larger_than_the_old_array_cap ... ok
 test tool::tests::http_get_with_headers ... ok
-test tool::tests::to_json_fn_direct_success_and_failure ... ok
-test tool::tests::parse_and_to_json_roundtrip ... ok
-test stage_hook::tests::a_runaway_hook_is_stopped_by_the_operation_budget ... ok
-test types::tests::content_format_invalid_falls_back_to_text ... ok
-test tool::tests::to_json_on_a_map_is_valid_json_for_non_printable_characters ... ok
-test types::tests::needs_eviction_above_threshold ... ok
-test tool::tests::to_json_on_unserializable_value_errors ... ok
-test types::tests::needs_eviction_below_threshold ... ok
-test types::tests::content_format_valid_formats ... ok
-test tool::tests::parse_json_invalid_errors ... ok
-test types::tests::needs_eviction_at_exact_threshold ... ok
 test tool::tests::parse_json_result_used_as_value ... ok
 test types::tests::content_format_empty_falls_back_to_text ... ok
-test types::tests::needs_eviction_zero_max_returns_true ... ok
+test types::tests::needs_eviction_below_threshold ... ok
+test types::tests::needs_eviction_at_exact_threshold ... ok
+test tool::tests::parse_json_invalid_errors ... ok
 test types::tests::region_clearable_returns_clearable ... ok
+test types::tests::content_format_invalid_falls_back_to_text ... ok
+test types::tests::content_format_valid_formats ... ok
+test types::tests::needs_eviction_above_threshold ... ok
 test types::tests::region_compacting_returns_map_with_kind_and_threshold ... ok
-test tool::tests::http_post_variants ... ok
+test tool::tests::to_json_on_unserializable_value_errors ... ok
+test types::tests::needs_eviction_zero_max_returns_true ... ok
+test tool::tests::parse_and_to_json_roundtrip ... ok
+test tool::tests::to_json_on_a_map_is_valid_json_for_non_printable_characters ... ok
 test types::tests::region_custom_returns_map_with_script_and_pinned ... ok
 test tool::tests::guarded_panic_renders_str_and_non_string_payloads ... ok
-test types::tests::region_entry_returns_map_with_content_and_tokens ... ok
-test types::tests::region_pinned_returns_pinned ... ok
-test types::tests::region_temporary_returns_temporary ... ok
-test types::tests::tokens_remaining_all_used ... ok
-test types::tests::region_entry_empty_content ... ok
-test types::tests::region_sliding_window_returns_map_with_kind_and_max_items ... ok
-test types::tests::tokens_remaining_saturates_instead_of_overflowing ... ok
 test types::tests::region_custom_unpinned ... ok
-test types::tests::usage_ratio_half ... ok
-test types::tests::tokens_remaining_zero_used ... ok
-test types::tests::tokens_remaining_basic ... ok
-test types::tests::region_sliding_window_zero ... ok
-test types::tests::usage_ratio_zero_max_returns_one ... ok
-test types::tests::usage_ratio_none_used ... ok
-test tool::tests::http_get_bytes_hands_back_the_type_and_a_blob ... ok
-test tool::tests::read_file_bytes_hands_back_a_blob ... ok
-test tool::tests::shell_read_env_hosts ... ok
-test tool::tests::discover_compiles_and_collides ... ok
+test types::tests::region_pinned_returns_pinned ... ok
 test output_validator::tests::a_runaway_validator_is_stopped ... ok
+test types::tests::region_sliding_window_zero ... ok
+test types::tests::region_sliding_window_returns_map_with_kind_and_max_items ... ok
+test types::tests::tokens_remaining_all_used ... ok
+test tool::tests::http_post_variants ... ok
+test types::tests::tokens_remaining_zero_used ... ok
+test types::tests::region_entry_returns_map_with_content_and_tokens ... ok
+test types::tests::region_entry_empty_content ... ok
+test types::tests::usage_ratio_half ... ok
+test types::tests::tokens_remaining_saturates_instead_of_overflowing ... ok
+test types::tests::usage_ratio_none_used ... ok
+test types::tests::region_temporary_returns_temporary ... ok
+test types::tests::usage_ratio_zero_max_returns_one ... ok
+test types::tests::tokens_remaining_basic ... ok
+test tool::tests::http_get_bytes_hands_back_the_type_and_a_blob ... ok
+test stage_hook::tests::a_runaway_hook_is_stopped_by_the_operation_budget ... ok
+test tool::tests::shell_read_env_hosts ... ok
+test tool::tests::read_file_bytes_hands_back_a_blob ... ok
 test tool::tests::every_host_fn_panic_becomes_a_script_error ... ok
 test tool::parts_tests::a_result_map_with_parts_becomes_typed_content ... ok
 test mime_check::tests::a_check_that_throws_or_returns_the_wrong_type_is_unusable ... ok
@@ -252,8 +252,8 @@ failures:
 
 ---- stage_hook::tests::oracle_protocol_compiles_and_round_trips_json_through_hooks stdout ----
 
-thread 'stage_hook::tests::oracle_protocol_compiles_and_round_trips_json_through_hooks' (976087) panicked at crates/leviath-scripting/src/stage_hook.rs:487:10:
-oracle hook functions compile: CompilationFailed("/data/wt/T01M3CXQRT7ASBEJMPQ9CBD84MZ-a1/repo/crates/leviath-scripting/../leviath-cli/agents/oracle/hooks/protocol.rhai: 'call' is a reserved keyword (line 96, position 9)")
+thread 'stage_hook::tests::oracle_protocol_compiles_and_round_trips_json_through_hooks' (988557) panicked at crates/leviath-scripting/src/stage_hook.rs:492:10:
+oracle hook functions compile: CompilationFailed("/data/wt/T01M3CXT378C00W1JXQXK9FRK29-a1/repo/crates/leviath-scripting/../leviath-cli/agents/oracle/hooks/protocol.rhai: 'call' is a reserved keyword (line 96, position 9)")
 note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
 
 

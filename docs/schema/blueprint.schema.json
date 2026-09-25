@@ -1293,6 +1293,9 @@
         "on_completion": {
           "type": "string"
         },
+        "on_terminal": {
+          "type": "string"
+        },
         "on_error": {
           "type": "string"
         }
