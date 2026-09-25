@@ -1,13 +1,26 @@
-//! The WebSocket event vocabulary: what `/ws` and `/ws/agents/{id}` send.
+//! The WebSocket event vocabulary: what `/ws` and `/ws/agents/{id}` send, and
+//! the bus that carries it.
 //!
 //! Split out of `types.rs` because this is a wire contract rather than an
 //! internal shape. Every variant here is something a client matches on by its
 //! `type` tag, so a change to one is a change to the API, and
 //! `API_CAPABILITIES` in `config_types.rs` is where that gets announced.
+//!
+//! Everything a producer sends goes through [`send`], which is the one place a
+//! frame is given its place in the stream: a [`Stamped`] wrapper carrying a
+//! sequence number and the second it was sent. `/ws` serializes the
+//! [`ServerEvent`] inside and nothing else, so its bytes are the bytes they
+//! always were; a GraphQL subscription reads the stamp as well, which is what
+//! lets a client tell a quiet fleet from a gap in what it was handed.
+
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::Serialize;
+use tokio::sync::broadcast;
 
 use super::types::FinalOutputResp;
+use super::update_job::{JobStatus, Step, StepStatus};
 
 /// Events broadcast to WebSocket subscribers.
 #[derive(Debug, Clone, Serialize)]
@@ -235,10 +248,10 @@ pub(crate) enum ServerEvent {
     UpdateProgress {
         /// The job this is about, as `POST /api/update` answered with.
         job_id: String,
-        /// `binary`, `agents` or `migrations`.
-        step: String,
-        /// `running`, `done`, `skipped`, `advised` or `failed`.
-        status: String,
+        /// Which part of the install the step touches.
+        step: Step,
+        /// Where the step got to.
+        status: StepStatus,
         /// One line about what just happened, ready to print.
         detail: String,
     },
@@ -251,14 +264,14 @@ pub(crate) enum ServerEvent {
         /// The job that finished.
         job_id: String,
         /// `complete` if every step that ran succeeded, `failed` otherwise.
-        status: String,
+        status: JobStatus,
         /// Whether the binary on disk is now newer than the processes serving
         /// this. Both this server and the daemon keep running the old build
         /// until they are restarted, so a console that reported the version it
         /// can see would be telling the truth in the least useful way possible.
         restart_required: bool,
         /// The same record `GET /api/update/jobs/{id}` returns.
-        job: serde_json::Value,
+        job: super::update_job::UpdateJob,
     },
 
     /// This server's own link to the daemon changed.
@@ -372,9 +385,133 @@ impl ServerEvent {
     }
 }
 
+/// One frame on the bus: the event, and where it sits in the stream.
+///
+/// The stamp is not part of any wire contract. `/ws` serializes
+/// [`event`](Self::event) alone, exactly as it did when that was all there
+/// was; the stamp exists for a subscriber that has to know whether it was
+/// handed everything, which is a question no frame's own contents can answer.
+#[derive(Debug, Clone)]
+pub(crate) struct Stamped {
+    /// This frame's place in the stream, counting from one.
+    ///
+    /// Strictly rising on every subscription, so a subscriber that sees a jump
+    /// knows frames went past it. It is this process's numbering and nothing
+    /// else's: a restart starts again, which is what
+    /// [`server_instance`] is there to make visible.
+    pub(crate) seq: u64,
+    /// When the server sent it, in unix seconds.
+    pub(crate) at: i64,
+    /// The event itself.
+    pub(crate) event: ServerEvent,
+}
+
+/// The sequence number the last frame was given, or zero before any.
+///
+/// One counter for the process rather than one per channel. `seq` answers
+/// "was I handed everything on this stream", and a stream is one channel, so
+/// a shared counter still rises strictly on each of them; which process minted
+/// a number is what [`server_instance`] says.
+static SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// This process's own id, minted once on first use.
+static INSTANCE: OnceLock<String> = OnceLock::new();
+
+/// The id of this server process, as a subscriber sees it.
+///
+/// Handed out on the frame that opens a subscription. Two subscriptions that
+/// report different instances were served by different processes, so their
+/// sequence numbers are not comparable and a client that was reconnecting has
+/// to re-read rather than resume.
+pub(crate) fn server_instance() -> &'static str {
+    INSTANCE.get_or_init(|| {
+        use rand::RngExt as _;
+        format!("{:016x}", rand::rng().random::<u64>())
+    })
+}
+
+/// The sequence number the most recent frame carries, or zero before any.
+///
+/// Read by the frame that opens a subscription, so its own number sits below
+/// the first frame that subscription is handed rather than consuming a number
+/// every other subscriber would then see missing.
+pub(crate) fn latest_seq() -> u64 {
+    SEQ.load(Ordering::Relaxed)
+}
+
+/// Held across taking a number and handing the frame over, so the two are one
+/// step.
+///
+/// Numbering and delivery apart would let a producer that took the lower
+/// number reach the channel second, and a subscriber would then read a number
+/// going backwards - which is exactly the comparison a gap is reported from.
+/// The lock covers a counter bump and a push into a ring buffer; nothing under
+/// it waits on anything.
+static ORDER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Stamp one event and hand it to every subscriber.
+///
+/// The one place a frame is given its sequence number and its time, so no
+/// producer can send an unstamped one or invent a numbering of its own. A send
+/// with nobody listening is not an error: the daemon keeps working whether or
+/// not a console is open.
+pub(crate) fn send(bus: &broadcast::Sender<Stamped>, event: ServerEvent) {
+    let at = leviath_core::duration::now_secs();
+    let _order = leviath_core::sync::lock(&ORDER);
+    let _ = bus.send(Stamped {
+        seq: SEQ.fetch_add(1, Ordering::Relaxed) + 1,
+        at,
+        event,
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two producers sending at once still hand the bus its frames in the
+    /// order they were numbered.
+    ///
+    /// Numbering and delivery are one step, so there is no window in which a
+    /// frame that took the lower number can be delivered after one that took
+    /// the higher. A subscriber that saw them the other way round would read a
+    /// number going backwards, and `EventsDroppedEvent` is derived from exactly
+    /// that comparison.
+    #[test]
+    fn frames_arrive_in_the_order_they_were_numbered() {
+        let (tx, mut rx) = broadcast::channel::<Stamped>(32_768);
+        let each = 4_000;
+        let producers = 4;
+        std::thread::scope(|scope| {
+            for producer in 0..producers {
+                let tx = tx.clone();
+                scope.spawn(move || {
+                    for line in 0..each {
+                        send(
+                            &tx,
+                            ServerEvent::Log {
+                                agent_id: format!("agent-{producer}"),
+                                run_id: "run-1".to_string(),
+                                line: format!("line {line}"),
+                            },
+                        );
+                    }
+                });
+            }
+        });
+        let mut last = 0;
+        let mut seen = 0;
+        while let Ok(frame) = rx.try_recv() {
+            assert!(
+                frame.seq > last,
+                "frame {seen} carries {} after {last}",
+                frame.seq
+            );
+            last = frame.seq;
+            seen += 1;
+        }
+        assert_eq!(seen, each * producers);
+    }
 
     /// The link event is about no run: it filters as the empty run id, and a
     /// per-run subscription still receives it.

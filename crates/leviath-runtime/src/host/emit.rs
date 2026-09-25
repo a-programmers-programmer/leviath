@@ -261,7 +261,6 @@ impl WorldHost {
         // is safe. The reaper is moved out for the loop to avoid borrowing `self`
         // twice, then restored.
         let mut reaper = self.reaper.take();
-        let reaped_any = !to_reap.is_empty();
         for (run_id, entity, entry) in to_reap {
             if let Some(reaper) = reaper.as_mut() {
                 reaper(&mut self.world, entity);
@@ -269,6 +268,10 @@ impl WorldHost {
             self.world.world_mut().despawn(entity);
             self.by_run_id.remove(&run_id);
             self.emitted.remove(&run_id);
+            // A reaped run raises no further prompt, so its request count
+            // goes with it. A parked run keeps its count: it comes back, and
+            // the ids it draws then must not repeat the ones it drew before.
+            self.interactions.forget_run(&run_id);
             // The run leaves memory but not the listing: for a while yet it
             // can still say how it ended.
             self.record_finished(entry, now);
@@ -288,13 +291,13 @@ impl WorldHost {
         }
         self.reaper = reaper;
         self.prune_finished(now);
-        // Reaped runs answer no further prompts: drop their request ids from
-        // the emitted-interaction set, which otherwise grows for the daemon's
-        // life (the set is keyed by request id, so prune by what is still
-        // pending - the same shape `cancel_tree` uses).
-        if reaped_any {
-            self.prune_emitted_interactions();
-        }
+        // Forget every request id that is no longer pending, whether it was
+        // answered, cancelled or reaped. A provider's tool-call id is unique
+        // within one message and not across a run's turns, so a later turn
+        // can raise a prompt under an id an earlier, settled prompt used, and
+        // that prompt has to be broadcast like any other. Pruning by what is
+        // pending, every tick, is what makes a set keyed by request id safe.
+        self.prune_emitted_interactions();
 
         for (agent_id, request) in self.interactions.pending() {
             if self.emitted_interactions.insert(request.id.clone()) {

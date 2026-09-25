@@ -200,6 +200,9 @@ fn resolve(query: &RunsQuery) -> Result<RunSpec, ServeError> {
         statuses,
         sort,
         descending,
+        // One key orders this route, which `sort` and `descending` already
+        // say; several is the other surface's.
+        order: None,
         q,
         sources,
         sources_raw: sources_raw.to_string(),
@@ -211,6 +214,9 @@ fn resolve(query: &RunsQuery) -> Result<RunSpec, ServeError> {
         // The flat query parameters above are the whole filter this route
         // takes; a composable predicate is the other surface's.
         predicate: None,
+        // This route holds no records of its own: a batch fetch by id reads
+        // each one it names.
+        preloaded: None,
     }
     .resolve(query.cursor.as_deref())
 }
