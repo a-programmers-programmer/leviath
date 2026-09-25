@@ -16599,7 +16599,7 @@ fn hook_scripts(src: &str, wanted: &[&str]) -> crate::components::StageHookScrip
         .expect("the fixture script compiles");
     let mut map = std::collections::HashMap::new();
     map.insert("h.rhai".to_string(), std::sync::Arc::new(compiled));
-    crate::components::StageHookScripts(map)
+    crate::components::StageHookScripts { scripts: map, host: None }
 }
 
 /// A one-stage blueprint whose stage names `h.rhai` for `on_stage_enter`.

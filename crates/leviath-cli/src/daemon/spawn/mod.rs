@@ -1052,7 +1052,10 @@ fn build_agent_inner(
     if !stage_hooks.is_empty() {
         world
             .entity_mut(entity)
-            .insert(leviath_runtime::components::StageHookScripts(stage_hooks));
+            .insert(leviath_runtime::components::StageHookScripts {
+                scripts: stage_hooks,
+                host: Some(script_host.clone()),
+            });
     }
 
     // 7. Attach run metadata / token totals / persistence watermark (+ optional
@@ -3985,7 +3988,7 @@ system_prompt = "be brief"
             .world_mut()
             .get::<leviath_runtime::components::StageHookScripts>(entity)
             .expect("the hook script is attached");
-        assert!(scripts.0.contains_key("h.rhai"));
+        assert!(scripts.scripts.contains_key("h.rhai"));
     }
 
     /// A broken hook script fails the spawn rather than the run - the `?` on

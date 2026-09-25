@@ -302,10 +302,11 @@ pub use context_window::*;
 /// The component is absent entirely on an agent whose blueprint declares no
 /// hooks, so the hook systems' queries skip it and nothing about the scripting
 /// engine is touched.
-#[derive(Component, Debug, Clone, Default)]
-pub struct StageHookScripts(
-    pub std::collections::HashMap<String, std::sync::Arc<leviath_scripting::stage_hook::HookScript>>,
-);
+#[derive(Component, Clone, Default)]
+pub struct StageHookScripts {
+    pub scripts: std::collections::HashMap<String, std::sync::Arc<leviath_scripting::stage_hook::HookScript>>,
+    pub host: Option<std::sync::Arc<dyn leviath_scripting::ScriptHost>>,
+}
 
 impl StageHookScripts {
     /// The compiled script backing `hook` for this stage, when the stage
@@ -329,7 +330,7 @@ impl StageHookScripts {
             "on_error" => stage.hooks.on_error.as_deref(),
             _ => None,
         }?;
-        self.0.get(path).cloned()
+        self.scripts.get(path).cloned()
     }
 }
 
@@ -4023,7 +4024,7 @@ mod stage_hook_scripts_tests {
         .expect("compiles");
         let mut m = std::collections::HashMap::new();
         m.insert(path.to_string(), std::sync::Arc::new(compiled));
-        StageHookScripts(m)
+        StageHookScripts { scripts: m, host: None }
     }
 
     fn stage_declaring(enter: Option<&str>, exit: Option<&str>) -> leviath_core::Stage {
