@@ -50,7 +50,38 @@ fn next_hook_tool_id(name: &str) -> String {
 /// Deliberately a snapshot rather than a handle: Rhai passes by value, so a
 /// script could not mutate a live window even if it were given one, and
 /// building the map is what makes the contract inspectable.
-fn stage_ctx(stage_name: &str, index: usize, window: &ContextWindow) -> serde_json::Value {
+#[derive(Component, Debug, Default, Clone, Copy)]
+pub struct InferenceAttempt(pub u32);
+
+pub(crate) struct RunFacts {
+    pub cost_usd: f64,
+    pub iterations: i64,
+    pub stage_iterations: i64,
+    pub elapsed_secs: i64,
+    pub attempt: i64,
+}
+
+pub(crate) fn run_facts(
+    state: &AgentState,
+    progress: Option<&StageProgress>,
+    clock: Option<&crate::persistence::RunClock>,
+    totals: Option<&crate::persistence::TokenTotals>,
+    attempt: Option<&InferenceAttempt>,
+) -> RunFacts {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or_default();
+    RunFacts {
+        cost_usd: totals.and_then(|t| t.cost.total_usd()).unwrap_or(0.0),
+        iterations: state.iteration as i64,
+        stage_iterations: progress.map_or(0, |p| p.iterations as i64),
+        elapsed_secs: clock.map_or(0, |c| c.0.total_secs(now) as i64),
+        attempt: attempt.map_or(0, |a| a.0 as i64),
+    }
+}
+
+pub(crate) fn stage_ctx(stage_name: &str, index: usize, window: &ContextWindow, facts: &RunFacts) -> serde_json::Value {
     // Entries joined, not the entry list: a hook that wants to seed or rewrite a
     // region thinks in text, and handing it the internal entry shape would make
     // the ctx an implementation detail scripts then depend on.
@@ -88,6 +119,11 @@ fn stage_ctx(stage_name: &str, index: usize, window: &ContextWindow) -> serde_js
         "stage_index": index,
         "regions": regions,
         "parts": parts,
+        "cost_usd": facts.cost_usd,
+        "iterations": facts.iterations,
+        "stage_iterations": facts.stage_iterations,
+        "elapsed_secs": facts.elapsed_secs,
+        "attempt": facts.attempt,
     })
 }
 
@@ -145,10 +181,14 @@ pub(crate) fn run_stage_enter_hooks(
         &StageHookScripts,
         &mut ContextWindow,
         &mut AgentState,
+        Option<&StageProgress>,
+        Option<&crate::persistence::RunClock>,
+        Option<&crate::persistence::TokenTotals>,
+        Option<&InferenceAttempt>,
     )>,
 ) {
     crate::tick_scope::clear();
-    for (entity, entered, bp, scripts, mut window, mut state) in agents.iter_mut() {
+    for (entity, entered, bp, scripts, mut window, mut state, progress, clock, totals, attempt) in agents.iter_mut() {
         crate::tick_scope::enter(entity);
         let Some(stage) = bp.0.stages.get(entered.index) else {
             continue;
@@ -157,7 +197,8 @@ pub(crate) fn run_stage_enter_hooks(
             continue;
         };
 
-        let ctx = stage_ctx(&entered.name, entered.index, &window);
+        let facts = run_facts(&state, progress, clock, totals, attempt);
+        let ctx = stage_ctx(&entered.name, entered.index, &window, &facts);
         let outcome = match run(&script, "on_stage_enter", ctx, scripts.host.clone()) {
             Ok(o) => o,
             Err(e) => {
@@ -224,6 +265,10 @@ type BeforeInferenceHookQuery = (
     &'static StageHookScripts,
     &'static mut ContextWindow,
     &'static mut AgentState,
+    Option<&'static StageProgress>,
+    Option<&'static crate::persistence::RunClock>,
+    Option<&'static crate::persistence::TokenTotals>,
+    Option<&'static InferenceAttempt>,
 );
 
 /// Run `before_inference` for every agent about to infer.
@@ -241,7 +286,7 @@ pub(crate) fn run_before_inference_hooks(
     mut commands: Commands,
 ) {
     crate::tick_scope::clear();
-    for (entity, cursor, bp, scripts, mut window, mut state) in agents.iter_mut() {
+    for (entity, cursor, bp, scripts, mut window, mut state, progress, clock, totals, attempt) in agents.iter_mut() {
         crate::tick_scope::enter(entity);
         let Some(stage) = bp.0.stages.get(cursor.index) else {
             continue;
@@ -250,7 +295,8 @@ pub(crate) fn run_before_inference_hooks(
             continue;
         };
 
-        let ctx = stage_ctx(&stage.name, cursor.index, &window);
+        let facts = run_facts(&state, progress, clock, totals, attempt);
+        let ctx = stage_ctx(&stage.name, cursor.index, &window, &facts);
         match run(&script, "before_inference", ctx, scripts.host.clone()) {
             Err(e) => refuse(&mut state, "before_inference", format!("hook failed: {e}")),
             Ok(HookOutcome::Allow) => {}
@@ -312,6 +358,10 @@ type AfterInferenceHookQuery = (
     &'static ContextWindow,
     &'static mut crate::components::InferenceResult,
     &'static mut AgentState,
+    Option<&'static StageProgress>,
+    Option<&'static crate::persistence::RunClock>,
+    Option<&'static crate::persistence::TokenTotals>,
+    Option<&'static InferenceAttempt>,
 );
 
 /// Run `after_inference` with the model's response in hand.
@@ -330,7 +380,7 @@ pub(crate) fn run_after_inference_hooks(
     mut commands: Commands,
 ) {
     crate::tick_scope::clear();
-    for (entity, cursor, bp, scripts, window, mut result, mut state) in agents.iter_mut() {
+    for (entity, cursor, bp, scripts, window, mut result, mut state, progress, clock, totals, attempt) in agents.iter_mut() {
         crate::tick_scope::enter(entity);
         let Some(stage) = bp.0.stages.get(cursor.index) else {
             continue;
@@ -339,7 +389,8 @@ pub(crate) fn run_after_inference_hooks(
             continue;
         };
 
-        let mut ctx = stage_ctx(&stage.name, cursor.index, window);
+        let facts = run_facts(&state, progress, clock, totals, attempt);
+        let mut ctx = stage_ctx(&stage.name, cursor.index, window, &facts);
         let object = ctx
             .as_object_mut()
             .expect("stage_ctx always returns an object");
@@ -481,6 +532,10 @@ type ToolCallHookQuery = (
     &'static ContextWindow,
     &'static mut crate::components::InferenceResult,
     &'static mut AgentState,
+    Option<&'static StageProgress>,
+    Option<&'static crate::persistence::RunClock>,
+    Option<&'static crate::persistence::TokenTotals>,
+    Option<&'static InferenceAttempt>,
 );
 
 /// Run `on_tool_call` before the model's tool calls reach the policy layer.
@@ -503,7 +558,7 @@ type ToolCallHookQuery = (
 /// rewrites everything.
 pub(crate) fn run_tool_call_hooks(mut agents: Query<ToolCallHookQuery, With<ReadyForTools>>) {
     crate::tick_scope::clear();
-    for (entity, cursor, bp, scripts, window, mut result, mut state) in agents.iter_mut() {
+    for (entity, cursor, bp, scripts, window, mut result, mut state, progress, clock, totals, attempt) in agents.iter_mut() {
         crate::tick_scope::enter(entity);
         let Some(stage) = bp.0.stages.get(cursor.index) else {
             continue;
@@ -515,7 +570,8 @@ pub(crate) fn run_tool_call_hooks(mut agents: Query<ToolCallHookQuery, With<Read
             continue;
         }
 
-        let mut ctx = stage_ctx(&stage.name, cursor.index, window);
+        let facts = run_facts(&state, progress, clock, totals, attempt);
+        let mut ctx = stage_ctx(&stage.name, cursor.index, window, &facts);
         let object = ctx
             .as_object_mut()
             .expect("stage_ctx always returns an object");
@@ -613,6 +669,10 @@ type TerminalHookQuery = (
     &'static StageHookScripts,
     &'static mut AgentState,
     Option<&'static mut crate::persistence::FinalOutput>,
+    Option<&'static StageProgress>,
+    Option<&'static crate::persistence::RunClock>,
+    Option<&'static crate::persistence::TokenTotals>,
+    Option<&'static InferenceAttempt>,
 );
 
 /// Run `on_completion` or `on_error` once, as the run finishes.
@@ -634,7 +694,7 @@ pub(crate) fn run_terminal_hooks(
     mut commands: Commands,
 ) {
     crate::tick_scope::clear();
-    for (entity, cursor, bp, scripts, mut state, mut output) in agents.iter_mut() {
+    for (entity, cursor, bp, scripts, mut state, mut output, progress, clock, totals, attempt) in agents.iter_mut() {
         if !super::transition::is_terminal_status(&state.status) {
             continue;
         }
@@ -652,6 +712,14 @@ pub(crate) fn run_terminal_hooks(
         let hooks = specific.into_iter().chain(std::iter::once(("on_terminal", String::new())));
         for (hook, subject) in hooks {
             let Some(script) = scripts.script_for(stage, hook) else { continue };
+            let facts = run_facts(&state, progress, clock, totals, attempt);
+            let mut ctx = stage_ctx(&stage.name, cursor.index, &ContextWindow::new(0), &facts);
+            let object = ctx.as_object_mut().expect("stage_ctx returns an object");
+            object.insert("status".into(), serde_json::json!(state.status.label()));
+            object.insert("status_label".into(), serde_json::json!(state.status.label()));
+            object.insert("output".into(), serde_json::json!(if hook == "on_completion" { subject.clone() } else { String::new() }));
+            object.insert("error".into(), serde_json::json!(if hook == "on_error" { subject.clone() } else { String::new() }));
+            /*
             let ctx = serde_json::json!({
                 "stage": stage.name,
                 "stage_index": cursor.index,
@@ -660,6 +728,7 @@ pub(crate) fn run_terminal_hooks(
                 "output": if hook == "on_completion" { subject.clone() } else { String::new() },
                 "error": if hook == "on_error" { subject.clone() } else { String::new() },
             });
+            */
             let result = if hook == "on_terminal" {
                 let (tx, rx) = std::sync::mpsc::channel();
                 let host = scripts.host.clone();
@@ -715,6 +784,10 @@ type StageExitHookQuery = (
     &'static StageHookScripts,
     &'static mut ContextWindow,
     &'static mut AgentState,
+    Option<&'static StageProgress>,
+    Option<&'static crate::persistence::RunClock>,
+    Option<&'static crate::persistence::TokenTotals>,
+    Option<&'static InferenceAttempt>,
 );
 
 /// Run `on_stage_exit` as a stage finishes, before its transition is chosen.
@@ -731,7 +804,7 @@ pub(crate) fn run_stage_exit_hooks(
     mut commands: Commands,
 ) {
     crate::tick_scope::clear();
-    for (entity, cursor, bp, scripts, mut window, mut state) in agents.iter_mut() {
+    for (entity, cursor, bp, scripts, mut window, mut state, progress, clock, totals, attempt) in agents.iter_mut() {
         crate::tick_scope::enter(entity);
         let Some(stage) = bp.0.stages.get(cursor.index) else {
             continue;
@@ -740,7 +813,8 @@ pub(crate) fn run_stage_exit_hooks(
             continue;
         };
 
-        let ctx = stage_ctx(&stage.name, cursor.index, &window);
+        let facts = run_facts(&state, progress, clock, totals, attempt);
+        let ctx = stage_ctx(&stage.name, cursor.index, &window, &facts);
         match run(&script, "on_stage_exit", ctx, scripts.host.clone()) {
             Err(e) => {
                 refuse(&mut state, "on_stage_exit", format!("hook failed: {e}"));
@@ -808,7 +882,7 @@ mod ctx_tests {
                 1_700,
             )
             .unwrap();
-        let ctx = stage_ctx("plan", 0, &window);
+        let ctx = stage_ctx("plan", 0, &window, &run_facts(&AgentState { agent_id: "test".into(), current_stage: "plan".into(), current_visit: String::new(), iteration: 0, status: AgentStatus::Active, spawned_children_ids: vec![], pending_wait: None, accepts_messages: true }, None, None, None, None));
         assert_eq!(ctx["regions"]["brief"], "words");
         assert!(ctx["parts"].get("brief").is_none());
         assert_eq!(ctx["parts"]["art"][0]["name"], "a.png");

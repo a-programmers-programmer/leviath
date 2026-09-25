@@ -16592,6 +16592,59 @@ fn entering_a_stage_clears_the_output_reentry_count() {
     assert!(world.get::<OutputReentries>(e).is_none());
 }
 
+
+#[test]
+fn the_ctx_carries_the_five_run_facts() {
+    let state = AgentState { iteration: 7, ..agent_state() };
+    let facts = crate::pipeline::hooks::run_facts(&state, None, None, None, Some(&crate::pipeline::hooks::InferenceAttempt(2)));
+    let ctx = crate::pipeline::hooks::stage_ctx("main", 0, &conv_window(), &facts);
+    assert_eq!(ctx["cost_usd"].as_f64(), Some(0.0));
+    assert_eq!(ctx["iterations"].as_i64(), Some(7));
+    assert_eq!(ctx["stage_iterations"].as_i64(), Some(0));
+    assert_eq!(ctx["elapsed_secs"].as_i64().unwrap(), 0);
+    assert_eq!(ctx["attempt"].as_i64(), Some(2));
+}
+
+#[test]
+fn the_ctx_facts_default_safely_when_the_components_are_absent() {
+    let facts = crate::pipeline::hooks::run_facts(&agent_state(), None, None, None, None);
+    let ctx = crate::pipeline::hooks::stage_ctx("main", 0, &conv_window(), &facts);
+    assert_eq!(ctx["cost_usd"].as_f64(), Some(0.0));
+    for key in ["iterations", "stage_iterations", "elapsed_secs", "attempt"] {
+        assert_eq!(ctx[key].as_i64(), Some(0), "{key}");
+    }
+}
+
+#[test]
+fn the_ctx_reaches_a_real_hook() {
+    let mut world = World::new();
+    let e = spawn_before(&mut world, r#"fn before_inference(ctx) { if ctx.iterations < 0 { #{ action: "refuse", reason: "neg" } } else { #{ action: "allow" } } }"#);
+    world.entity_mut(e).insert(crate::pipeline::hooks::InferenceAttempt(2));
+    run_before_hooks(&mut world);
+    assert!(status_message(&world, e).is_none());
+    assert!(world.get::<ReadyToInfer>(e).is_some());
+}
+
+#[test]
+fn every_hook_kind_gets_the_five_facts() {
+    let mut world = World::new();
+    let src = r#"
+        fn check(ctx) {
+            if !(ctx.contains("cost_usd") && ctx.contains("iterations") && ctx.contains("stage_iterations") && ctx.contains("elapsed_secs") && ctx.contains("attempt")) {
+                #{ action: "refuse", reason: "missing" }
+            } else { #{ action: "allow" } }
+        }
+        fn on_stage_enter(ctx) { check(ctx) }
+        fn before_inference(ctx) { check(ctx) }
+        fn after_inference(ctx) { check(ctx) }
+        fn on_tool_call(ctx) { check(ctx) }
+        fn on_stage_exit(ctx) { check(ctx) }
+        fn on_terminal(ctx) { check(ctx) }
+    "#;
+    let e = spawn_before(&mut world, src);
+    assert!(status_message(&world, e).is_none());
+}
+
 // ─── on_stage_enter ──────────────────────────────────────────────────────────
 
 fn hook_scripts(src: &str, wanted: &[&str]) -> crate::components::StageHookScripts {
