@@ -143,6 +143,7 @@ type TransitionChoiceQuery = (
         Option<&'static crate::pipeline::inference::SystemBlockHashes>,
         Option<&'static crate::pipeline::PromptCalibration>,
     ),
+    Option<&'static crate::pipeline::hooks::InferenceAttempt>,
 );
 
 /// The shape of `tool_choice: none` for a provider's wire format, or `None`
@@ -225,7 +226,7 @@ pub(crate) fn dispatch_transition_choice(
 ) {
     crate::tick_scope::clear();
     let now = chrono::Utc::now().timestamp();
-    for (entity, state, mut window, si, bp, cursor, choice, in_flight, stalled, built_from) in
+    for (entity, state, mut window, si, bp, cursor, choice, in_flight, stalled, built_from, attempt) in
         agents.iter_mut()
     {
         let (config, progress, prefix, block_prefix, calibration) = built_from;
@@ -280,9 +281,15 @@ pub(crate) fn dispatch_transition_choice(
         providers
             .0
             .apply_retention_knobs(&si.provider_name, &mut request.extra);
+        let attempt_counter = attempt.map(|counter| counter.0.clone()).unwrap_or_else(|| {
+            let counter = crate::pipeline::hooks::InferenceAttempt::default();
+            let shared = counter.0.clone();
+            commands.entity(entity).insert(counter);
+            shared
+        });
         let job = InferenceJob {
             entity,
-            attempt_counter: None,
+            attempt_counter: Some(attempt_counter),
             refused: providers.0.retention_refusal(&si.provider_name, &si.model),
             provider,
             request,

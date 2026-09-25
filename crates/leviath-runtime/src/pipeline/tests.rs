@@ -891,6 +891,32 @@ async fn dispatch_uses_the_configured_retry_schedule() {
     assert!(outcome.result.is_ok());
 }
 
+#[tokio::test]
+async fn hook_attempt_counter_is_attached_to_real_dispatch() {
+    let (mut world, mut rx) = build_world(InferencePools::new(InferencePoolConfig::new()));
+    let e = world
+        .spawn((agent_state(), window(), stage("m", vec![], None), ReadyToInfer))
+        .id();
+
+    run(&mut world);
+    assert!(rx.recv().await.expect("first outcome").result.is_ok());
+    let first = world
+        .get::<crate::pipeline::hooks::InferenceAttempt>(e)
+        .expect("dispatch attaches the shared attempt counter");
+    let first_count = first.0.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(first_count > 0, "the real provider attempt increments it");
+
+    world.entity_mut(e).remove::<AwaitingInference>().insert(ReadyToInfer);
+    run(&mut world);
+    assert!(rx.recv().await.expect("second outcome").result.is_ok());
+    let second_count = world
+        .get::<crate::pipeline::hooks::InferenceAttempt>(e)
+        .expect("the counter remains attached")
+        .0
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert!(second_count > first_count, "a later dispatch reuses the counter");
+}
+
 /// A dispatched job journals its attempt, carrying the run, the stage and the
 /// name the run calls the provider by - none of which the retry loop knows on
 /// its own, which is why the dispatch system hands them over with the request.

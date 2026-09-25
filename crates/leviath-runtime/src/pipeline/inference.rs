@@ -558,6 +558,7 @@ type InferenceQuery = (
     Option<&'static SystemBlockHashes>,
     Option<&'static crate::pipeline::PromptCalibration>,
     Option<&'static CaptureModelInput>,
+    Option<&'static crate::pipeline::hooks::InferenceAttempt>,
 );
 
 /// The system prefix the last request sent, as a digest.
@@ -647,6 +648,7 @@ pub(crate) fn dispatch_inference(
             block_prefix,
             calibration,
             capture,
+            attempt,
         )| {
             crate::tick_scope::run_agent_parallel(entity, &par_commands, &mut || {
                 if state.status != AgentStatus::Active {
@@ -817,9 +819,17 @@ pub(crate) fn dispatch_inference(
                         tool_catalog_version: tool_catalog_version(&request.tools),
                     },
                 });
+                let attempt_counter = attempt.map(|counter| counter.0.clone()).unwrap_or_else(|| {
+                    let counter = crate::pipeline::hooks::InferenceAttempt::default();
+                    let shared = counter.0.clone();
+                    par_commands.command_scope(|mut commands| {
+                        commands.entity(entity).insert(counter);
+                    });
+                    shared
+                });
                 let job = InferenceJob {
                     entity,
-                    attempt_counter: None,
+                    attempt_counter: Some(attempt_counter),
                     // Checked here, against the registry's live settings,
                     // as well as at spawn: zero retention switched on under
                     // a running daemon holds from the next call.
