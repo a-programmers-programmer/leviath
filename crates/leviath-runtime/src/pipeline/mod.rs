@@ -48,7 +48,7 @@ mod hooks;
 #[cfg(test)]
 pub(crate) use hooks::TerminalHookFired;
 pub(crate) use hooks::{
-    run_after_inference_hooks, run_before_inference_hooks, run_stage_enter_hooks,
+    run_after_inference_hooks, run_before_inference_hooks, release_waits, run_stage_enter_hooks,
     run_stage_exit_hooks, run_terminal_hooks, run_tool_call_hooks,
 };
 mod convergence;

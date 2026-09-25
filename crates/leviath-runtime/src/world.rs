@@ -49,7 +49,7 @@ use crate::pipeline::{
     gate_requires_children, handle_empty_response, journal_interactions, poll_dynamic_tool_refresh,
     process_response, reflect_interaction_status, refresh_advertised_tools,
     require_context_regions, require_fan_out, require_final_output, rescan_before_dispatch,
-    resolve_transition, run_after_inference_hooks, run_before_inference_hooks,
+    resolve_transition, release_waits, run_after_inference_hooks, run_before_inference_hooks,
     run_stage_enter_hooks, run_stage_exit_hooks, run_terminal_hooks, run_tool_call_hooks,
     sync_tool_stages,
 };
@@ -479,6 +479,7 @@ impl PipelineWorld {
                 // `before_inference` runs with the window assembled and before
                 // the request is built from it.
                 (
+                    release_waits,
                     // Hold authoritative fan-out stages out of inference while
                     // their entry hooks run; the matching starter below consumes
                     // the region after the hook and current tool resolution.

@@ -254,8 +254,24 @@ pub(crate) fn run_before_inference_hooks(
         match run(&script, "before_inference", ctx, scripts.host.clone()) {
             Err(e) => refuse(&mut state, "before_inference", format!("hook failed: {e}")),
             Ok(HookOutcome::Allow) => {}
-            Ok(HookOutcome::Wait { .. }) => {
-                tracing::warn!("wait outcome not yet wired; treating as allow");
+            Ok(HookOutcome::Wait { secs, reason }) => {
+                let now_unix = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|duration| duration.as_secs() as i64)
+                    .unwrap_or_default();
+                let until_unix = now_unix + secs as i64;
+                state.status = AgentStatus::Waiting;
+                commands.entity(entity).remove::<ReadyToInfer>();
+                commands.entity(entity).insert(WaitUntil {
+                    until_unix,
+                    secs,
+                    reason: reason.clone(),
+                });
+                tracing::info!(
+                    "hook wait: parking {secs}s ({})",
+                    reason.as_deref().unwrap_or("no reason given")
+                );
+                continue;
             }
             Ok(HookOutcome::Modify(value)) => {
                 if let Err(e) = apply_modify(&mut window, &value) {
@@ -544,6 +560,35 @@ pub(crate) fn run_tool_call_hooks(mut agents: Query<ToolCallHookQuery, With<Read
                     .to_string(),
             ),
         }
+    }
+}
+
+/// A run parked by a before-inference hook until its requested delay expires.
+#[derive(Component, Debug, Clone)]
+pub struct WaitUntil {
+    pub until_unix: i64,
+    pub secs: u64,
+    pub reason: Option<String>,
+}
+
+/// Re-arm runs parked by a before-inference hook once their delay expires.
+pub fn release_waits(
+    mut agents: Query<(Entity, &WaitUntil, &mut AgentState)>,
+    mut commands: Commands,
+) {
+    let now_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default();
+    for (entity, wait, mut state) in &mut agents {
+        if wait.until_unix > now_unix {
+            continue;
+        }
+        let secs = wait.secs;
+        state.status = AgentStatus::Active;
+        commands.entity(entity).remove::<WaitUntil>();
+        commands.entity(entity).insert(ReadyToInfer);
+        tracing::info!("hook wait: released after {secs}s");
     }
 }
 
