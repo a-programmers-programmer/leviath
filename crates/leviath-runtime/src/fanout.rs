@@ -419,6 +419,7 @@ pub(crate) fn start_authoritative_fanouts(world: &mut World) {
         // approved region without allowing a model-shaped override.
         world.entity_mut(entity).insert((
             InferenceResult {
+                attempt_id: String::new(),
                 response: String::new(),
                 tool_calls: vec![crate::components::ToolCall {
                     tool_id: format!(
@@ -436,6 +437,7 @@ pub(crate) fn start_authoritative_fanouts(world: &mut World) {
                 tokens_used: 0,
                 cut_off_at: None,
                 reasoning: None,
+                parts: Vec::new(),
             },
             crate::pipeline::ReadyForTools,
         ));
@@ -2132,12 +2134,15 @@ mod tests {
             .get_mut::<ContextWindow>(entity)
             .expect("parent window")
             .typed_write(
-                crate::components::WriteOrigin::System,
-                "conversation",
-                leviath_core::EntryKind::UserMessage,
+                crate::components::TypedWrite {
+                    cause: None,
+                    origin: crate::components::WriteOrigin::System,
+                    region: "conversation",
+                    kind: leviath_core::EntryKind::UserMessage,
+                    taint: Some(leviath_core::TaintLevel::Internal),
+                },
                 "secret".to_string(),
                 5,
-                Some(leviath_core::TaintLevel::Internal),
             )
             .expect("tainted context write");
         let (jobs, _jobs_rx) = tokio::sync::mpsc::unbounded_channel();
