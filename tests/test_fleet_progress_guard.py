@@ -166,3 +166,14 @@ def test_policy_rules_and_initial_checkpoint_are_deterministic():
         result = decide(policy(**changes), guard.initial_state(p), 101)
         assert result["action"] == "cancel"
     assert math.isfinite(guard.initial_state(p)["last_now"])
+
+
+def test_fresh_running_observation_reopens_prior_terminal_proof():
+    p = policy()
+    state = guard.initial_state(p)
+    terminal = decide(p, state, 105, obs=observation("completed", False))
+    assert terminal["action"] == "terminal"
+    reopened = decide(p, terminal["state"], 106, obs=observation("running", True))
+    assert reopened["action"] == "cancel"
+    assert reopened["state"]["cancel_reason"] == "terminal_reopened"
+    assert reopened["state"]["terminal_verified"] is False

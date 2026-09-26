@@ -137,7 +137,9 @@ def decide(policy, state, observation, receipt, now):
         updated["cancel_reason"] = None
         return {"action": "terminal", "state": updated}
     if state["terminal_verified"]:
-        return {"action": "terminal", "state": updated}
+        updated["terminal_verified"] = False
+        updated["cancel_reason"] = updated["cancel_reason"] or "terminal_reopened"
+        return {"action": "cancel", "state": updated}
     if updated["cancel_reason"]:
         return {"action": "cancel", "state": updated}
     if now >= policy["hard_deadline"]:
