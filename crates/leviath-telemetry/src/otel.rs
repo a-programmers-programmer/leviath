@@ -904,6 +904,91 @@ mod tests {
     }
 
     #[test]
+    fn revisited_stage_emits_distinct_ordered_spans() {
+        let h = harness();
+        h.sink.emit(run_started("r1", 1_000));
+        h.sink.emit(stage_entered("r1", 0, 1_100));
+        h.sink.emit(stage_exited("r1", 0, 1_500));
+        h.sink.emit(stage_entered("r1", 1, 1_600));
+        h.sink.emit(stage_exited("r1", 1, 2_000));
+        h.sink.emit(stage_entered("r1", 0, 2_100));
+        h.sink.emit(stage_exited("r1", 0, 2_500));
+        h.sink.emit(run_completed("r1", 2_600));
+
+        let spans = h.spans.get_finished_spans().unwrap();
+        let stages: Vec<_> = spans
+            .iter()
+            .filter(|span| span.name == "agent.stage")
+            .collect();
+        let runs: Vec<_> = spans
+            .iter()
+            .filter(|span| span.name == "agent.run")
+            .collect();
+        assert_eq!(stages.len(), 3, "{spans:?}");
+        assert_eq!(runs.len(), 1, "{spans:?}");
+        let run = runs[0];
+        assert_eq!(run.start_time, ms_to_time(1_000));
+        assert_eq!(run.end_time, ms_to_time(2_600));
+
+        let span_ids: HashSet<_> = stages
+            .iter()
+            .map(|stage| stage.span_context.span_id())
+            .collect();
+        assert_eq!(
+            span_ids.len(),
+            3,
+            "stage spans must have distinct IDs: {stages:?}"
+        );
+
+        let stage_details: Vec<_> = stages
+            .iter()
+            .map(|stage| {
+                let index = stage
+                    .attributes
+                    .iter()
+                    .find(|kv| kv.key.as_str() == "leviath.stage.index")
+                    .expect("stage index attribute")
+                    .value
+                    .clone();
+                let name = stage
+                    .attributes
+                    .iter()
+                    .find(|kv| kv.key.as_str() == "leviath.stage.name")
+                    .expect("stage name attribute")
+                    .value
+                    .clone();
+                (index, name, stage.start_time, stage.end_time)
+            })
+            .collect();
+        assert_eq!(
+            stage_details,
+            vec![
+                (
+                    opentelemetry::Value::I64(0),
+                    opentelemetry::Value::from("stage0"),
+                    ms_to_time(1_100),
+                    ms_to_time(1_500),
+                ),
+                (
+                    opentelemetry::Value::I64(1),
+                    opentelemetry::Value::from("stage1"),
+                    ms_to_time(1_600),
+                    ms_to_time(2_000),
+                ),
+                (
+                    opentelemetry::Value::I64(0),
+                    opentelemetry::Value::from("stage0"),
+                    ms_to_time(2_100),
+                    ms_to_time(2_500),
+                ),
+            ]
+        );
+        for stage in stages {
+            assert_eq!(stage.parent_span_id, run.span_context.span_id());
+            assert_eq!(stage.span_context.trace_id(), run.span_context.trace_id());
+        }
+    }
+    #[test]
     fn inference_span_nests_under_the_open_stage() {
         let h = harness();
         h.sink.emit(run_started("r1", 0));
