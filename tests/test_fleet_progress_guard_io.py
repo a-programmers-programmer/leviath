@@ -36,7 +36,8 @@ def setup(tmp_path):
 
 
 def ps(runs=None, finished=None, health=None):
-    return json.dumps({"runs": runs or [], "finished": finished or [], "health": health or {"ok": True}})
+    return json.dumps({"runs": runs or [], "finished": finished or [],
+                       "health": health or {"redrive_secs": 30, "dead_cycles": 0, "tools_busy": 0}})
 
 
 def result(stdout, rc=0):
@@ -148,6 +149,94 @@ def test_missing_and_corrupt_state_fail_closed_and_preserve_corrupt_bytes(tmp_pa
     assert io.tick(p, state, receipt, "lev", runs, now=121, run=runner) == 1
     assert raw in [f.read_bytes() for f in tmp_path.glob("state.json.corrupt.*")]
     assert json.loads(state.read_text())["core"]["cancel_reason"] == "corrupt_state"
+
+
+def test_observe_accepts_documented_live_statuses(tmp_path):
+    for status in ("waiting", "paused", "idle"):
+        p, runs, _, _ = setup(tmp_path / status)
+        (runs / "target" / "meta.json").write_text(json.dumps({"status": status, "cost_usd": 1.25,
+            "children": [], "unpriced_calls": 0}))
+        runner, _ = native_runner(ps([{"run_id": "target", "status": status}]))
+        observation, summary = io.observe(p, "lev", runs, runner)
+        assert observation == {"status": status, "live": True, "cost_usd": 1.25}
+        assert summary["known"]
+
+
+@pytest.mark.parametrize("cost", [float("nan"), float("inf"), -float("inf")])
+def test_tick_nonfinite_cost_persists_cancel_before_native_cancel(tmp_path, cost):
+    p, runs, state, receipt = setup(tmp_path)
+    (runs / "target" / "meta.json").write_text(json.dumps({"status": "running", "cost_usd": cost,
+        "children": [], "unpriced_calls": 0}))
+    calls = []
+    def runner(argv, **kwargs):
+        calls.append(argv)
+        if argv[1] == "cancel":
+            saved = json.loads(state.read_text())
+            assert saved["core"]["cancel_reason"] == "invalid_observation"
+            assert saved["observation"]["cost_usd"] is None
+        return result(ps([{"run_id": "target", "status": "running"}]))
+    assert io.tick(p, state, receipt, "lev", runs, now=120, run=runner) == 1
+    assert calls == [["lev", "ps", "--json"], ["lev", "cancel", "target"]]
+
+
+@pytest.mark.parametrize("invalid", ["not-a-time", float("nan"), float("inf"), -float("inf")])
+def test_invalid_last_cancel_at_preserves_state_and_cancels(tmp_path, invalid):
+    p, runs, state, receipt = setup(tmp_path)
+    wrapper = json.loads(state.read_text())
+    wrapper["core"]["cancel_reason"] = "hard_deadline"
+    wrapper["last_cancel_at"] = invalid
+    raw = json.dumps(wrapper, allow_nan=True).encode()
+    state.write_bytes(raw)
+    calls = []
+    def runner(argv, **kwargs):
+        calls.append(argv)
+        if argv[1] == "cancel":
+            assert raw in [f.read_bytes() for f in tmp_path.glob("state.json.corrupt.*")]
+            assert json.loads(state.read_text())["core"]["cancel_reason"] == "corrupt_state"
+        return result(ps([{"run_id": "target", "status": "running"}]))
+    assert io.tick(p, state, receipt, "lev", runs, now=120, run=runner) == 1
+    assert calls == [["lev", "ps", "--json"], ["lev", "cancel", "target"]]
+
+
+def test_main_normal_mode_polls_until_fresh_terminal_proof(tmp_path, monkeypatch):
+    p, runs, state, receipt = setup(tmp_path)
+    p["first_checkpoint"] = 110.0
+    p["window_seconds"] = 10.0
+    wrapper = json.loads(state.read_text())
+    wrapper["core"] = io.initial_state(p)
+    state.write_text(json.dumps(wrapper))
+    policyfile = tmp_path / "policy.json"
+    policyfile.write_text(json.dumps(p))
+    (runs / "target" / "meta.json").write_text(json.dumps({"status": "running", "cost_usd": 1.25,
+        "children": [], "unpriced_calls": 0}))
+    polls = []
+    cancels = []
+    sleeps = []
+    clock = [109.0]
+    def runner(argv, **kwargs):
+        if argv[1] == "ps":
+            polls.append(argv)
+            if len(polls) >= 5 and cancels:
+                (runs / "target" / "meta.json").write_text(json.dumps({"status": "Complete", "cost_usd": 1.25,
+                    "children": [], "unpriced_calls": 0}))
+                return result(ps([], [{"run_id": "target", "status": "Complete"}]))
+            return result(ps([{"run_id": "target", "status": "running"}]))
+        cancels.append(argv)
+        saved = json.loads(state.read_text())
+        assert saved["core"]["cancel_reason"] == "missed_checkpoints"
+        assert saved["cancel_attempts"] == 1
+        return result("")
+    def sleep(seconds):
+        sleeps.append(seconds)
+        clock[0] += 10
+        if len(sleeps) > 8:
+            pytest.fail("normal mode exceeded eight polls")
+    assert io.main(["--policy", str(policyfile), "--state", str(state), "--receipt", str(receipt),
+                    "--native-lev", "lev", "--runs-dir", str(runs), "--poll-seconds", "10"],
+                   run=runner, clock=lambda: clock[0], sleep=sleep) == 0
+    assert len(polls) >= 5 and len(sleeps) >= 4
+    assert cancels == [["lev", "cancel", "target"]]
+    assert json.loads(state.read_text())["core"]["terminal_verified"] is True
 
 
 def test_main_once_does_not_sleep_and_init_refuses_overwrite(tmp_path, monkeypatch):

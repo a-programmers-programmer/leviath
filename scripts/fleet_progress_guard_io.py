@@ -3,6 +3,7 @@
 import argparse
 import fcntl
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -13,6 +14,7 @@ import time
 from fleet_progress_guard import decide, initial_state
 
 _TERMINAL = {"complete", "completed", "failed", "cancelled", "canceled", "stopped", "error"}
+_LIVE = {"running", "active", "queued", "pending", "waiting", "paused", "idle"}
 
 
 def _json(path):
@@ -67,8 +69,6 @@ def observe(policy, native_lev="/data/bin/lev", runs_dir="/data/.leviath/runs", 
         payload = json.loads(result.stdout)
         if not isinstance(payload, dict) or not isinstance(payload.get("health"), dict):
             raise ValueError("invalid_daemon_schema")
-        if not isinstance(payload["health"].get("ok"), bool) or not payload["health"]["ok"]:
-            raise ValueError("daemon_unreachable")
         live_ids = _row_ids(payload.get("runs"))
         finished_ids = _row_ids(payload.get("finished"))
         if live_ids & finished_ids:
@@ -86,15 +86,15 @@ def observe(policy, native_lev="/data/bin/lev", runs_dir="/data/.leviath/runs", 
         children = meta.get("children")
         unpriced = meta.get("unpriced_calls")
         if (not isinstance(status, str) or not status.strip() or isinstance(cost, bool) or
-                not isinstance(cost, (int, float)) or cost < 0 or
+                not isinstance(cost, (int, float)) or not math.isfinite(cost) or cost < 0 or
                 not isinstance(unpriced, int) or isinstance(unpriced, bool) or unpriced != 0 or
                 not isinstance(children, list) or children):
             raise ValueError("invalid_or_unpriced_meta")
         if live and (status.lower() in _TERMINAL or not isinstance(native_status, str) or native_status.lower() in _TERMINAL):
             raise ValueError("native_status_mismatch")
-        if live and not target_finished and status.lower() not in {"running", "active", "queued", "pending"}:
+        if live and not target_finished and status.lower() not in _LIVE:
             raise ValueError("native_status_mismatch")
-        if live and status.lower() not in {"running", "active", "queued", "pending"}:
+        if live and status.lower() not in _LIVE:
             raise ValueError("native_status_mismatch")
         if not live and not target_finished and status.lower() not in _TERMINAL:
             raise ValueError("absent_nonterminal_meta")
@@ -134,9 +134,16 @@ def tick(policy, state_path, receipt_path, native_lev="/data/bin/lev", runs_dir=
     try:
         raw = path.read_bytes()
         wrapper = json.loads(raw)
-        if (not isinstance(wrapper, dict) or set(wrapper) != {"core", "cancel_attempts", "last_cancel_at", "unresolved_cancel", "observation"} or
-                not isinstance(wrapper["cancel_attempts"], int) or isinstance(wrapper["cancel_attempts"], bool) or
-                wrapper["cancel_attempts"] < 0 or not isinstance(wrapper["unresolved_cancel"], bool)):
+        if not isinstance(wrapper, dict) or set(wrapper) != {"core", "cancel_attempts", "last_cancel_at", "unresolved_cancel", "observation"}:
+            raise ValueError("corrupt_state")
+        last_cancel_at = wrapper["last_cancel_at"]
+        invalid_last_cancel = (last_cancel_at is not None and
+                               (isinstance(last_cancel_at, bool) or
+                                not isinstance(last_cancel_at, (int, float)) or
+                                not math.isfinite(last_cancel_at)))
+        if (not isinstance(wrapper["cancel_attempts"], int) or isinstance(wrapper["cancel_attempts"], bool) or
+                wrapper["cancel_attempts"] < 0 or not isinstance(wrapper["unresolved_cancel"], bool) or
+                invalid_last_cancel):
             raise ValueError("corrupt_state")
     except FileNotFoundError:
         wrapper = _fresh_wrapper(policy, "missing_state")
@@ -201,7 +208,7 @@ def tick(policy, state_path, receipt_path, native_lev="/data/bin/lev", runs_dir=
     return 1 if wrapper["unresolved_cancel"] else 0
 
 
-def main(argv=None):
+def main(argv=None, run=subprocess.run, clock=time.time, sleep=time.sleep):
     parser = argparse.ArgumentParser()
     parser.add_argument("--policy", required=True)
     parser.add_argument("--state", required=True)
@@ -233,10 +240,10 @@ def main(argv=None):
                 os.fsync(stream.fileno())
             return 0
         while True:
-            rc = tick(policy, args.state, args.receipt, args.native_lev, args.runs_dir)
-            if args.once or rc == 0:
-                return rc
-            time.sleep(max(0.1, args.poll_seconds))
+            rc = tick(policy, args.state, args.receipt, args.native_lev, args.runs_dir, now=clock(), run=run)
+            if args.once or json.loads(state_path.read_text(encoding="utf-8")).get("core", {}).get("terminal_verified"):
+                return 0 if args.once and rc == 0 else rc
+            sleep(max(0.1, args.poll_seconds))
     except (OSError, ValueError, TypeError) as exc:
         print(f"progress guard IO error: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
