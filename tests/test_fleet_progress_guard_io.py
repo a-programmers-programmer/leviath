@@ -265,3 +265,56 @@ def test_lock_contention_and_persistence_errors_surface(tmp_path, monkeypatch):
     runner, _ = native_runner(ps([{"run_id": "target", "status": "running", "active": {}}]))
     with pytest.raises(OSError):
         io.tick(p, state, receipt, "lev", runs, now=120, run=runner)
+
+
+def test_main_supervises_absent_waiting_input_until_two_misses_then_terminal(tmp_path):
+    p, runs, state, receipt = setup(tmp_path)
+    p["first_checkpoint"] = 110.0
+    p["window_seconds"] = 10.0
+    wrapper = json.loads(state.read_text())
+    wrapper["core"] = io.initial_state(p)
+    state.write_text(json.dumps(wrapper))
+    (runs / "target" / "meta.json").write_text(json.dumps({
+        "status": "waiting_input", "cost_usd": 0, "children": [], "unpriced_calls": 0,
+    }))
+    policyfile = tmp_path / "policy.json"
+    policyfile.write_text(json.dumps(p))
+    polls = []
+    cancels = []
+    sleeps = []
+    clock = [109.0]
+
+    def runner(argv, **kwargs):
+        if argv[1] == "ps":
+            polls.append(argv)
+            if len(polls) == 1:
+                observation, summary = io.observe(p, "lev", runs,
+                    lambda *args, **kw: result(ps([], [], {"healthy": True})))
+                assert observation == {"status": "waiting_input", "live": False, "cost_usd": 0.0}
+                assert summary["known"]
+            if len(polls) >= 4 and cancels:
+                (runs / "target" / "meta.json").write_text(json.dumps({
+                    "status": "complete", "cost_usd": 0, "children": [], "unpriced_calls": 0,
+                }))
+                return result(ps([], [], {"healthy": True}))
+            return result(ps([], [], {"healthy": True}))
+        cancels.append(argv)
+        saved = json.loads(state.read_text())
+        assert saved["core"]["cancel_reason"] == "missed_checkpoints"
+        assert saved["core"]["misses"] == 2
+        assert saved["cancel_attempts"] == 1
+        return result("")
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        clock[0] += 10
+
+    assert io.main(["--policy", str(policyfile), "--state", str(state), "--receipt", str(receipt),
+                    "--native-lev", "lev", "--runs-dir", str(runs), "--poll-seconds", "10"],
+                   run=runner, clock=lambda: clock[0], sleep=sleep) == 0
+    assert len(polls) == 4
+    assert cancels == [["lev", "cancel", "target"]]
+    assert len(sleeps) == 3
+    saved = json.loads(state.read_text())
+    assert saved["core"]["terminal_verified"] is True
+    assert saved["cancel_attempts"] == 1

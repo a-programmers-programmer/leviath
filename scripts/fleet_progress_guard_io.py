@@ -14,7 +14,7 @@ import time
 from fleet_progress_guard import decide, initial_state
 
 _TERMINAL = {"complete", "completed", "failed", "cancelled", "canceled", "stopped", "error"}
-_LIVE = {"running", "active", "queued", "pending", "waiting", "paused", "idle"}
+_LIVE = {"running", "active", "queued", "pending", "waiting", "waiting_input", "paused", "idle"}
 
 
 def _json(path):
@@ -96,7 +96,7 @@ def observe(policy, native_lev="/data/bin/lev", runs_dir="/data/.leviath/runs", 
             raise ValueError("native_status_mismatch")
         if live and status.lower() not in _LIVE:
             raise ValueError("native_status_mismatch")
-        if not live and not target_finished and status.lower() not in _TERMINAL:
+        if not live and not target_finished and status.lower() not in _TERMINAL and status.lower() != "waiting_input":
             raise ValueError("absent_nonterminal_meta")
         return {"status": status, "live": live, "cost_usd": float(cost)}, {
             "known": True, "status": status, "live": live, "cost_usd": float(cost), "error": None,
@@ -188,7 +188,8 @@ def tick(policy, state_path, receipt_path, native_lev="/data/bin/lev", runs_dir=
     if cancel and summary["known"] and summary["live"] is False:
         # Core needs terminal meta as well as non-live observation. Unknown becomes no proof.
         pass
-    should_cancel = cancel and (not summary["known"] or summary["live"] is not False)
+    should_cancel = cancel and (not summary["known"] or summary["live"] is not False or
+                                summary.get("status", "").lower() == "waiting_input")
     if should_cancel and (wrapper["last_cancel_at"] is None or now - wrapper["last_cancel_at"] >= 30):
         wrapper["cancel_attempts"] += 1
         wrapper["last_cancel_at"] = now
