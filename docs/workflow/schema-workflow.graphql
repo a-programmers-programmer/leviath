@@ -2,7 +2,11 @@
 # WORKFLOW ABSTRACTION — GraphQL SCHEMA + AUTHORING MODEL
 # Bead: d-type-workflow (SUPERSEDES earlier locks; substantive revision)
 #
-# CORE MODEL (Josh, converged 2026-09-08):
+# Contract: workflow-model v1 — reconciled by work order GQL-01, 2026-09-12.
+# Spec:     docs/workflow/workflow-reconciliation-v1.md
+# Gate:     docs/workflow/check-workflow-contract.py
+#
+# CORE MODEL (Josh, converged 2026-09-08 — unchanged by the reconciliation):
 #   - WorkflowStep IS the callable (no StepContract wrapper, no binding, no
 #     stepNumber, no prev/next). A step is a NODE: typed input + output +
 #     a search annotation, and (implicitly) the code that runs it.
@@ -16,12 +20,50 @@
 #     declared on the type. SENSITIVE data uses a monadic confirmation gate.
 #   - dataType DERIVES from implementing type; exhaustive typechecking rides
 #     interface + codegen switch. No unions/string-bags for data.
-# =========================================================================
+#
+# RECONCILIATION RULES (GQL-01, 2026-09-12 — normative; see the spec):
+#   R1 DOMAIN PORT != INPUT OBJECT. WorkflowStepInput/WorkflowStepOutput are
+#      domain ports (GraphQL interfaces). GraphQL forbids an interface from
+#      being an input type, so a port is NEVER an argument type. In this file
+#      `*Input`/`*Output` name PORT DIRECTION, not a GraphQL input object.
+#   R2 INPUT TRANSPORT. Mutations take intent arguments; the domain port value
+#      travels inside ONE generated finite envelope (`PortValue`) whose codec is
+#      generated from the registered port implementations. There is no
+#      hand-maintained Create*/Update* mirror and no per-port input type.
+#   R3 SEVERITY != ENFORCEMENT LOCATION. `severity` says HOW BAD a violation is
+#      (WARN | ERROR); `enforcedAt` says WHERE it is checked. Two concepts, two
+#      fields. Severity is a fixed function of the rule, never chosen per edge.
+#   R4 ERROR IS NOT WAIVABLE. A violated ERROR invariant yields an
+#      InvariantRejection, which structurally has no waiver arm. ACYCLIC is
+#      ERROR by contract, so a cycle can never be waived into a DAG.
+#   R5 OUTCOME SHAPE. A closed finite set of symbolic values with no payload is
+#      an ENUM. An outcome that carries per-variant payload is a UNION (gated-
+#      value pattern). An interface is for shapes queried through a shared
+#      contract, never for "exactly one of N".
+#   R6 AUTHORITY. A sensitive value is an opaque scalar (`Confidential`) or the
+#      generated envelope codec. The directive DECLARES the gate; authority is
+#      the authenticated principal plus the exact approved intent.
+# =====================================================================
 
 scalar DateTime
 scalar Duration
 scalar Decimal
 scalar URI
+
+"""
+Opaque sensitive value (R6). No read path returns its contents; it unwraps only
+through the confirmation gate, under the authenticated principal and the exact
+approved intent the gate recorded.
+"""
+scalar Confidential
+
+"""
+Transport envelope for a domain port value (R1, R2). Its admissible shapes are
+exactly the registered WorkflowStepInput implementations, so the codec is
+GENERATED from the port registry — a finite generated envelope, not a
+hand-maintained Create*/Update* input mirror.
+"""
+scalar PortValue
 
 directive @sink2sync(
   """The side that initiated the last edit: SCHEMA or CODE. Symmetric — neither canonical."""
@@ -30,32 +72,49 @@ directive @sink2sync(
   counterpart: URI
 ) on SCHEMA
 
-directive @user_confirmation(
-  """Who/what must confirm to unwrap the monadic value (e.g. the step Runner / a human gate)."""
-  by: String!
-  """Hard-coded by implementation of the monad; a directive DECLARES, code unwraps."""
-) on FIELD_DEFINITION | ARGUMENT_DEFINITION
-
 enum Side { SCHEMA CODE }
+
+enum ConfirmationAuthority {
+  """The authenticated principal on the request that approved the exact intent."""
+  AUTHENTICATED_PRINCIPAL
+  """A human review gate (Desk/UI) resolved the request."""
+  HUMAN_GATE
+  """The step runner unwraps the value for the duration of one step execution."""
+  STEP_RUNNER
+}
+
+"""
+Declares that a sensitive value is gated. DECLARATION ONLY (R6): the value stays
+opaque and unwraps only through the confirm gate. A directive alone confers no
+authority, and no secret is ever carried in the directive.
+"""
+directive @user_confirmation(
+  """Who or what must confirm before the value unwraps."""
+  by: ConfirmationAuthority!
+) on FIELD_DEFINITION | ARGUMENT_DEFINITION
 
 enum ISO4217 { USD EUR GBP }
 enum Provider { OPENAI ANTHROPIC GOOGLE AWS DEEPSEEK ALIBABA META MISTRAL REPLICATE FAL HUGGINGFACE CUSTOM }
 enum ModelFamily { GPT4 CLAUDE GEMINI LLAMA QWEN DEEPSEEK NOVA STABLE_DIFFUSION FLUX ELEVENLABS WHISPER }
 
 # ---------------------------------------------------------------------------
-# 1. STEP INPUT / OUTPUT — separate interfaces. dataType = the implementing type.
+# 1. DOMAIN PORTS. Interfaces (R1). dataType DERIVES from the implementing
+#    type. `*Input`/`*Output` is port direction: none of these types is a
+#    GraphQL input object and none may be used as an argument type.
 # ---------------------------------------------------------------------------
 interface WorkflowStepInput {
+  """Human-readable annotation: search/discovery + authoring (Sept 8 decision)."""
   simpleEnglishDescription: String!
 }
 interface WorkflowStepOutput {
+  """Human-readable annotation: search/discovery + authoring (Sept 8 decision)."""
   simpleEnglishDescription: String!
 }
 
-type OAuthRedirectCodeInput implements WorkflowStepInput { simpleEnglishDescription: String!  code: String!  state: String! }
+type OAuthRedirectCodeInput implements WorkflowStepInput { simpleEnglishDescription: String!  code: Confidential!  state: String! }
 type OAuthRefreshTokenInput implements WorkflowStepInput {
   simpleEnglishDescription: String!
-  token: String @user_confirmation(by: "runner")   # monadic sensitive string
+  token: Confidential @user_confirmation(by: STEP_RUNNER)
   expiresAt: DateTime!
   scope: [String!]!
 }
@@ -66,7 +125,7 @@ type FileSpecInput           implements WorkflowStepInput { simpleEnglishDescrip
 
 type OAuthRefreshTokenOutput implements WorkflowStepOutput {
   simpleEnglishDescription: String!
-  token: String @user_confirmation(by: "runner")
+  token: Confidential @user_confirmation(by: STEP_RUNNER)
   expiresAt: DateTime!
   scope: [String!]!
 }
@@ -76,7 +135,8 @@ type MoneyOutput             implements WorkflowStepOutput { simpleEnglishDescri
 type FileSpecOutput          implements WorkflowStepOutput { simpleEnglishDescription: String!  path: String!  checksum: String!  size: Int! }
 
 # ---------------------------------------------------------------------------
-# 2. WORKFLOW STEP — a NODE. IS the callable.
+# 2. WORKFLOW STEP — a NODE. IS the callable. No wrapper, no binding, no
+#    stepNumber, no prev/next.
 # ---------------------------------------------------------------------------
 type WorkflowStep {
   id: ID!
@@ -88,6 +148,9 @@ type WorkflowStep {
 
 # ---------------------------------------------------------------------------
 # 3. WORKFLOW EDGE — first-class. Graph relationships + invariants live here.
+#    Edge kinds are the Sept-8 set: branch / gate / join / parallel. There is
+#    deliberately no linear "NEXT" kind (that would be an ordering pointer and
+#    a prev/next revival); sequencing is expressed by the edges themselves.
 # ---------------------------------------------------------------------------
 type WorkflowEdge {
   id: ID!
@@ -97,15 +160,90 @@ type WorkflowEdge {
   condition: EdgeCondition
   relationship: [EdgeInvariant!]!
 }
-enum EdgeKind { NEXT PARALLEL JOIN SIGNAL_ON }
+enum EdgeKind { BRANCH GATE JOIN PARALLEL }
 type EdgeCondition { signal: String!  fromOutput: String! }
+
+"""
+An evaluated invariant on an edge. `severity` (how bad) and `enforcedAt` (where
+it is checked) are separate concepts and separate fields (R3). Which rule gets
+which severity is fixed by the rule contract, not chosen per instance — see
+Query.edgeInvariantRules.
+"""
 type EdgeInvariant {
   rule: EdgeInvariantRule!
   severity: EdgeInvariantSeverity!
-  reason: String           # required to override a WARN
+  enforcedAt: [InvariantEnforcement!]!
+  disposition: InvariantDisposition!
 }
-enum EdgeInvariantRule { NO_TRANSITIVE_ANCESTOR ACYCLIC }
+
+enum EdgeInvariantRule {
+  """No transitive ancestor relation may be re-declared as a direct edge."""
+  NO_TRANSITIVE_ANCESTOR
+  """The steps+edges graph must be acyclic. A cycle is not a DAG."""
+  ACYCLIC
+}
+"""How bad a violation is. Independent of where it is enforced (R3)."""
 enum EdgeInvariantSeverity { WARN ERROR }
+
+"""Where a rule is checked. Independent of how bad its violation is (R3)."""
+enum InvariantEnforcement {
+  """Checked by the authoring reconciler (schema<->code 2-way sync) and the LSP."""
+  AUTHORING_RECONCILER
+  """Checked by the runner before a workflow is dispatched."""
+  RUN_PREFLIGHT
+}
+
+"""
+Fixed rule -> (severity, enforcedAt, waivable) contract. Published so the
+reconciler, the pre-flight runner and reviewers read ONE table, and so severity
+can never be re-declared per edge instance.
+"""
+type EdgeInvariantRuleContract {
+  rule: EdgeInvariantRule!
+  severity: EdgeInvariantSeverity!
+  enforcedAt: [InvariantEnforcement!]!
+  """
+  True iff a violation may be acknowledged and carried. Contract: true for WARN,
+  false for ERROR (R4). ACYCLIC is ERROR and therefore never waivable.
+  """
+  waivable: Boolean!
+}
+
+"""
+The invariant did not hold as a rejection (R4). This type has NO waiver field:
+an ERROR violation cannot be acknowledged away, and ACYCLIC is ERROR.
+"""
+type InvariantRejection {
+  rule: EdgeInvariantRule!
+  severity: EdgeInvariantSeverity!
+  enforcedAt: [InvariantEnforcement!]!
+  """Why it failed, in the caller's terms."""
+  reason: String!
+}
+
+"""A WARN was violated and explicitly acknowledged with a reason (R4)."""
+type InvariantWaiver {
+  rule: EdgeInvariantRule!
+  severity: EdgeInvariantSeverity!
+  enforcedAt: [InvariantEnforcement!]!
+  reason: String!
+  """The principal that acknowledged the WARN."""
+  acknowledgedBy: String! @user_confirmation(by: AUTHENTICATED_PRINCIPAL)
+}
+
+"""Nothing was violated (R4)."""
+type InvariantSatisfied {
+  rule: EdgeInvariantRule!
+  severity: EdgeInvariantSeverity!
+  enforcedAt: [InvariantEnforcement!]!
+}
+
+"""
+What happened when the invariant was evaluated. Union, not a nullable reason
+field with an implicit contract (R5): ERROR can be Satisfied or Rejected, never
+Waived, so a cycle cannot be waived into a DAG.
+"""
+union InvariantDisposition = InvariantSatisfied | InvariantWaiver | InvariantRejection
 
 # ---------------------------------------------------------------------------
 # 4. WORKFLOW DEFINITION — a DAG of steps + edges, one input + one output.
@@ -120,8 +258,22 @@ type WorkflowDefinition {
   output: WorkflowStepOutput!
   steps: [WorkflowStep!]!
   edges: [WorkflowEdge!]!
+  """Structural verdict for this graph; computed, not authored."""
+  validation: WorkflowValidation!
   createdAt: DateTime!
   updatedAt: DateTime!
+}
+
+"""
+Structural verdict (R4). `dispatchable` is false whenever any ERROR invariant is
+rejecting, and a rejection carries no waiver, so an ERROR cycle cannot be waived
+into a DAG.
+"""
+type WorkflowValidation {
+  """True only when the graph has at least one step and no ERROR rejection."""
+  dispatchable: Boolean!
+  rejections: [InvariantRejection!]!
+  waivers: [InvariantWaiver!]!
 }
 
 # ---------------------------------------------------------------------------
@@ -134,14 +286,56 @@ enum WorkflowState {
   SUCCEEDED FAILED BUDGET_STOPPED
 }
 
+"""
+What the caller decides at a gate. Input-side, finite, symbolic, no payload:
+an ENUM, and only the values a caller may choose (R5).
+"""
+enum GateDecision { APPROVE REJECT }
+
+"""
+What actually happened at a gate, including states the caller cannot choose
+(expiry). Outcome-side: an ENUM because it carries no per-variant payload, and
+it must NOT be reused as an input, because a caller cannot decide EXPIRED (R5).
+"""
+enum GateOutcome { APPROVED REJECTED EXPIRED }
+
+type GateResolution {
+  gate: MatchGate!
+  outcome: GateOutcome!
+  decidedBy: String!
+  note: String
+}
+
+"""Typed, expected failure. Expected domain outcomes are data, not strings."""
+type RunError { code: String!  message: String!  retryable: Boolean! }
+
+"""
+Run outcomes carry per-variant payload, so they are a UNION (R5, gated-value
+pattern), not a nullable `output`/`error` pair whose nulls carry implicit
+meaning.
+"""
+union WorkflowRunOutcome = RunSucceeded | RunFailed | RunStopped | RunPending
+
+type RunSucceeded { output: WorkflowStepOutput!  completedAt: DateTime! }
+type RunFailed    { error: RunError!            failedAt: DateTime! }
+type RunStopped   { reason: String!             stoppedAt: DateTime! }
+type RunPending   { awaiting: GateResolution    resumeAfter: DateTime }
+
 type WorkflowRun {
-  id: ID!  state: WorkflowState!  workflowId: ID
-  input: WorkflowStepInput  output: WorkflowStepOutput
-  artifacts: [ArtifactRef!]!  audit: [AuditEvent!]!  error: String
+  id: ID!
+  state: WorkflowState!
+  workflow: WorkflowDefinition!
+  input: WorkflowStepInput!
+  outcome: WorkflowRunOutcome!
+  artifacts: [ArtifactRef!]!
+  audit: [AuditEvent!]!
 }
 type WorkflowStepRun {
-  id: ID!  state: WorkflowState!  stepId: ID!
-  input: WorkflowStepInput  output: WorkflowStepOutput  error: String
+  id: ID!
+  state: WorkflowState!
+  step: WorkflowStep!
+  input: WorkflowStepInput!
+  outcome: WorkflowRunOutcome!
 }
 type ArtifactRef { kind: String!  checksum: String!  uri: URI }
 type AuditEvent {
@@ -156,16 +350,25 @@ type WorkflowSearchResult { outcome: SearchOutcome!  matches: [WorkflowSearchMat
 enum SearchOutcome { RESOLVED NO_MATCH AMBIGUOUS }
 type WorkflowSearchMatch {
   workflow: WorkflowDefinition!  gatesCleared: [GateResult!]!
-  historicalSuccessRate: Float  expectedCost: Money  matchReasons: [String!]!
+  historicalSuccessRate: Float  expectedCost: MoneyOutput  matchReasons: [String!]!
 }
-type GateResult { gate: MatchGate!  passed: Boolean!  evidence: String }
+type GateResult { gate: MatchGate!  outcome: GateCheckOutcome!  evidence: String }
 enum MatchGate { TYPECONFORMANCE EFFECT_SUBSET BUDGET_FEASIBLE RESIDENCY_COMPATIBLE HISTORICAL_SUCCESS COST_EFFICIENCY SPECIFICITY }
-scalar Money
+"""
+Three-valued on purpose: "not evaluated" is a real state and must not be
+encoded as a nullable Boolean (R5).
+"""
+enum GateCheckOutcome { PASSED FAILED NOT_EVALUATED }
 
 # ---------------------------------------------------------------------------
 # 7. QUERIES & MUTATIONS
 #    Authoring is the SCHEMA<->CODE 2-WAY SYNC (@sink2sync). Runtime dispatch
 #    still runs workflows/steps. No mirror Create*Input types.
+#
+#    INPUT TRANSPORT (R2): mutations take INTENT ARGUMENTS; the domain port
+#    value travels in the single generated finite envelope `PortValue`. A port
+#    interface is never an argument type (R1) — that is what made the previous
+#    revision fail to build.
 # ---------------------------------------------------------------------------
 type Query {
   searchWorkflows(query: String!, domain: String): WorkflowSearchResult!
@@ -173,10 +376,18 @@ type Query {
   workflow(id: ID!): WorkflowDefinition!
   workflowByName(name: String!): WorkflowDefinition!
   workflowRun(id: ID!): WorkflowRun!
+  """The finite rule -> (severity, enforcedAt, waivable) contract table (R3/R4)."""
+  edgeInvariantRules: [EdgeInvariantRuleContract!]!
 }
 
 type Mutation {
-  dispatchWorkflow(workflowId: ID!, input: WorkflowStepInput!): WorkflowRun!
-  runWorkflowStep(stepId: ID!, input: WorkflowStepInput!): WorkflowStepRun!
-  respondToGate(runId: ID!, approval: Boolean!, note: String): WorkflowRun!
+  """Dispatch a whole workflow. `input` is the workflow's declared input port,
+  encoded in the generated PortValue envelope (R2)."""
+  dispatchWorkflow(workflowId: ID!, input: PortValue!): WorkflowRun!
+  """Run one callable step. `input` is the step's declared input port, encoded
+  in the generated PortValue envelope (R2)."""
+  runWorkflowStep(stepId: ID!, input: PortValue!): WorkflowStepRun!
+  """Resolve a pending confirmation gate. `decision` is an input-side enum; the
+  recorded GateOutcome is the outcome-side enum (R5)."""
+  respondToGate(runId: ID!, decision: GateDecision!, note: String): WorkflowRun!
 }
