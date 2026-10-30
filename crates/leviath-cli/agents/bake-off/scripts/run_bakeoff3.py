@@ -1,132 +1,68 @@
 #!/usr/bin/env python3
 """
-HarnessQL bakeoff runner v3 — diff-based merge for level N>0.
-Level 0: 2 parallel lanes on SEED (unchanged, full-schema iteration).
-Level N>0: compute compact diff of the two candidates, hand the diff to
-each lane for reconciliation decisions, then apply_merge to produce output.
+HarnessQL bakeoff runner v3 — diff-based merge for level N>0 (portable, GQL-09).
 
-Uses LeviathClient.run_and_wait (async, no spawn-race).
+Level 0: two parallel lanes on the seed (full-schema iteration).
+Level N>0: compute the COMPACT diff of the two candidates, hand it to the
+`bake-merge` lane (which has no file tools), then apply the returned STRUCTURED
+decision document with merge_decisions, and parse-gate the result.
+
+Portability (GQL-09):
+  * every path comes from :mod:`harnessql_paths` (agent-relative, `HARNESSQL_*`
+    overridable) — no `/data/work/leviath` default and no `/data/work/leviath/python`
+    import;
+  * no key file is read: `lev` owns its own credentials;
+  * decisions are the harnessql-merge-decisions/v1 JSON document, not prose. A
+    lane that answers with prose is rejected by `merge_decisions.validate`, and
+    the rejection is reported, never reinterpreted.
 """
-import asyncio, sys, os, json, textwrap
+import os
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
-sys.path.insert(0, "/data/work/leviath/python")
-sys.path.insert(0, "/data/work/leviath/study")
-from leviath import LeviathClient
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import harnessql_driver as driver
+import harnessql_paths
+from graphql import build_schema
+from graphql_diff import diff_types
 from harnessql import identical
-from graphql import build_schema, GraphQLSyntaxError
-from graphql_diff import (
-    diff_types, apply_merge, parse_decisions, MergeDecision,
-    extract_type_names, SchemaDiff
-)
+from merge_decisions import MergeDecisionError, decision_json_schema
 
-STUDY = "/data/work/leviath/study"
-BO = os.path.join(STUDY, "bakeoff")
-os.makedirs(BO, exist_ok=True)
-SEED = os.path.join(STUDY, "B2.graphql")
+BO = harnessql_paths.workdir()
+BO.mkdir(parents=True, exist_ok=True)
+SEED = harnessql_paths.default_seed()
 MAX_LEVELS = 5
-env = {"OPENROUTER_API_KEY": open("/data/state/openrouter_key.txt").read().strip()}
+LANE_AGENT = "bake-off"
+MERGE_AGENT = "bake-merge"
+MAX_LANE_RETRIES = 2
 
 
-def build_diff_task(diff: SchemaDiff, label: str) -> str:
-    """Build a compact task for a flash lane to decide on divergent types."""
-    summary = diff.summary()
-
-    # Identify likely renames between only_a and only_b
-    renames = _guess_renames(diff)
-
-    task = textwrap.dedent(f"""\
-    BAKE_OFF label={label} MERGE_DECISIONS
-
-    You are a schema arbitrator. Below is a COMPACT DIFF between two candidate
-    GraphQL schemas (A and B) for the same domain. Your job: for each DIVERGENT
-    type, decide whether to keep A's version, keep B's version, or reconcile
-    (pick specific fields from each). Output your decisions in the format
-    below, then call submit_output with the decisions text.
-
-    === DIFF SUMMARY ===
-    {summary}
-
-    === LIKELY RENAMES (A name → B name) ===
-    {_format_renames(renames)}
-
-    === DECISION FORMAT ===
-    For each divergent type, output one block:
-      TYPE <TypeName>: reconcile | keep_a | keep_b
-      REASON: <one line; for keep_* name the STRUCTURAL reason, not a preference>
-      FIELDS: <comma-separated field names>   (required when reconcile: the fields to
-               carry over from the other side onto A's base definition)
-
-    For each likely rename pair, output:
-      RENAME <OldName> -> <NewName>: keep_a | keep_b
-      REASON: <one-line reason>
-
-    === RULES ===
-    - DEFAULT IS RECONCILE. For every divergent type, emit `reconcile` and list the
-      fields to carry over, so the result is a SUPERSET of both: A's definition as the
-      base, plus every field from B that A lacks or that B models better. Do not pick a
-      whole side out of preference.
-    - `keep_a` / `keep_b` (adopting one side wholesale) is the EXCEPTION. You may only
-      emit it when field-level combination would be WRONG, and your REASON must name
-      that structural reason (e.g. "B models this as a different abstraction", "the two
-      variant sets are mutually exclusive"). "More evolved" / "better name" alone is
-      NOT a justification for discarding the other side's fields.
-    - Where a field exists on both sides but differs, reconcile it: include the field
-      and describe in REASON which side's shape you are keeping and why.
-    - Renames: a RENAME line decides the NAME only. The type's BODY is still decided by
-      the TYPE line above, and it follows the reconcile-first rule like any other.
-    - Output ALL divergent types and ALL renames. Do not skip any.
+def dbg(msg):
+    print(msg, flush=True)
 
 
-    After listing all decisions, call submit_output with the full decisions text.
-    """)
-    return task
-
-
-def _guess_renames(diff: SchemaDiff) -> list[tuple[str, str]]:
-    """Heuristically pair only_a with only_b types that look like renames."""
-    renames = []
-    # Known renames in this domain:
-    known = [
-        ("ProposalChange", "ProposalResult"),
-        ("ReviewerBindingChange", "ReviewerBindingResult"),
-        ("Resource", "ProposalResource"),
-        ("ResourceNotFound", "ProposalNotFound"),
-        ("ReviewOutcome", "RoundOutcome"),
-        ("ResourceKind", "ProposalResource"),
-        ("ConfirmationInput", "ConfirmationGateInput"),
-        ("ChoiceInput", "ChoiceGateInput"),
-    ]
-    for a_name, b_name in known:
-        if a_name in diff.only_a and b_name in diff.only_b:
-            renames.append((a_name, b_name))
-    return renames
-
-
-def _format_renames(renames: list[tuple[str, str]]) -> str:
-    if not renames:
-        return "  (none detected)"
-    return '\n'.join(f"  {a} → {b}" for a, b in renames)
-
-
-def parse_gate(path: str, label: str) -> bool:
+def parse_gate(path, label) -> bool:
     """Validate a schema file with graphql-core's build_schema().
-    Returns True if valid, False (prints warning) if not.
-    An unparseable artifact cannot be declared converged."""
-    try:
-        text = open(path).read()
-        build_schema(text)
-        print(f"[{label}] PARSE GATE PASS: {os.path.basename(path)}", flush=True)
-        return True
-    except GraphQLSyntaxError as e:
-        print(f"[{label}] PARSE GATE FAIL: {os.path.basename(path)}: {e}", flush=True)
+
+    An unparseable artifact can never be declared converged.
+    """
+    if not os.path.exists(path):
+        dbg(f"[{label}] PARSE GATE FAIL: no file at {path}")
         return False
+    try:
+        build_schema(open(path).read())
+        dbg(f"[{label}] PARSE GATE PASS: {os.path.basename(path)}")
+        return True
     except Exception as e:
-        print(f"[{label}] PARSE GATE ERROR: {os.path.basename(path)}: {e}", flush=True)
+        dbg(f"[{label}] PARSE GATE FAIL: {os.path.basename(path)}: {e}")
         return False
 
 
 def parse_error_of(path: str) -> str:
-    """Return the parser's complaint about a file, or '' if it parses."""
     try:
         build_schema(open(path).read())
         return ""
@@ -134,30 +70,35 @@ def parse_error_of(path: str) -> str:
         return str(e).split("\n")[0]
 
 
-MAX_LANE_RETRIES = 2
+def run_schema_lane(out: str, label: str, base_task: str, workdir: Path) -> dict:
+    """Dispatch a lane and ENFORCE validity, re-dispatching with the parse error.
 
-
-async def run_schema_lane(client, out: str, label: str, base_task: str, agent: str = "bake-off"):
-    """Dispatch a lane and ENFORCE validity: if its schema output fails the
-    graphql-core parse gate, re-dispatch that lane with the parse error fed back.
-    This is the real 'cannot finish until the schema is valid' — the engine's
-    hooks cannot retry, so the conductor enforces it. Up to MAX_LANE_RETRIES."""
+    The engine cannot retry a hook, so the conductor enforces the gate: a lane
+    whose schema does not parse gets its parser complaint handed back, up to
+    MAX_LANE_RETRIES. Returns a record carrying the run id, so the caller can
+    prove the candidates came from two different runs.
+    """
     task = base_task
-    result = None
+    record = {"label": label, "out": out, "run_id": None, "state": "blocked",
+              "reason": None}
     for attempt in range(MAX_LANE_RETRIES + 1):
         if os.path.exists(out):
             os.remove(out)
         try:
-            result = await client.run_and_wait(agent, task=task, workdir=STUDY, timeout=0)
-        except Exception as e:
-            print(f"[{label}] attempt {attempt+1} RUN FAILED: {e}", flush=True)
-            return None, False
+            result = driver.lev_run(LANE_AGENT, task, workdir, timeout=3600)
+        except driver.LevError as e:
+            dbg(f"[{label}] attempt {attempt+1} RUN FAILED: {e}")
+            record["reason"] = str(e)
+            return record
+        record["run_id"] = result.get("run_id")
+        dbg(f"[{label}] attempt {attempt+1} run {record['run_id']} "
+            f"status {result.get('status')}")
         if os.path.exists(out) and parse_gate(out, f"{label} attempt{attempt+1}"):
-            if attempt > 0:
-                print(f"[{label}] VALID after re-dispatch (attempt {attempt+1})", flush=True)
-            return result, True
-        err = parse_error_of(out) if os.path.exists(out) else "no output file was written"
-        print(f"[{label}] attempt {attempt+1} REJECTED — not valid GraphQL: {err}", flush=True)
+            record["state"] = "verified"
+            return record
+        err = (parse_error_of(out) if os.path.exists(out)
+               else "no output file was written")
+        dbg(f"[{label}] attempt {attempt+1} REJECTED — not valid GraphQL: {err}")
         task = (
             base_task
             + "\n\n*** YOUR PREVIOUS OUTPUT WAS REJECTED BY THE SCHEMA VALIDATOR. ***\n"
@@ -166,226 +107,218 @@ async def run_schema_lane(client, out: str, label: str, base_task: str, agent: s
             + "(no duplicated type/enum/union/input definitions; every union member "
             + "defined exactly once; braces balanced) and then call submit_output."
         )
-    print(f"[{label}] EXHAUSTED {MAX_LANE_RETRIES+1} attempts — schema never validated", flush=True)
-    return result, False
+    dbg(f"[{label}] EXHAUSTED {MAX_LANE_RETRIES+1} attempts — schema never validated")
+    record["reason"] = "schema never validated"
+    return record
 
 
+def run_level0() -> tuple[list, bool, list]:
+    """Level 0: two lanes each iterate on the seed independently.
 
-async def run_level0():
-    """Level 0: two lanes each iterate on the seed schema independently.
-    Each lane is validity-enforced via run_schema_lane (re-dispatch until parseable)."""
-    outs = [os.path.join(BO, "v0_L0L0.graphql"), os.path.join(BO, "v0_L0L1.graphql")]
-    tasks = []
-    async with LeviathClient(env=env) as client:
-        for lane, out in enumerate(outs):
-            label = f"L0L{lane}"
-            task = (
-                f"BAKE_OFF label={label} level=0 seed={SEED} out={out}\n"
-                f"Iterate on the GraphQL schema at {SEED} to produce an improved "
-                f"version. Follow the Composition Guide at /data/work/leviath/study/"
-                f"composition-guide.md. The output MUST be syntactically valid GraphQL SDL "
-                f"(no duplicated type/enum/union/input definitions; every union member defined "
-                f"exactly once; braces balanced). Write the final schema to {out} and call "
-                f"submit_output."
-            )
-            tasks.append(asyncio.create_task(
-                run_schema_lane(client, out, label, task, agent="bake-off")))
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-    # results are (RunResult|None, valid:bool) tuples, or exceptions
-    ok = [r for r in results if isinstance(r, tuple) and r[1]]
-    return outs, results
-
-
-
-async def run_merge_level(cands: list[str], level: int):
+    Both lanes run concurrently (the point of a bake-off is that they are
+    independent, not sequential) and each is validity-enforced separately.
+    Returns (paths, all_ok, provenance) where provenance carries each lane's run
+    id, so a converged pair can be labelled honestly.
     """
-    Merge level (N>0): compute diff, ask lanes to decide, apply_merge.
-    Returns (out_paths, results) where out_paths are the merged files.
-    """
-    a_text = open(cands[0]).read()
-    b_text = open(cands[1]).read()
+    outs = [BO / "v0_L0L0.graphql", BO / "v0_L0L1.graphql"]
 
-    # Compute the compact diff
+    # Stage the seed into the workdir: the lanes' file tools are confined there,
+    # so the seed is readable without widening [read_paths].
+    seed_local = BO / Path(str(SEED)).name
+    if not seed_local.exists():
+        seed_local.write_text(Path(SEED).read_text(), encoding="utf-8")
+
+    jobs = []
+    for lane, out in enumerate(outs):
+        label = f"L0L{lane}"
+        task = (
+            f"BAKE_OFF label={label} level=0 seed={seed_local} out={out}\n"
+            f"Iterate on the GraphQL schema at {seed_local} to produce an improved "
+            f"version. Read the Composition Guide with the composition_guide tool. "
+            f"The output MUST be syntactically valid GraphQL SDL (no duplicated "
+            f"type/enum/union/input definitions; every union member defined exactly "
+            f"once; braces balanced). Write the final schema to {out} and call "
+            f"submit_output."
+        )
+        jobs.append((out, label, task))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        records = list(pool.map(
+            lambda job: run_schema_lane(str(job[0]), job[1], job[2], BO), jobs))
+    provenance = [{"lane": i, "label": r["label"], "run_id": r["run_id"],
+                   "path": r["out"], "state": r["state"], "reason": r["reason"]}
+                  for i, r in enumerate(records)]
+    return outs, all(r["state"] == "verified" for r in records), provenance
+
+
+def run_merge_lane(cands: list, level: int, lane: int, task: str,
+                   diff_file: Path, schema_path: Path) -> dict:
+    """Run ONE merge-decision lane and apply its document. Returns a record.
+
+    Each lane is an independent decision: its own `lev run` (its own run id), its
+    own document, its own merged output. Two lanes at a level give the next level
+    two genuinely independent candidates; one lane reused for both would be a
+    self-merge dressed up as convergence.
+    """
+    out = BO / f"v{level}_merged_lane{lane}.graphql"
+    record = {"lane": lane, "run_id": None, "status": None, "out": str(out),
+              "state": "blocked", "reason": None}
+    try:
+        result = driver.lev_run(MERGE_AGENT, task, BO,
+                                output_schema=schema_path, timeout=3600)
+    except driver.LevError as e:
+        record["reason"] = f"merge lane failed: {e}"
+        return record
+    record["run_id"] = result.get("run_id")
+    record["status"] = result.get("status")
+    dbg(f"[L{level}] lane{lane} run {record['run_id']} status {record['status']}")
+
+    decisions_text = driver.final_output_text(result)
+    if not decisions_text.strip():
+        record["reason"] = "the merge lane produced no final output"
+        return record
+    dec_file = BO / f"v{level}_decisions_lane{lane}.json"
+    dec_file.write_text(decisions_text, encoding="utf-8")
+
+    code = driver.do_merge(str(cands[0]), str(cands[1]), str(out),
+                           decisions=str(dec_file),
+                           evidence=harnessql_paths.evidence_dir() / f"L{level}_lane{lane}",
+                           diff_out=diff_file if lane == 0 else None)
+    if code != 0:
+        record["reason"] = {1: "REJECTED (invalid decision document)",
+                            2: "BLOCKED (unusable input)"}.get(code, "FAILED")
+        return record
+    if not parse_gate(str(out), f"L{level} lane{lane} merged"):
+        record["reason"] = "CONVERGENCE-REFUSED: merged schema is unparseable"
+        return record
+    record["state"] = "verified"
+    return record
+
+
+def run_merge_level(cands: list, level: int) -> tuple[list, list]:
+    """Merge level (N>0): diff, ask TWO independent merge lanes, apply, parse-gate.
+
+    Returns (merged_paths, provenance). Two lanes are dispatched so the next level
+    has two independent candidates; the run ids go into `provenance` so a
+    converged pair is only ever labelled independent when the provenance says so.
+    """
+    a_text = Path(cands[0]).read_text()
+    b_text = Path(cands[1]).read_text()
     diff = diff_types(a_text, b_text)
-    diff_file = os.path.join(BO, f"v{level}_diff.txt")
-    diff_task_text = build_diff_task(diff, f"L{level}")
 
-    # Write the diff for reference
-    with open(diff_file, 'w') as f:
-        f.write(diff.summary())
+    diff_file = BO / f"v{level}_diff.txt"
+    dbg(f"[L{level}] Diff: {len(diff.only_a)} only-A, {len(diff.only_b)} only-B, "
+        f"{len(diff.both)} identical, {len(diff.divergent)} divergent")
 
-    print(f"[L{level}] Diff: {len(diff.only_a)} only-A, {len(diff.only_b)} only-B, "
-          f"{len(diff.both)} identical, {len(diff.divergent)} divergent "
-          f"(diff size: {len(diff.summary())}B vs {len(a_text)}+{len(b_text)}="
-          f"{len(a_text)+len(b_text)}B raw)", flush=True)
-
-    # CONVERGED: nothing divergent means there is nothing to arbitrate. There is
-    # no decision for a lane to make, so do not ask one — a lane handed an empty
-    # diff has no TYPE/RENAME blocks to emit and its output is unparseable by
-    # design. The candidates already agree; emit one as the result and stop.
-    if diff.is_empty or (not diff.divergent and not diff.only_a and not diff.only_b):
-        converged = os.path.join(BO, f"v{level}_merged.graphql")
-        with open(converged, 'w') as f:
-            f.write(a_text)
-        print(f"[L{level}] CONVERGED — no divergence between candidates; "
-              f"nothing to arbitrate. -> {converged}", flush=True)
+    if diff.is_empty:
+        converged = BO / f"v{level}_merged.graphql"
+        converged.write_text(a_text)
+        dbg(f"[L{level}] CONVERGED — no divergence; nothing to arbitrate -> {converged}")
         return [converged], []
 
-    # Two parallel lanes, each gets the same diff task
-    outs = [os.path.join(BO, f"v{level}_L{lane}_decisions.txt") for lane in range(2)]
-    tasks = []
-    async with LeviathClient(env=env) as client:
-        for lane, out in enumerate(outs):
-            label = f"L{level}L{lane}"
-            task = f"{diff_task_text}\nWrite your final decisions to {out}."
-            tasks.append(asyncio.create_task(client.run_and_wait(
-                "bake-merge", task=task, workdir=STUDY, timeout=0)))
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+    # The reviewer gets the compact diff and nothing else, and cannot read the
+    # candidates or write a schema.
+    schema_path = BO / f"v{level}_decisions.schema.json"
+    schema_path.write_text(
+        __import__("json").dumps(decision_json_schema(), indent=2, sort_keys=True),
+        encoding="utf-8")
+    diff_text = driver.compact_diff_text(a_text, b_text,
+                                        {"a": str(cands[0]), "b": str(cands[1])})
+    base_task = driver.merge_task(diff_text, str(diff_file))
 
-    # Check results
-    for i, (r, out) in enumerate(zip(results, outs)):
-        if isinstance(r, Exception):
-            print(f"[L{level}] lane{i} FAILED: {r}", flush=True)
-        else:
-            print(f"[L{level}] lane{i} {r.status.value} iters={r.iteration} "
-                  f"-> {out} ({os.path.getsize(out) if os.path.exists(out) else 0}B)", flush=True)
+    # Two independent decisions. The task text is identical (the contract is
+    # fixed); independence comes from being two separate runs, and the recorded
+    # run ids are what prove it.
+    tasks = [(0, base_task), (1, base_task)]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        records = list(pool.map(
+            lambda job: run_merge_lane(cands, level, job[0], job[1], diff_file,
+                                       schema_path), tasks))
 
-    # One valid decision set is enough (two lanes are two attempts at the same decision)
-    usable = [o for r, o in zip(results, outs) if not isinstance(r, Exception) and os.path.exists(o) and os.path.getsize(o) > 0]
-    if not usable:
-        print(f"[L{level}] ABORT: no usable decision output from either lane", flush=True)
-        return [], results
+    merged = [Path(r["out"]) for r in records if r["state"] == "verified"]
+    provenance = [{"lane": r["lane"], "run_id": str(r["run_id"]),
+                   "path": r["out"], "state": r["state"], "reason": r["reason"]}
+                  for r in records]
 
-    # Parse decisions from whichever lane(s) succeeded (prefer lane0)
-    ordered = sorted(usable, key=lambda p: 0 if p == outs[0] else 1)
-    decisions, renames = [], {}
-    for p in ordered:
-        d, rn = parse_decisions(open(p).read())
-        if d or rn:
-            decisions, renames = d, rn
-            print(f"[L{level}] using decisions from {os.path.basename(p)}: {len(d)} decisions, {len(rn)} renames", flush=True)
-            break
+    if not merged:
+        reasons = "; ".join(f"lane{r['lane']}: {r['reason']}" for r in records)
+        dbg(f"[L{level}] ABORT: no merge decision was applied ({reasons})")
+        return [], provenance
 
-    if not decisions and not renames:
-        print(f"[L{level}] ABORT: no parseable decisions from either lane", flush=True)
-        return [], results
-
-    # Apply merge
-    # Build detected renames from diff (same-concept types with different names)
-    detected_renames = {}
-    for a_name, b_name in renames.items():
-        detected_renames[a_name] = b_name
-    # Also add the auto-detected renames from _guess_renames
-    guessed = _guess_renames(diff)
-    for a_name, b_name in guessed:
-        if a_name not in detected_renames:
-            detected_renames[a_name] = b_name
-
-    merged_text = apply_merge(a_text, b_text, decisions, renames=renames,
-                              detected_renames=detected_renames)
-    merged_out = os.path.join(BO, f"v{level}_merged.graphql")
-    with open(merged_out, 'w') as f:
-        f.write(merged_text)
-
-    print(f"[L{level}] Merged -> {merged_out} ({len(merged_text)}B)", flush=True)
-
-    # For the purpose of the bakeoff, we also write the merged result to both
-    # lane output paths (so the next level can pick them up)
-    for out in outs:
-        with open(out.replace('_decisions.txt', '.graphql'), 'w') as f:
-            f.write(merged_text)
-
-    return [merged_out], results
+    if len(merged) == 1:
+        dbg(f"[L{level}] only ONE merged candidate was produced; stopping rather "
+            "than feeding it to both slots as a self-merge")
+    return merged, provenance
 
 
-async def main():
-    # Level 0: independent iteration
-    print("[L0] Running level 0 (independent iteration on seed)...", flush=True)
-    outs, results = await run_level0()
+def main() -> int:
+    dbg(f"HarnessQL bakeoff v3: seed={SEED} workdir={BO} max_levels={MAX_LEVELS}")
+    dbg("paths: " + __import__("json").dumps(harnessql_paths.summary(), sort_keys=True))
 
-    for i, (r, out) in enumerate(zip(results, outs)):
-        if isinstance(r, Exception):
-            print(f"[L0] lane{i} FAILED: {r}", flush=True)
-        elif isinstance(r, tuple):
-            rr, valid = r
-            status = getattr(rr, "status", None)
-            iters = getattr(rr, "iteration", "?")
-            print(f"[L0] lane{i} {status} iters={iters} valid={valid} "
-                  f"-> {out} ({os.path.getsize(out) if os.path.exists(out) else 0}B)", flush=True)
-        else:
-            print(f"[L0] lane{i} {getattr(r,'status',r)}", flush=True)
+    outs, all_ok, prov0 = run_level0()
+    if not all_ok:
+        dbg("[L0] ABORT: a lane never produced a VALID schema")
+        return 2
 
-    def lane_ok(r):
-        return (isinstance(r, tuple) and r[1]) or (not isinstance(r, (Exception, tuple)) and not isinstance(r, Exception))
-
-    if any(isinstance(r, Exception) for r in results) or not all(
-            isinstance(r, tuple) and r[1] for r in results):
-        print("[L0] ABORT: a lane never produced a VALID schema", flush=True)
-        return
-
-    a = open(outs[0]).read()
-    b = open(outs[1]).read()
+    a = Path(outs[0]).read_text()
+    b = Path(outs[1]).read_text()
     same = identical(a, b)
-    print(f"[L0] lane0 {len(a)}B vs lane1 {len(b)}B -> "
-          f"{'IDENTICAL-MERGED' if same else 'DIFFERENT-recurse'}", flush=True)
-
-    # PARSE GATE: L0 outputs must parse before we declare anything
-    for i, out in enumerate(outs):
-        if not parse_gate(out, f"L0 lane{i}"):
-            print(f"[L0] ABORT: unparseable output {out}", flush=True)
-            return
-
+    dbg(f"[L0] lane0 {len(a)}B vs lane1 {len(b)}B -> "
+        f"{'IDENTICAL-MERGED' if same else 'DIFFERENT-recurse'}")
+    note = driver.convergence_note([str(outs[0]), str(outs[1])],
+                                   provenance=prov0, a_text=a, b_text=b)
+    dbg(f"[L0] convergence: {note['label']} (run ids {note['run_ids']})")
     if same:
-        print(f"RESULT: MERGED at level 0 -> {outs[0]}", flush=True)
-        return
+        if not note["independent"]:
+            dbg("RESULT: NOT CONVERGENCE — the two 'converged' candidates are not "
+                "independent (see the reason above); refusing to report a self-merge "
+                "as convergence")
+            return 1
+        dbg(f"RESULT: MERGED at level 0 -> {outs[0]}")
+        return 0
 
-    cands = outs
-
-    # Level 1+: diff-based merge
+    cands = [str(p) for p in outs]
     for level in range(1, MAX_LEVELS):
-        print(f"\n[L{level}] Running diff-based merge level...", flush=True)
-        merged_outs, results = await run_merge_level(cands, level)
-
+        dbg(f"\n[L{level}] Running diff-based merge level...")
+        merged_outs, provenance = run_merge_level(cands, level)
         if not merged_outs:
-            print(f"[L{level}] ABORT: merge failed", flush=True)
+            dbg(f"[L{level}] ABORT: merge failed")
             break
 
-        # For convergence check: compare the merged output to itself (always identical
-        # since we only produce one merged output). If the diff was empty, we converged.
-        diff = diff_types(open(cands[0]).read(), open(cands[1]).read())
-        if diff.is_empty:
-            # PARSE GATE: convergence requires the merged artifact to parse
-            if parse_gate(merged_outs[0], f"L{level} converged"):
-                print(f"RESULT: CONVERGED at level {level} (no diff between candidates)", flush=True)
-            else:
-                print(f"RESULT: CONVERGENCE-REFUSED at level {level} — "
-                      "merged schema is unparseable", flush=True)
-            break
+        merged_text = Path(merged_outs[0]).read_text()
+        a_text = Path(cands[0]).read_text()
+        b_text = Path(cands[1]).read_text()
 
-        # Check if the merge produced something new
-        merged_text = open(merged_outs[0]).read()
-        a_text = open(cands[0]).read()
-        b_text = open(cands[1]).read()
-
+        # A merge that equals one candidate means the other's content was fully
+        # absorbed (or the diff was empty) — that is the stopping condition.
         if identical(merged_text, a_text) or identical(merged_text, b_text):
-            if parse_gate(merged_outs[0], f"L{level} merged"):
-                print(f"RESULT: MERGED at level {level} -> {merged_outs[0]}", flush=True)
-            else:
-                print(f"RESULT: MERGED-REFUSED — unparseable", flush=True)
-            break
+            dbg(f"RESULT: MERGED at level {level} -> {merged_outs[0]}")
+            return 0
 
-        # Continue with the merged output as the new candidate
-        # (self-merge: both lanes get the same merged output)
-        # PARSE GATE: validate before continuing
-        if not parse_gate(merged_outs[0], f"L{level} merge"):
-            print(f"RESULT: CONVERGENCE-REFUSED at level {level} — "
-                  "merged schema is unparseable", flush=True)
-            break
-        cands = [merged_outs[0], merged_outs[0]]
+        if len(merged_outs) < 2:
+            dbg(f"RESULT: MERGED at level {level} -> {merged_outs[0]} "
+                "(one independent merge lane only; stopping rather than "
+                "self-merging)")
+            return 0
 
+        # Two independent merge lanes fed the next level two candidates that come
+        # from two different runs. The provenance is recorded and checked below,
+        # so a pair that is secretly one artifact is never called convergence.
+        cands = [str(merged_outs[0]), str(merged_outs[1])]
+        pair_texts = [Path(c).read_text() for c in cands]
+        note = driver.convergence_note(cands, provenance=provenance,
+                                       a_text=pair_texts[0], b_text=pair_texts[1])
+        dbg(f"[L{level}] next-level candidates: {note['label']} "
+            f"(run ids {note['run_ids']})")
+        if not note["independent"]:
+            dbg(f"RESULT: MERGED at level {level} -> {merged_outs[0]} "
+                "(next level would be a self-merge)")
+            return 0
     else:
-        print("RESULT: NO_CONVERGENCE after 5 levels", flush=True)
+        dbg("RESULT: NO_CONVERGENCE after 5 levels")
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    sys.exit(main())

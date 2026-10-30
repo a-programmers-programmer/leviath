@@ -1,0 +1,182 @@
+# =====================================================================
+# WORKFLOW ABSTRACTION — GraphQL SCHEMA + AUTHORING MODEL
+# Bead: d-type-workflow (SUPERSEDES earlier locks; substantive revision)
+#
+# CORE MODEL (Josh, converged 2026-09-08):
+#   - WorkflowStep IS the callable (no StepContract wrapper, no binding, no
+#     stepNumber, no prev/next). A step is a NODE: typed input + output +
+#     a search annotation, and (implicitly) the code that runs it.
+#   - WorkflowDefinition is a DAG of steps + first-class edges (branch/gate/
+#     join/parallel). Whole-workflow input + output contracts.
+#   - AUTHORING IS GENUINELY 2-WAY SYMMETRIC between a schema file and typed
+#     code. Neither is canonical; whichever was last edited wins; a sync hook
+#     derives the other and ALERTS the writing agent on mismatch. No hand-
+#     authored mirror `Create*Input` mutation types — authoring is the sync.
+#   - DIRECTIVES are the authoring language. Publishable/searchable state is
+#     declared on the type. SENSITIVE data uses a monadic confirmation gate.
+#   - dataType DERIVES from implementing type; exhaustive typechecking rides
+#     interface + codegen switch. No unions/string-bags for data.
+# =========================================================================
+
+scalar DateTime
+scalar Duration
+scalar Decimal
+scalar URI
+
+directive @sink2sync(
+  """The side that initiated the last edit: SCHEMA or CODE. Symmetric — neither canonical."""
+  lastEdited: Side!
+  """Path to the counterpart (code module or schema file) the hook reconciles against."""
+  counterpart: URI
+) on SCHEMA
+
+directive @user_confirmation(
+  """Who/what must confirm to unwrap the monadic value (e.g. the step Runner / a human gate)."""
+  by: String!
+  """Hard-coded by implementation of the monad; a directive DECLARES, code unwraps."""
+) on FIELD_DEFINITION | ARGUMENT_DEFINITION
+
+enum Side { SCHEMA CODE }
+
+enum ISO4217 { USD EUR GBP }
+enum Provider { OPENAI ANTHROPIC GOOGLE AWS DEEPSEEK ALIBABA META MISTRAL REPLICATE FAL HUGGINGFACE CUSTOM }
+enum ModelFamily { GPT4 CLAUDE GEMINI LLAMA QWEN DEEPSEEK NOVA STABLE_DIFFUSION FLUX ELEVENLABS WHISPER }
+
+# ---------------------------------------------------------------------------
+# 1. STEP INPUT / OUTPUT — separate interfaces. dataType = the implementing type.
+# ---------------------------------------------------------------------------
+interface WorkflowStepInput {
+  simpleEnglishDescription: String!
+}
+interface WorkflowStepOutput {
+  simpleEnglishDescription: String!
+}
+
+type OAuthRedirectCodeInput implements WorkflowStepInput { simpleEnglishDescription: String!  code: String!  state: String! }
+type OAuthRefreshTokenInput implements WorkflowStepInput {
+  simpleEnglishDescription: String!
+  token: String @user_confirmation(by: "runner")   # monadic sensitive string
+  expiresAt: DateTime!
+  scope: [String!]!
+}
+type ModelKeyInput           implements WorkflowStepInput { simpleEnglishDescription: String!  provider: Provider!  family: ModelFamily!  version: String! }
+type JsonPointerInput        implements WorkflowStepInput { simpleEnglishDescription: String!  pointer: String!  targetKind: String! }
+type MoneyInput              implements WorkflowStepInput { simpleEnglishDescription: String!  amount: Decimal!  currency: ISO4217! }
+type FileSpecInput           implements WorkflowStepInput { simpleEnglishDescription: String!  path: String!  checksum: String!  size: Int! }
+
+type OAuthRefreshTokenOutput implements WorkflowStepOutput {
+  simpleEnglishDescription: String!
+  token: String @user_confirmation(by: "runner")
+  expiresAt: DateTime!
+  scope: [String!]!
+}
+type ModelKeyOutput          implements WorkflowStepOutput { simpleEnglishDescription: String!  provider: Provider!  family: ModelFamily!  version: String! }
+type JsonPointerOutput       implements WorkflowStepOutput { simpleEnglishDescription: String!  pointer: String!  targetKind: String! }
+type MoneyOutput             implements WorkflowStepOutput { simpleEnglishDescription: String!  amount: Decimal!  currency: ISO4217! }
+type FileSpecOutput          implements WorkflowStepOutput { simpleEnglishDescription: String!  path: String!  checksum: String!  size: Int! }
+
+# ---------------------------------------------------------------------------
+# 2. WORKFLOW STEP — a NODE. IS the callable.
+# ---------------------------------------------------------------------------
+type WorkflowStep {
+  id: ID!
+  name: String!
+  simpleEnglishDescription: String!   # search/discovery + authoring annotation
+  input: WorkflowStepInput!
+  output: WorkflowStepOutput!
+}
+
+# ---------------------------------------------------------------------------
+# 3. WORKFLOW EDGE — first-class. Graph relationships + invariants live here.
+# ---------------------------------------------------------------------------
+type WorkflowEdge {
+  id: ID!
+  fromStep: WorkflowStep!
+  toStep: WorkflowStep!
+  kind: EdgeKind!
+  condition: EdgeCondition
+  relationship: [EdgeInvariant!]!
+}
+enum EdgeKind { NEXT PARALLEL JOIN SIGNAL_ON }
+type EdgeCondition { signal: String!  fromOutput: String! }
+type EdgeInvariant {
+  rule: EdgeInvariantRule!
+  severity: EdgeInvariantSeverity!
+  reason: String           # required to override a WARN
+}
+enum EdgeInvariantRule { NO_TRANSITIVE_ANCESTOR ACYCLIC }
+enum EdgeInvariantSeverity { WARN ERROR }
+
+# ---------------------------------------------------------------------------
+# 4. WORKFLOW DEFINITION — a DAG of steps + edges, one input + one output.
+# ---------------------------------------------------------------------------
+type WorkflowDefinition {
+  id: ID!
+  name: String!
+  description: String!
+  domain: String!
+  version: String!
+  input: WorkflowStepInput!
+  output: WorkflowStepOutput!
+  steps: [WorkflowStep!]!
+  edges: [WorkflowEdge!]!
+  createdAt: DateTime!
+  updatedAt: DateTime!
+}
+
+# ---------------------------------------------------------------------------
+# 5. LIFECYCLE + RUN
+# ---------------------------------------------------------------------------
+enum WorkflowState {
+  RECEIVED CLASSIFIED MATCHED NO_MATCH COMPOSING COMPOSED
+  VALIDATING VALIDATED REPAIRING INFEASIBLE PENDING_APPROVAL
+  APPROVED REJECTED EXPIRED REGISTERED EXECUTING
+  SUCCEEDED FAILED BUDGET_STOPPED
+}
+
+type WorkflowRun {
+  id: ID!  state: WorkflowState!  workflowId: ID
+  input: WorkflowStepInput  output: WorkflowStepOutput
+  artifacts: [ArtifactRef!]!  audit: [AuditEvent!]!  error: String
+}
+type WorkflowStepRun {
+  id: ID!  state: WorkflowState!  stepId: ID!
+  input: WorkflowStepInput  output: WorkflowStepOutput  error: String
+}
+type ArtifactRef { kind: String!  checksum: String!  uri: URI }
+type AuditEvent {
+  seq: Int!  fromState: WorkflowState!  toState: WorkflowState!
+  decidedBy: String!  evidence: String  prevHash: String!  hash: String!
+}
+
+# ---------------------------------------------------------------------------
+# 6. SEARCH RESULT
+# ---------------------------------------------------------------------------
+type WorkflowSearchResult { outcome: SearchOutcome!  matches: [WorkflowSearchMatch!]! }
+enum SearchOutcome { RESOLVED NO_MATCH AMBIGUOUS }
+type WorkflowSearchMatch {
+  workflow: WorkflowDefinition!  gatesCleared: [GateResult!]!
+  historicalSuccessRate: Float  expectedCost: Money  matchReasons: [String!]!
+}
+type GateResult { gate: MatchGate!  passed: Boolean!  evidence: String }
+enum MatchGate { TYPECONFORMANCE EFFECT_SUBSET BUDGET_FEASIBLE RESIDENCY_COMPATIBLE HISTORICAL_SUCCESS COST_EFFICIENCY SPECIFICITY }
+scalar Money
+
+# ---------------------------------------------------------------------------
+# 7. QUERIES & MUTATIONS
+#    Authoring is the SCHEMA<->CODE 2-WAY SYNC (@sink2sync). Runtime dispatch
+#    still runs workflows/steps. No mirror Create*Input types.
+# ---------------------------------------------------------------------------
+type Query {
+  searchWorkflows(query: String!, domain: String): WorkflowSearchResult!
+  workflows(domain: String, state: WorkflowState): [WorkflowDefinition!]!
+  workflow(id: ID!): WorkflowDefinition!
+  workflowByName(name: String!): WorkflowDefinition!
+  workflowRun(id: ID!): WorkflowRun!
+}
+
+type Mutation {
+  dispatchWorkflow(workflowId: ID!, input: WorkflowStepInput!): WorkflowRun!
+  runWorkflowStep(stepId: ID!, input: WorkflowStepInput!): WorkflowStepRun!
+  respondToGate(runId: ID!, approval: Boolean!, note: String): WorkflowRun!
+}

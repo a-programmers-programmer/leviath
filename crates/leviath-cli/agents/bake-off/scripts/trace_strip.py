@@ -1,16 +1,28 @@
-import sys, re
-sys.path.insert(0, '/data/work/leviath/study')
+#!/usr/bin/env python3
+"""Diagnostic: show which docstring/comment lines a strip pass removes (portable, GQL-09).
+
+Run:  python3 scripts/trace_strip.py [schema.graphql]
+Defaults to the in-repo seed resolved through harnessql_paths. No key file, no
+absolute scratch path.
+"""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import harnessql_paths
+import graphql_diff
 from graphql_diff import _strip_orphan_docstrings
 
-seed = open('/data/work/leviath/study/B2.graphql').read()
+seed_path = sys.argv[1] if len(sys.argv) > 1 else str(harnessql_paths.default_seed())
+seed = open(seed_path).read()
 result = _strip_orphan_docstrings(seed)
-print(f"Seed: {len(seed)}B, After strip: {len(result)}B, Removed: {len(seed)-len(result)}B")
+print(f"Seed: {seed_path} {len(seed)}B, After strip: {len(result)}B, "
+      f"Removed: {len(seed)-len(result)}B")
 
-# Find first few removed docstrings
 lines_seed = seed.split('\n')
 lines_res = result.split('\n')
 
-# Compare line by line
 removed_blocks = []
 i_seed = 0
 i_res = 0
@@ -19,10 +31,10 @@ while i_seed < len(lines_seed) and i_res < len(lines_res):
         i_seed += 1
         i_res += 1
     else:
-        # Lines differ - capture the removed block
         block = []
-        while i_seed < len(lines_seed) and (i_res >= len(lines_res) or lines_seed[i_seed] != lines_res[i_res]):
-            block.append((i_seed+1, lines_seed[i_seed]))
+        while i_seed < len(lines_seed) and (i_res >= len(lines_res)
+                                            or lines_seed[i_seed] != lines_res[i_res]):
+            block.append((i_seed + 1, lines_seed[i_seed]))
             i_seed += 1
         if block:
             removed_blocks.append(block)
