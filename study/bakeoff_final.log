@@ -1,0 +1,23 @@
+[L0] Running level 0 (independent iteration on seed)...
+[L0L0 attempt1] PARSE GATE PASS: v0_L0L0.graphql
+[L0L1 attempt1] PARSE GATE PASS: v0_L0L1.graphql
+[L0] lane0 RunStatus.COMPLETE iters=8 valid=True -> /data/work/leviath/study/bakeoff/v0_L0L0.graphql (48700B)
+[L0] lane1 RunStatus.COMPLETE iters=45 valid=True -> /data/work/leviath/study/bakeoff/v0_L0L1.graphql (46526B)
+[L0] lane0 48700B vs lane1 46526B -> DIFFERENT-recurse
+[L0 lane0] PARSE GATE PASS: v0_L0L0.graphql
+[L0 lane1] PARSE GATE PASS: v0_L0L1.graphql
+
+[L1] Running diff-based merge level...
+[L1] Diff: 4 only-A, 6 only-B, 37 identical, 24 divergent (diff size: 1926B vs 48700+46526=95226B raw)
+[L1] lane0 complete iters=3 -> /data/work/leviath/study/bakeoff/v1_L0_decisions.txt (5305B)
+[L1] lane1 complete iters=2 -> /data/work/leviath/study/bakeoff/v1_L1_decisions.txt (4164B)
+[L1] using decisions from v1_L0_decisions.txt: 24 decisions, 0 renames
+[L1] Merged -> /data/work/leviath/study/bakeoff/v1_merged.graphql (51492B)
+[L1 merge] PARSE GATE FAIL: v1_merged.graphql: Syntax Error: Expected '@', found Name 'can'.
+
+GraphQL request:1187:11
+1186 |
+1187 | directive can still validate the SDL; the declaration alone does not implement
+     |           ^
+1188 |
+RESULT: CONVERGENCE-REFUSED at level 1 — merged schema is unparseable

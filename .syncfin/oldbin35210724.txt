@@ -1,0 +1,37 @@
+[2m2026-09-12T02:28:56.467413Z[0m [32m INFO[0m [2mlev[0m[2m:[0m Leviath CLI v0.5.9
+[2m2026-09-12T02:28:56.467737Z[0m [33m WARN[0m [2mleviath_cli::config[0m[2m:[0m config.toml has keys nothing reads; they are being ignored. `lev doctor` reports them too, if this scrolls past. [3mkeys[0m[2m=[0magent_read_paths.fixer.write_paths, agent_read_paths.oracle.write_paths, limits.exact_token_counting
+warning: config.toml has key(s) nothing reads - check the spelling: agent_read_paths.fixer.write_paths, agent_read_paths.oracle.write_paths, limits.exact_token_counting
+✓ Blueprint 'graphql-schema' is valid.
+  10 stages, version 0.1.0
+  Inputs: --task (required)
+  Graph mode: entry stage 'intake'
+  - intake → error, blocked, design (max_revisits: 1)
+  - design → error, draft, blocked (max_revisits: 1)
+  - draft → blocked, check, error (max_revisits: 1)
+  - revise → check, error, blocked (max_revisits: 2)
+  - review → error, accept, blocked (max_revisits: 3)
+  - check → revise, error, blocked, review (max_revisits: 3)
+  - accept → done, revise, error, blocked (max_revisits: 3)
+  - done (terminal)
+  - blocked (terminal)
+  - error (terminal)
+  2 script tool(s) in tools/
+
+Models this install would use:
+  intake           openrouter/openai/gpt-5.4-mini
+  design           openrouter/anthropic/claude-opus-5
+  draft            openrouter/openai/gpt-5.4-mini
+  revise           openrouter/openai/gpt-5.4-mini
+  review           openrouter/anthropic/claude-opus-5
+  check            openrouter/openai/gpt-5.4-mini
+  accept           openrouter/openai/gpt-5.4-mini
+  done             openrouter/openai/gpt-5.4-mini
+  blocked          openrouter/openai/gpt-5.4-mini
+  error            openrouter/openai/gpt-5.4-mini
+  default_provider = openrouter, override_model = (unset), fallback_model = (unset)
+  WARN stage 'intake': grants 'bash' with no permission set for it, so it defaults to ask - and an unattended run waits on that prompt rather than being denied [implicit-shell-policy]
+       set shell = "allow" or "deny" in [tool_permissions] or [stages.intake.tool_permissions]
+  WARN stage 'draft': grants 'bash' with no permission set for it, so it defaults to ask - and an unattended run waits on that prompt rather than being denied [implicit-shell-policy]
+       set shell = "allow" or "deny" in [tool_permissions] or [stages.draft.tool_permissions]
+  WARN stage 'revise': grants 'bash' with no permission set for it, so it defaults to ask - and an unattended run waits on that prompt rather than being denied [implicit-shell-policy]
+       set shell = "allow" or "deny" in [tool_permissions] or [stages.revise.tool_permissions]

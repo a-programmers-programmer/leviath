@@ -1,0 +1,47 @@
+BAKE_OFF L2 MERGE_DECISIONS
+lane: L2 (diff-based merge) -> v2_L0
+
+DIFF SUMMARY (authoritative input)
+  only in A (A-only types): 0
+  only in B (B-only types): 0
+  identical types:          66
+  divergent types:          0
+  likely renames:           none detected
+
+=== DIVERGENT TYPES ===
+TYPE <none>: no divergent type exists in this diff.
+
+REASON: The compact diff reports 0 divergent types (66 identical, 0 only-A,
+0 only-B). A keep_a / keep_b / reconcile decision requires a field-level delta
+between A and B; no such delta is present, so emitting a block for any type
+would mean inventing divergence the diff does not contain. A fabricated
+decision is worse than no decision. The default posture "prefer B unless A is
+clearly better" is vacuous: the 66 shared types are field-for-field identical,
+so there is no candidate advantage to weigh.
+FIELDS: (not applicable)
+
+=== LIKELY RENAMES ===
+RENAME <none> -> <none>: no rename pair exists.
+
+REASON: The diff reports "(none detected)" — there is no A-name/B-name
+correspondence offered to arbitrate. No RENAME block is emitted.
+
+=== TEMPLATE RULES CHECKED AGAINST THIS DIFF ===
+These are template boilerplate rules; none of the referenced divergences are
+present in this diff, so none apply:
+  - connection/edge types gaining `implements PageConnection`/`PageEdge`:
+    absent (0 divergent types); the relevant types are identical in A and B.
+  - Mutation return-type union renames (ProposalChange -> ProposalResult,
+    etc.): absent; Mutation is identical in A and B.
+  - ProposalRevision.rounds removed by B: absent; ProposalRevision is identical.
+  - ReviewRound.outcome (ReviewOutcome -> RoundOutcome): absent; ReviewRound is
+    identical.
+Applying these rules would require asserting deltas the diff does not contain.
+
+=== DECISION ===
+merge = IDENTITY. Adopt the single shared schema (the 66 identical types)
+verbatim: no field selection, no union/enum reconciliation, no interface
+adoption, no rename. There is nothing to reconcile and nothing to discard.
+
+CONFIDENCE: high. Both the set of divergent types and the set of renames are
+empty and both are enumerated as empty above; nothing was skipped.

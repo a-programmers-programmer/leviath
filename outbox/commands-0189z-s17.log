@@ -1,0 +1,123 @@
+# Commands log — RUNTIME REPAIR 0189z / 0191 (s17)
+# workdir /data/work/leviath, HEAD 36025f69. No commit, no push.
+# Format: command, then exit code. No secret value read or printed.
+
+## Phase 0 — locate the pins (read only)
+
+grep -rn "DEFAULT_WEDGE_TIMEOUT_SECS" crates/
+  exit 0
+  crates/leviath-cli/src/config/limits.rs:64
+  crates/leviath-runtime/src/pipeline/wedge/tests.rs:380
+  crates/leviath-runtime/src/pipeline/wedge/tests.rs:381
+  crates/leviath-runtime/src/pipeline/wedge.rs:91
+  crates/leviath-runtime/src/pipeline/wedge.rs:103
+  crates/leviath-runtime/src/pipeline/wedge.rs:181
+  crates/leviath-runtime/src/pipeline/mod.rs:156
+
+grep -n "wedge_timeout_secs" crates/leviath-cli/src/config/mod.rs
+  exit 0   (assertion of 0 at line 2431; assertion of 300 at 2444)
+
+sed -n '92,106p' crates/leviath-runtime/src/pipeline/wedge.rs
+  exit 0
+
+## Phase 0b — HEAD baselines, so pre-existing failures are separated from mine
+
+cargo test -p leviath-cli --lib > tmp/base_cli.log 2>&1
+  exit 101   4821 passed; 27 failed   -> failure names into tmp/f_base.txt
+cargo test -p leviath-runtime --lib > tmp/base_rt.log 2>&1
+  exit 101   1818 passed; 3 failed    -> failure names into tmp/rt_base.txt
+
+## Phase 1 — RED
+
+# The directive's filter matches no test:
+cargo test -p leviath-cli --lib wedge_timeout -- --list
+  exit 0   "0 tests, 0 benchmarks"
+
+# So tdd_cmd widens to the enclosing test, as the directive allows.
+# Edit: crates/leviath-cli/src/config/mod.rs line 2431 assertion 0 -> 300.
+# Constant still 0 at this point (verified inline).
+
+cd /data/work/leviath && cargo test -p leviath-cli --lib limits -- --nocapture
+  exit 101   RED
+  103:pub const DEFAULT_WEDGE_TIMEOUT_SECS: u64 = 0;
+  panicked at crates/leviath-cli/src/config/mod.rs:2432:9
+  assertion `left == right` failed / left: 0 / right: 300
+  test result: FAILED. 44 passed; 1 failed; 0 ignored; 0 measured; 4803 filtered out
+
+## Phase 2 — GREEN
+
+# Edit: crates/leviath-runtime/src/pipeline/wedge.rs
+#   pub const DEFAULT_WEDGE_TIMEOUT_SECS: u64 = 0  ->  300
+#   doc comment rewritten: enabled by default at 300s, set
+#   `[limits] wedge_timeout_secs = 0` to disable, ten re-drives reasoning kept.
+
+cd /data/work/leviath && cargo test -p leviath-cli --lib limits -- --nocapture
+  exit 0   GREEN
+  103:pub const DEFAULT_WEDGE_TIMEOUT_SECS: u64 = 300;
+  test config::tests::limits_absent_section_uses_defaults ... ok
+  test result: ok. 45 passed; 0 failed; 0 ignored; 0 measured; 4803 filtered out
+
+## Phase 3 — suites
+
+cd /data/work/leviath && cargo test -p leviath-runtime --lib 2>&1 | tail -30
+  exit 101   1817 passed; 4 failed
+  diff vs HEAD baseline: exactly one new failure
+    pipeline::wedge::tests::a_world_without_the_resource_is_off_by_default
+  (second pin of the old default, in a file the constraints forbid editing — STOPPED)
+
+cd /data/work/leviath && cargo test -p leviath-cli --lib 2>&1 | tail -30
+  exit 101   4820 passed; 28 failed
+  diff vs HEAD baseline: one extra name
+    commands::serve::providers::tests::the_default_admin_points_at_this_machine
+  grep -ci "wedge|limits|config::tests" on CLI failure set -> 0
+
+# Flake check on that extra CLI name, 3 runs:
+cargo test -p leviath-cli --lib the_default_admin_points_at_this_machine   (x3)
+  exit 0, exit 0, exit 0   -> flaky, unrelated to this change
+
+# Wedge module tests, all cases:
+cargo test -p leviath-runtime --lib pipeline::wedge
+  exit 101   10 passed; 1 failed
+  a_zero_timeout_disables_the_watchdog ... ok
+  a_run_no_system_can_reach_is_failed ... ok
+  a_run_blocked_on_a_person_is_left_to_issue_204 ... ok
+  a_finished_run_with_no_record_is_a_no_op ... ok
+  a_paused_run_is_never_failed_and_loses_its_record ... ok
+  an_agent_without_a_stage_log_still_fails ... ok
+  a_recovered_agent_starts_a_fresh_clock ... ok
+  inside_the_grace_period_it_is_only_recorded ... ok
+  a_finished_run_is_left_to_the_host ... ok
+  every_phase_marker_exempts_its_agent ... ok
+  a_world_without_the_resource_is_off_by_default ... FAILED  (the second pin)
+
+## Phase 4 — evidence
+
+git show HEAD:crates/leviath-runtime/src/pipeline/wedge.rs | sha256sum
+  exit 0   8f028c331616c57a2c2e96ccc2511dd3d592071ef905a7ffbfe21121f0ab502b  -
+
+sha256sum crates/leviath-runtime/src/pipeline/wedge.rs
+  exit 0   3daa65b57c71eea327e2ac40134daa6f84fb667e24e95962b5737f9a7048ed20
+
+git diff --stat
+  exit 0
+   crates/leviath-cli/src/config/mod.rs         |  7 ++++---
+   crates/leviath-runtime/src/pipeline/wedge.rs | 14 +++++++-------
+   2 files changed, 11 insertions(+), 10 deletions(-)
+
+git status --porcelain | grep -v '^??'
+  exit 0
+   M crates/leviath-cli/src/config/mod.rs
+   M crates/leviath-runtime/src/pipeline/wedge.rs
+
+git diff
+  exit 0   (reviewed: constant + doc comment, and the one assertion; nothing else)
+
+# Outbox files written:
+#   outbox/RUNTIME-REPAIR-0189z-s17.md
+#   outbox/commands-0189z-s17.log
+
+## Notes
+# Scratch logs under tmp/ only, each far below 10 MB.
+# No edit to /data/.leviath/config.toml or any permission file.
+# No untracked scratch belonging to other work was touched.
+# No commit, no push, no ledger edit. Working tree left dirty.

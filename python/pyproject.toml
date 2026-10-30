@@ -1,0 +1,16 @@
+[project]
+name = "leviath"
+version = "0.1.0"
+description = "Async Python client for the Leviath agent runtime"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+readme = "README.md"
+
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio", "pytest-cov"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

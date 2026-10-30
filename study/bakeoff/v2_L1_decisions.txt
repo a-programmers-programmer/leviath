@@ -1,0 +1,67 @@
+BAKE_OFF label=L2 MERGE_DECISIONS
+lane: L2 (diff-based merge) -> v2_L0
+source diff: /data/work/leviath/study/bakeoff/v2_diff.txt
+
+DIFF SUMMARY (authoritative input)
+  only in A (A-only types):  0
+  only in B (B-only types):  0
+  identical types:          66
+  divergent types:           0
+  likely renames:           (none detected)
+  diff size:                19B  vs  22258B + 22258B = 44516B raw
+cross-check (bakeoff_v7.log): [L2] Diff: 0 only-A, 0 only-B, 66 identical,
+                              0 divergent (diff size: 19B vs 44516B raw)
+
+=== DIVERGENT TYPES ===
+(none — the diff enumerates zero divergent types)
+
+No TYPE block is emitted. A `keep_a` / `keep_b` / `reconcile` verdict requires a
+field-level delta between A and B; the diff contains none. The default posture
+"prefer B unless A is clearly structurally better" is vacuous here: across all
+66 shared types the two candidates are field-for-field identical, so there is no
+candidate advantage to weigh and nothing to reconcile. Emitting decisions for
+the 66 identical types would mean inventing deltas the diff does not contain,
+and a fabricated decision is worse than no decision.
+
+=== RENAMES ===
+(none — "(none detected)")
+
+No RENAME block is emitted: the diff reports no A-name -> B-name correspondence,
+so there is no naming choice to make.
+
+=== DECISION RULE APPLICABILITY CHECK ===
+The task template names specific divergences to arbitrate at this level. Each
+was checked against the diff and each is ABSENT (0 divergent types):
+
+  - connection/edge types gaining `implements PageConnection` / `PageEdge`:
+    not present. No type in this diff has an implements-removed/implements-added
+    delta (and no ReviewConnection/ReviewEdge A-only-B-only residue remains), so
+    the structural improvement was already adopted at L1 and both candidates now
+    carry it. If it were present, the verdict would be keep_b.
+  - Mutation return-type union renames (ProposalChange -> ProposalResult,
+    etc.): not present. Mutation has no field delta, the union member sets are
+    equal, and no union is only-A or only-B. Already converged; verdict would be
+    keep_b were it divergent.
+  - ProposalRevision.rounds (B removed it): not present. ProposalRevision has no
+    fields-removed delta, so there is nothing to add back — reconcile is moot.
+    Both candidates carry the same, compact revision shape (revisionNumber).
+  - ReviewRound.outcome (ReviewOutcome -> RoundOutcome): not present. ReviewRound
+    has no field or enum-reference delta; the RoundOutcome naming is already in
+    both candidates. Verdict would be keep_b were it divergent.
+
+Also checked and absent: any union-members-removed that would drop a real error
+state (e.g. InvalidProposalInput) — all unions are member-identical.
+
+=== MERGED RESULT ===
+The merge is the IDENTITY function. Adopt the single shared schema (66 identical
+types) verbatim from either candidate: no field selection, no enum or union
+reconciliation, no interface adoption, no rename, no A-only/B-only residue to
+classify. The merged L2 artifact is type-structurally identical to both inputs.
+
+=== COVERAGE / CONFIDENCE ===
+  divergent types emitted: 0 of 0
+  renames emitted:         0 of 0
+Nothing was skipped: both sets are enumerated above and both are empty.
+Confidence: high — verified from two independent sources (the 19B diff itself
+and the [L2] log line, whose byte counts show two equal 22258B candidates).
+Action: carry the converged schema forward unchanged (MERGE_TERMINATE at L2).

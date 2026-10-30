@@ -1,0 +1,720 @@
+# =============================================================================
+# A1 — GROUP 1: TASK
+# GraphQL type group for a durable WORK UNIT ("task"/"bead") in an agentic
+# execution system: the unit agents claim, run, and close.
+#
+# Scope: the work unit itself, claiming/assignment, the execution trajectory
+# (runs -> iterations -> tool calls -> artifacts), and dependency/blocking.
+# This is the TASK abstraction — distinct from workflow (composition of steps)
+# and memory (knowledge graph).
+# =============================================================================
+
+schema {
+  query: Query
+  mutation: Mutation
+}
+
+# -----------------------------------------------------------------------------
+# DIRECTIVES — execution plane ("how to execute", not "what is true")
+# -----------------------------------------------------------------------------
+
+"""Groups execution concerns (authz, rate limiting) into one directive instead
+of scattering @authenticated / @rateLimited across the schema."""
+directive @policy(
+  auth: AuthRequirement = PUBLIC
+  rateLimit: String
+) on FIELD_DEFINITION | OBJECT
+
+enum AuthRequirement {
+  PUBLIC
+  AUTHENTICATED
+  ADMIN
+}
+
+# -----------------------------------------------------------------------------
+# SCALARS
+# -----------------------------------------------------------------------------
+
+"""RFC 3339 UTC timestamp."""
+scalar DateTime
+
+"""Arbitrary structured JSON (tool inputs/outputs, failure details)."""
+scalar JSON
+
+"""RFC 3986 URI reference (artifact locations)."""
+scalar URI
+
+# -----------------------------------------------------------------------------
+# INTERFACES
+# -----------------------------------------------------------------------------
+
+"""Anything with durable identity in the task graph."""
+interface Node {
+  id: ID!
+}
+
+"""Anything whose record creation/update is audited."""
+interface Temporal {
+  createdAt: DateTime!
+  updatedAt: DateTime!
+}
+
+# -----------------------------------------------------------------------------
+# ENUMS — closed, finite sets of symbolic domain states
+# -----------------------------------------------------------------------------
+
+"""Lifecycle of a work unit. TASK_READY means claimable; TASK_BLOCKED means
+held by unsatisfied HARD dependencies; the terminal states are COMPLETED,
+FAILED, CANCELLED."""
+enum TaskStatus {
+  TASK_PENDING
+  TASK_READY
+  TASK_RUNNING
+  TASK_BLOCKED
+  TASK_COMPLETED
+  TASK_FAILED
+  TASK_CANCELLED
+}
+
+"""How important the work is. A closed set; assigning metadata to priorities
+would demote them to a type with an enum field, so the enum stays bare."""
+enum Priority {
+  PRIORITY_LOW
+  PRIORITY_MEDIUM
+  PRIORITY_HIGH
+  PRIORITY_CRITICAL
+}
+
+"""Who/what may hold a claim and execute a task."""
+enum AgentKind {
+  AGENT_HUMAN
+  AGENT_WORKER
+  AGENT_SERVICE
+}
+
+enum ClaimState {
+  CLAIM_ACTIVE
+  CLAIM_RELEASED
+  CLAIM_EXPIRED
+}
+
+enum RunState {
+  RUN_QUEUED
+  RUN_RUNNING
+  RUN_PAUSED
+  RUN_COMPLETED
+  RUN_FAILED
+  RUN_CANCELLED
+}
+
+enum ToolCallStatus {
+  TOOL_PENDING
+  TOOL_RUNNING
+  TOOL_SUCCEEDED
+  TOOL_FAILED
+  TOOL_CANCELLED
+}
+
+"""HARD deps block the source task until satisfied; SOFT deps are
+informational and never block."""
+enum DependencyType {
+  DEPENDENCY_HARD
+  DEPENDENCY_SOFT
+}
+
+enum DependencyState {
+  DEPENDENCY_PENDING
+  DEPENDENCY_SATISFIED
+  DEPENDENCY_BROKEN
+}
+
+enum ArtifactKind {
+  ARTIFACT_FILE
+  ARTIFACT_URL
+  ARTIFACT_DATASET
+  ARTIFACT_IMAGE
+  ARTIFACT_LOG
+  ARTIFACT_OTHER
+}
+
+"""Domain failure codes. Keeps Failure structured instead of a string bag."""
+enum FailureCode {
+  FAILURE_TIMEOUT
+  FAILURE_TOOL
+  FAILURE_AGENT
+  FAILURE_VALIDATION
+  FAILURE_DEPENDENCY
+  FAILURE_CANCELLED
+  FAILURE_UNKNOWN
+}
+
+# -----------------------------------------------------------------------------
+# UNIONS — gated-value wrappers (sum types). Each variant carries the data
+# that exists only in that state; the parallel status/state enum stays as a
+# cheap, filterable discriminator. Soft invariant (resolver-enforced): the
+# variant returned always matches the enum value.
+# -----------------------------------------------------------------------------
+
+union TaskOutcome =
+    TaskPending
+  | TaskReady
+  | TaskRunning
+  | TaskBlocked
+  | TaskCompleted
+  | TaskFailed
+  | TaskCancelled
+
+union RunOutcome =
+    RunQueued
+  | RunRunning
+  | RunPaused
+  | RunCompleted
+  | RunFailed
+  | RunCancelled
+
+union ToolCallOutcome =
+    ToolCallPending
+  | ToolCallRunning
+  | ToolCallSucceeded
+  | ToolCallFailed
+  | ToolCallCancelled
+
+union DependencyCondition =
+    DependencyPending
+  | DependencySatisfied
+  | DependencyBroken
+
+union ClaimResolution =
+    ClaimActive
+  | ClaimReleased
+  | ClaimExpired
+
+# -----------------------------------------------------------------------------
+# TYPES
+# -----------------------------------------------------------------------------
+
+"""A durable work unit: the thing agents claim, run, and close."""
+type Task implements Node & Temporal {
+  id: ID!
+  title: String!
+  description: String!
+
+  """Cheap, filterable discriminator (see outcome for state-gated data).
+  Soft invariant: the TaskOutcome variant always matches this value."""
+  status: TaskStatus!
+  outcome: TaskOutcome!
+  priority: Priority!
+
+  """The agent that created this task."""
+  createdBy: Agent
+
+  """The currently active claim, or null when no agent holds the task.
+  Null here is explicit — no active claim — not a hidden state."""
+  claim: Claim
+
+  """All claims on this task, newest first (active, released, expired)."""
+  claims: [Claim!]!
+
+  """All execution runs of this task, newest first."""
+  runs: [Run!]!
+
+  """Outgoing dependency edges — things this task depends on. Includes HARD
+  and SOFT edges; only unsatisfied HARD edges block (see TaskBlocked)."""
+  dependencies: [DependencyEdge!]!
+
+  """Incoming dependency edges — tasks that depend on this one."""
+  dependents: [DependencyEdge!]!
+
+  createdAt: DateTime!
+  updatedAt: DateTime!
+}
+
+# --- Task state-gated variants (TaskOutcome members) ---
+
+type TaskPending {
+  pendingSince: DateTime!
+}
+
+type TaskReady {
+  readySince: DateTime!
+}
+
+type TaskRunning {
+  """The claim currently driving this task."""
+  activeClaim: Claim!
+}
+
+type TaskBlocked {
+  """Unsatisfied HARD dependencies holding the task."""
+  blockingEdges: [DependencyEdge!]!
+}
+
+type TaskCompleted {
+  completedAt: DateTime!
+
+  """The run that completed this task."""
+  completedBy: Run
+
+  """Output artifact refs produced across the task's runs."""
+  artifacts: [Artifact!]!
+}
+
+type TaskFailed {
+  failedAt: DateTime!
+  failure: Failure!
+}
+
+type TaskCancelled {
+  cancelledAt: DateTime!
+  reason: String
+}
+
+"""An actor (human operator, AI worker, or service) that may claim and run
+tasks. Minimal by design — it is referenced by claiming, not the subject of
+this group."""
+type Agent implements Node & Temporal {
+  id: ID!
+  name: String!
+  kind: AgentKind!
+
+  """Claims this agent holds or has held, newest first."""
+  claims: [Claim!]! @policy(type: AUTHENTICATED)
+
+  createdAt: DateTime!
+  updatedAt: DateTime!
+}
+
+"""A claim: an agent takes exclusive custody of a task to run it."""
+type Claim implements Node {
+  id: ID!
+  task: Task!
+  agent: Agent!
+
+  """Cheap, filterable discriminator (see resolution for gated data)."""
+  state: ClaimState!
+
+  """Gated wrapper: releasedAt/releasedBy/reason exist only once the claim
+  is no longer active."""
+  resolution: ClaimResolution!
+
+  """When the claim was taken."""
+  claimedAt: DateTime!
+}
+
+# --- Claim state-gate variants (ClaimResolution members) ---
+
+type ClaimActive {
+  """When the active claim lapses if not renewed."""
+  expiresAt: DateTime
+}
+
+type ClaimReleased {
+  releasedAt: DateTime!
+  releasedBy: Agent
+  reason: String
+}
+
+type ClaimExpired {
+  expiredAt: DateTime!
+}
+
+"""One execution attempt of a task. A task can be run multiple times
+(e.g. after a failed attempt is released and re-claimed)."""
+type Run implements Node {
+  id: ID!
+  task: Task!
+
+  """1-based attempt number of this task (1 = first run). Soft invariant: >= 1."""
+  attempt: Int!
+
+  """Cheap, filterable discriminator (see outcome for state-gated data)."""
+  state: RunState!
+  outcome: RunOutcome!
+
+  """The claim that authorized this run. A run without an authorization is
+  incoherent — a hard invariant."""
+  claim: Claim!
+
+  """Iterations of the agent loop within this run, oldest first."""
+  iterations: [Iteration!]!
+
+  """Latest progress reading, or null before the first progress report.
+  Null here is explicit — nothing has been reported yet."""
+  progress: ProgressUpdate
+
+  """Full progress trajectory, oldest first."""
+  progressUpdates: [ProgressUpdate!]!
+
+  """Legacy convenience. Use outcome instead:
+  RunCompleted.completedAt / RunFailed.failedAt / RunCancelled.cancelledAt."""
+  finishedAt: DateTime @deprecated(reason: "Use the terminal RunOutcome variant timestamps instead")
+}
+
+# --- Run state-gate variants (RunOutcome members) ---
+
+type RunQueued {
+  queuedAt: DateTime!
+}
+
+type RunRunning {
+  """The iteration the agent is currently on, if any."""
+  currentIteration: Iteration
+}
+
+type RunPaused {
+  pausedAt: DateTime!
+  resumeAt: DateTime
+}
+
+type RunCompleted {
+  completedAt: DateTime!
+  summary: String
+
+  """Output artifact references produced by this run."""
+  artifacts: [Artifact!]!
+}
+
+type RunFailed {
+  failedAt: DateTime!
+  failure: Failure!
+}
+
+type RunCancelled {
+  cancelledAt: DateTime!
+  reason: String
+}
+
+"""One pass of the agent loop (think -> act -> observe) within a run."""
+type Iteration implements Node {
+  id: ID!
+  run: Run!
+
+  """1-based iteration number within the run. Soft invariant: >= 1."""
+  index: Int!
+  startedAt: DateTime!
+
+  """null while the iteration is still in progress."""
+  completedAt: DateTime
+  summary: String
+
+  """Tool invocations made during this iteration, in order."""
+  toolCalls: [ToolCall!]!
+
+  """The iteration's final output, if any."""
+  output: JSON
+}
+
+"""A single tool invocation within an iteration."""
+type ToolCall implements Node {
+  id: ID!
+  iteration: Iteration!
+
+  """Name of the tool invoked (e.g. 'web_search', 'file_write'). An open,
+  pluggable set — hence a String, not a frozen enum."""
+  tool: String!
+
+  """Cheap, filterable discriminator (see outcome for gated data)."""
+  status: ToolCallStatus!
+  outcome: ToolCallOutcome!
+
+  """Structured arguments passed to the tool."""
+  input: JSON!
+}
+
+# --- Tool-call state-gate variants (ToolCallOutcome members) ---
+
+type ToolCallPending {
+  queuedAt: DateTime!
+}
+
+type ToolCallRunning {
+  startedAt: DateTime!
+}
+
+type ToolCallSucceeded {
+  output: JSON!
+  finishedAt: DateTime!
+}
+
+type ToolCallFailed {
+  failure: Failure!
+  finishedAt: DateTime!
+}
+
+type ToolCallCancelled {
+  cancelledAt: DateTime!
+}
+
+"""A reference to something a run produced. References, not blobs — the
+payload lives behind the URI."""
+type Artifact implements Node & Temporal {
+  id: ID!
+  name: String!
+  kind: ArtifactKind!
+  uri: URI!
+  contentType: String
+  sizeBytes: Int
+  checksum: String
+
+  """The run that produced this artifact."""
+  producedBy: Run
+
+  createdAt: DateTime!
+  updatedAt: DateTime!
+}
+
+"""A point-in-time progress reading on a run."""
+type ProgressUpdate {
+  at: DateTime!
+
+  """0–100. Soft invariant: resolver rejects/clamps out-of-range values."""
+  percent: Int!
+  message: String
+}
+
+"""A directed dependency between two tasks. First-class edge: it carries its
+own lifecycle (PENDING -> SATISFIED | BROKEN), type (HARD/SOFT), and audit
+metadata, so it earns an edge type rather than a bare sourceTaskId field."""
+type DependencyEdge implements Node & Temporal {
+  id: ID!
+  source: Task!
+  target: Task!
+  type: DependencyType!
+
+  """Cheap, filterable discriminator (see condition for gated data)."""
+  state: DependencyState!
+  condition: DependencyCondition!
+
+  """The agent that declared this dependency."""
+  createdBy: Agent
+
+  createdAt: DateTime!
+  updatedAt: DateTime!
+}
+
+# --- Dependency state-gate variants (DependencyCondition members) ---
+
+type DependencyPending {
+  since: DateTime!
+}
+
+type DependencySatisfied {
+  satisfiedAt: DateTime!
+}
+
+type DependencyBroken {
+  brokenAt: DateTime!
+  reason: String!
+}
+
+"""What went wrong when a run or tool call fails. One concept, one type —
+shared by RunFailed, ToolCallFailed, and TaskFailed instead of three
+near-identical error types."""
+type Failure {
+  code: FailureCode!
+  message: String!
+  details: JSON
+
+  """Whether retrying the same work may succeed."""
+  retryable: Boolean!
+}
+
+# -----------------------------------------------------------------------------
+# INPUTS — express caller intent, not output-state mirrors
+# -----------------------------------------------------------------------------
+
+"""Single input for both create and update. All fields optional; the
+mutation determines which are required (createTask requires title). One
+intent-shape instead of CreateTaskInput/UpdateTaskInput/PatchTaskInput."""
+input TaskInput {
+  title: String
+  description: String
+  priority: Priority = PRIORITY_MEDIUM
+  createdByAgentId: ID
+}
+
+input FailureInput {
+  code: FailureCode!
+  message: String!
+  details: JSON
+  retryable: Boolean = false
+}
+
+input TaskFilter {
+  status: TaskStatus
+  priority: Priority
+  claimedByAgentId: ID
+
+  """True = only tasks currently blocked by dependencies."""
+  blocked: Boolean
+
+  """Free-text match on title/description."""
+  query: String
+}
+
+input RunFilter {
+  taskId: ID
+  agentId: ID
+  state: RunState
+}
+
+# -----------------------------------------------------------------------------
+# ROOTS
+# -----------------------------------------------------------------------------
+
+type Query {
+  task(id: ID!): Task
+  tasks(filter: TaskFilter, first: Int = 50, after: String): [Task!]!
+  run(id: ID!): Run
+  runs(filter: RunFilter, first: Int = 50, after: String): [Run!]!
+  agent(id: ID!): Agent
+  agents(first: Int = 50, after: String): [Agent!]!
+}
+
+type Mutation {
+  createTask(input: TaskInput!): Task!
+  updateTask(id: ID!, input: TaskInput!): Task!
+  claimTask(taskId: ID!, agentId: ID!): Claim! @policy(type: AUTHENTICATED, rateLimit: "10/m")
+  releaseTask(taskId: ID!): Claim! @policy(type: AUTHENTICATED)
+  addDependency(sourceTaskId: ID!, targetTaskId: ID!, type: DependencyType!): DependencyEdge!
+  removeDependency(edgeId: ID!): ID!
+  startRun(taskId: ID!): Run!
+  reportProgress(runId: ID!, percent: Int!, message: String): ProgressUpdate!
+  completeRun(runId: ID!, summary: String): Run!
+  failRun(runId: ID!, failure: FailureInput!): Run!
+  cancelTask(taskId: ID!, reason: String): Task!
+}
+
+# =============================================================================
+# RATIONALE
+# =============================================================================
+#
+# 1. ONE CONCEPT, ONE TYPE
+#    Every domain concept gets exactly one canonical type:
+#      Task (the work unit)       Claim (custody/assignment)
+#      Run (an attempt)           Iteration (a loop pass)
+#      ToolCall (an invocation)   Artifact (an output ref)
+#      ProgressUpdate (a reading) DependencyEdge (a dependency)
+#      Failure (an error)         Agent (the actor referenced by claiming)
+#    There is no TaskSummary/TaskDetail mirror, no TaskRun vs Run split, and
+#    no parallel Progress + ProgressUpdate pair — ProgressUpdate is the one
+#    progress concept, reached two ways (Run.progress = latest,
+#    Run.progressUpdates = trajectory). Failure is one shared type used by
+#    RunFailed, ToolCallFailed, and TaskFailed instead of three near-identical
+#    error types. State-gate union members are deliberately NOT "views" of the
+#    parent — they are the state-shaped payloads of a sum type, which the
+#    gated-value pattern demands.
+#
+# 2. NAMING (sniff test)
+#    Read aloud to a domain expert: "the task is READY to claim; the agent
+#    holds an ACTIVE claim; the run is RUNNING with 3 iterations; the tool
+#    call SUCCEEDED with output; the dependency is SATISFIED." No translation
+#    needed. No storage/protocol names leak (no MongoDocument, no
+#    KafkaMessage, no QueueMessage). Union-member names keep their domain
+#    prefix (TaskPending, RunFailed, ToolCallSucceeded) because they are
+#    queried OUTSIDE their parent via inline fragments (`... on TaskFailed`),
+#    so the prefix disambiguates across the whole API rather than repeating
+#    nested context. Tool names stay String because tools are a pluggable open
+#    set — an enum would freeze the registry; this is a real open set, not a
+#    string bag.
+#
+# 3. DECISION TREE (applied in order)
+#    Enum: every closed symbolic state set (TaskStatus, RunState,
+#    ToolCallStatus, ClaimState, DependencyState, Priority, AgentKind,
+#    ArtifactKind, FailureCode, AuthRequirement).
+#    Interface: Node (durable identity) and Temporal (audit timestamps) —
+#    flat, composable (`type Task implements Node & Temporal`), not a deep
+#    inheritance chain. Applied only where auditors genuinely exist: Run,
+#    Claim, ToolCall, Iteration carry their own domain timestamps (queuedAt,
+#    claimedAt, startedAt), so they implement Node only — forcing a
+#    createdAt/updatedAt pair on every child type would be fabrication.
+#    Union: the five gated-value wrappers. A proposed sixth union for a
+#    polymorphic "search results" surface was rejected — this group has no
+#    such surface.
+#    Scalar: DateTime (serialization/validation), JSON (structured tool data
+#    — not a string bag), URI (artifact locations). Name is NOT a scalar —
+#    it is a plain String; Email would be, Name isn't.
+#
+# 4. GATED-VALUE PATTERN (the flagship)
+#    Every state machine pairs a cheap, filterable enum with a sum-type
+#    wrapper whose variants carry exactly the data that exists in that state:
+#      TaskOutcome (7 variants)    RunOutcome (6)      ToolCallOutcome (5)
+#      DependencyCondition (3)     ClaimResolution (3)
+#    You cannot read `output` unless the tool call SUCCEEDED; cannot read
+#    `blockingEdges` unless the task is BLOCKED; cannot read `releasedAt`
+#    unless the claim is RELEASED — the schema structurally forbids it (hard
+#    invariant). The predicate "which variant matches which enum" is a soft
+#    invariant enforced by resolvers. This converts would-be-nullable
+#    contracts ("result null because not done? errored? empty?") into
+#    unrepresentable illegal states.
+#    Deliberate balance: single temporal fields with exactly one null meaning
+#    stay nullable (Iteration.completedAt = "still in progress", Task.claim =
+#    "no active claim", Run.progress = "nothing reported yet",
+#    RunRunning.currentIteration = "between iterations"). Those nulls are
+#    unambiguous; wrapping a lone field in a union would be over-structuring.
+#
+# 5. EDGE-FIRST GRAPH MODELING
+#    DependencyEdge is a first-class type (the guide's own exemplar): it owns
+#    its lifecycle (PENDING -> SATISFIED | BROKEN), type (HARD/SOFT), and
+#    audit metadata, so clients ask "is this edge blocking, and why" without
+#    polluting Task. Traversal is explicit both ways — Task.dependencies
+#    (outgoing) and Task.dependents (incoming) — so the graph stays queryable
+#    through node-type refactorings. Simple, metadata-free relationships stay
+#    plain fields: Task.createdBy, Claim.agent, Run.task, Artifact.producedBy.
+#    No ID-soup: every relationship is a typed field; bare IDs appear only as
+#    mutation arguments and as identity (id: ID!). Edge state is gated via
+#    the DependencyCondition wrapper.
+#
+# 6. SOFT vs HARD INVARIANTS
+#    Hard (schema-enforced — structural incoherence): id: ID! on every Node;
+#    Run.claim: Claim! (a run without an authorization is incoherent);
+#    DependencyEdge.source: Task! and .target: Task!; every state enum and
+#    every state union non-null.
+#    Soft (resolver + description): a task cannot depend on itself (cycle +
+#    transitive-cycle rejection); percent is 0..100; attempt/index >= 1;
+#    title <= 256 chars; only HARD deps block (unsatisfied SOFT deps never
+#    force TASK_BLOCKED); TASK_BLOCKED iff blockingEdges is non-empty;
+#    the outcome variant always matches the status enum. These stay in the
+#    code layer so they evolve without schema migrations — the schema stays
+#    the stable structural contract.
+#
+# 7. DIRECTIVES vs FIELDS
+#    Execution concerns are grouped into ONE @policy directive (auth + rate
+#    limit) and applied only where execution behavior changes: claimTask
+#    (creating payloads commits agents — needs a real role), releaseTask,
+#    and the Agent.claims traversal (aquire visibility). No
+#    @authenticated/@validated/@logged/@cached litter. @deprecated on
+#    Run.finishedAt is guidance: the superseded field keeps old clients
+#    working while they migrate to the terminal RunOutcome variant
+#    timestamps. Everything a client SELECTs, filters, or mutates lives in
+#    the field plane; nothing from the execution plane leaks into fields
+#    (no cacheControl field, no auditing flags).
+#
+# 8. INPUTS EXPRESS INTENT, NOT MIRRORS
+#    One TaskInput serves both createTask and updateTask — no
+#    CreateTaskInput/UpdateTaskInput/PatchTaskInput triple, and the input
+#    field list is a subset of Task (no status/outcome/claims — callers do
+#    not write those directly). Small mutations use flat argument lists
+#    (claimTask, reportProgress, addDependency, cancelTask). Inputs declare
+#    intent; outputs declare state; they never mirror.
+#
+# 9. "WOULD I QUERY THIS?" AUDIT
+#    Kept: TaskCompleted.artifacts (aggregated output — the common "what did
+#    this task produce" query walks the outcome), Agent.claims ("what is this
+#    agent working on"), Run.progressUpdates (trajectory charts),
+#    TaskFilter (status/priority/blocked/who-owns filtering).
+#    Cut: task parent/children layers, tags, due dates, task-level progress
+#    (4-handled by the active run), run log text (blob — would leak storage).
+#    NONE of those pass the real-client test in this group's domain.
+#
+# 10. DRIFT / COHESION (schema <-> code two-way)
+#    Schema prompts implementation: every union variant and every edge names
+#    the resolver branch that must exist. Code informs schema: the soft
+#    invariants (cycle rejection, percentage bounds) tighten in resolvers
+#    without a schema migration. Adding a state (e.g. TASK_ARCHIVED) is a
+#    paired change — one enum value + one union variant + one resolver
+#    branch — making the coupling explicit rather than hidden. The gated
+#    wrappers bridge schema and code: schema declares the shape of each
+#    state, code decides which state applies. Both projections stay
+#    symmetric — regenerate either from the other without hidden coupling.
+# =============================================================================

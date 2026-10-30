@@ -1,0 +1,5 @@
+[2m2026-09-09T06:48:58.692130Z[0m [32m INFO[0m [2mlev[0m[2m:[0m Leviath CLI v0.5.0
+[2m2026-09-09T06:48:58.696882Z[0m [33m WARN[0m [2mleviath_cli::config[0m[2m:[0m config.toml has keys nothing reads; they are being ignored. `lev doctor` reports them too, if this scrolls past. [3mkeys[0m[2m=[0magent_read_paths.fixer.write_paths, agent_read_paths.oracle.write_paths
+[2m2026-09-09T06:48:58.697372Z[0m [33m WARN[0m [2mleviath_cli::config[0m[2m:[0m config.toml has keys nothing reads; they are being ignored. `lev doctor` reports them too, if this scrolls past. [3mkeys[0m[2m=[0magent_read_paths.fixer.write_paths, agent_read_paths.oracle.write_paths
+[2m2026-09-09T06:48:58.697557Z[0m [33m WARN[0m [2mleviath_cli::config[0m[2m:[0m config.toml has keys nothing reads; they are being ignored. `lev doctor` reports them too, if this scrolls past. [3mkeys[0m[2m=[0magent_read_paths.fixer.write_paths, agent_read_paths.oracle.write_paths
+spawned draft-flash-1788936538-de5a42f57e66

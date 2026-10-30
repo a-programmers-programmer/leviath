@@ -1,0 +1,6 @@
+{
+  "run_id": "investigator-1789339802-0c89c5b8abd7",
+  "blueprint_path": "/data/.leviath/agents/investigator/agent.leviath",
+  "workdir": "/data/work/leviath",
+  "yolo": false
+}

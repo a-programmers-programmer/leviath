@@ -1,0 +1,30 @@
+=== PORCELAIN
+ M crates/leviath-cli/src/commands/mcp/serve_tests.rs
+ M crates/leviath-cli/src/commands/mcp/serve_tools/control.rs
+ M crates/leviath-cli/src/commands/mcp/serve_tools/run.rs
+ M crates/leviath-cli/src/daemon/spawn/mod.rs
+ M crates/leviath-cli/src/daemon/tool_service.rs
+?? .lv_scratch.txt
+?? .pinwork/
+?? .verify_out.txt
+?? _manifest.json
+?? aggregator.md
+?? build.log
+?? lens_deepseek.md
+?? lens_qwen.md
+?? lens_tencent.md
+?? moa-primitives-workflows-research.md
+?? oracle-output/scout-thinking-workflows-research.md
+?? python/
+?? study/
+=== DIFF STAT
+ crates/leviath-cli/src/commands/mcp/serve_tests.rs         |  4 ++++
+ crates/leviath-cli/src/commands/mcp/serve_tools/control.rs |  9 +++++++++
+ crates/leviath-cli/src/commands/mcp/serve_tools/run.rs     | 10 ++++++++++
+ crates/leviath-cli/src/daemon/spawn/mod.rs                 | 11 +++++++++--
+ crates/leviath-cli/src/daemon/tool_service.rs              |  8 ++++++++
+ 5 files changed, 40 insertions(+), 2 deletions(-)
+=== HEAD
+0e946883 fix(agents): give the folded bake-off lanes a blueprint version so the bundled-agent build script can read one
+4fd3e4f2 fix(runtime): restore the parts field the sync merge dropped from a fan-out InferenceResult
+a327db52 Merge remote-tracking branch 'app/main' into sync/upstream-0.6.0

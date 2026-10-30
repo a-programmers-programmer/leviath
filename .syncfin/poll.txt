@@ -1,0 +1,68 @@
+=== 34667066022 Fork binary (dispatch) | completed | success | 15dc182e | https://github.com/a-programmers-programmer/leviath/actions/runs/34667066022
+   Build lev (x86_64-unknown-linux-gnu)           | completed   | success
+
+=== 34667165102 Alpha (Nightly) | completed | failure | 15dc182e | https://github.com/a-programmers-programmer/leviath/actions/runs/34667165102
+   Check for a version bump                       | completed   | success
+   Gate / Docs                                    | completed   | success
+   Gate / Clippy (ubuntu-latest)                  | completed   | success
+   Gate / Test (ubuntu-24.04-arm)                 | completed   | failure
+   Gate / Supply chain                            | completed   | failure
+   Gate / Clippy (windows-latest)                 | completed   | success
+   Gate / Test (macos-latest)                     | completed   | failure
+   Gate / Test (windows-latest)                   | completed   | failure
+   Gate / Build with default features             | completed   | success
+   Gate / Test (ubuntu-latest)                    | completed   | failure
+   Gate / Guard re-export-only facade (crates/leviath) | completed   | success
+   Gate / Clippy (macos-latest)                   | completed   | success
+   Gate / Format                                  | completed   | success
+   Gate / Check coverage suppression markers      | completed   | success
+   Gate / Guard bin entrypoint (main.rs)          | completed   | skipped
+   Gate / Coverage (ubuntu-latest / leviath-alloc) | completed   | success
+   Gate / Coverage (ubuntu-latest / leviath-runtime) | completed   | failure
+   Gate / Coverage (ubuntu-latest / leviath-core) | completed   | failure
+   Gate / Coverage (ubuntu-latest / leviath-agent-client) | completed   | success
+   Gate / Coverage (ubuntu-latest / leviath-net)  | completed   | success
+   Gate / Coverage (macos-latest / leviath-core)  | completed   | failure
+   Gate / Coverage (macos-latest / leviath-agent-client) | completed   | success
+   Gate / Coverage (ubuntu-latest / leviath-cli)  | completed   | failure
+   Gate / Coverage (ubuntu-latest / leviath-providers) | completed   | success
+   Gate / Coverage (macos-latest / leviath-net)   | completed   | success
+   Gate / Coverage (ubuntu-latest / leviath-package) | completed   | success
+   Gate / Coverage (macos-latest / leviath-tools) | completed   | success
+   Gate / Coverage (ubuntu-latest / leviath-mcp)  | completed   | success
+   Gate / Coverage (macos-latest / leviath-alloc) | completed   | success
+   Gate / Coverage (macos-latest / leviath-runtime) | completed   | failure
+   Gate / Coverage (macos-latest / leviath-telemetry) | completed   | success
+   Gate / Coverage (macos-latest / leviath-package) | completed   | success
+   Gate / Coverage (ubuntu-latest / leviath-scripting) | completed   | failure
+   Gate / Coverage (ubuntu-latest / leviath-tools) | completed   | success
+   Gate / Coverage (macos-latest / leviath-mcp)   | completed   | success
+   Gate / Coverage (windows-latest / leviath-mcp) | completed   | success
+   Gate / Coverage (ubuntu-latest / leviath-sys)  | completed   | success
+   Gate / Coverage (windows-latest / leviath-alloc) | completed   | success
+   Gate / Coverage (windows-latest / leviath-scripting) | completed   | failure
+   Gate / Coverage (ubuntu-latest / leviath-telemetry) | completed   | success
+   Gate / Coverage (windows-latest / leviath-agent-client) | completed   | success
+   Gate / Coverage (macos-latest / leviath-cli)   | completed   | failure
+   Gate / Coverage (macos-latest / leviath-scripting) | completed   | failure
+   Gate / Coverage (macos-latest / leviath-sys)   | completed   | success
+   Gate / Coverage (macos-latest / leviath-providers) | completed   | success
+   Gate / Coverage (windows-latest / leviath-core) | completed   | failure
+   Gate / Coverage (windows-latest / leviath-providers) | completed   | success
+   Gate / Coverage (windows-latest / leviath-tools) | completed   | success
+   Gate / Coverage (windows-latest / leviath-package) | completed   | success
+   Gate / Coverage (windows-latest / leviath-net) | completed   | success
+   Gate / Coverage (windows-latest / leviath-sys) | completed   | success
+   Gate / Coverage (windows-latest / leviath-telemetry) | completed   | success
+   Gate / Coverage (windows-latest / leviath-runtime) | completed   | failure
+   Gate / Coverage (windows-latest / leviath-cli) | completed   | failure
+   Gate / Guard release version bump              | completed   | skipped
+   Gate / Coverage gate (ubuntu-latest)           | completed   | success
+   Gate / Coverage gate (macos-latest)            | completed   | success
+   Gate / Coverage gate (windows-latest)          | completed   | success
+   Gate / Publish combined test badge             | completed   | skipped
+   Build (${{ matrix.target }})                   | completed   | skipped
+   Publish Alpha                                  | completed   | skipped
+   Publish docs (alpha)                           | completed   | skipped
+   Bump tap manifests (alpha)                     | completed   | skipped
+

@@ -1,0 +1,13 @@
+Read-only verification task. Do NOT write, edit, or create any file.
+
+Read these files in order and report one line each:
+
+1. /data/.leviath/runs/investigator-1789339768-6f33646874c1/meta.json
+2. /data/.leviath/runs/investigator-1789339768-6f33646874c1/stages.json
+3. /data/.leviath/runs/hivemind-1789339438-1083d0ffd3b3/meta.json
+
+For each, report the file path and its byte size, then one short
+sentence on what it holds. Then answer: does the run store keep a
+run's metadata under /data/.leviath/runs/<run_id>/meta.json?
+
+Hand the answer back through submit_output. Keep it under 250 words.

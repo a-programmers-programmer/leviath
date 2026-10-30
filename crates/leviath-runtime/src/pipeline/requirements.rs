@@ -259,7 +259,7 @@ pub(crate) struct OutputReentries(pub usize);
 /// Names the tool rather than describing it, because the description the model
 /// already has carries the shape; what it missed was that the call is not
 /// optional.
-const MISSING_OUTPUT_NUDGE: &str = "This stage is not finished: you have not called `submit_output`. Whatever you wrote to \
+pub(crate) const MISSING_OUTPUT_NUDGE: &str = "This stage is not finished: you have not called `submit_output`. Whatever you wrote to \
      files or to context is not what the caller receives - only the final output is. Call \
      `submit_output` now with your answer.";
 
@@ -279,18 +279,47 @@ type FinalOutputQuery = (
     Option<&'static mut crate::persistence::RunOutcomeFlags>,
 );
 
-/// The last non-empty text in the conversation region, if any.
+/// Whether an entry is one of the runtime's own injected `[System]` nudges.
+///
+/// A nudge is guidance to the model about what to do next, not something the
+/// model said; adopting one as a stage's final output hands the caller the
+/// runtime's nag instead of an answer. They reach the conversation through
+/// [`inject_system_nudge`](crate::pipeline::response::inject_system_nudge), the
+/// single injection path, which writes them as a plain [`EntryKind::Text`]
+/// entry. The kind alone cannot separate them from a summary or a scratch note
+/// - both are also `Text` - so the injected prefix is what marks them. An
+/// unprefixed `Text` entry assembles as a user message, which is why the prefix
+/// is the reliable discriminator.
+fn is_injected_system_nudge(entry: &leviath_core::RegionEntry) -> bool {
+    matches!(entry.kind, leviath_core::EntryKind::Text)
+        && entry.content.trim_start().starts_with("[System]")
+}
+
+/// The last non-empty text the *model* produced in the conversation region, if
+/// any.
 ///
 /// Shared by the two give-up branches of [`require_final_output`]: a stage that
 /// hit its iteration cap and a stage that exhausted its re-entry budget both end
 /// with whatever the model last said. Adopting it is the difference between a
 /// partial answer and no answer at all, so the two paths must not drift.
+///
+/// Injected `[System]` nudges are skipped. On the exhausted-budget arm the last
+/// non-empty entry is very often the runtime's own "you have not called
+/// `submit_output`" nag, and adopting that reports `produced_output: true` while
+/// delivering nothing the caller asked for. Walking past it either finds an
+/// earlier genuine model turn - a partial answer, which is exactly what the
+/// adoption is for - or finds nothing, which correctly leaves the
+/// `output_forced` flag as the honest signal.
 fn last_conversation_text(window: &ContextWindow) -> Option<String> {
     window.get_region("conversation").and_then(|r| {
-        r.content.iter().rev().find_map(|e| {
-            let text = e.content.trim();
-            (!text.is_empty()).then(|| text.to_owned())
-        })
+        r.content
+            .iter()
+            .rev()
+            .filter(|e| !is_injected_system_nudge(e))
+            .find_map(|e| {
+                let text = e.content.trim();
+                (!text.is_empty()).then(|| text.to_owned())
+            })
     })
 }
 

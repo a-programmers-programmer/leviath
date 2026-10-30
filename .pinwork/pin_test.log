@@ -1,0 +1,151 @@
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /data/work/leviath/crates/leviath-cli/Cargo.toml
+workspace: /data/work/leviath/Cargo.toml
+   Compiling leviath-cli v0.5.8 (/data/work/leviath/crates/leviath-cli)
+   Compiling leviath-runtime v0.5.8 (/data/work/leviath/crates/leviath-runtime)
+warning: function `bool_request` is never used
+   --> crates/leviath-cli/src/commands/mcp/serve_tools/mod.rs:422:10
+    |
+422 | async fn bool_request(
+    |          ^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `leviath-cli` (lib test) generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 46.41s
+     Running unittests src/lib.rs (target/debug/deps/leviath_cli-0ea534afb6bfe02c)
+
+running 130 tests
+test daemon::spawn::tests::a_call_that_returns_nothing_contributes_no_block ... ok
+test daemon::spawn::tests::a_failed_call_is_skipped_and_the_rest_still_seed ... ok
+test daemon::spawn::tests::a_call_carries_the_arguments_the_blueprint_wrote ... ok
+test daemon::spawn::tests::a_required_region_fails_the_spawn_when_its_tool_does ... ok
+test daemon::spawn::tests::a_required_region_fails_when_nothing_was_produced ... ok
+test daemon::spawn::tests::a_tool_seed_writes_every_call_into_one_region_in_order ... ok
+test daemon::spawn::tests::a_task_the_blueprint_cannot_hold_is_refused ... ok
+test daemon::spawn::tests::a_whitespace_only_task_is_not_treated_as_a_task ... ok
+test daemon::spawn::tests::an_optional_region_whose_calls_all_fail_stays_unseeded ... ok
+test daemon::spawn::tests::an_agent_driven_by_named_regions_still_spawns_with_no_task ... ok
+test daemon::spawn::tests::a_glob_that_matches_outside_the_workdir_is_refused ... ok
+test daemon::spawn::tests::a_seed_file_inside_the_workdir_still_seeds ... ok
+test daemon::spawn::tests::a_granted_read_path_lets_a_seed_file_out ... ok
+test daemon::spawn::tests::an_output_validator_outside_the_blueprint_directory_is_refused ... ok
+test daemon::spawn::tests::a_missing_hook_script_fails_the_spawn ... ok
+test daemon::spawn::tests::a_hook_script_outside_the_blueprint_directory_is_refused ... ok
+test daemon::spawn::tests::a_missing_blueprint_prefixed_file_honors_required_and_optional ... ok
+test daemon::spawn::tests::a_custom_region_script_outside_the_blueprint_directory_is_refused ... ok
+test daemon::spawn::tests::a_declared_but_ungranted_read_path_does_not_let_a_seed_file_out ... ok
+test daemon::spawn::tests::a_read_paths_grant_does_not_rescue_an_escaping_blueprint_seed ... ok
+test daemon::spawn::tests::a_file_that_lacks_the_hook_it_was_named_for_fails_the_spawn ... ok
+test daemon::spawn::tests::a_blueprint_prefixed_glob_seeds_shipped_files ... ok
+test daemon::spawn::tests::a_blueprint_prefixed_seed_file_reads_from_the_blueprint_directory ... ok
+test daemon::spawn::tests::a_blueprint_prefixed_rhai_seed_runs_from_the_blueprint_directory ... ok
+test daemon::spawn::tests::a_blueprint_prefixed_glob_matching_outside_is_refused ... ok
+test daemon::spawn::tests::a_hook_script_beside_the_blueprint_still_loads ... ok
+test daemon::spawn::tests::a_rhai_seed_script_outside_the_workdir_is_refused ... ok
+test daemon::spawn::tests::a_blueprint_prefixed_seed_escaping_the_blueprint_directory_is_refused ... ok
+test daemon::spawn::tests::a_seed_file_outside_the_workdir_is_refused ... ok
+test daemon::spawn::tests::a_declared_hook_is_compiled_and_keyed_by_its_path ... ok
+test daemon::spawn::tests::a_hook_script_that_does_not_compile_fails_the_spawn ... ok
+test daemon::spawn::tests::build_agent_read_error ... ok
+test daemon::spawn::tests::build_agent_invalid_blueprint ... ok
+test daemon::spawn::tests::build_agent_parse_error ... ok
+test daemon::spawn::tests::build_agent_fails_fast_on_a_broken_custom_region_script ... ok
+test daemon::spawn::tests::build_agent_carries_required_tools_into_the_tool_state ... ok
+test daemon::spawn::tests::build_agent_errors_when_sandbox_runtime_unavailable ... ok
+test daemon::spawn::tests::build_agent_no_security_block_leaves_taint_off_by_default ... ok
+test daemon::spawn::tests::build_agent_honors_agent_level_tool_permissions ... ok
+test daemon::spawn::tests::build_agent_propagates_spawn_error ... ok
+test daemon::spawn::tests::build_agent_applies_default_max_iterations_only_when_stage_omits_it ... ok
+test daemon::spawn::tests::build_agent_attaches_taint_gate_when_security_enabled ... ok
+test daemon::spawn::tests::build_agent_carries_no_validators_when_none_are_named ... ok
+test daemon::spawn::tests::build_agent_attaches_sandbox_when_configured ... ok
+test daemon::spawn::tests::build_agent_keeps_a_pinned_stage_model_over_the_users_default ... ok
+test daemon::spawn::tests::build_agent_applies_policy_mcp_overrides_to_the_gate ... ok
+test daemon::spawn::tests::build_agent_does_not_grant_a_workdir_script_shadowing_a_global_tool ... ok
+test daemon::spawn::tests::build_agent_errors_when_required_caller_region_missing ... ok
+test daemon::spawn::tests::build_agent_rejects_a_malformed_config_grant ... ok
+test daemon::spawn::tests::build_agent_refuses_a_manifest_with_no_usable_provider ... ok
+test daemon::spawn::tests::build_agent_leaves_max_iterations_unset_when_config_default_is_none ... ok
+test daemon::spawn::tests::build_agent_carries_output_validators_onto_the_entity ... ok
+test daemon::spawn::tests::build_agent_attaches_declared_stage_hooks ... ok
+test daemon::spawn::tests::build_agent_rejects_a_workdir_that_is_missing_or_not_a_directory ... ok
+test daemon::spawn::tests::build_agent_rejects_a_run_id_that_is_not_a_directory_name ... ok
+test daemon::spawn::tests::expand_global_grants_appends_without_duplicates_only_when_allowed ... ok
+test daemon::spawn::tests::fake_provider_methods_are_exercised ... ok
+test daemon::spawn::tests::build_agent_refuses_a_broken_stage_hook ... ok
+test daemon::spawn::tests::build_agent_refuses_to_substitute_a_model_for_an_unreachable_pin ... ok
+test daemon::spawn::tests::fallback_order_parses_provider_slash_model_and_drops_junk ... ok
+test daemon::spawn::tests::build_agent_script_host_honors_agent_level_grants ... ok
+test daemon::spawn::tests::build_agent_refuses_a_validator_that_does_not_compile ... ok
+test daemon::spawn::tests::model_defaults_carries_the_fallback_chain_from_config ... ok
+test daemon::spawn::tests::platform_satisfies_caps_gates_on_support ... ok
+test daemon::spawn::tests::read_path_grant_counts_are_recorded_for_a_declaring_blueprint ... ok
+test daemon::spawn::tests::read_path_policy_is_inactive_without_declarations ... ok
+test daemon::spawn::tests::read_path_policy_is_quiet_under_the_override ... ok
+test daemon::spawn::tests::read_path_policy_is_quiet_when_granted ... ok
+test daemon::spawn::tests::read_path_policy_rejects_bad_entries_loudly ... ok
+test daemon::spawn::tests::build_agent_reserves_mcp_tool_names_for_install_tool ... ok
+test daemon::spawn::tests::read_path_policy_warns_when_nothing_grants ... ok
+test daemon::spawn::tests::read_sensitivities_bump_only_the_read_tools_when_granted ... ok
+test daemon::spawn::tests::one_file_backing_two_hooks_is_compiled_once ... ok
+test daemon::spawn::tests::build_agent_marks_root_runs_for_titling_but_not_subagents ... ok
+test daemon::spawn::tests::resolve_output_validators_compiles_each_distinct_script_once ... ok
+test daemon::spawn::tests::build_agent_yolo_attaches_gate_auto_approve_when_taint_on ... ok
+test daemon::spawn::tests::build_agent_without_yolo_keeps_prompts_interactive ... ok
+test daemon::spawn::tests::build_agent_tool_permission_allow_does_not_waive_the_taint_gate ... ok
+test daemon::spawn::tests::build_agent_without_entry_stage_and_with_compaction ... ok
+test daemon::spawn::tests::global_tool_names_are_the_surviving_tools_from_the_global_dir_only ... ok
+test daemon::spawn::tests::resolve_output_validators_is_empty_without_any ... ok
+test daemon::spawn::tests::build_agent_records_whether_the_blueprint_can_write_at_all ... ok
+test daemon::spawn::tests::resolve_output_validators_reports_a_missing_script ... ok
+test daemon::spawn::tests::resolve_region_scripts_empty_without_custom_regions ... ok
+test daemon::spawn::tests::resolve_region_scripts_missing_file_is_a_hard_error ... ok
+test daemon::spawn::tests::resolve_seeds_command_empty_output_is_skipped_when_optional ... ok
+test daemon::spawn::tests::resolve_seeds_bad_glob_pattern_errors ... ok
+test daemon::spawn::tests::build_agent_yolo_leaves_the_run_active_and_unattended ... ok
+test daemon::spawn::tests::resolve_seeds_command_empty_output_errors_when_required ... ok
+test daemon::spawn::tests::resolve_output_validators_reports_one_that_does_not_compile ... ok
+test daemon::spawn::tests::build_agent_wires_granted_read_paths ... ok
+test daemon::spawn::tests::resolve_region_scripts_uncompilable_script_is_a_hard_error ... ok
+test daemon::spawn::tests::resolve_seeds_command_failure_errors_when_required ... ok
+test daemon::spawn::tests::resolve_seeds_command_failure_is_skipped_when_optional ... ok
+test daemon::spawn::tests::resolve_region_scripts_reads_a_shared_path_once ... ok
+test daemon::spawn::tests::build_agent_seeds_a_region_from_a_real_tool_call ... ok
+test daemon::spawn::tests::resolve_seeds_command_skipped_when_disabled ... ok
+test daemon::spawn::tests::build_agent_tags_dynamic_tools_agent ... ok
+test daemon::spawn::tests::resolve_seeds_command_receives_the_workdir_and_command ... ok
+test daemon::spawn::tests::resolve_seeds_command_stores_output ... ok
+test daemon::spawn::tests::resolve_seeds_optional_caller_input_missing_is_omitted ... ok
+test daemon::spawn::tests::resolve_seeds_glob_matching_directory_required_errors ... ok
+test daemon::spawn::tests::resolve_seeds_fills_task_and_caller_input ... ok
+test daemon::spawn::tests::resolve_region_scripts_collects_global_and_per_stage_layouts ... ok
+test daemon::spawn::tests::resolve_seeds_glob_no_match_required_errors_optional_skips ... ok
+test daemon::spawn::tests::resolve_seeds_literal_and_files ... ok
+test daemon::spawn::tests::resolve_seeds_required_command_errors_when_disabled ... ok
+test daemon::spawn::tests::resolve_seeds_files_required_missing_errors_optional_skips ... ok
+test daemon::spawn::tests::resolve_seeds_glob_concatenates_matches ... ok
+test daemon::spawn::tests::build_agent_wires_ungranted_read_paths ... ok
+test daemon::spawn::tests::resolve_seeds_required_caller_input_missing_is_error ... ok
+test daemon::spawn::tests::script_cap_maps_known_and_unknown_names ... ok
+test daemon::spawn::tests::the_refusal_names_the_input_the_agent_does_take ... ok
+test daemon::spawn::tests::warn_retired_output_checks_logs_the_retirement ... ok
+test daemon::spawn::tests::stage_hooks_are_empty_when_no_stage_declares_one ... ok
+test daemon::spawn::tests::resolve_seeds_tolerates_unknown_caller_region ... ok
+test daemon::spawn::tests::resolve_seeds_rhai_read_error ... ok
+test daemon::spawn::tests::build_agent_grants_global_tools_to_a_stage_that_opted_in ... ok
+test daemon::spawn::tests::resolve_seeds_rhai_empty_required_errors_optional_skips ... ok
+test daemon::spawn::tests::resolve_seeds_rhai_runs_script ... ok
+test daemon::spawn::tests::resolve_seeds_rhai_script_error ... ok
+test daemon::spawn::tests::resolve_seeds_caps_an_oversized_file ... ok
+test daemon::spawn::tests::discover_script_tools_empty_when_no_tools_dir ... ok
+test daemon::spawn::tests::every_bundled_agent_that_documents_a_task_accepts_one ... ok
+test daemon::spawn::tests::discover_script_tools_registers_and_drops_collisions ... ok
+test daemon::spawn::tests::discover_script_tools_handles_pathless_blueprint ... ok
+test daemon::spawn::tests::log_blueprint_lint_is_silent_for_a_clean_blueprint ... ok
+test daemon::spawn::tests::log_blueprint_lint_warns_about_findings_and_skips_notes ... ok
+test daemon::spawn::tests::build_agent_spawns_registers_and_wires_tools ... ok
+test daemon::spawn::tests::build_agent_applies_yolo_allow_and_max_depth ... ok
+
+test result: ok. 130 passed; 0 failed; 0 ignored; 0 measured; 4465 filtered out; finished in 0.11s
+

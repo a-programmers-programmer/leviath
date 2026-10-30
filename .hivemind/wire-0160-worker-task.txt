@@ -1,0 +1,14 @@
+Read-only verification task. Do NOT write, edit, or create any file.
+
+Read the file /data/.leviath/runs/hivemind-1789339438-1083d0ffd3b3/meta.json
+and report these four facts, each on its own line:
+
+1. run_id
+2. parent_run_id
+3. workdir
+4. the first 80 characters of the "task" field
+
+Then state in one line where the run store keeps a run's metadata
+(the directory pattern), based only on what you read.
+
+Hand the answer back through submit_output. Keep it under 200 words.

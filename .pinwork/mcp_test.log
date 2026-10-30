@@ -1,0 +1,97 @@
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /data/work/leviath/crates/leviath-cli/Cargo.toml
+workspace: /data/work/leviath/Cargo.toml
+   Compiling leviath-cli v0.5.8 (/data/work/leviath/crates/leviath-cli)
+warning: function `bool_request` is never used
+   --> crates/leviath-cli/src/commands/mcp/serve_tools/mod.rs:422:10
+    |
+422 | async fn bool_request(
+    |          ^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `leviath-cli` (lib test) generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 11.26s
+     Running unittests src/lib.rs (target/debug/deps/leviath_cli-0ea534afb6bfe02c)
+
+running 37 tests
+test commands::mcp::serve::tests::a_daemon_label_is_translated_and_an_unknown_one_passed_through ... ok
+test commands::mcp::serve::tests::cap_text_cuts_on_a_character_boundary_and_names_the_location_when_it_has_one ... ok
+test commands::mcp::serve::tests::an_interaction_answer_is_built_the_way_lev_respond_builds_it ... FAILED
+test commands::mcp::serve::tests::routing_separates_serve_from_the_managing_subcommands ... ok
+test commands::mcp::serve::tests::a_host_that_stops_reading_ends_the_server ... ok
+test commands::mcp::serve::tests::respond_lists_open_interactions_and_answers_one ... FAILED
+test commands::mcp::serve::tests::run_refuses_a_symlinked_home_given_as_its_real_path ... ok
+test commands::mcp::serve::tests::message_reports_delivery_refusal_and_an_absent_daemon ... FAILED
+test commands::mcp::serve::tests::bad_lines_unknown_methods_and_malformed_calls_are_refused_with_the_right_codes ... ok
+test commands::mcp::serve::tests::run_refuses_bad_workdirs_before_touching_anything ... ok
+test commands::mcp::serve::tests::the_defaults_are_what_the_help_promises ... ok
+test commands::mcp::serve::tests::a_duplicate_request_id_is_refused_and_the_first_call_left_alone ... ok
+test commands::mcp::serve::tests::the_wait_deadline_is_none_for_zero_and_clamped_for_a_huge_timeout ... ok
+test commands::mcp::serve::tests::cancel_asks_the_daemon_and_falls_back_to_the_record_on_disk ... FAILED
+test commands::mcp::serve::tests::the_handshake_ping_and_tool_list_need_no_daemon ... ok
+test commands::mcp::serve::tests::list_runs_merges_the_daemons_view_with_the_records_on_disk ... ok
+test commands::mcp::serve::tests::status_reads_the_record_and_asks_the_daemon_only_about_a_live_run ... ok
+test commands::mcp::serve::tests::result_pages_the_answer_on_character_boundaries_and_caps_it_for_the_host ... ok
+test commands::mcp::serve::tests::install_tool_writes_a_stamped_script_that_list_tools_then_shows ... ok
+test commands::mcp::serve::tests::wait_follows_an_existing_run_and_refuses_one_it_does_not_know ... ok
+test commands::mcp::serve::tests::every_tool_schema_compiles_and_every_tool_is_callable ... ok
+test commands::mcp::serve::tests::the_bundled_agents_a_run_installs_are_the_missing_ones_it_needs ... ok
+test commands::mcp::serve::tests::list_agents_shows_installed_blueprints_and_bundled_ones_not_yet_installed ... ok
+test commands::mcp::serve::tests::a_waiting_call_heartbeats_under_the_clients_token ... ok
+test commands::mcp::serve::tests::a_host_cancellation_stops_the_waiting_and_not_the_run ... ok
+test commands::mcp::serve::tests::granted_read_paths_are_false_when_the_blueprint_or_config_cannot_be_read ... ok
+test commands::mcp::serve::tests::run_installs_a_missing_bundled_agent_first_and_says_so ... ok
+test commands::mcp::serve::tests::run_spawns_waits_reports_progress_and_returns_the_answer ... ok
+test commands::mcp::serve::tests::run_reports_a_failed_run_a_question_and_a_lost_daemon ... ok
+test commands::mcp::serve::tests::run_takes_named_inputs_without_a_task_and_explains_a_task_an_agent_cannot_take ... ok
+test commands::mcp::serve::tests::run_reports_an_agent_it_cannot_resolve_and_a_daemon_it_cannot_reach ... ok
+test commands::mcp::serve::tests::run_with_no_model_argument_leaves_the_model_to_the_blueprint ... ok
+test commands::mcp::serve::tests::the_daemon_is_started_again_after_it_went_away ... FAILED
+test commands::mcp::serve::tests::run_stops_waiting_at_its_timeout_and_leaves_the_run_alone ... ok
+test commands::mcp::serve::tests::run_requires_an_explicit_yolo_for_an_agent_whose_read_paths_are_granted ... ok
+test commands::mcp::serve::tests::run_with_wait_false_returns_the_run_id_at_once ... ok
+test commands::mcp::serve::tests::run_without_a_token_emits_no_progress_and_a_null_token_counts_as_none ... ok
+
+failures:
+
+---- commands::mcp::serve::tests::an_interaction_answer_is_built_the_way_lev_respond_builds_it stdout ----
+
+thread 'commands::mcp::serve::tests::an_interaction_answer_is_built_the_way_lev_respond_builds_it' (615719) panicked at crates/leviath-cli/src/commands/mcp/serve_tests.rs:2151:5:
+assertion `left == right` failed
+  left: InteractionResponse { request_id: "r", value: None, choice_index: Some(2), approved: None, scope: Some(Once), feedback: None }
+ right: InteractionResponse { request_id: "r", value: None, choice_index: Some(2), approved: None, scope: None, feedback: None }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- commands::mcp::serve::tests::respond_lists_open_interactions_and_answers_one stdout ----
+
+thread 'commands::mcp::serve::tests::respond_lists_open_interactions_and_answers_one' (615729) panicked at crates/leviath-cli/src/commands/mcp/serve_tests.rs:2043:5:
+request_id q-1: agent coder-test-run, kind 'ToolApproval'
+  Run bash `ls`?
+
+---- commands::mcp::serve::tests::message_reports_delivery_refusal_and_an_absent_daemon stdout ----
+
+thread 'commands::mcp::serve::tests::message_reports_delivery_refusal_and_an_absent_daemon' (615728) panicked at crates/leviath-cli/src/commands/mcp/serve_tests.rs:1970:5:
+delivered message to live
+
+---- commands::mcp::serve::tests::cancel_asks_the_daemon_and_falls_back_to_the_record_on_disk stdout ----
+
+thread 'commands::mcp::serve::tests::cancel_asks_the_daemon_and_falls_back_to_the_record_on_disk' (615721) panicked at crates/leviath-cli/src/commands/mcp/serve_tests.rs:1904:5:
+cancelled run coder-test-run (on disk; daemon unavailable: No such file or directory (os error 2))
+
+---- commands::mcp::serve::tests::the_daemon_is_started_again_after_it_went_away stdout ----
+
+thread 'commands::mcp::serve::tests::the_daemon_is_started_again_after_it_went_away' (615746) panicked at crates/leviath-cli/src/commands/mcp/serve_tests.rs:1482:5:
+control error: No such file or directory (os error 2)
+
+
+failures:
+    commands::mcp::serve::tests::an_interaction_answer_is_built_the_way_lev_respond_builds_it
+    commands::mcp::serve::tests::cancel_asks_the_daemon_and_falls_back_to_the_record_on_disk
+    commands::mcp::serve::tests::message_reports_delivery_refusal_and_an_absent_daemon
+    commands::mcp::serve::tests::respond_lists_open_interactions_and_answers_one
+    commands::mcp::serve::tests::the_daemon_is_started_again_after_it_went_away
+
+test result: FAILED. 32 passed; 5 failed; 0 ignored; 0 measured; 4559 filtered out; finished in 2.04s
+
+error: test failed, to rerun pass `-p leviath-cli --lib`

@@ -1,0 +1,62 @@
+$ /usr/local/bin/lev --version
+lev 0.5.0
+
+EXIT=0
+======================================================================
+$ /usr/local/bin/lev validate /data/work/leviath/crates/leviath-cli/agents/graphql-schema/agent.leviath
+[2m2026-09-12T02:25:33.089247Z[0m [32m INFO[0m [2mlev[0m[2m:[0m Leviath CLI v0.5.0
+[2m2026-09-12T02:25:33.089717Z[0m [33m WARN[0m [2mleviath_cli::config[0m[2m:[0m config.toml has keys nothing reads; they are being ignored. `lev doctor` reports them too, if this scrolls past. [3mkeys[0m[2m=[0magent_read_paths.fixer.write_paths, agent_read_paths.oracle.write_paths
+[2m2026-09-12T02:25:33.094307Z[0m [32m INFO[0m [2mleviath_runtime::provider_creds[0m[2m:[0m nothing is listening for ollama; not registering it. Start ollama and reload the config to use it. [3mbase_url[0m[2m=[0mhttp://localhost:11434
+Error: ✗ Parse error: stage 'intake' has unknown key 'available_global_tools' (valid: accepts_messages, allow_as_worker, allow_blocking_tools, allow_complete, available_connectors, available_tools, batch_tool_hint, context, description, hooks, interaction_points, max_attempts, max_items, max_iterations, max_revisits, max_workers, merge_stage, mode, model, nudge, on_worker_failure, output, require_output, required_tools, requires_children, results_region, sandbox, security, shell_hint, split_prompt, system_prompt, tool_permissions, tool_routing, transition_prompt, transitions, worker_agent, worker_query, worker_stage)
+
+EXIT=1
+======================================================================
+$ /data/work/leviath/.syncfin/artifact/x/lev --version
+lev 0.5.9
+
+EXIT=0
+======================================================================
+$ /data/work/leviath/.syncfin/artifact/x/lev validate /data/work/leviath/crates/leviath-cli/agents/graphql-schema/agent.leviath
+✓ Blueprint 'graphql-schema' is valid.
+  10 stages, version 0.1.0
+  Inputs: --task (required)
+  Graph mode: entry stage 'intake'
+  - intake → error, design, blocked (max_revisits: 1)
+  - design → draft, error, blocked (max_revisits: 1)
+  - draft → check, blocked, error (max_revisits: 1)
+  - revise → error, blocked, check (max_revisits: 2)
+  - review → blocked, error, accept (max_revisits: 3)
+  - check → blocked, error, revise, review (max_revisits: 3)
+  - accept → done, revise, blocked, error (max_revisits: 3)
+  - done (terminal)
+  - blocked (terminal)
+  - error (terminal)
+  2 script tool(s) in tools/
+
+Models this install would use:
+  intake           openrouter/openai/gpt-5.4-mini
+  design           openrouter/anthropic/claude-opus-5
+  draft            openrouter/openai/gpt-5.4-mini
+  revise           openrouter/openai/gpt-5.4-mini
+  review           openrouter/anthropic/claude-opus-5
+  check            openrouter/openai/gpt-5.4-mini
+  accept           openrouter/openai/gpt-5.4-mini
+  done             openrouter/openai/gpt-5.4-mini
+  blocked          openrouter/openai/gpt-5.4-mini
+  error            openrouter/openai/gpt-5.4-mini
+  default_provider = openrouter, override_model = (unset), fallback_model = (unset)
+  WARN stage 'intake': grants 'bash' with no permission set for it, so it defaults to ask - and an unattended run waits on that prompt rather than being denied [implicit-shell-policy]
+       set shell = "allow" or "deny" in [tool_permissions] or [stages.intake.tool_permissions]
+  WARN stage 'draft': grants 'bash' with no permission set for it, so it defaults to ask - and an unattended run waits on that prompt rather than being denied [implicit-shell-policy]
+       set shell = "allow" or "deny" in [tool_permissions] or [stages.draft.tool_permissions]
+  WARN stage 'revise': grants 'bash' with no permission set for it, so it defaults to ask - and an unattended run waits on that prompt rather than being denied [implicit-shell-policy]
+       set shell = "allow" or "deny" in [tool_permissions] or [stages.revise.tool_permissions]
+[2m2026-09-12T02:25:33.283527Z[0m [32m INFO[0m [2mlev[0m[2m:[0m Leviath CLI v0.5.9
+[2m2026-09-12T02:25:33.284032Z[0m [33m WARN[0m [2mleviath_cli::config[0m[2m:[0m config.toml has keys nothing reads; they are being ignored. `lev doctor` reports them too, if this scrolls past. [3mkeys[0m[2m=[0magent_read_paths.fixer.write_paths, agent_read_paths.oracle.write_paths, limits.exact_token_counting
+warning: config.toml has key(s) nothing reads - check the spelling: agent_read_paths.fixer.write_paths, agent_read_paths.oracle.write_paths, limits.exact_token_counting
+
+EXIT=0
+======================================================================
+OLD stale error present?  True
+NEW stale error present?  False
+old validate exit 1 new validate exit 0

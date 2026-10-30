@@ -1,0 +1,67 @@
+### binary identities
+/data/bin/lev -> lev-0.5.9-15dc182e
+sha256 /data/bin/lev-0.5.9-15dc182e = f78bff18cbb06166d9795e26630dc4f3128ac5e7c4e78d0029da546db28a413e
+sha256 /data/bin/lev-0.5.9-35210724 = c8c6993606cd7d931e584ea95b7efefc683cee4264329906e375a05104455261
+sha256 artifact tarball            = 5177778e499dd6fb1441441da99ac4c3c8e13f714e65afab26d75856ed156aeb
+
+### BEFORE-install: the stale 0.5.0 the task described
+$ /usr/local/bin/lev --version
+lev 0.5.0
+EXIT=0
+
+$ /usr/local/bin/lev validate /data/work/leviath/crates/leviath-cli/agents/graphql-schema/agent.leviath
+[2m2026-09-12T02:30:12.712837Z[0m [32m INFO[0m [2mlev[0m[2m:[0m Leviath CLI v0.5.0
+[2m2026-09-12T02:30:12.713409Z[0m [33m WARN[0m [2mleviath_cli::config[0m[2m:[0m config.toml has keys nothing reads; they are being ignored. `lev doctor` reports them too, if this scrolls past. [3mkeys[0m[2m=[0magent_read_paths.fixer.write_paths, agent_read_paths.oracle.write_paths
+[2m2026-09-12T02:30:12.720663Z[0m [32m INFO[0m [2mleviath_runtime::provider_creds[0m[2m:[0m nothing is listening for ollama; not registering it. Start ollama and reload the config to use it. [3mbase_url[0m[2m=[0mhttp://localhost:11434
+Error: ✗ Parse error: stage 'intake' has unknown key 'available_global_tools' (valid: accepts_messages, allow_as_worker, allow_blocking_tools, allow_complete, available_connectors, available_tools, batch_tool_hint, context, description, hooks, interaction_points, max_attempts, max_items, max_iterations, max_revisits, max_workers, merge_stage, mode, model, nudge, on_worker_failure, output, require_output, required_tools, requires_children, results_region, sandbox, security, shell_hint, split_prompt, system_prompt, tool_permissions, tool_routing, transition_prompt, transitions, worker_agent, worker_query, worker_stage)
+EXIT=1
+
+### AFTER-install: /data/bin/lev (the two required proofs)
+$ /data/bin/lev --version
+lev 0.5.9
+EXIT=0
+
+$ /data/bin/lev validate /data/work/leviath/crates/leviath-cli/agents/graphql-schema/agent.leviath
+✓ Blueprint 'graphql-schema' is valid.
+  10 stages, version 0.1.0
+  Inputs: --task (required)
+  Graph mode: entry stage 'intake'
+  - intake → design, blocked, error (max_revisits: 1)
+  - design → blocked, error, draft (max_revisits: 1)
+  - draft → check, blocked, error (max_revisits: 1)
+  - revise → blocked, error, check (max_revisits: 2)
+  - review → accept, error, blocked (max_revisits: 3)
+  - check → error, blocked, review, revise (max_revisits: 3)
+  - accept → revise, blocked, error, done (max_revisits: 3)
+  - done (terminal)
+  - blocked (terminal)
+  - error (terminal)
+  2 script tool(s) in tools/
+
+Models this install would use:
+  intake           openrouter/openai/gpt-5.4-mini
+  design           openrouter/anthropic/claude-opus-5
+  draft            openrouter/openai/gpt-5.4-mini
+  revise           openrouter/openai/gpt-5.4-mini
+  review           openrouter/anthropic/claude-opus-5
+  check            openrouter/openai/gpt-5.4-mini
+  accept           openrouter/openai/gpt-5.4-mini
+  done             openrouter/openai/gpt-5.4-mini
+  blocked          openrouter/openai/gpt-5.4-mini
+  error            openrouter/openai/gpt-5.4-mini
+  default_provider = openrouter, override_model = (unset), fallback_model = (unset)
+  WARN stage 'intake': grants 'bash' with no permission set for it, so it defaults to ask - and an unattended run waits on that prompt rather than being denied [implicit-shell-policy]
+       set shell = "allow" or "deny" in [tool_permissions] or [stages.intake.tool_permissions]
+  WARN stage 'draft': grants 'bash' with no permission set for it, so it defaults to ask - and an unattended run waits on that prompt rather than being denied [implicit-shell-policy]
+       set shell = "allow" or "deny" in [tool_permissions] or [stages.draft.tool_permissions]
+  WARN stage 'revise': grants 'bash' with no permission set for it, so it defaults to ask - and an unattended run waits on that prompt rather than being denied [implicit-shell-policy]
+       set shell = "allow" or "deny" in [tool_permissions] or [stages.revise.tool_permissions]
+[2m2026-09-12T02:30:12.878254Z[0m [32m INFO[0m [2mlev[0m[2m:[0m Leviath CLI v0.5.9
+[2m2026-09-12T02:30:12.878556Z[0m [33m WARN[0m [2mleviath_cli::config[0m[2m:[0m config.toml has keys nothing reads; they are being ignored. `lev doctor` reports them too, if this scrolls past. [3mkeys[0m[2m=[0magent_read_paths.fixer.write_paths, agent_read_paths.oracle.write_paths, limits.exact_token_counting
+warning: config.toml has key(s) nothing reads - check the spelling: agent_read_paths.fixer.write_paths, agent_read_paths.oracle.write_paths, limits.exact_token_counting
+EXIT=0
+
+### verdict
+stale error 'available_global_tools' with /usr/local/bin/lev 0.5.0 : True
+stale error 'available_global_tools' with /data/bin/lev 0.5.9      : False
+old validate exit=1  new validate exit=0

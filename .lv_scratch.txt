@@ -1,0 +1,82 @@
+        workdir: PathBuf,
+        scan_dir: PathBuf,
+        static_defs: Vec<leviath_providers::Tool>,
+        stage_available: Vec<Vec<String>>,
+        stage_required: Vec<Vec<String>>,
+        unattended: bool,
+    ) -> Arc<AgentToolState> {
+        dynamic_state_with(
+            workdir,
+            DynamicToolCtx {
+                scan_dirs: vec![scan_dir],
+                reserved_names: HashSet::new(),
+                static_defs,
+                stage_available,
+                stage_required,
+                stage_global: Vec::new(),
+                tools_dir: None,
+                unattended,
+                dirty: Arc::new(AtomicBool::new(false)),
+            },
+        )
+    }
+
+    /// A `DynamicToolCtx` for a global-grant test: `scan_dirs` is the full
+    /// precedence-ordered scan list, `tools_dir` the one directory a
+    /// `stage_global` grant draws from, and every stage names `read_file`.
+    fn global_ctx(
+        scan_dirs: Vec<PathBuf>,
+        stage_global: Vec<bool>,
+        tools_dir: Option<PathBuf>,
+    ) -> DynamicToolCtx {
+        DynamicToolCtx {
+            scan_dirs,
+            reserved_names: HashSet::new(),
+            static_defs: vec![tool_def("read_file")],
+            stage_available: vec![vec!["read_file".to_string()]; stage_global.len()],
+            stage_required: Vec::new(),
+            stage_global,
+            tools_dir,
+            unattended: false,
+            dirty: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// The state every dynamic-tools test hangs off: attended, write tools
+    /// allowed, and `dynamic` exactly as handed in.
+    fn dynamic_state_with(workdir: PathBuf, dynamic: DynamicToolCtx) -> Arc<AgentToolState> {
+        let hub = InteractionHub::new();
+        // `install_tool` writes into the ctx's global tools dir when a test
+        // names one, else into its first scan dir, never the real
+        // `~/.leviath/tools`, so a test install is what the next refresh finds.
+        let install_dir = dynamic
+            .tools_dir
+            .clone()
+            name: name.to_string(),
+            description: String::new(),
+            parameters: serde_json::json!({}),
+        }
+    }
+
+    /// A state with a `DynamicToolCtx` scanning `scan_dir`, over `workdir`,
+    /// attended (a refresh keeps whatever `stage_available` names).
+    fn dynamic_state(
+        workdir: PathBuf,
+        scan_dir: PathBuf,
+        static_defs: Vec<leviath_providers::Tool>,
+        stage_available: Vec<Vec<String>>,
+    ) -> Arc<AgentToolState> {
+        dynamic_state_unattended(
+            workdir,
+            scan_dir,
+            static_defs,
+            stage_available,
+            Vec::new(),
+            false,
+        )
+    }
+
+    /// The same, with the unattended cut in play: `stage_required` names the
+    /// human tools each stage keeps anyway.
+    fn dynamic_state_unattended(
+        workdir: PathBuf,

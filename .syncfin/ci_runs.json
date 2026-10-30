@@ -1,0 +1,378 @@
+{
+  "34666224646": {
+    "name": "CI",
+    "status": "completed",
+    "conclusion": "failure",
+    "sha": "15dc182e0bc6c28dfa93f4b8dd3c423372808f61",
+    "url": "https://github.com/a-programmers-programmer/leviath/actions/runs/34666224646",
+    "created": "2026-09-12T01:55:27Z",
+    "event": "pull_request",
+    "jobs": [
+      {
+        "name": "Format",
+        "status": "completed",
+        "conclusion": "success",
+        "id": 103479179339
+      },
+      {
+        "name": "Test (ubuntu-24.04-arm)",
+        "status": "completed",
+        "conclusion": "failure",
+        "id": 103479179403
+      },
+      {
+        "name": "Test (macos-latest)",
+        "status": "completed",
+        "conclusion": "failure",
+        "id": 103479179407
+      },
+      {
+        "name": "Docs",
+        "status": "completed",
+        "conclusion": "success",
+        "id": 103479179425
+      },
+      {
+        "name": "Guard re-export-only facade (crates/leviath)",
+        "status": "completed",
+        "conclusion": "success",
+        "id": 103479179431
+      },
+      {
+        "name": "Guard bin entrypoint (main.rs)",
+        "status": "completed",
+        "conclusion": "success",
+        "id": 103479179432
+      },
+      {
+        "name": "Guard release version bump",
+        "status": "completed",
+        "conclusion": "success",
+        "id": 103479179433
+      },
+      {
+        "name": "Clippy (windows-latest)",
+        "status": "completed",
+        "conclusion": "success",
+        "id": 103479179438
+      },
+      {
+        "name": "Clippy (macos-latest)",
+        "status": "completed",
+        "conclusion": "success",
+        "id": 103479179450
+      },
+      {
+        "name": "Test (ubuntu-latest)",
+        "status": "completed",
+        "conclusion": "failure",
+        "id": 103479179452
+      },
+      {
+        "name": "Clippy (ubuntu-latest)",
+        "status": "completed",
+        "conclusion": "success",
+        "id": 103479179456
+      },
+      {
+        "name": "Build with default features",
+        "status": "completed",
+        "conclusion": "success",
+        "id": 103479179457
+      },
+      {
+        "name": "Check coverage suppression markers",
+        "status": "completed",
+        "conclusion": "success",
+        "id": 103479179460
+      },
+      {
+        "name": "Supply chain",
+        "status": "completed",
+        "conclusion": "failure",
+        "id": 103479179466
+      },
+      {
+        "name": "Test (windows-latest)",
+        "status": "completed",
+        "conclusion": "failure",
+        "id": 103479179525
+      },
+      {
+        "name": "Coverage (macos-latest / leviath-tools)",
+        "status": "completed",
+        "conclusion": "success",
+        "id": 103479179677
+      },
+      {
+        "name": "Coverage (ubuntu-latest / leviath-agent-client)",
+        "status": "completed",
+        "conclusion": "success",
+        "id": 103479179685
+      },
+      {
+        "name": "Coverage (ubuntu-latest / leviath-providers)",
+        "status": "completed",
+        "conclusion": "success",
+        "id": 103479179696
+      },
+      {
+        "name": "Coverage (windows-latest / leviath-core)",
+        "status": "completed",
+        "conclusion": "failure",
+        "id": 103479179698
+      },
+      {
+        "name": "Coverage (macos-latest / leviath-cli)",
+        "status": "completed",
+        "conclusion": "failure",
+        "id": 103479179699
+      },
+      {
+        "name": "Coverage (ubuntu-latest / leviath-cli)",
+        "status": "completed",
+        "conclusion": "failure",
+        "id": 103479179715
+      },
+      {
+        "name": "Coverage (windows-latest / leviath-cli)",
+        "status": "completed",
+        "conclusion": "failure",
+        "id": 103479179717
+      },
+      {
+        "name": "Coverage (ubuntu-latest / leviath-alloc)",
+        "status": "completed",
+        "conclusion": "success",
+        "id": 103479179718
+      },
+      {
+        "name": "Coverage (ubuntu-latest / leviath-sys)",
+        "status": "completed",
+        "conclusion": "success",
+        "id": 103479179720
+      },
+      {
+        "name": "Coverage (macos-latest / leviath-agent-client)",
+        "status": "completed",
+        "conclusion": "success",
+        "id": 103479179725
+      },
+      {
+        "name": "Coverage (ubuntu-latest / leviath-runtime)",
+        "status": "completed",
+        "conclusion": "failure",
+        "id": 103479179729
+      },
+      {
+        "name": "Coverage (macos-latest / leviath-sys)",
+        "status": "completed",
+        "conclusion": "success",
+        "id": 103479179733
+      },
+      {
+        "name": "Coverage (ubuntu-latest / leviath-core)",
+        "status": "completed",
+        "conclusion": "failure",
+        "id": 103479179734
+      },
+      {
+        "name": "Coverage (ubuntu-latest / leviath-package)",
+        "status": "completed",
+        "conclusion": "success",
+        "id": 103479179737
+      },
+      {
+        "name": "Coverage (windows-latest / leviath-sys)",
+        "status": "completed",
+        "conclusion": "success",
+        "id": 103479179740
+      },
+      {
+        "name": "Coverage (windows-latest / leviath-tools)",
+        "status": "completed",
+        "conclusion": "success",
+        "id": 103479179747
+      },
+      {
+        "name": "Coverage (windows-latest / leviath-runtime)",
+        "status": "completed",
+        "conclusion": "failure",
+        "id": 103479179749
+      },
+      {
+        "name": "Coverage (macos-latest / leviath-alloc)",
+        "status": "completed",
+        "conclusion": "success",
+        "id": 103479179752
+      },
+      {
+        "name": "Coverage (macos-latest / leviath-package)",
+        "status": "completed",
+        "conclusion": "success",
+        "id": 103479179754
+      },
+      {
+        "name": "Coverage (macos-latest / leviath-runtime)",
+        "status": "completed",
+        "conclusion": "failure",
+        "id": 103479179755
+      },
+      {
+        "name": "Coverage (windows-latest / leviath-net)",
+        "status": "completed",
+        "conclusion": "success",
+        "id": 103479179756
+      },
+      {
+        "name": "Coverage (windows-latest / leviath-providers)",
+        "status": "completed",
+        "conclusion": "success",
+        "id": 103479179758
+      },
+      {
+        "name": "Coverage (macos-latest / leviath-scripting)",
+        "status": "completed",
+        "conclusion": "failure",
+        "id": 103479179759
+      },
+      {
+        "name": "Coverage (windows-latest / leviath-alloc)",
+        "status": "completed",
+        "conclusion": "success",
+        "id": 103479179760
+      },
+      {
+        "name": "Coverage (macos-latest / leviath-mcp)",
+        "status": "completed",
+        "conclusion": "success",
+        "id": 103479179766
+      },
+      {
+        "name": "Coverage (ubuntu-latest / leviath-tools)",
+        "status": "completed",
+        "conclusion": "success",
+        "id": 103479179768
+      },
+      {
+        "name": "Coverage (windows-latest / leviath-agent-client)",
+        "status": "completed",
+        "conclusion": "success",
+        "id": 103479179778
+      },
+      {
+        "name": "Coverage (macos-latest / leviath-net)",
+        "status": "completed",
+        "conclusion": "success",
+        "id": 103479179784
+      },
+      {
+        "name": "Coverage (windows-latest / leviath-telemetry)",
+        "status": "completed",
+        "conclusion": "success",
+        "id": 103479179789
+      },
+      {
+        "name": "Coverage (ubuntu-latest / leviath-mcp)",
+        "status": "completed",
+        "conclusion": "success",
+        "id": 103479179792
+      },
+      {
+        "name": "Coverage (macos-latest / leviath-core)",
+        "status": "completed",
+        "conclusion": "failure",
+        "id": 103479179794
+      },
+      {
+        "name": "Coverage (windows-latest / leviath-scripting)",
+        "status": "completed",
+        "conclusion": "failure",
+        "id": 103479179795
+      },
+      {
+        "name": "Coverage (windows-latest / leviath-package)",
+        "status": "completed",
+        "conclusion": "success",
+        "id": 103479179796
+      },
+      {
+        "name": "Coverage (ubuntu-latest / leviath-telemetry)",
+        "status": "completed",
+        "conclusion": "success",
+        "id": 103479179804
+      },
+      {
+        "name": "Coverage (windows-latest / leviath-mcp)",
+        "status": "completed",
+        "conclusion": "success",
+        "id": 103479179830
+      },
+      {
+        "name": "Coverage (ubuntu-latest / leviath-scripting)",
+        "status": "completed",
+        "conclusion": "failure",
+        "id": 103479179835
+      },
+      {
+        "name": "Coverage (ubuntu-latest / leviath-net)",
+        "status": "completed",
+        "conclusion": "success",
+        "id": 103479179846
+      },
+      {
+        "name": "Coverage (macos-latest / leviath-telemetry)",
+        "status": "completed",
+        "conclusion": "success",
+        "id": 103479179859
+      },
+      {
+        "name": "Coverage (macos-latest / leviath-providers)",
+        "status": "completed",
+        "conclusion": "success",
+        "id": 103479179936
+      },
+      {
+        "name": "Coverage gate (windows-latest)",
+        "status": "completed",
+        "conclusion": "success",
+        "id": 103480456492
+      },
+      {
+        "name": "Coverage gate (macos-latest)",
+        "status": "completed",
+        "conclusion": "success",
+        "id": 103480456509
+      },
+      {
+        "name": "Coverage gate (ubuntu-latest)",
+        "status": "completed",
+        "conclusion": "success",
+        "id": 103480456541
+      },
+      {
+        "name": "Publish combined test badge",
+        "status": "completed",
+        "conclusion": "skipped",
+        "id": 103480765381
+      }
+    ]
+  },
+  "34666224645": {
+    "name": "CodeQL",
+    "status": "completed",
+    "conclusion": "success",
+    "sha": "15dc182e0bc6c28dfa93f4b8dd3c423372808f61",
+    "url": "https://github.com/a-programmers-programmer/leviath/actions/runs/34666224645",
+    "created": "2026-09-12T01:55:27Z",
+    "event": "pull_request",
+    "jobs": [
+      {
+        "name": "CodeQL",
+        "status": "completed",
+        "conclusion": "success",
+        "id": 103478527605
+      }
+    ]
+  }
+}

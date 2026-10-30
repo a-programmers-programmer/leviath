@@ -1,0 +1,11 @@
+[L0] Running level 0 (independent iteration on seed)...
+[L0] lane0 complete iters=6 -> /data/work/leviath/study/bakeoff/v0_L0L0.graphql (31087B)
+[L0] lane1 complete iters=14 -> /data/work/leviath/study/bakeoff/v0_L0L1.graphql (47952B)
+[L0] lane0 31067B vs lane1 47952B -> DIFFERENT-recurse
+
+[L1] Running diff-based merge level...
+[L1] Diff: 9 only-A, 7 only-B, 51 identical, 6 divergent (diff size: 867B vs 31067+47952=79019B raw)
+[L1] lane0 error iters=60 -> /data/work/leviath/study/bakeoff/v1_L0_decisions.txt (0B)
+[L1] lane1 complete iters=47 -> /data/work/leviath/study/bakeoff/v1_L1_decisions.txt (8128B)
+[L1] ABORT: missing decision output
+[L1] ABORT: merge failed

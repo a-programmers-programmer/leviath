@@ -1,0 +1,15 @@
+container memory limit : 22.35 GB
+watchdog kill threshold: 19.35 GB
+cargo build jobs       : 1
+
+WATCHDOG FIRED at 19.46 GB
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /data/work/leviath/crates/leviath-cli/Cargo.toml
+workspace: /data/work/leviath/Cargo.toml
+   Compiling aws-lc-sys v0.43.0
+Terminated
+
+=== cargo build exit code: 143 ===
+=== peak container memory: 19.46 GB of 22.35 GB ===
+=== RESULT: watchdog fired. The build does NOT fit without more memory. ===
+EXIT=42

@@ -1,0 +1,26 @@
+[2m2026-09-12T02:29:47.496837Z[0m [32m INFO[0m [2mlev[0m[2m:[0m Leviath CLI v0.5.9
+[2m2026-09-12T02:29:47.497463Z[0m [33m WARN[0m [2mleviath_cli::config[0m[2m:[0m config.toml has keys nothing reads; they are being ignored. `lev doctor` reports them too, if this scrolls past. [3mkeys[0m[2m=[0magent_read_paths.fixer.write_paths, agent_read_paths.oracle.write_paths, limits.exact_token_counting
+warning: config.toml has key(s) nothing reads - check the spelling: agent_read_paths.fixer.write_paths, agent_read_paths.oracle.write_paths, limits.exact_token_counting
+✓ Blueprint 'orchestrator' is valid.
+  7 stages, version 0.1.0
+  Inputs: --task (required), --constraints
+  Graph mode: entry stage 'intake'
+  - intake → plan, done, error_recovery (max_revisits: 2) (global tools)
+  - plan → done, execute, error_recovery (max_revisits: 3)
+  - execute → done, error_recovery (max_revisits: 3)
+  - verify → plan, done, crystallize, error_recovery (max_revisits: 3) (global tools)
+  - crystallize → done, error_recovery (max_revisits: 1)
+  - error_recovery → done, verify (max_revisits: 2)
+  - done (terminal)
+
+Models this install would use:
+  intake           openrouter/anthropic/claude-sonnet-5
+  plan             openrouter/anthropic/claude-opus-5
+  execute          openrouter/anthropic/claude-sonnet-5
+  verify           openrouter/anthropic/claude-opus-5
+  crystallize      openrouter/anthropic/claude-opus-5
+  error_recovery   openrouter/anthropic/claude-sonnet-5
+  done             openrouter/anthropic/claude-sonnet-5
+  default_provider = openrouter, override_model = (unset), fallback_model = (unset)
+  NOTE 1 region(s) run a shell command at spawn, before the first inference and before any tool-approval prompt: repo_files: git ls-files (pre-approved) [command-seed]
+       a refused seed needs its programs in `[safe_commands] shell`; disable seeds entirely with `--no-seed-commands`, or machine-wide via `[security] allow_seed_commands = false`

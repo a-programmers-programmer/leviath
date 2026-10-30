@@ -1,0 +1,3183 @@
+# =============================================================================
+# DRAFT A2 — GROUP: TASK
+# A durable WORK UNIT ("task" / "bead") in an agentic execution system.
+#
+# Full, un-capped schema + rationale. Composed under the Composition Guide
+# (One Concept One Type; naming sniff test; decision tree; no ID-soup /
+# mirror types / string-bags; gated-value pattern; edge-first where warranted;
+# soft vs hard invariants; directives vs fields; "would I query this?").
+#
+# Scope note: this is the TASK abstraction — the unit an agent claims, runs and
+# closes, plus its execution trajectory. It is deliberately NOT the workflow
+# (composition-of-steps) abstraction: there is no DAG-of-steps-as-first-class-
+# plan type here. Steps appear only as *observed history inside a run*, which
+# is a different concept with different invariants (append-only, immutable,
+# never re-ordered) than a workflow step (planned, editable, position-bearing).
+# =============================================================================
+
+
+# =============================================================================
+# 0. DIRECTIVES
+#    The guide's "directives vs fields" rule: a constraint that the *server*
+#    must enforce and that a client must never have to re-derive is a directive
+#    on the field it guards. A constraint that a *client* needs to read in order
+#    to decide what to do next is a field. Both appear below; the split is
+#    audited in the rationale (§9).
+# =============================================================================
+
+"""
+Marks a field whose value is produced by a state transition and cannot be set
+directly by a client. Writing it is a protocol error, not a validation error.
+This is the *gated-value pattern* made visible in the schema: the gate is named
+so a client knows which mutation to call instead.
+"""
+directive @gated(
+  """The mutation field that is the only legal writer of this value."""
+  via: String!
+  """What happens if a client attempts to write it anyway."""
+  onViolation: GateViolation = REJECT
+) on FIELD_DEFINITION | INPUT_FIELD_DEFINITION
+
+"""
+Marks a field that is a pure rollup of other queryable data. Always safe to
+read, never safe to write, and always allowed to be momentarily stale.
+"""
+directive @derived(
+  """Human-readable description of what this is rolled up from."""
+  from: String!
+  """Whether a stale value may be served rather than recomputed."""
+  staleness: Staleness = EVENTUALLY_CONSISTENT
+) on FIELD_DEFINITION
+
+"""
+A hard invariant: the resolver chain guarantees it, and a response that
+violates it is a bug. Clients may build logic on it without re-checking.
+"""
+directive @invariant(
+  reason: String!
+) on FIELD_DEFINITION | OBJECT | ARGUMENT_DEFINITION
+
+"""
+A soft invariant: normally true, but the system will serve a violating value
+rather than fail the query. Clients should treat it as a hint, not a promise.
+"""
+directive @expected(
+  reason: String!
+  """What the client should do when the expectation does not hold."""
+  onViolation: String!
+) on FIELD_DEFINITION
+
+"""
+The field is an edge in the task graph, not an attribute of the task. It is
+traversable in both directions and carries its own semantics as a relation.
+"""
+directive @edge(
+  """The field on the other side that traverses back."""
+  inverse: String
+) on FIELD_DEFINITION
+
+"""The field is append-only history. Existing entries never change or vanish."""
+directive @immutable(
+  """The one exception, if any (e.g. redaction)."""
+  except: String
+) on FIELD_DEFINITION
+
+"""
+The field may be absent for a *structural* reason that the client can act on,
+and the reason is discoverable rather than opaque. Absence is information.
+"""
+directive @absentWhen(
+  condition: String!
+) on FIELD_DEFINITION
+
+enum GateViolation {
+  """The write is rejected with a typed error payload."""
+  REJECT
+  """The write is accepted and silently ignored (idempotent no-op)."""
+  IGNORE
+}
+
+enum Staleness {
+  """Recomputed on read; may be slow."""
+  STRONG
+  """Recomputed on a short delay; cheap to read."""
+  EVENTUALLY_CONSISTENT
+  """Only updated by transitions; exact at transition boundaries."""
+  SNAPSHOT
+}
+
+
+# =============================================================================
+# 1. SCALARS
+#    Each scalar earns its place by carrying a validation or a comparison
+#    semantic that String/Int/Float would lose. No decorative scalars.
+# =============================================================================
+
+"""An RFC 3339 instant, always UTC, millisecond resolution or better."""
+scalar DateTime
+
+"""
+A signed span of time, serialised as an RFC 3339 duration string (`PT4H30M`).
+Distinct from DateTime: a Duration is a *quantity*, a DateTime is a *position*.
+Collapsing them is how schemas end up with `estimateSeconds: Int` next to
+`deadline: String` and no way to compare them.
+"""
+scalar Duration
+
+"""An absolute URI. Used for artifact locations and webhook targets."""
+scalar URI
+
+"""
+A project-scoped, human-memorable, permanently stable task identifier
+(`lev-417`, `bead-auth-23`). This is the ID a human types and a commit message
+cites. It is a distinct concept from the opaque global id, and it is the reason
+`TaskKey` exists rather than `String`.
+"""
+scalar TaskKey
+
+"""A lexicographically sortable opaque identifier (ULID). Ordering is meaningful."""
+scalar ULID
+
+"""A SHA-256 content digest, hex, optionally prefixed by the algorithm."""
+scalar ContentHash
+
+"""GitHub-flavoured Markdown. Signals to clients that the value is rendered, not displayed raw."""
+scalar Markdown
+
+"""A JSON Patch (RFC 6902) document. Used for the one legitimate string-bag: free-form event data."""
+scalar JSONPatch
+
+"""An arbitrary JSON object. Used ONLY where the shape is genuinely open (tool I/O, event data)."""
+scalar JSONObject
+
+"""
+A JSONPath / jq-style selector into a JSONObject. Exists so that "which part of
+the tool output mattered" is queryable instead of requiring the client to pull
+the whole blob and re-derive it.
+"""
+scalar JSONPath
+
+
+# =============================================================================
+# 2. ENUMS
+#    Every enum below is a *closed* vocabulary the server branches on. Anything
+#    open-ended is a String or a JSONObject, and says so.
+# =============================================================================
+
+"""
+The lifecycle position of a task. Status answers "where is this work in its
+life?" and nothing else — it is deliberately NOT a union with claim state,
+run state or blockedness, because those vary independently (see §7 of the
+rationale for the orthogonality argument).
+"""
+enum TaskStatus {
+  """Triageable. Not yet admitted to the ready set."""
+  TRIAGE
+  """Admitted, unclaimed, and not blocked. The queue head candidate set."""
+  OPEN
+  """Admitted but waiting on dependencies or an external condition."""
+  BLOCKED
+  """A claim exists and a lease is live. An agent owns it right now."""
+  IN_PROGRESS
+  """Work is done; awaiting verification before it becomes closed."""
+  IN_REVIEW
+  """Terminal. Acceptance criteria met and recorded."""
+  CLOSED
+  """Terminal-by-decision. Will not be done; carries a reason."""
+  CANCELLED
+  """Work stopped but the claim was released without closing. Resumable."""
+  STALLED
+}
+
+"""What kind of work this is. Drives default policy, not behaviour branching in clients."""
+enum TaskType {
+  EPIC
+  FEATURE
+  BUG
+  CHORE
+  SPIKE
+  REFACTOR
+  REVIEW
+  INCIDENT
+}
+
+"""
+Priority as a *total order key*, not a label. P0 is the highest. Numeric-backed
+so clients can sort without a lookup table; named so humans can read it.
+"""
+enum TaskPriority {
+  P0_CRITICAL
+  P1_HIGH
+  P2_MEDIUM
+  P3_LOW
+  P4_SOMEDAY
+}
+
+"""
+The state of a claim. Distinct from TaskStatus because a claim has its own
+lifecycle (offered → held → expired) that outlives and crosscuts task status:
+a task can be OPEN with an EXPIRED claim attached, and that is a meaningful,
+queryable condition (it is how orphaned work is found).
+"""
+enum ClaimState {
+  """A claim was requested but never granted (policy conflict, lost race)."""
+  OFFERED
+  """Granted and currently leased."""
+  ACTIVE
+  """The lease lapsed without release. The task returns to the ready set."""
+  EXPIRED
+  """The agent gave it back voluntarily."""
+  RELEASED
+  """The task was closed or cancelled while claimed."""
+  SETTLED
+  """Revoked by a human or by policy (e.g. agent misbehaviour)."""
+  REVOKED
+}
+
+"""Why a run ended. Closed because the system bills and retries on it."""
+enum RunEndReason {
+  COMPLETED
+  FAILED
+  TIMED_OUT
+  CANCELLED_BY_HUMAN
+  CANCELLED_BY_AGENT
+  SUPERSEDED_BY_NEWER_RUN
+  LEASE_EXPIRED
+  BUDGET_EXHAUSTED
+  TOOL_PERMISSION_DENIED
+  CRASHED
+}
+
+"""The live state of a run."""
+enum RunState {
+  QUEUED
+  STARTING
+  RUNNING
+  PAUSED
+  DRAINING
+  SUCCEEDED
+  FAILED
+  CANCELLED
+  TIMED_OUT
+  ABANDONED
+}
+
+"""What caused a run to exist. Needed to answer "did a human make this happen?"."""
+enum RunTrigger {
+  AGENT_CLAIM
+  HUMAN_REQUEST
+  SCHEDULE
+  RETRY_OF_FAILED_RUN
+  DEPENDENCY_SATISFIED
+  WEBHOOK
+}
+
+"""The kind of thing a step did. Closed; the tool's own name is a separate String."""
+enum StepKind {
+  LLM_TURN
+  TOOL_CALL
+  SUBTASK_SPAWN
+  HUMAN_INPUT
+  VERIFICATION
+  CHECKPOINT
+}
+
+"""Where in its own micro-lifecycle a step is."""
+enum StepPhase {
+  PENDING
+  IN_FLIGHT
+  SETTLED
+}
+
+"""How a settled step turned out. Separate from phase: a step can settle badly."""
+enum StepOutcome {
+  SUCCESS
+  PARTIAL
+  ERROR
+  DENIED
+  TIMED_OUT
+  SKIPPED
+}
+
+"""Per-step state, for clients that prefer one field over the phase/outcome pair."""
+enum StepState {
+  PENDING
+  RUNNING
+  SUCCEEDED
+  FAILED
+  DENIED
+  SKIPPED
+  TIMED_OUT
+}
+
+"""
+Blast radius of a tool. This is a *policy* fact about the tool as invoked, and
+it is the gate for the gated-value pattern on artifact mutation: a DESTRUCTIVE
+tool call cannot silently produce a promoted artifact.
+"""
+enum ToolRisk {
+  READ_ONLY
+  IDEMPOTENT_WRITE
+  DESTRUCTIVE
+  EXTERNAL_SIDE_EFFECT
+}
+
+"""Why an artifact exists relative to the run. Drives which one a client shows."""
+enum ArtifactRole {
+  PRIMARY_OUTPUT
+  DIFF
+  PATCH
+  LOG
+  TEST_REPORT
+  SCREENSHOT
+  BENCHMARK
+  INTERMEDIATE
+  COVERAGE
+  TRACE
+}
+
+"""What an artifact is, structurally. Determines how to fetch and render it."""
+enum ArtifactKind {
+  INLINE_TEXT
+  INLINE_JSON
+  CONTENT_ADDRESSED_BLOB
+  REMOTE_URI
+  GIT_REF
+  FILE_PATH
+}
+
+"""Promotion state. The gate on artifact trustworthiness."""
+enum ArtifactState {
+  """Written by the run, unverified."""
+  PRODUCED
+  """A verification step consumed and passed it."""
+  VERIFIED
+  """A human accepted it as the task's output."""
+  ACCEPTED
+  """A later artifact replaced it."""
+  SUPERSEDED
+  """Known bad; retained for forensics."""
+  REJECTED
+  """Removed from serving; metadata retained."""
+  REDACTED
+}
+
+"""What kind of dependency this is. Semantics differ per kind, so it is closed."""
+enum DependencyKind {
+  """`blocks` cannot start until this task closes."""
+  BLOCKING
+  """Would help, but does not gate. Never affects readiness."""
+  SOFT
+  """This task is a duplicate of the other; closing the other closes this."""
+  DUPLICATE_OF
+  """This task is a decomposed child of the other."""
+  SUBTASK_OF
+  """Must be resolved either way before this task may close."""
+  RELATED
+}
+
+"""The evaluated state of a dependency edge, as of the last readiness computation."""
+enum DependencyState {
+  UNSATISFIED
+  SATISFIED
+  WONT_SATISFY
+  """The edge was rejected or removed because it formed a cycle."""
+  CYCLIC
+}
+
+"""Why a task cannot be claimed or run right now. Actionable, not descriptive."""
+enum BlockerKind {
+  UNSATISFIED_DEPENDENCY
+  CYCLIC_DEPENDENCY
+  LEASE_HELD_BY_OTHER
+  MISSING_REQUIRED_CAPABILITY
+  APPROVAL_REQUIRED
+  BUDGET_EXHAUSTED
+  TOOL_PERMISSION_DENIED
+  OUTSIDE_SCHEDULED_WINDOW
+  RATE_LIMITED
+  QUARANTINED_BY_HUMAN
+  MAX_ATTEMPTS_REACHED
+}
+
+"""Whether a blocker clears on its own."""
+enum BlockerState {
+  """Will clear when the named condition changes; no human needed."""
+  TRANSIENT
+  """Requires a human or policy change to clear."""
+  STICKY
+}
+
+"""A capability an agent must hold to claim a task. Closed by policy, not by schema."""
+enum AgentCapability {
+  SHELL_EXEC
+  NETWORK_EGRESS
+  REPO_WRITE
+  SECRET_READ
+  GPU
+  LONG_RUNNING
+  HUMAN_ESCALATION
+  DEPLOY
+  DATABASE_WRITE
+  SANDBOX_ESCAPE_REVIEWED
+}
+
+"""What kind of thing acted. Keeps `actor` a single edge instead of three nullable ones."""
+enum ActorKind {
+  HUMAN
+  AGENT
+  SYSTEM
+  SCHEDULER
+  WEBHOOK
+}
+
+"""The role a task plays in a traversed edge. Makes direction explicit at the edge."""
+enum TaskConnectionRole {
+  BLOCKS
+  BLOCKED_BY
+  PARENT
+  CHILD
+  DUPLICATE
+  DUPLICATE_OF
+  RELATED
+  SPAWNED_RUN_FOR
+}
+
+"""Outcome of a lease renewal attempt. Typed so the agent knows whether to stop."""
+enum LeaseRenewalOutcome {
+  RENEWED
+  """Someone else holds it now; the caller must stop immediately."""
+  LOST
+  """Task left the claimable statuses; finish and report, do not renew."""
+  NO_LONGER_CLAIMABLE
+  """Renewal refused by policy (budget, capability drift, quarantine)."""
+  REFUSED
+}
+
+"""Every kind of durable timeline entry. One event type, one vocabulary (§6)."""
+enum TaskEventKind {
+  CREATED
+  UPDATED
+  ASSIGNED
+  UNASSIGNED
+  STATUS_CHANGED
+  PRIORITY_CHANGED
+  CLAIM_REQUESTED
+  CLAIMED
+  CLAIM_RELEASED
+  CLAIM_REVOKED
+  LEASE_RENEWED
+  LEASE_EXPIRED
+  RUN_STARTED
+  RUN_PROGRESSED
+  RUN_STEP_RECORDED
+  RUN_SUCCEEDED
+  RUN_FAILED
+  RUN_CANCELLED
+  RUN_TIMED_OUT
+  RUN_ABANDONED
+  DEPENDENCY_ADDED
+  DEPENDENCY_SATISFIED
+  DEPENDENCY_UNSATISFIED
+  DEPENDENCY_REMOVED
+  DEPENDENCY_CYCLE_REJECTED
+  BLOCKED
+  UNBLOCKED
+  ARTIFACT_RECORDED
+  ARTIFACT_PROMOTED
+  ARTIFACT_SUPERSEDED
+  COMMENT_ADDED
+  CLOSED
+  REOPENED
+  ARCHIVED
+}
+
+"""Subscription delivery semantics."""
+enum StreamWindow {
+  """Everything retained, oldest first."""
+  FROM_BEGINNING
+  """Only events after the cursor the client supplied."""
+  AFTER_CURSOR
+  """Only events from subscription start onward."""
+  LIVE_ONLY
+}
+
+enum StreamCursorState {
+  VALID
+  EXPIRED
+  TOO_FAR_BEHIND
+}
+
+"""How a task sort is directed."""
+enum TaskOrder { ASC DESC }
+
+
+# =============================================================================
+# 3. ACTORS
+#    One concept, one type: "who acted" is ONE concept with several shapes, so
+#    it is ONE type with a discriminator — not three nullable ID fields and not
+#    a union that forces a fragment for every read.
+# =============================================================================
+
+"""
+Anything that can act on a task: a human, an agent, the scheduler, the system.
+This is the single actor type. It replaces the ID-soup alternative
+(`claimedByAgentId`, `claimedByUserId`, `reportedBy`, `closedBy` as raw strings)
+with one traversable edge.
+"""
+type TaskActor {
+  """Opaque global id."""
+  id: ULID!
+
+  """What kind of actor this is. Discriminator; safe to branch on."""
+  kind: ActorKind!
+
+  """Stable, human-meaningful handle: `alice`, `agent:qwen-coder`, `scheduler`."""
+  handle: String!
+
+  """Display name, if any. Never used as an identity."""
+  displayName: String
+
+  """The agent definition behind this actor, when kind == AGENT."""
+  agent: AgentRef @absentWhen(condition: "kind != AGENT")
+
+  """The human identity behind this actor, when kind == HUMAN."""
+  human: ActorIdentity @absentWhen(condition: "kind != HUMAN")
+
+  """
+  Capabilities this actor actually held at the time of its most recent action.
+  Snapshot, not live: an agent's capabilities can be revoked mid-run, and the
+  audit trail must show what it had *then*.
+  """
+  capabilitiesAtLastAction: [AgentCapability!] @derived(from: "last event authored by this actor")
+}
+
+"""A human identity, minimally modelled. Not a User type — this group owns no user directory."""
+type ActorIdentity {
+  id: ULID!
+  handle: String!
+  displayName: String
+  email: String
+}
+
+"""
+A reference to an agent *definition* (the thing that can be instantiated to run
+tasks), as opposed to a TaskActor (a specific instance acting at a time).
+Kept deliberately thin: agent modelling belongs to another group.
+"""
+type AgentRef {
+  id: ULID!
+  """Stable name of the agent definition, e.g. `qwen-coder`."""
+  name: String!
+  """Version of the definition. Two runs by `qwen-coder@1.2` are comparable; across versions they are not."""
+  version: String
+  """Model family, when the agent is LLM-driven."""
+  model: String
+  """Capabilities this definition is allowed to exercise."""
+  capabilities: [AgentCapability!]!
+}
+
+
+# =============================================================================
+# 4. THE WORK UNIT
+# =============================================================================
+
+"""
+A durable unit of work that an agent claims, runs, and closes.
+
+The root concept of this group. Everything else here is either (a) an edge out
+of a Task, (b) a component of a Task's execution trajectory, or (c) a result
+envelope for a transition.
+
+Design commitments, all audited in the rationale:
+  * Status, claim state, run state and blockedness are FOUR orthogonal axes and
+    are modelled as four separate, separately queryable things — never as one
+    mega-enum.
+  * Readiness is a *derived verdict with a reason*, not a boolean.
+  * Dependencies are edges with their own type, traversable both ways.
+  * The execution trajectory is a Run → Steps → Events/Artifacts tree, all of it
+    append-only and cursor-paginated.
+"""
+type Task {
+  # ---- identity -------------------------------------------------------------
+
+  """Opaque global id. Use this in mutations."""
+  id: ULID!
+
+  """
+  Human-citable key (`lev-417`). Stable for the task's whole life, unique within
+  a project, and the thing that appears in commit messages and PR bodies.
+  """
+  key: TaskKey!
+
+  """One-line imperative summary. Rendered everywhere; never Markdown."""
+  title: String!
+
+  """The full statement of work. Markdown, because it is read by humans."""
+  description: Markdown
+
+  """What kind of work this is."""
+  type: TaskType!
+
+  """
+  Free-form labels. A *set of tags*, not a bag of attributes: nothing in the
+  system branches on a label's value, which is what keeps it a legitimate
+  String list rather than a string-bag smell.
+  """
+  labels: [String!]!
+
+  # ---- lifecycle ------------------------------------------------------------
+
+  """Where this work is in its life."""
+  status: TaskStatus!
+
+  """
+  The task's status, as an object with its reason and its history. Use `status`
+  when you only need the enum; use this when you need to explain a status to a
+  human or to act on *why*.
+  """
+  lifecycle: TaskLifecycle!
+
+  """
+  Whether the task may be claimed and run right now, and if not, exactly what
+  is in the way. This is the single most-queried field in the group and it is a
+  *verdict with reasons*, never a bare Boolean — a `false` you cannot act on is
+  a round trip wasted.
+  """
+  readiness: TaskReadiness!
+
+  """
+  Everything preventing progress, including blockers that readiness summarises.
+  Empty exactly when `readiness.isReady` is true (hard invariant).
+  """
+  blockers: [TaskBlocker!]! @derived(from: "dependencies, claims, policy, budget")
+    @invariant(reason: "blockers.isEmpty == readiness.isReady; enforced by the readiness resolver")
+
+  # ---- assignment / claiming ------------------------------------------------
+
+  """
+  The rules governing who may claim this task. Present from creation; mutable
+  only via `updateClaimPolicy`.
+  """
+  claimPolicy: TaskClaimPolicy!
+
+  """
+  The live claim, if any. Null when the task is unclaimed — and that null is
+  meaningful, not lazy: it is the difference between "free" and "taken".
+  """
+  currentClaim: TaskClaim
+    @absentWhen(condition: "status is not IN_PROGRESS, or the last claim EXPIRED/RELEASED/REVOKED")
+
+  """
+  Every claim ever made on this task, newest first. The claim *history* is how
+  you find work that keeps getting dropped — a first-class question, so a
+  first-class field.
+  """
+  claims(
+    states: [ClaimState!]
+    after: String
+    first: Int = 25
+  ): TaskClaimPage! @immutable(except: "none; claims are never edited, only transitioned")
+
+  """
+  Actors currently assigned to shepherd this task (may be zero, one, or many).
+  Assignment is NOT a claim: an assignee is accountable, a claimer is executing.
+  Conflating them is the classic ID-soup trap this schema avoids.
+  """
+  assignees: [TaskActor!]! @edge(inverse: "assignedTasks")
+
+  # ---- dependencies (edges) -------------------------------------------------
+
+  """
+  Tasks this task depends on, as edges. Traversable: each edge carries its
+  kind, its evaluated state, and the task at the other end.
+  """
+  dependsOn(
+    kinds: [DependencyKind!]
+    states: [DependencyState!]
+  ): [TaskDependency!]! @edge(inverse: "Task.blockers_")
+
+  """
+  Tasks that depend on this one. The inverse traversal of `dependsOn`, served
+  from the same edge store — not a mirror type, the same `TaskDependency`
+  object viewed from the other end (`direction` tells you which end you hold).
+  """
+  blockers_(
+    kinds: [DependencyKind!]
+    states: [DependencyState!]
+  ): [TaskDependency!]! @edge(inverse: "Task.dependsOn")
+
+  """
+  A single flattened, traversable view of every task-to-task relation this task
+  participates in, with the role named on the edge. This is the edge-first
+  surface: a graph client walks `connections` and never needs to know which of
+  the six relation fields to ask for.
+  """
+  connections(
+    roles: [TaskConnectionRole!]
+    after: String
+    first: Int = 50
+  ): TaskConnectionPage! @edge
+
+  # ---- execution trajectory -------------------------------------------------
+
+  """
+  The most recent run, if any. The 90% query: "what happened last time".
+  Null for a task that has never been executed — a structural absence, not an
+  error.
+  """
+  latestRun: TaskRun @absentWhen(condition: "runCount == 0")
+
+  """
+  The run that is live right now, if one is. At most one may be live
+  (hard invariant, enforced by `startRun`).
+  """
+  activeRun: TaskRun
+    @absentWhen(condition: "no run is in QUEUED/STARTING/RUNNING/PAUSED/DRAINING")
+    @invariant(reason: "startRun rejects a second concurrent run for the same task")
+
+  """All runs, newest first, cursor-paginated. The retry/forensics surface."""
+  runs(
+    states: [RunState!]
+    triggers: [RunTrigger!]
+    actorId: ULID
+    after: String
+    first: Int = 25
+  ): TaskRunPage! @immutable(except: "run end fields settle once; the record itself is never deleted")
+
+  """How many runs have been started. Cheap; used for triage lists."""
+  runCount: Int! @derived(from: "count(runs)")
+
+  """
+  Rollup counters for list views. Exists so a dashboard can render 200 tasks
+  without 200 sub-selections of `runs`.
+  """
+  counters: TaskCounters! @derived(from: "runs, claims, artifacts, events")
+
+  # ---- output ---------------------------------------------------------------
+
+  """
+  Artifacts promoted to *task-level* output — the answer this task produced,
+  independent of which run produced it. Run-scoped artifacts live under
+  `TaskRun.artifacts`; these are the ones that survived verification and were
+  accepted as the task's deliverable.
+  """
+  outputArtifacts(roles: [ArtifactRole!]): [RunArtifact!]!
+    @gated(via: "promoteArtifact", onViolation: REJECT)
+    @derived(from: "RunArtifact nodes with state VERIFIED or ACCEPTED")
+
+  # ---- provenance / audit ---------------------------------------------------
+
+  """Who created this task."""
+  createdBy: TaskActor!
+
+  createdAt: DateTime!
+  updatedAt: DateTime!
+
+  """Who closed or cancelled it, and therefore who owns the terminal decision."""
+  closedBy: TaskActor @absentWhen(condition: "status is not CLOSED or CANCELLED")
+  closedAt: DateTime @absentWhen(condition: "status is not CLOSED or CANCELLED")
+
+  """
+  Why a CANCELLED task was cancelled. A human sentence, not an enum: the
+  reasons are open-ended and nothing branches on them.
+  """
+  cancellationReason: String @absentWhen(condition: "status != CANCELLED")
+
+  """The durable, append-only timeline of everything that happened to this task."""
+  events(
+    kinds: [TaskEventKind!]
+    since: DateTime
+    after: String
+    first: Int = 50
+  ): TaskEventPage! @immutable(except: "PII redaction, which appends a REDACTED marker rather than rewriting")
+
+  """
+  The single next action a client should offer a human or an agent. One field,
+  because "what do I do with this task" is one question.
+  """
+  suggestedNextAction: TaskNextAction
+    @derived(from: "status, readiness, blockers, activeRun")
+    @absentWhen(condition: "task is CLOSED or CANCELLED")
+}
+
+"""
+A task's status plus the *reason* for it and the transition that produced it.
+Separate from Task because "status" as an enum and "status" as an explained,
+audited fact are two different query needs, and stuffing the explanation into
+Task would put five rarely-read fields on the hottest type in the schema.
+"""
+type TaskLifecycle {
+  status: TaskStatus!
+
+  """The transition that produced the current status."""
+  enteredAt: DateTime!
+  enteredBy: TaskActor!
+
+  """How long the task has been in this status. Recomputed on read."""
+  timeInStatus: Duration! @derived(from: "enteredAt vs now")
+
+  """
+  Machine-readable reason for the current status, when there is one worth
+  giving (e.g. `dependency:lev-388`, `lease_expired`, `budget_exhausted`).
+  A *reason code with a subject*, not a free-text bag.
+  """
+  reasonCode: String
+  reasonSubject: Task @absentWhen(condition: "reasonCode does not name another task")
+
+  """Human-readable explanation. May be absent; never required for logic."""
+  note: String
+
+  """The statuses this task may legally move to from here."""
+  allowedTransitions: [TaskStatus!]!
+    @invariant(reason: "transitionTask rejects anything not in this list; the list is the contract")
+
+  """
+  Full status history, oldest first. Distinct from `Task.events` because it
+  contains only status transitions and is therefore cheap enough to always load.
+  """
+  history: [TaskStatusChange!]! @immutable
+}
+
+"""One status transition."""
+type TaskStatusChange {
+  from: TaskStatus @absentWhen(condition: "this is the initial transition (from == null on creation)")
+  to: TaskStatus!
+  at: DateTime!
+  by: TaskActor!
+  note: String
+}
+
+"""
+The verdict on "can this be worked right now", with reasons. This is the
+gated-value pattern applied to *readiness*: the value is computed by the
+scheduler, cannot be written by a client, and always arrives with the gate that
+would have to open.
+"""
+type TaskReadiness {
+  """May be claimed and run this instant."""
+  isReady: Boolean!
+    @invariant(reason: "isReady == (blockers is empty); both come from one resolver")
+
+  """
+  The single most important blocker, chosen by policy (sticky before transient,
+  dependency before rate-limit). Null exactly when isReady.
+  """
+  primaryBlocker: TaskBlocker @absentWhen(condition: "isReady == true")
+
+  """
+  The earliest instant at which this task is expected to become ready, if the
+  system can predict one (a lease expiry, a scheduled window opening). Absent
+  when readiness depends on work completing, which is unpredictable by nature.
+  """
+  readyAt: DateTime @absentWhen(condition: "no blocker has a predictable clear time")
+
+  """
+  Whether readiness was evaluated against live data or a cached snapshot, and
+  how old that snapshot is. Present so a client can decide to force a recheck.
+  """
+  evaluatedAt: DateTime!
+  fromCache: Boolean!
+}
+
+"""
+One concrete thing standing in the way. Actionable by construction: it always
+names either the subject (a task, a claim, an approval) or the remedy.
+"""
+type TaskBlocker {
+  kind: BlockerKind!
+
+  """Whether this clears by itself or needs a human."""
+  state: BlockerState!
+
+  """The task, if the blocker is another task."""
+  subject: Task @absentWhen(condition: "blocker is not task-shaped")
+
+  """The dependency edge, if the blocker is a dependency."""
+  dependency: TaskDependency @absentWhen(condition: "kind != UNSATISFIED_DEPENDENCY and kind != CYCLIC_DEPENDENCY")
+
+  """The claim, if the blocker is a live lease held by someone else."""
+  claim: TaskClaim @absentWhen(condition: "kind != LEASE_HELD_BY_OTHER")
+
+  """The capability the claiming agent lacks, if that is the blocker."""
+  missingCapability: AgentCapability @absentWhen(condition: "kind != MISSING_REQUIRED_CAPABILITY")
+
+  """When this blocker is expected to clear, if predictable."""
+  clearsAt: DateTime @absentWhen(condition: "clear time is not predictable")
+
+  """One sentence for a human. Never parsed by clients."""
+  message: String!
+
+  """
+  The mutation that would clear this blocker, when one exists. This is what
+  makes the blocker a *gate* rather than a complaint: `unblockTask` tells a
+  client exactly which call to make, or that none exists.
+  """
+  remedy: BlockerRemedy @absentWhen(condition: "no client-invocable remedy exists (e.g. rate limit)")
+}
+
+"""The named remedy for a blocker: which mutation, with what subject."""
+type BlockerRemedy {
+  """The mutation field name, e.g. `removeDependency`, `revokeClaim`, `approveTask`."""
+  mutation: String!
+  """The subject id to pass, when the remedy needs one."""
+  subjectId: ULID @absentWhen(condition: "the remedy takes no subject")
+  """Whether the calling actor is permitted to invoke the remedy."""
+  invokableByMe: Boolean!
+}
+
+"""
+The rules for who may claim this task, and what happens when they do.
+A first-class type rather than four fields on Task, because it is read as a
+unit ("can I take this?") and written as a unit (`updateClaimPolicy`).
+"""
+type TaskClaimPolicy {
+  """Must the claimer be a specific actor, or may anyone eligible take it?"""
+  exclusive: Boolean!
+
+  """A specific assignee-only claimant, when the task is reserved."""
+  reservedFor: TaskActor @absentWhen(condition: "exclusive == false")
+
+  """Capabilities a claimer must hold. Empty means no capability gate."""
+  requiredCapabilities: [AgentCapability!]!
+
+  """Agent definitions explicitly allowed. Empty means any eligible agent."""
+  allowedAgents: [AgentRef!]!
+
+  """Agent definitions explicitly barred, overriding allowedAgents."""
+  deniedAgents: [AgentRef!]!
+
+  """Initial lease length granted on claim."""
+  leaseTtl: Duration!
+
+  """How long an expired lease blocks re-claim (anti-thrash)."""
+  rebackoff: Duration!
+
+  """How many times this task may be claimed before it is quarantined for a human."""
+  maxClaims: Int!
+
+  """How many runs may be attempted before MAX_ATTEMPTS_REACHED blocks it."""
+  maxRunAttempts: Int!
+
+  """Wall-clock ceiling for a single run."""
+  maxRunDuration: Duration!
+
+  """Token/cost ceiling for a single run, in the project's billing unit."""
+  maxRunCost: Float
+
+  """Whether a human must approve before the first run may start."""
+  requiresHumanApproval: Boolean!
+
+  """Whether the task may be claimed at all right now (a kill switch)."""
+  claimable: Boolean!
+
+  """Who last changed the policy, and when. Policy changes are auditable events."""
+  updatedBy: TaskActor!
+  updatedAt: DateTime!
+}
+
+"""
+A claim: one actor's assertion of ownership over one task, for one lease.
+Claims are historical objects — they are never deleted, and a task accumulates
+them. This is what makes "which agent keeps dropping this task?" answerable.
+"""
+type TaskClaim {
+  id: ULID!
+  task: Task!
+  claimant: TaskActor!
+  state: ClaimState!
+
+  claimedAt: DateTime!
+
+  """The lease currently or most recently attached to this claim."""
+  lease: TaskLease @absentWhen(condition: "state == OFFERED (never granted)")
+
+  """Why the claim ended, when it ended for a reason worth recording."""
+  endedAt: DateTime @absentWhen(condition: "state == ACTIVE")
+  endReason: String @absentWhen(condition: "state == ACTIVE")
+
+  """Runs executed under this claim. A claim may span several retried runs."""
+  runs(after: String, first: Int = 25): TaskRunPage!
+
+  """
+  Whether this claim was granted after a race with another claimer. Kept
+  because contested claims are the interesting ones when debugging a scheduler.
+  """
+  contested: Boolean! @derived(from: "claim requests within the race window")
+}
+
+"""
+A lease: the time-bounded right to execute. Separate from TaskClaim because a
+claim can be re-leased many times, and because the lease is the object an agent
+actually has to keep alive.
+"""
+type TaskLease {
+  id: ULID!
+  claim: TaskClaim!
+
+  acquiredAt: DateTime!
+  expiresAt: DateTime!
+
+  """A monotonic counter; every renewal increments it. Detects split-brain agents."""
+  epoch: Int!
+    @gated(via: "renewLease", onViolation: REJECT)
+    @invariant(reason: "epoch is strictly increasing per lease; renewLease is the only writer")
+
+  lastRenewedAt: DateTime @absentWhen(condition: "epoch == 0 (never renewed)")
+  renewalCount: Int! @derived(from: "count of renewals on this lease")
+
+  """
+  How far behind the heartbeat the agent is right now. An agent whose lag
+  approaches the TTL is about to lose the lease; this field is the warning.
+  """
+  heartbeatLag: Duration! @derived(from: "now - lastRenewedAt")
+
+  """Whether the lease is live at this instant."""
+  isLive: Boolean! @derived(from: "expiresAt vs now, and claim state")
+
+  """
+  Grace period granted after expiry before the task returns to the ready set.
+  Zero means no grace.
+  """
+  grace: Duration!
+}
+
+
+# =============================================================================
+# 5. DEPENDENCIES — EDGES, NOT LISTS
+# =============================================================================
+
+"""
+A directed dependency edge between two tasks, as seen from one end.
+
+Edge-first, per the guide: the relation is the concept, so the relation is the
+type. `from` and `to` are both traversable, `kind` gives the edge its
+semantics, and `state` is the evaluated verdict the scheduler wrote.
+
+There is exactly ONE edge type for task-to-task dependencies. The tempting
+alternative — `BlockingDependency`, `SoftDependency`, `DuplicateLink`,
+`SubtaskLink` as four types — is a mirror-type explosion: they would share
+every field and differ only in an enum value, so they differ in nothing that
+matters structurally.
+"""
+type TaskDependency {
+  """The edge's own id. Edges are addressable because they are mutable objects."""
+  id: ULID!
+
+  """Which end of the edge this object was reached from. Read this first."""
+  direction: TaskConnectionRole!
+
+  """The task on the dependent side."""
+  from: Task!
+
+  """The task on the depended-upon side."""
+  to: Task!
+
+  """What kind of dependency this is."""
+  kind: DependencyKind!
+
+  """
+  The evaluated state, as of `evaluatedAt`. SATISFIED means the scheduler has
+  confirmed the `to` task no longer gates the `from` task.
+  """
+  state: DependencyState! @gated(via: "the readiness recomputation triggered by transitionTask")
+
+  evaluatedAt: DateTime!
+
+  """
+  Whether this edge participates in the task's readiness computation. False for
+  SOFT and RELATED edges — which is precisely why `kind` is not decorative.
+  """
+  gatesReadiness: Boolean! @derived(from: "kind")
+    @invariant(reason: "gatesReadiness is true iff kind is BLOCKING or DUPLICATE_OF")
+
+  """Who created the edge. Dependencies are assertions; assertions have authors."""
+  createdBy: TaskActor!
+  createdAt: DateTime!
+
+  """
+  The cycle this edge was found to participate in, when state == CYCLIC.
+  Ordered from `from` back to `from`.
+  """
+  cycle: [Task!] @absentWhen(condition: "state != CYCLIC")
+    @invariant(reason: "addDependency rejects an edge that would create a cycle; a CYCLIC state can only arise from a pre-existing or concurrently-added edge")
+
+  """Free-text justification. Optional; never parsed."""
+  note: String
+}
+
+"""
+One entry in the flattened `Task.connections` view: a task reached by an edge,
+with the edge's role and the edge itself. This is the type a graph walker
+consumes; it exists so traversal does not require six separate field
+selections and six fragment spreads.
+"""
+type TaskConnection {
+  """The task at the far end."""
+  task: Task!
+
+  """The role the *far* task plays relative to the near one."""
+  role: TaskConnectionRole!
+
+  """The underlying dependency edge, when the connection is a dependency."""
+  dependency: TaskDependency @absentWhen(condition: "role is not a dependency kind (e.g. SPAWNED_RUN_FOR)")
+
+  """Edge weight for ranking: how strongly this connection gates the near task."""
+  weight: Float! @derived(from: "kind and state")
+}
+
+
+# =============================================================================
+# 6. EXECUTION TRAJECTORY
+#    Run → Step → (ToolCall | StepEvent) and Run → Artifact.
+#    All append-only. All cursor-paginated. Nothing here is editable.
+# =============================================================================
+
+"""
+One execution of a task by one actor under one claim.
+
+A Run is the unit of *trajectory*: it has a beginning, an end, a cost, a
+progress curve, an ordered list of steps, and a set of artifacts. Runs are
+immutable history — you never edit a run, you start another one.
+
+Deliberately NOT a workflow: a Run has no plan, no branching structure and no
+editable steps. It is a recording.
+"""
+type TaskRun {
+  id: ULID!
+  task: Task!
+
+  """The claim this run executed under. Null for a human-triggered run with no claim."""
+  claim: TaskClaim @absentWhen(condition: "trigger is not AGENT_CLAIM")
+
+  """Who or what started the run."""
+  actor: TaskActor!
+  trigger: RunTrigger!
+
+  state: RunState!
+
+  startedAt: DateTime!
+  endedAt: DateTime @absentWhen(condition: "state is not terminal")
+  endReason: RunEndReason @absentWhen(condition: "state is not terminal")
+
+  """Wall-clock duration. Live while the run is live."""
+  elapsed: Duration! @derived(from: "startedAt vs (endedAt ?? now)")
+
+  """
+  The run this one retries, when trigger == RETRY_OF_FAILED_RUN. A self-edge:
+  the retry chain is traversable without a separate type.
+  """
+  retryOf: TaskRun @absentWhen(condition: "trigger != RETRY_OF_FAILED_RUN")
+
+  """Runs that retry this one. Inverse of `retryOf`, same edge store."""
+  retriedBy: [TaskRun!]! @edge(inverse: "TaskRun.retryOf")
+
+  """
+  The attempt number, 1-based, within this task. Denormalised from the retry
+  chain because it is asked for on every single run read.
+  """
+  attempt: Int! @derived(from: "length of the retryOf chain")
+
+  """
+  Iteration count as reported by the agent. Distinct from `steps.length`:
+  one iteration may comprise several steps (a turn plus its tool calls).
+  """
+  iterations: Int! @gated(via: "recordStep / updateRunProgress", onViolation: IGNORE)
+
+  """Live progress, as reported. Structured, not a bare percentage (§8)."""
+  progress: RunProgress!
+
+  """Cost so far / at end."""
+  cost: RunCost!
+
+  """The ordered steps of this run. Cursor-paginated: a long run has thousands."""
+  steps(
+    kinds: [StepKind!]
+    outcomes: [StepOutcome!]
+    toolNames: [String!]
+    after: String
+    first: Int = 50
+  ): RunStepPage! @immutable
+
+  """Only the tool-call steps, for the very common "what did it touch?" query."""
+  toolCalls(toolNames: [String!], risks: [ToolRisk!], after: String, first: Int = 50): RunStepPage!
+    @derived(from: "steps where kind == TOOL_CALL")
+
+  """Fine-grained events emitted during the run (streamed telemetry, persisted)."""
+  events(
+    kinds: [TaskEventKind!]
+    after: String
+    first: Int = 100
+  ): StepEventPage! @immutable
+
+  """Artifacts this run produced, in production order."""
+  artifacts(
+    roles: [ArtifactRole!]
+    kinds: [ArtifactKind!]
+    states: [ArtifactState!]
+    after: String
+    first: Int = 25
+  ): RunArtifactPage!
+
+  """
+  The artifact that represents this run's answer, if one was designated.
+  Convenience edge to the PRIMARY_OUTPUT artifact; null when the run produced
+  no primary output (a failed run, or a read-only investigation).
+  """
+  primaryArtifact: RunArtifact
+    @absentWhen(condition: "no artifact with role PRIMARY_OUTPUT and state != REJECTED")
+
+  """
+  The run's own final message to whoever reads the task next. Not an artifact:
+  a short piece of prose the agent leaves behind. Open-ended by nature.
+  """
+  summary: Markdown @absentWhen(condition: "run has not settled")
+
+  """
+  Whether this run's output was accepted as the task's output. Gated: only
+  `promoteArtifact` / `transitionTask` may set it.
+  """
+  accepted: Boolean! @gated(via: "acceptRun", onViolation: REJECT)
+
+  """Environment fingerprint, so two runs can be compared honestly."""
+  environment: RunEnvironment!
+}
+
+"""
+The execution environment a run happened in. Exists because "it worked on the
+second run" is unanswerable without it, and because it is read as a unit.
+"""
+type RunEnvironment {
+  """Agent definition and version that executed."""
+  agent: AgentRef!
+
+  """Repository revision the run started from."""
+  baseRevision: String
+
+  """Repository revision the run left behind, if it committed."""
+  headRevision: String @absentWhen(condition: "the run produced no commit")
+
+  """Sandbox / runner label, e.g. `docker:lev-runner@0.5`, `local`."""
+  runner: String!
+
+  """Capabilities actually granted to this run (may be fewer than the agent's)."""
+  grantedCapabilities: [AgentCapability!]!
+
+  """Whether network egress was permitted."""
+  networkEgress: Boolean!
+
+  """Model parameters that materially affect reproducibility."""
+  temperature: Float
+  maxTokensPerTurn: Int
+  contextWindow: Int
+}
+
+"""
+Structured progress. A bare `percentComplete: Int` is the string-bag version of
+progress: it cannot distinguish "3 of 10 steps done" from "the agent feels
+good". This models the three things an agent can honestly report.
+"""
+type RunProgress {
+  """
+  Self-reported completion fraction in [0,1]. Explicitly untrustworthy, and
+  labelled as such so no client builds a schedule on it.
+  """
+  reportedFraction: Float
+    @expected(reason: "agent self-report; not monotonic and not calibrated",
+              onViolation: "prefer stepsSettled/expectedSteps or the artifact record")
+
+  """Steps settled so far."""
+  stepsSettled: Int! @derived(from: "count(steps where phase == SETTLED)")
+
+  """Steps the agent declared it expects to take. May be absent or revised."""
+  expectedSteps: Int @expected(reason: "agent-declared plan size; frequently revised",
+                               onViolation: "treat as unknown, not as zero")
+
+  """Iterations consumed vs the ceiling, when a ceiling exists."""
+  iterationsUsed: Int!
+  iterationsLimit: Int @absentWhen(condition: "no iteration ceiling configured")
+
+  """The agent's current one-line statement of what it is doing."""
+  currentActivity: String
+
+  """When progress was last reported. Staleness is the real signal here."""
+  lastReportedAt: DateTime @absentWhen(condition: "no progress reported yet")
+
+  """
+  Whether progress has advanced within the stall window. The field that answers
+  "is this run stuck?" — a question a percentage can never answer.
+  """
+  isStalled: Boolean! @derived(from: "lastReportedAt and step activity vs the stall window")
+
+  """Verification signals that are objective, unlike reportedFraction."""
+  checksPassed: Int!
+  checksFailed: Int!
+  checksTotal: Int @absentWhen(condition: "the run declared no check suite")
+}
+
+"""Cost of a run, in the units the system bills in."""
+type RunCost {
+  """Total monetary cost, in the project's billing currency."""
+  total: Float!
+
+  promptTokens: Int!
+  completionTokens: Int!
+  cachedTokens: Int! @derived(from: "provider usage records")
+
+  """Wall-clock the agent was actually computing, excluding queue wait."""
+  computeTime: Duration!
+
+  """Tool invocations, by risk. Destructive calls are the ones you audit."""
+  toolInvocations: Int!
+  destructiveToolInvocations: Int! @derived(from: "count(toolCalls where risk == DESTRUCTIVE)")
+
+  """The budget ceiling this run was started with, if any."""
+  budget: Float @absentWhen(condition: "no per-run budget configured")
+
+  """Whether the run stopped because it hit the ceiling."""
+  budgetExhausted: Boolean! @derived(from: "endReason == BUDGET_EXHAUSTED")
+}
+
+"""
+One step of a run: an LLM turn, a tool call, a spawned subtask, a verification.
+
+Steps are recorded, never edited. `index` is assigned at record time and is
+dense and monotonic within a run (hard invariant) — which is what makes
+"resume from step N" and "diff two runs" possible.
+"""
+type RunStep {
+  id: ULID!
+  run: TaskRun!
+
+  """0-based position within the run. Assigned once, never renumbered."""
+  index: Int! @invariant(reason: "recordStep assigns max(index)+1 atomically; indexes are dense and unique per run")
+
+  kind: StepKind!
+  phase: StepPhase!
+  outcome: StepOutcome @absentWhen(condition: "phase != SETTLED")
+
+  """Convenience single-field state for clients that do not want the pair."""
+  state: StepState! @derived(from: "phase and outcome")
+
+  startedAt: DateTime!
+  endedAt: DateTime @absentWhen(condition: "phase != SETTLED")
+  duration: Duration @absentWhen(condition: "phase != SETTLED")
+
+  """Which iteration this step belongs to. Groups a turn with its tool calls."""
+  iteration: Int!
+
+  """The tool call, when kind == TOOL_CALL. Null otherwise — structurally, not lazily."""
+  toolCall: ToolCall @absentWhen(condition: "kind != TOOL_CALL")
+
+  """The subtask spawned, when kind == SUBTASK_SPAWN. A task-graph edge."""
+  spawnedTask: Task @absentWhen(condition: "kind != SUBTASK_SPAWN") @edge(inverse: "Task.events")
+
+  """The agent's own one-line rationale for taking this step, when it gave one."""
+  intent: String
+
+  """Fine-grained events within this step (messages, partial output, retries)."""
+  events(after: StepEventFilter, first: Int = 50): StepEventPage! @immutable
+
+  """Artifacts produced by this specific step."""
+  artifacts: [RunArtifact!]! @derived(from: "artifacts whose producingStep is this step")
+
+  """Tokens and cost attributable to this step."""
+  cost: RunCost @absentWhen(condition: "the provider reported no per-step usage")
+
+  """
+  The error, when outcome is ERROR/DENIED/TIMED_OUT. Structured: a code the
+  system branches on, plus a human message.
+  """
+  error: StepError @absentWhen(condition: "outcome is SUCCESS, PARTIAL or SKIPPED")
+}
+
+"""A structured step failure. `code` is closed-ish and machine-handled; `message` is for humans."""
+type StepError {
+  """Stable error code, e.g. `tool.not_found`, `sandbox.egress_denied`, `llm.context_overflow`."""
+  code: String!
+  message: String!
+  """Whether retrying this exact step could plausibly succeed."""
+  retryable: Boolean!
+  """The tool, when the error came from one."""
+  toolName: String @absentWhen(condition: "error did not originate in a tool call")
+  """Upstream error detail, when the provider supplied any. Genuinely open shape."""
+  detail: JSONObject
+}
+
+"""
+A tool invocation within a step. Its own type because it has its own fields
+(name, args, risk, output, exit status) that no other step kind has — the
+opposite of a mirror type.
+"""
+type ToolCall {
+  step: RunStep!
+
+  """Registered tool name, e.g. `shell`, `edit_file`, `web_fetch`."""
+  toolName: String!
+
+  """
+  Arguments as passed. Open shape by nature — every tool has its own schema,
+  and this schema does not pretend otherwise. This is a *legitimate* JSON bag:
+  the alternative (one field per known tool) is the real smell.
+  """
+  args: JSONObject!
+
+  """Blast radius as evaluated at call time by the permission system."""
+  risk: ToolRisk!
+
+  """Whether the permission system allowed the call."""
+  permitted: Boolean!
+
+  """The policy rule that decided `permitted`. Present when a decision was recorded."""
+  permissionRule: String @absentWhen(condition: "no rule was evaluated (auto-permitted)")
+
+  startedAt: DateTime!
+  endedAt: DateTime
+  duration: Duration
+
+  """
+  Output as returned. Open shape, same argument as `args`.
+  Truncated flag is explicit: a client must never mistake a truncated output
+  for a complete one.
+  """
+  output: JSONObject
+  outputTruncated: Boolean!
+  outputBytes: Int! @derived(from: "byte length of the full output")
+
+  """Tool-reported exit status, when the tool has one."""
+  exitCode: Int @absentWhen(condition: "the tool does not report exit codes")
+
+  succeeded: Boolean!
+
+  """Files this call touched, when the tool reports them. The audit surface."""
+  touchedPaths: [String!]!
+
+  """Nested tool calls, when a tool orchestrates others (e.g. a sub-agent)."""
+  childCalls: [ToolCall!]! @edge(inverse: "none; tree-internal")
+}
+
+"""
+A fine-grained event inside a step or a run: a streamed message chunk, a
+reasoning trace, a retry notice. The telemetry layer, kept separate from
+`TaskEvent` (the durable lifecycle timeline) because their retention, volume
+and consumers differ by two orders of magnitude.
+"""
+type StepEvent {
+  id: ULID!
+  step: RunStep @absentWhen(condition: "the event is run-scoped rather than step-scoped")
+  run: TaskRun!
+
+  """Monotonic within the run."""
+  seq: Int! @invariant(reason: "assigned by the run's append log; strictly increasing, no gaps")
+
+  at: DateTime!
+
+  """Event channel: `message`, `reasoning`, `tool_stream`, `stderr`, `metric`, `retry`."""
+  channel: String!
+
+  """Sequence position within the channel, for reassembly of streamed output."""
+  channelSeq: Int!
+
+  """The event body. Open shape; this is the one place a JSON bag is the honest model."""
+  payload: JSONObject
+
+  """Text content, when the event carries text. Promoted out of payload because it is queried."""
+  text: String
+
+  """Whether this event's payload was redacted after the fact."""
+  redacted: Boolean!
+}
+
+"""
+An artifact produced by a run: a diff, a log, a report, a blob, a git ref.
+
+Separate from ArtifactBlob because an artifact is the *reference with meaning*
+(role, state, producer) and a blob is the *bytes*. Many artifacts share one
+blob; one artifact may be a URI with no blob at all. Collapsing them is how
+schemas end up with `outputUrl: String` and lose the ability to say "this is
+the verified primary output".
+"""
+type RunArtifact {
+  id: ULID!
+  run: TaskRun!
+  step: RunStep @absentWhen(condition: "the artifact was not attributable to a single step")
+
+  role: ArtifactRole!
+  kind: ArtifactKind!
+  state: ArtifactState!
+    @gated(via: "promoteArtifact / rejectArtifact", onViolation: REJECT)
+
+  """Human label, e.g. `fix.patch`, `pytest output`."""
+  label: String!
+
+  """The bytes, when this artifact is content-addressed or inline."""
+  blob: ArtifactBlob @absentWhen(condition: "kind is REMOTE_URI, GIT_REF or FILE_PATH")
+
+  """Location, when the artifact lives elsewhere."""
+  location: URI @absentWhen(condition: "kind is INLINE_TEXT, INLINE_JSON or CONTENT_ADDRESSED_BLOB")
+
+  """Git ref, when kind == GIT_REF."""
+  gitRef: String @absentWhen(condition: "kind != GIT_REF")
+
+  producedAt: DateTime!
+  producedBy: TaskActor!
+
+  """Revision history of this artifact slot. Artifacts get replaced, not edited."""
+  revisions: [ArtifactRevision!]! @immutable
+
+  """The artifact this one superseded, if any."""
+  supersedes: RunArtifact @edge(inverse: "RunArtifact.supersededBy")
+  supersededBy: RunArtifact @edge(inverse: "RunArtifact.supersedes")
+
+  """
+  Whether this artifact was promoted to the task's output. Read this instead of
+  scanning `Task.outputArtifacts` when you already hold the artifact.
+  """
+  promotedToTaskOutput: Boolean! @derived(from: "Task.outputArtifacts membership")
+
+  """
+  The verification that produced state == VERIFIED, when there was one.
+  This is the gate made explicit: an artifact is trusted because a named
+  verification step said so, and you can go read that step.
+  """
+  verifiedBy: RunStep @absentWhen(condition: "state is PRODUCED, SUPERSEDED, REJECTED or REDACTED")
+    @edge(inverse: "RunStep.artifacts")
+
+  """Inline text, when kind == INLINE_TEXT and the client asked for it."""
+  inlineText: String @absentWhen(condition: "kind != INLINE_TEXT")
+
+  """Inline JSON, when kind == INLINE_JSON."""
+  inlineJson: JSONObject @absentWhen(condition: "kind != INLINE_JSON")
+
+  """
+  A selector into `inlineJson` naming the part that matters, when the producer
+  declared one. Saves the client from re-deriving "which field was the result".
+  """
+  resultSelector: JSONPath @absentWhen(condition: "no selector was declared")
+}
+
+"""Content-addressed bytes. Deduplicated across artifacts and runs."""
+type ArtifactBlob {
+  digest: ContentHash!
+  algorithm: String!
+  byteSize: Int!
+  mediaType: String!
+
+  """
+  The bytes, when small enough to serve inline and the client asked for them.
+  Large blobs are fetched out-of-band via `downloadUrl`.
+  """
+  inline: Boolean!
+  content: String @absentWhen(condition: "inline == false")
+  downloadUrl: URI @absentWhen(condition: "inline == true")
+  expiresAt: DateTime @absentWhen(condition: "downloadUrl is not time-limited")
+}
+
+"""One replacement of an artifact's content, retaining the old value's identity."""
+type ArtifactRevision {
+  revision: Int!
+  artifact: RunArtifact!
+  blob: ArtifactBlob @absentWhen(condition: "this revision had no content (a URI-only artifact)")
+  replacedAt: DateTime!
+  replacedBy: TaskActor!
+  reason: String
+}
+
+"""
+Rollup counters for a task, for list and dashboard views. Every field here is
+available elsewhere in richer form; this type exists purely to make the common
+list query one round trip.
+"""
+type TaskCounters {
+  claims: Int!
+  expiredClaims: Int!
+  runs: Int!
+  failedRuns: Int!
+  steps: Int!
+  toolCalls: Int!
+  artifacts: Int!
+  promotedArtifacts: Int!
+  events: Int!
+  openDependencies: Int!
+  openDependents: Int!
+  totalCost: Float! @derived(from: "sum(runs.cost.total)")
+  totalElapsed: Duration! @derived(from: "sum(runs.elapsed)")
+}
+
+"""
+The single next action to offer. One type, because "what now?" is one question
+and a client should not have to reconstruct the answer from five fields.
+"""
+type TaskNextAction {
+  """The mutation to call, e.g. `claimTask`, `startRun`, `renewLease`, `transitionTask`."""
+  mutation: String!
+
+  """Human label for the action, e.g. `Claim and run`, `Close as done`."""
+  label: String!
+
+  """Why this is the next action. Machine-readable code."""
+  because: String!
+
+  """Whether the calling actor may perform it."""
+  permitted: Boolean!
+
+  """The blocker that must clear first, when the action is not yet permitted."""
+  gatedBy: TaskBlocker @absentWhen(condition: "permitted == true")
+}
+
+
+# =============================================================================
+# 7. THE DURABLE TIMELINE
+#    ONE event type. Not a union of six near-identical event types, and not one
+#    event type per concept: a task's timeline is a single append-only log whose
+#    entries differ in kind, and the kind is an enum the server already
+#    branches on. Optional back-references (`run`, `step`) give the specific
+#    entries their specificity without splitting the type.
+# =============================================================================
+
+"""
+One durable entry in a task's timeline. Append-only, totally ordered by `seq`,
+and the authoritative audit record: everything else in this schema can be
+rebuilt from it.
+"""
+type TaskEvent {
+  id: ULID!
+
+  """Strictly increasing within the task, no gaps. The ordering contract."""
+  seq: Int! @invariant(reason: "assigned by the task's append log under a per-task lock")
+
+  task: Task!
+  kind: TaskEventKind!
+  at: DateTime!
+  actor: TaskActor!
+
+  """The run involved, for run-scoped kinds."""
+  run: TaskRun @absentWhen(condition: "kind is not run-scoped")
+
+  """The step involved, for step-scoped kinds."""
+  step: RunStep @absentWhen(condition: "kind is not step-scoped")
+
+  """The claim involved, for claim-scoped kinds."""
+  claim: TaskClaim @absentWhen(condition: "kind is not claim-scoped")
+
+  """The dependency edge involved, for dependency-scoped kinds."""
+  dependency: TaskDependency @absentWhen(condition: "kind is not dependency-scoped")
+
+  """The artifact involved, for artifact-scoped kinds."""
+  artifact: RunArtifact @absentWhen(condition: "kind is not artifact-scoped")
+
+  """For STATUS_CHANGED: the transition. Null for every other kind."""
+  statusChange: TaskStatusChange @absentWhen(condition: "kind != STATUS_CHANGED")
+
+  """One-line human rendering of the event. Always present; always safe to show."""
+  message: String!
+
+  """
+  Kind-specific structured detail. This is the *only* JSON bag on the timeline,
+  and it is bounded: every kind that clients actually branch on has a typed
+  field above. `data` carries the rest, and the rest is never load-bearing.
+  """
+  data: JSONObject
+}
+
+
+# =============================================================================
+# 8. PAGINATION
+#    One connection shape per paginated concept is unavoidable in GraphQL, but
+#    the *page* type is uniform: `nodes`, `pageInfo`, `totalCount`. No
+#    per-type quirks, no offset/limit mixed with cursors.
+# =============================================================================
+
+type PageInfo {
+  hasNextPage: Boolean!
+  hasPreviousPage: Boolean!
+  startCursor: String
+  endCursor: String
+  """Opaque cursor validity, so a client knows when to restart rather than silently lose events."""
+  cursorState: StreamCursorState!
+}
+
+type TaskPage          { nodes: [Task!]!          pageInfo: PageInfo! totalCount: Int }
+type TaskClaimPage     { nodes: [TaskClaim!]!     pageInfo: PageInfo! totalCount: Int }
+type TaskRunPage       { nodes: [TaskRun!]!       pageInfo: PageInfo! totalCount: Int }
+type RunStepPage       { nodes: [RunStep!]!       pageInfo: PageInfo! totalCount: Int }
+type StepEventPage     { nodes: [StepEvent!]!     pageInfo: PageInfo! totalCount: Int }
+type RunArtifactPage   { nodes: [RunArtifact!]!   pageInfo: PageInfo! totalCount: Int }
+type TaskEventPage     { nodes: [TaskEvent!]!     pageInfo: PageInfo! totalCount: Int }
+type TaskConnectionPage{ nodes: [TaskConnection!]! pageInfo: PageInfo! totalCount: Int }
+
+"""Cursor-based pagination arguments, factored out because every list takes them."""
+input PaginationInput {
+  after: String
+  before: String
+  first: Int
+  last: Int
+}
+
+"""Filter for fine-grained step events."""
+input StepEventFilter {
+  channels: [String!]
+  since: DateTime
+  until: DateTime
+  minSeq: Int
+}
+
+
+# =============================================================================
+# 9. QUERY ROOT
+#    Shaped by "would I query this?" — every field below is a question a real
+#    client of an agentic execution system asks. See §10 of the rationale for
+#    the audit, including what was cut.
+# =============================================================================
+
+type Query {
+  """Fetch one task by opaque id."""
+  task(id: ULID!): Task @absentWhen(condition: "no such task, or the caller may not see it")
+
+  """Fetch one task by its human key (`lev-417`). The field humans actually use."""
+  taskByKey(key: TaskKey!): Task @absentWhen(condition: "no such key in scope")
+
+  """Fetch many tasks by id. Bounded to prevent an accidental full-table read."""
+  tasks(ids: [ULID!]!): [Task!]!
+    @invariant(reason: "result order matches input order; unknown ids yield null entries")
+
+  """
+  The ready set: tasks claimable right now, ordered by the scheduler's own
+  ranking. This is the single hottest query in the system — it is what an idle
+  agent calls — so it gets a dedicated field rather than being expressed as
+  `tasks(filter: {ready: true})`.
+  """
+  readyTasks(
+    """Restrict to tasks this actor is permitted and able to claim."""
+    forActor: ULID
+    capabilities: [AgentCapability!]
+    types: [TaskType!]
+    labels: [String!]
+    limit: Int = 20
+  ): [Task!]! @derived(from: "tasks where readiness.isReady, ranked by priority then age")
+
+  """General filtered search over tasks."""
+  searchTasks(
+    filter: TaskFilter
+    sort: TaskSort = { field: UPDATED_AT, order: DESC }
+    pagination: PaginationInput = { first: 25 }
+  ): TaskPage!
+
+  """
+  Tasks blocked on the given task — i.e. "what unblocks if I close this?"
+  The inverse traversal, promoted to the root because it is asked at decision
+  time and should not require walking the graph from each task.
+  """
+  tasksBlockedBy(id: ULID!, transitively: Boolean = false): [Task!]!
+
+  """
+  Detect and return every cycle reachable from a task. A diagnostic, not a
+  validator: cycles are rejected on write, so a non-empty result means
+  something is already wrong.
+  """
+  dependencyCycles(from: ULID!): [[Task!]!]!
+
+  """One claim by id."""
+  claim(id: ULID!): TaskClaim
+
+  """
+  Claims currently held by an actor across all tasks. The "what am I doing
+  right now?" query an agent asks on restart after a crash.
+  """
+  activeClaimsFor(actorId: ULID!): [TaskClaim!]!
+
+  """
+  Leases expiring within a window, across all tasks. The reaper's query, and
+  the dashboard's "about to be orphaned" panel.
+  """
+  expiringLeases(within: Duration!, limit: Int = 50): [TaskLease!]!
+
+  """One run by id."""
+  run(id: ULID!): TaskRun
+
+  """Runs currently live across the fleet, newest first."""
+  activeRuns(limit: Int = 50): [TaskRun!]!
+
+  """
+  Runs that stopped making progress but have not ended. The stuck-run queue —
+  the most operationally valuable list in the system after `readyTasks`.
+  """
+  stalledRuns(stalledFor: Duration!, limit: Int = 50): [TaskRun!]!
+
+  """One step by id."""
+  step(id: ULID!): RunStep
+
+  """One artifact by id."""
+  artifact(id: ULID!): RunArtifact
+
+  """Fetch a blob by digest, for dedup-aware clients."""
+  blob(digest: ContentHash!): ArtifactBlob
+
+  """
+  Artifacts across tasks matching a filter — e.g. "every unverified DESTRUCTIVE
+  tool output from yesterday". The audit query.
+  """
+  artifacts(filter: ArtifactFilter, pagination: PaginationInput = { first: 25 }): RunArtifactPage!
+
+  """One event by id."""
+  event(id: ULID!): TaskEvent
+
+  """
+  The task timeline across many tasks, merged and ordered. Used for the
+  global activity feed; `Task.events` is the per-task view of the same log.
+  """
+  eventFeed(
+    taskIds: [ULID!]
+    kinds: [TaskEventKind!]
+    since: DateTime
+    pagination: PaginationInput = { first: 50 }
+  ): TaskEventPage!
+
+  """Fleet-level statistics. One type, because a dashboard asks for all of it at once."""
+  stats(scope: TaskFilter): TaskStats!
+
+  """Resolve an actor by id or handle."""
+  actor(id: ULID, handle: String): TaskActor
+    @invariant(reason: "exactly one of id/handle must be supplied")
+
+  """The actor making this request. Lets a client render `permitted` fields correctly."""
+  me: TaskActor!
+}
+
+"""Everything filterable about tasks. One input type; no per-field query args sprawl."""
+input TaskFilter {
+  ids: [ULID!]
+  keys: [TaskKey!]
+  statuses: [TaskStatus!]
+  types: [TaskType!]
+  priorities: [TaskPriority!]
+  labels: [String!]
+  """Match tasks carrying ALL of these labels (default) or ANY of them."""
+  labelMatch: LabelMatch = ALL
+  assigneeIds: [ULID!]
+  claimantIds: [ULID!]
+  createdByIds: [ULID!]
+  """Only tasks that are ready to be claimed and run."""
+  ready: Boolean
+  """Only tasks currently blocked, with an optional blocker-kind restriction."""
+  blockedByKinds: [BlockerKind!]
+  """Only tasks with a live claim."""
+  hasActiveClaim: Boolean
+  """Only tasks with a live run."""
+  hasActiveRun: Boolean
+  dependsOnTaskIds: [ULID!]
+  blocksTaskIds: [ULID!]
+  createdAfter: DateTime
+  createdBefore: DateTime
+  updatedAfter: DateTime
+  updatedBefore: DateTime
+  closedAfter: DateTime
+  closedBefore: DateTime
+  """Free-text over title, description and labels."""
+  query: String
+  """Restrict to tasks the given actor is permitted to claim."""
+  claimableBy: ULID
+  """Exclude tasks already claimed by the given actor."""
+  excludeClaimedBy: ULID
+  minPriority: TaskPriority
+  maxRunAttempts: Int
+  """Include archived tasks (excluded by default)."""
+  includeArchived: Boolean = false
+}
+
+enum LabelMatch { ALL ANY }
+
+"""Sortable fields. Closed: sorting on an unindexed field is a server decision."""
+input TaskSort {
+  field: TaskSortField!
+  order: TaskOrder! = DESC
+}
+
+enum TaskSortField {
+  PRIORITY
+  CREATED_AT
+  UPDATED_AT
+  CLOSED_AT
+  STATUS_ENTERED_AT
+  AGE_IN_STATUS
+  RUN_COUNT
+  TOTAL_COST
+  KEY
+  READY_RANK
+}
+
+input ArtifactFilter {
+  taskIds: [ULID!]
+  runIds: [ULID!]
+  roles: [ArtifactRole!]
+  kinds: [ArtifactKind!]
+  states: [ArtifactState!]
+  producedByIds: [ULID!]
+  producedAfter: DateTime
+  producedBefore: DateTime
+  minBytes: Int
+  """Only artifacts produced by a tool call of at least this risk."""
+  minRisk: ToolRisk
+}
+
+"""Fleet-level rollups. Read-only, always derived, never writable."""
+type TaskStats {
+  totalTasks: Int!
+  byStatus: [StatusCount!]!
+  byType: [TypeCount!]!
+  byPriority: [PriorityCount!]!
+  readyCount: Int!
+  blockedCount: Int!
+  inProgressCount: Int!
+  activeRuns: Int!
+  stalledRuns: Int!
+  expiringLeases: Int!
+  """Median and p95 time from OPEN to CLOSED, over tasks closed in the window."""
+  medianCycleTime: Duration
+  p95CycleTime: Duration
+  """Median wall time from claim to first run start. Scheduler health."""
+  medianClaimToStart: Duration
+  totalCost: Float!
+  totalTokens: Int!
+  """Tasks claimed and then dropped (lease expired) at least once."""
+  thrashedTasks: Int!
+  """Tasks that hit maxRunAttempts. The human-attention queue."""
+  exhaustedTasks: Int!
+  computedAt: DateTime!
+}
+
+type StatusCount   { status: TaskStatus!   count: Int! }
+type TypeCount     { type: TaskType!       count: Int! }
+type PriorityCount { priority: TaskPriority! count: Int! }
+
+
+# =============================================================================
+# 10. MUTATION ROOT
+#     Every state change is a *transition* returning a typed result envelope,
+#     never a bare object. Reason: these operations race (two agents claim the
+#     same task; a lease expires mid-renewal), and a racing client must be able
+#     to distinguish "you lost" from "you broke something" without parsing an
+#     error string. The envelope is the gated-value pattern on the write side.
+# =============================================================================
+
+type Mutation {
+  # ---- authoring ------------------------------------------------------------
+
+  """Create a task. Returns the task plus the policy conflicts, if any."""
+  createTask(draft: TaskDraftInput!): TaskCreateResult!
+
+  """
+  Edit the mutable descriptive fields of a task. Status is NOT here: status
+  changes go through `transitionTask`, which is the only writer of lifecycle
+  state and the only thing that recomputes readiness for dependents.
+  """
+  updateTask(id: ULID!, patch: TaskPatchInput!): TaskUpdateResult!
+
+  """Add a human comment to the task's timeline."""
+  commentOnTask(id: ULID!, body: Markdown!): TaskEvent!
+
+  """Archive a closed or cancelled task. Reversible; never deletes."""
+  archiveTask(id: ULID!, archive: Boolean!): TaskUpdateResult!
+
+  # ---- lifecycle ------------------------------------------------------------
+
+  """
+  Move a task to a new status. The ONLY writer of `Task.status` and
+  `Task.lifecycle`. Recomputes readiness for this task and every task that
+  depends on it, and emits the corresponding timeline events.
+  """
+  transitionTask(id: ULID!, to: TaskStatus!, note: String): TaskTransitionResult!
+    @invariant(reason: "`to` must be in Task.lifecycle.allowedTransitions; anything else is rejected with an INVALID_TRANSITION envelope, never a partial write")
+
+  """Reopen a CLOSED or CANCELLED task. A named transition because it has extra semantics (claims are invalidated)."""
+  reopenTask(id: ULID!, note: String): TaskTransitionResult!
+
+  # ---- claiming -------------------------------------------------------------
+
+  """
+  Attempt to claim a task for an actor. Contested: at most one claim wins.
+  The result envelope says which happened, and why not if it did not.
+  """
+  claimTask(taskId: ULID!, actorId: ULID!, requestedTtl: Duration): ClaimResult!
+
+  """
+  Voluntarily release a claim without closing the task. The task returns to the
+  ready set after the policy's re-backoff.
+  """
+  releaseClaim(claimId: ULID!, reason: String): ReleaseResult!
+
+  """Forcibly revoke another actor's claim. Human/policy-only."""
+  revokeClaim(claimId: ULID!, reason: String!): ReleaseResult!
+
+  """
+  Renew a lease and report a heartbeat. The agent's keep-alive. Returns a typed
+  outcome because "you lost the lease" must be distinguishable from "renewal
+  refused by policy" — the first means stop immediately, the second means
+  finish and report.
+  """
+  renewLease(input: LeaseRenewalInput!): LeaseRenewalResult!
+
+  """Change the claim policy. Audited; emits a timeline event."""
+  updateClaimPolicy(taskId: ULID!, patch: ClaimPolicyPatchInput!): TaskUpdateResult!
+
+  """Assign or unassign a shepherd. Assignment is not a claim."""
+  setAssignees(taskId: ULID!, assigneeIds: [ULID!]!): TaskUpdateResult!
+
+  # ---- dependencies ---------------------------------------------------------
+
+  """
+  Add a dependency edge. Rejects cycles: the envelope carries the offending
+  cycle rather than a generic error, because the client needs to show it.
+  """
+  addDependency(taskId: ULID!, input: DependencyDraftInput!): DependencyAddResult!
+
+  """Remove a dependency edge. Recomputes readiness for both endpoints."""
+  removeDependency(edgeId: ULID!): DependencyRemoveResult!
+
+  """Re-evaluate a dependency edge's state without changing the graph."""
+  reevaluateDependency(edgeId: ULID!): DependencyAddResult!
+
+  # ---- execution ------------------------------------------------------------
+
+  """
+  Start a run against a task. Requires a live claim unless the policy allows
+  unclaimed runs. At most one live run per task (hard invariant).
+  """
+  startRun(taskId: ULID!, input: RunStartInput!): RunStartResult!
+
+  """Record a completed or in-flight step. Append-only; assigns the step index."""
+  recordStep(runId: ULID!, input: StepRecordInput!): StepRecordResult!
+
+  """Report progress. Idempotent-ish: last write wins, and staleness is visible."""
+  updateRunProgress(runId: ULID!, input: ProgressInput!): ProgressUpdateResult!
+
+  """
+  End a run. Terminal: once a run has ended it cannot be resumed, only
+  retried via `startRun` with `retryOf`.
+  """
+  endRun(runId: ULID!, input: RunEndInput!): RunEndResult!
+
+  """Pause or resume a live run."""
+  setRunState(runId: ULID!, state: RunState!): RunEndResult!
+
+  """Cancel a live run. Emits RUN_CANCELLED and releases nothing else."""
+  cancelRun(runId: ULID!, reason: String!): RunEndResult!
+
+  """
+  Record an artifact produced by a run. Content-addressed blobs are deduped by
+  digest, so recording the same bytes twice yields one blob and two artifacts.
+  """
+  recordArtifact(runId: ULID!, input: ArtifactDraftInput!): ArtifactRecordResult!
+
+  """
+  Promote an artifact's state (PRODUCED → VERIFIED → ACCEPTED). Gated: the
+  transition must be legal for the current state, and ACCEPTED requires a human
+  actor. This is the trust gate for `Task.outputArtifacts`.
+  """
+  promoteArtifact(artifactId: ULID!, to: ArtifactState!, note: String): ArtifactRecordResult!
+
+  """Accept a run's primary artifact as the task's output, in one call."""
+  acceptRun(runId: ULID!, note: String): ArtifactRecordResult!
+
+  """
+  Spawn a subtask from within a run, wiring the SUBTASK_OF edge and the
+  originating step in one atomic operation. Exists because the alternative
+  (createTask + addDependency + recordStep) is three round trips that can
+  partially fail.
+  """
+  spawnSubtask(runId: ULID!, stepId: ULID, draft: TaskDraftInput!): TaskCreateResult!
+
+  # ---- operations -----------------------------------------------------------
+
+  """Quarantine a task: bar it from being claimed until a human clears it."""
+  quarantineTask(taskId: ULID!, quarantine: Boolean!, reason: String!): TaskUpdateResult!
+
+  """Force a readiness recomputation for a task and its dependents."""
+  reevaluateReadiness(taskId: ULID!, transitively: Boolean = false): TaskUpdateResult!
+
+  """Subscribe/unsubscribe an actor to notifications for a task."""
+  watchTask(taskId: ULID!, actorId: ULID!, watch: Boolean!): WatchResult!
+}
+
+# ---- mutation inputs --------------------------------------------------------
+
+input TaskDraftInput {
+  title: String!
+  description: Markdown
+  type: TaskType! = CHORE
+  priority: TaskPriority! = P2_MEDIUM
+  labels: [String!]! = []
+  claimPolicy: ClaimPolicyDraftInput
+  dependencies: [DependencyDraftInput!]! = []
+  """Create directly in BLOCKED/OPEN; never in IN_PROGRESS (that requires a claim)."""
+  initialStatus: TaskStatus! = OPEN
+  createdById: ULID
+  """Acceptance criteria, as separate checkable lines. Not folded into description."""
+  acceptanceCriteria: [String!]! = []
+  estimate: Duration
+  attachArtifacts: [ArtifactDraftInput!]! = []
+}
+
+input TaskPatchInput {
+  title: String
+  description: Markdown
+  type: TaskType
+  priority: TaskPriority
+  labels: [String!]
+  acceptanceCriteria: [String!]
+  estimate: Duration
+}
+
+input ClaimPolicyDraftInput {
+  exclusive: Boolean = false
+  reservedForId: ULID
+  requiredCapabilities: [AgentCapability!] = []
+  allowedAgentIds: [ULID!] = []
+  deniedAgentIds: [ULID!] = []
+  leaseTtl: Duration = "PT30M"
+  rebackoff: Duration = "PT1M"
+  maxClaims: Int = 5
+  maxRunAttempts: Int = 3
+  maxRunDuration: Duration = "PT2H"
+  maxRunCost: Float
+  requiresHumanApproval: Boolean = false
+  claimable: Boolean = true
+}
+
+input ClaimPolicyPatchInput {
+  exclusive: Boolean
+  reservedForId: ULID
+  requiredCapabilities: [AgentCapability!]
+  allowedAgentIds: [ULID!]
+  deniedAgentIds: [ULID!]
+  leaseTtl: Duration
+  rebackoff: Duration
+  maxClaims: Int
+  maxRunAttempts: Int
+  maxRunDuration: Duration
+  maxRunCost: Float
+  requiresHumanApproval: Boolean
+  claimable: Boolean
+}
+
+input DependencyDraftInput {
+  """The task at the other end of the edge."""
+  taskId: ULID!
+  """Or by key, for human-authored drafts. Exactly one of taskId/taskKey."""
+  taskKey: TaskKey
+  kind: DependencyKind! = BLOCKING
+  note: String
+}
+
+input LeaseRenewalInput {
+  leaseId: ULID!
+  """The epoch the caller believes it holds. A mismatch means the caller is stale."""
+  expectedEpoch: Int!
+  requestedTtl: Duration
+  """Optional progress piggybacked on the heartbeat, to save a round trip."""
+  progress: ProgressInput
+}
+
+input RunStartInput {
+  actorId: ULID!
+  trigger: RunTrigger! = AGENT_CLAIM
+  claimId: ULID
+  retryOf: ULID
+  environment: RunEnvironmentInput!
+  budget: Float
+  iterationLimit: Int
+  expectedSteps: [String!]
+}
+
+input RunEnvironmentInput {
+  agentId: ULID!
+  baseRevision: String
+  runner: String!
+  grantedCapabilities: [AgentCapability!] = []
+  networkEgress: Boolean! = false
+  temperature: Float
+  maxTokensPerTurn: Int
+  contextWindow: Int
+}
+
+input StepRecordInput {
+  kind: StepKind!
+  iteration: Int!
+  intent: String
+  startedAt: DateTime
+  endedAt: DateTime
+  outcome: StepOutcome
+  toolCall: ToolCallInput
+  spawnedTaskId: ULID
+  error: StepErrorInput
+  artifactIds: [ULID!] = []
+}
+
+input ToolCallInput {
+  toolName: String!
+  args: JSONObject!
+  risk: ToolRisk!
+  permitted: Boolean!
+  permissionRule: String
+  output: JSONObject
+  outputTruncated: Boolean! = false
+  outputBytes: Int
+  exitCode: Int
+  succeeded: Boolean!
+  touchedPaths: [String!] = []
+}
+
+input StepErrorInput {
+  code: String!
+  message: String!
+  retryable: Boolean! = false
+  toolName: String
+  detail: JSONObject
+}
+
+input ProgressInput {
+  reportedFraction: Float
+  expectedSteps: Int
+  currentActivity: String
+  checksPassed: Int
+  checksFailed: Int
+  checksTotal: Int
+}
+
+input RunEndInput {
+  state: RunState!
+  endReason: RunEndReason!
+  summary: Markdown
+  headRevision: String
+  primaryArtifactId: ULID
+  cost: RunCostInput
+}
+
+input RunCostInput {
+  total: Float!
+  promptTokens: Int! = 0
+  completionTokens: Int! = 0
+  cachedTokens: Int! = 0
+  computeTime: Duration
+  toolInvocations: Int! = 0
+}
+
+input ArtifactDraftInput {
+  role: ArtifactRole!
+  kind: ArtifactKind!
+  label: String!
+  stepId: ULID
+  """For CONTENT_ADDRESSED_BLOB."""
+  digest: ContentHash
+  algorithm: String = "sha256"
+  mediaType: String
+  byteSize: Int
+  inlineText: String
+  inlineJson: JSONObject
+  """For REMOTE_URI."""
+  location: URI
+  """For GIT_REF."""
+  gitRef: String
+  resultSelector: JSONPath
+  supersedes: ULID
+}
+
+# ---- mutation result envelopes ---------------------------------------------
+
+"""
+A claim attempt outcome. The envelope exists because claiming is a race, and
+the losing client needs the winner's identity and the retry-after, not a
+generic `false`.
+"""
+type ClaimResult {
+  ok: Boolean!
+  claim: TaskClaim @absentWhen(condition: "ok == false")
+  task: Task!
+
+  """Why the claim was refused. Null when ok."""
+  denial: ClaimDenial @absentWhen(condition: "ok == true")
+
+  """The claim that won, when this attempt lost a race."""
+  wonBy: TaskClaim @absentWhen(condition: "the attempt was not a lost race")
+
+  """When the caller may retry, if the denial is time-based."""
+  retryAfter: Duration @absentWhen(condition: "denial is not time-based")
+
+  """The task's readiness after the attempt, so the client need not re-query."""
+  readiness: TaskReadiness!
+}
+
+"""A typed claim refusal."""
+type ClaimDenial {
+  kind: BlockerKind!
+  message: String!
+  """The policy field that caused the refusal, when it was policy."""
+  policyField: String @absentWhen(condition: "the refusal was not caused by a policy field")
+  remedy: BlockerRemedy
+}
+
+type ReleaseResult {
+  ok: Boolean!
+  claim: TaskClaim @absentWhen(condition: "the claim did not exist or was already ended")
+  task: Task!
+  """The new state of the claim."""
+  newState: ClaimState
+  """When the task becomes claimable again, after re-backoff."""
+  claimableAgainAt: DateTime
+  failure: String @absentWhen(condition: "ok == true")
+}
+
+type LeaseRenewalResult {
+  outcome: LeaseRenewalOutcome!
+  lease: TaskLease @absentWhen(condition: "outcome != RENEWED")
+  """The live epoch, so a stale caller can see how far behind it is."""
+  currentEpoch: Int!
+  newExpiresAt: DateTime @absentWhen(condition: "outcome != RENEWED")
+  """Who holds the lease now, when the caller lost it."""
+  heldBy: TaskActor @absentWhen(condition: "outcome != LOST")
+  message: String!
+}
+
+type DependencyAddResult {
+  ok: Boolean!
+  dependency: TaskDependency @absentWhen(condition: "ok == false")
+  """The cycle that caused rejection, ordered from the subject task back to itself."""
+  cycle: [Task!] @absentWhen(condition: "the failure was not a cycle")
+  """Readiness of both endpoints after the change."""
+  taskReadiness: TaskReadiness!
+  otherTaskReadiness: TaskReadiness @absentWhen(condition: "the edge was rejected")
+  failure: String @absentWhen(condition: "ok == true")
+}
+
+type DependencyRemoveResult {
+  ok: Boolean!
+  removedEdgeId: ULID
+  taskReadiness: TaskReadiness!
+  failure: String @absentWhen(condition: "ok == true")
+}
+
+type RunStartResult {
+  ok: Boolean!
+  run: TaskRun @absentWhen(condition: "ok == false")
+  task: Task!
+  """The run already live, when the refusal was a concurrency conflict."""
+  conflictingRun: TaskRun @absentWhen(condition: "the refusal was not a concurrency conflict")
+  denial: ClaimDenial @absentWhen(condition: "ok == true")
+}
+
+type StepRecordResult {
+  ok: Boolean!
+  step: RunStep @absentWhen(condition: "ok == false")
+  """The index assigned. Returned so the caller can chain without re-querying."""
+  assignedIndex: Int @absentWhen(condition: "ok == false")
+  run: TaskRun!
+  failure: String @absentWhen(condition: "ok == true")
+}
+
+type ProgressUpdateResult {
+  ok: Boolean!
+  progress: RunProgress @absentWhen(condition: "ok == false")
+  run: TaskRun!
+  """Set when the report was ignored because the run had already ended."""
+  ignoredBecauseEnded: Boolean!
+}
+
+type RunEndResult {
+  ok: Boolean!
+  run: TaskRun @absentWhen(condition: "ok == false")
+  task: Task!
+  """Readiness of dependent tasks after the run ended, since ending a run may unblock work."""
+  unblockedTasks: [Task!]!
+  failure: String @absentWhen(condition: "ok == true")
+}
+
+type ArtifactRecordResult {
+  ok: Boolean!
+  artifact: RunArtifact @absentWhen(condition: "ok == false")
+  """True when the blob already existed and was deduped."""
+  blobDeduped: Boolean!
+  """The task's output set after the change, so a promote need not re-query."""
+  taskOutputArtifacts: [RunArtifact!]!
+  """Set when a promotion was refused because the state transition is illegal."""
+  illegalTransitionFrom: ArtifactState @absentWhen(condition: "the failure was not an illegal promotion")
+  failure: String @absentWhen(condition: "ok == true")
+}
+
+type TaskCreateResult {
+  ok: Boolean!
+  task: Task @absentWhen(condition: "ok == false")
+  """Edges that were requested but rejected (e.g. a cyclic dependency)."""
+  rejectedDependencies: [RejectedDependency!]!
+  failure: String @absentWhen(condition: "ok == true")
+}
+
+type RejectedDependency {
+  requested: DependencyDraftInput!
+  reason: String!
+  cycle: [Task!]
+}
+
+type TaskUpdateResult {
+  ok: Boolean!
+  task: Task @absentWhen(condition: "ok == false")
+  """The timeline entry this update produced."""
+  event: TaskEvent @absentWhen(condition: "ok == false")
+  readiness: TaskReadiness @absentWhen(condition: "ok == false")
+  failure: String @absentWhen(condition: "ok == true")
+}
+
+type TaskTransitionResult {
+  ok: Boolean!
+  task: Task @absentWhen(condition: "ok == false")
+  """The recorded transition."""
+  statusChange: TaskStatusChange @absentWhen(condition: "ok == false")
+  """Tasks whose readiness changed as a consequence. The unblocking fan-out."""
+  affectedTasks: [Task!]!
+  """Set when the requested transition is not in allowedTransitions."""
+  illegalTransition: IllegalTransition @absentWhen(condition: "ok == true")
+  """Set when a required side-effect (e.g. releasing a claim) failed."""
+  sideEffectFailures: [String!]!
+}
+
+type IllegalTransition {
+  from: TaskStatus!
+  requested: TaskStatus!
+  allowed: [TaskStatus!]!
+  message: String!
+}
+
+type WatchResult {
+  ok: Boolean!
+  watching: Boolean!
+  task: Task!
+}
+
+
+# =============================================================================
+# 11. SUBSCRIPTIONS
+#     Two streams, both serving the SAME event type as the queryable timeline.
+#     No separate `TaskStreamEvent` mirror: a subscription is a delivery
+#     mechanism for `TaskEvent`, not a different concept.
+# =============================================================================
+
+type Subscription {
+  """
+  Live timeline for one task. Same objects `Task.events` returns, so a client
+  can hydrate from the query and continue from the subscription with no
+  translation layer.
+  """
+  taskEvents(
+    taskId: ULID!
+    kinds: [TaskEventKind!]
+    window: StreamWindow = LIVE_ONLY
+    cursor: String
+  ): TaskEvent!
+
+  """Live timeline for every task matching a filter — the global feed."""
+  taskFeed(filter: TaskFilter, kinds: [TaskEventKind!], window: StreamWindow = LIVE_ONLY): TaskEvent!
+
+  """
+  Live events for one run, including its fine-grained step telemetry. Serves
+  `StepEvent` because that is the stream an operator watches during a run.
+  """
+  runEvents(runId: ULID!, channels: [String!], window: StreamWindow = LIVE_ONLY): StepEvent!
+
+  """
+  Fires when a task becomes ready. The scheduler's wake-up signal, and the
+  reason an idle agent does not have to poll `readyTasks`.
+  """
+  taskBecameReady(forActor: ULID, capabilities: [AgentCapability!]): Task!
+
+  """Fires when a lease is about to expire, giving the holder a chance to renew."""
+  leaseExpiring(within: Duration!): TaskLease!
+
+  """Fires when a run stops making progress."""
+  runStalled(stalledFor: Duration!): TaskRun!
+}
+
+
+# =============================================================================
+# =============================================================================
+#
+#                          R A T I O N A L E
+#
+# =============================================================================
+# =============================================================================
+#
+# -----------------------------------------------------------------------------
+# §1. WHAT THE CONCEPTS ACTUALLY ARE (the inventory before the types)
+# -----------------------------------------------------------------------------
+#
+# The prompt names four concept clusters. Before writing a single type I
+# enumerated the *concepts* inside them, because the guide's first rule is One
+# Concept One Type and you cannot apply it to a cluster label.
+#
+#   "The work unit itself"        → Task (identity, description, lifecycle)
+#                                 → TaskLifecycle (status + reason + history)
+#                                 → TaskKey vs ULID (two identities, two concepts)
+#
+#   "Claiming / assignment"       → TaskClaimPolicy (the rules)
+#                                 → TaskClaim (one assertion of ownership)
+#                                 → TaskLease (the time-bounded right to execute)
+#                                 → assignment (a shepherd, NOT a claimer)
+#                                 → readiness (the verdict) + TaskBlocker (the reason)
+#
+#   "Execution trajectory"        → TaskRun (one execution)
+#                                 → RunStep (one recorded action)
+#                                 → ToolCall (a step that invoked a tool)
+#                                 → StepEvent (fine telemetry inside a step)
+#                                 → RunProgress / RunCost (the shape of the run)
+#                                 → RunArtifact / ArtifactBlob (output refs)
+#                                 → RunEnvironment (reproducibility)
+#
+#   "Dependencies and blocking"   → TaskDependency (the edge)
+#                                 → TaskConnection (the flattened traversal)
+#                                 → TaskBlocker (the evaluated obstruction)
+#                                 → TaskEvent (the durable record of all of it)
+#
+# That is 18 concepts. The schema has ~40 object types; the remainder are
+# pagination shells, result envelopes, and count rows — all of which are
+# justified individually in §11 and §12.
+#
+# -----------------------------------------------------------------------------
+# §2. THE DECISION, UP FRONT: FOUR ORTHOGONAL AXES, NOT ONE MEGA-STATUS
+# -----------------------------------------------------------------------------
+#
+# The single biggest composition risk in this domain is collapsing "where is
+# this work?" into one enum. The tempting design is:
+#
+#     enum TaskState { TODO BLOCKED READY CLAIMED RUNNING WAITING_ON_TOOL
+#                      REVIEW DONE FAILED CANCELLED RETRYING ... }
+#
+# That enum is a cross-product wearing a trench coat. Claim state, run state,
+# dependency state and lifecycle status vary *independently*:
+#
+#   * A task can be IN_PROGRESS (status) with an EXPIRED claim (claim) — the
+#     orphaned-work condition, and the single most important thing an operator
+#     needs to find. In a mega-enum it is unrepresentable.
+#   * A task can be CLOSED (status) with a FAILED last run (run) — closed
+#     because a human fixed it by hand. Also unrepresentable.
+#   * A task can be BLOCKED (status) with a live run draining (run) — the agent
+#     is finishing what it started while a dependency regressed.
+#
+# So the schema keeps four axes, each with its own type and its own vocabulary:
+#
+#     TaskStatus     — lifecycle position        (8 values, closed)
+#     ClaimState     — ownership lifecycle       (6 values, closed)
+#     RunState       — execution lifecycle       (10 values, closed)
+#     DependencyState— edge evaluation           (4 values, closed)
+#
+# and derives the *composite* questions rather than storing them:
+#
+#     readiness.isReady  = f(dependencies, claims, policy, budget)
+#     blockers           = the reasons, itemised
+#
+# Naming sniff test applied to each: "TaskStatus.IN_PROGRESS" reads as a
+# lifecycle position. "TaskStatus.WAITING_ON_TOOL" does not — that is a run
+# fact, and it now lives at `Task.activeRun.progress.currentActivity` where it
+# belongs. Every value that failed the sniff test was moved to the axis it
+# actually described.
+#
+# -----------------------------------------------------------------------------
+# §3. READINESS IS A VERDICT WITH A REASON, NEVER A BOOLEAN
+# -----------------------------------------------------------------------------
+#
+# `Task.isReady: Boolean` would be the obvious field and it is wrong. An agent
+# that receives `false` must immediately ask "why?", which is a second round
+# trip on the hottest path in the system. Worse, "why" determines the remedy:
+# an unsatisfied dependency means *wait*, a missing capability means *never
+# retry with this agent*, a held lease means *retry after T*, a budget
+# exhaustion means *escalate to a human*. Four different behaviours from one
+# boolean.
+#
+# Hence `TaskReadiness { isReady, primaryBlocker, readyAt, evaluatedAt,
+# fromCache }` and `TaskBlocker { kind, state, subject, remedy, clearsAt,
+# message }`.
+#
+# `TaskBlocker.remedy` is the piece I would defend hardest. A blocker that
+# names the mutation which would clear it turns the schema from a description
+# of state into a description of *available actions*. That is the gated-value
+# pattern applied to obstruction: the gate is named, the key is identified, and
+# `invokableByMe` says whether this caller holds it.
+#
+# Hard invariant: `blockers.isEmpty == readiness.isReady`. Both come from one
+# resolver, so they cannot disagree; the directive documents that a client may
+# rely on it. This is a *hard* invariant because a client that queues work off
+# `isReady` and displays `blockers` would show a contradiction otherwise.
+#
+# `readyAt` is `@absentWhen("no blocker has a predictable clear time")`. That
+# absence is information: a lease expiry is predictable, "the other task
+# finishes" is not. A client can therefore distinguish "poll at T" from "watch
+# the event stream" without a second field.
+#
+# -----------------------------------------------------------------------------
+# §4. CLAIM ≠ LEASE ≠ ASSIGNMENT (three concepts that look like one)
+# -----------------------------------------------------------------------------
+#
+# These are routinely collapsed into `assignee: String`. They are not the same
+# concept:
+#
+#   TaskClaim   — "I assert ownership of this task." Historical, accumulates,
+#                 has a state machine (OFFERED→ACTIVE→EXPIRED/RELEASED/
+#                 REVOKED/SETTLED), and is the object you audit. A task may
+#                 have nine claims over its life; that count is the thrash
+#                 signal (`TaskStats.thrashedTasks`).
+#   TaskLease   — "I have the right to execute until T." Time-bounded,
+#                 renewable, epoch-numbered. One claim may carry many leases.
+#                 This is the object an agent must keep alive, so it gets its
+#                 own type and its own mutation (`renewLease`).
+#   assignees   — "These actors are accountable for this task." Neither
+#                 ownership nor execution. A human shepherding an agent-run
+#                 task is an assignee and never a claimer.
+#
+# Collapsing claim and lease loses the ability to answer "how many times was
+# this dropped?" Collapsing claim and assignment loses the ability to answer
+# "who is accountable?" — which, in an agentic system where the executor is a
+# process, is the question a human actually needs answered.
+#
+# `TaskLease.epoch` is `@gated(via: renewLease)`. It is a monotonic counter
+# whose only purpose is to detect a zombie agent: an agent that was paused,
+# lost its lease, and resumed believing it still holds it. `renewLease` takes
+# `expectedEpoch` and returns `LeaseRenewalOutcome.LOST` with `heldBy` when it
+# does not match. This is the split-brain guard, and it is a *field* rather
+# than a directive because the client must read it to decide to stop.
+#
+# `LeaseRenewalOutcome` is an enum with four values that map to four different
+# agent behaviours:
+#     RENEWED              → keep going
+#     LOST                 → stop immediately, do not write
+#     NO_LONGER_CLAIMABLE  → finish the current step, report, exit
+#     REFUSED              → finish, report, escalate
+# A `Boolean` here would be actively dangerous: `false` cannot distinguish
+# "stop now" from "wind down".
+#
+# -----------------------------------------------------------------------------
+# §5. DEPENDENCIES ARE EDGES (edge-first, and why)
+# -----------------------------------------------------------------------------
+#
+# The guide's edge-first test: is the relation itself queried, mutated, or
+# reasoned about independently of its endpoints? For task dependencies the
+# answer is emphatically yes on all three:
+#
+#   queried   — "what unblocks if I close lev-417?" (inverse traversal),
+#               "show me every cycle" (graph walk),
+#               "which SOFT edges are actually load-bearing?" (kind filter)
+#   mutated   — edges are added, removed, re-evaluated, and rejected; they have
+#               authors and timestamps
+#   reasoned  — `gatesReadiness` is a property OF THE EDGE, not of either task
+#
+# So the relation is a type: `TaskDependency`, with its own `id`, its own
+# `createdBy`, its own evaluated `state`, and a `direction` field so a client
+# holding one end knows which end it holds.
+#
+# Both directions are exposed on Task (`dependsOn`, `blockers_`) and both
+# return the SAME type. That is not a mirror-type violation — a mirror is two
+# types with the same fields. This is one type reachable from two ends, which
+# is what an edge is. `direction` disambiguates.
+#
+# Rejected alternative: four types (`BlockingDependency`, `SoftDependency`,
+# `DuplicateLink`, `SubtaskLink`). They would share id/from/to/state/createdAt/
+# createdBy/note and differ only in a discriminator — the textbook mirror
+# explosion. `DependencyKind` carries the distinction; `gatesReadiness`
+# carries the consequence.
+#
+# Rejected alternative: `blockedBy: [Task!]!` + `blocks: [Task!]!` as bare
+# lists. This is ID-soup: it discards the edge's kind, state, author and
+# creation time, and it makes "why is this task blocked?" unanswerable without
+# a second system.
+#
+# `TaskConnection` / `Task.connections` is the flattened traversal surface. It
+# exists because a graph client walking five hops should not have to know, at
+# each hop, whether the relation it wants is `dependsOn`, `blockers_`, a
+# parent, a child, a duplicate, or a spawned-run link. One field, one type,
+# `role` on the edge. This is the "would I query this?" test passed with room
+# to spare: it is the only sane way to render a task's neighbourhood.
+#
+# Cycle handling: `addDependency` rejects a cycle and returns the offending
+# cycle in the envelope (`DependencyAddResult.cycle`) rather than a string. A
+# client must be able to *show* the cycle. `DependencyState.CYCLIC` and
+# `TaskDependency.cycle` exist for the residual case — a cycle that arose from
+# concurrent additions or from importing external data — because pretending it
+# cannot happen is how you get an infinite loop in a resolver.
+#
+# -----------------------------------------------------------------------------
+# §6. ONE EVENT TYPE, NOT SIX (the mirror-type trap on the timeline)
+# -----------------------------------------------------------------------------
+#
+# The fashionable design is a union:
+#
+#     union TaskEvent = StatusChangedEvent | ClaimedEvent | RunStartedEvent
+#                     | DependencyAddedEvent | ArtifactRecordedEvent | ...
+#
+# I rejected it. Those types would each carry `id`, `task`, `at`, `actor`,
+# `message`, `data` and then one or two specific fields. That is six types
+# sharing six fields — a mirror cluster. Every client reading the timeline must
+# spread six fragments to render a list, and adding a seventh event kind is a
+# breaking change to every consumer.
+#
+# Instead: ONE `TaskEvent` with a closed `kind` enum and *typed optional
+# back-references* (`run`, `step`, `claim`, `dependency`, `artifact`,
+# `statusChange`). Each is `@absentWhen` its kind. A client rendering a
+# timeline selects the fields it wants once; a client acting on a specific kind
+# reads the one reference it needs.
+#
+# The same object serves the queryable timeline (`Task.events`), the global
+# feed (`Query.eventFeed`) and both subscriptions (`taskEvents`, `taskFeed`).
+# There is no `TaskStreamEvent` wrapper type: a subscription is a delivery
+# mechanism, not a concept, and inventing a wrapper for it produces an exact
+# mirror of `TaskEvent`. A client can hydrate from the query and continue from
+# the subscription with zero translation — which is the practical payoff.
+#
+# `StepEvent` IS separate, and that is not an inconsistency. It differs from
+# `TaskEvent` on every axis that matters: volume (thousands per run vs dozens
+# per task), retention (days vs forever), mutability (redactable vs append-
+# only), ordering scope (per-run `seq` vs per-task `seq`), and consumer
+# (an operator watching a live run vs an auditor reconstructing history). Two
+# concepts, two types.
+#
+# `TaskEvent.seq` is `@invariant` — strictly increasing per task, no gaps. That
+# is what makes the timeline a *log* rather than a list, and what makes
+# "resume the stream from cursor" correct.
+#
+# -----------------------------------------------------------------------------
+# §7. THE TRAJECTORY: Run → Step → ToolCall, AND WHY A RUN IS NOT A WORKFLOW
+# -----------------------------------------------------------------------------
+#
+# The prompt warns against copying the workflow schema, and the distinction is
+# real and load-bearing here:
+#
+#     A WORKFLOW is a plan.     Steps are declared before execution, editable,
+#                               position-bearing, branchable, and may never run.
+#     A RUN is a recording.     Steps are appended as they happen, immutable,
+#                               densely indexed, and every one of them did occur.
+#
+# So `TaskRun` has no `plannedSteps`, no branching, no `nextStep` pointer and
+# no edit mutation. `recordStep` appends; nothing else writes. The only
+# forward-looking field is `RunProgress.expectedSteps`, which is explicitly
+# `@expected(... onViolation: "treat as unknown, not as zero")` — an agent's
+# guess about its own plan size, labelled as a guess.
+#
+# `RunStep.index` is a hard invariant (dense, monotonic, unique per run,
+# assigned atomically by `recordStep`). That single property buys: run
+# comparison ("step 7 differed"), resumption ("continue from index 12"), and
+# gap detection ("index 9 is missing, the log is corrupt"). It is worth more
+# than any other invariant in the schema.
+#
+# `ToolCall` is its own type, not folded into RunStep, because it has eleven
+# fields no other step kind has (args, risk, permitted, permissionRule, output,
+# outputTruncated, outputBytes, exitCode, touchedPaths, childCalls,
+# succeeded). That is the opposite of a mirror: near-zero field overlap with
+# the other step kinds. `RunStep.toolCall` is `@absentWhen(kind != TOOL_CALL)`
+# — a structural absence, discoverable, not a null you have to guess about.
+#
+# `ToolRisk` deserves a note. It is not metadata; it is a *gate*. `promoteArtifact`
+# refuses to promote output from a DESTRUCTIVE tool call without verification,
+# and `RunCost.destructiveToolInvocations` exists because "what did the agent
+# irreversibly touch?" is the first question after any incident. `ToolCall.
+# touchedPaths` is the audit answer.
+#
+# `ToolCall.args` and `.output` are `JSONObject`. This is the one place a
+# string/JSON bag is *correct*: every tool has its own argument schema, and
+# modelling `shellArgs`, `editFileArgs`, `webFetchArgs` as separate fields on
+# one type is a bag with extra steps and a compile-time lie. What keeps it
+# honest is that the fields clients actually branch on — `toolName`, `risk`,
+# `permitted`, `succeeded`, `exitCode`, `touchedPaths`, `outputTruncated` —
+# are all typed and promoted out of the bag.
+#
+# `RunProgress` replaces `percentComplete: Int`. A bare percentage is the
+# string-bag of progress: it conflates three different honest signals (steps
+# settled vs expected, iterations consumed vs limit, objective checks passed)
+# with one dishonest one (the agent's feeling). All four are present, and the
+# dishonest one is marked `@expected` with an explicit instruction to prefer
+# the others. `isStalled` is the field that actually answers the operational
+# question, and it is derived from timestamps, not from the agent's opinion.
+#
+# `TaskRun.retryOf` / `retriedBy` is a self-edge. The retry chain is a graph
+# relation between runs and is traversable as one; `attempt` is the denormalised
+# count because it is read on every single run view.
+#
+# -----------------------------------------------------------------------------
+# §8. ARTIFACT ≠ BLOB (and the promotion gate)
+# -----------------------------------------------------------------------------
+#
+# `RunArtifact` is a *reference with meaning*: role, state, producer, label,
+# revision history, and the verification that blessed it. `ArtifactBlob` is
+# *bytes*: digest, size, media type, and how to fetch them. They are separate
+# because the relationship is many-to-one (ten runs producing identical output
+# share one blob) and because half the artifacts have no blob at all (a git
+# ref, a remote URI, a file path).
+#
+# Collapsing them yields `outputUrl: String` on the run — which cannot express
+# "this is the verified primary output", cannot dedupe, and cannot retain a
+# rejected artifact's metadata after its bytes are garbage-collected.
+#
+# `ArtifactState` is the trust ladder and it is GATED:
+#
+#     PRODUCED → VERIFIED → ACCEPTED
+#              ↘ SUPERSEDED  ↘ REJECTED  ↘ REDACTED
+#
+# `promoteArtifact` is the only writer; `RunArtifact.state` carries
+# `@gated(via: "promoteArtifact / rejectArtifact")`. ACCEPTED requires a human
+# actor. `Task.outputArtifacts` is `@gated(via: promoteArtifact)` and
+# `@derived` — a client cannot inject an artifact into a task's output set by
+# recording one; it must pass the gate. And `RunArtifact.verifiedBy` points at
+# the actual `RunStep` that did the verifying, so trust is never an assertion:
+# it is a traversable claim with evidence behind it.
+#
+# `ArtifactRevision` exists because artifacts get *replaced*, not edited. A
+# regenerated patch is a new revision of the same artifact slot, and the old
+# one stays addressable. Without this, "what did the agent produce before I
+# asked it to redo it?" is unanswerable.
+#
+# `resultSelector: JSONPath` is a small field doing a real job: it lets a
+# producer say "the answer is at `$.files[0].path`" so a consumer does not have
+# to re-derive structure from a blob. It is `@absentWhen` no selector was
+# declared, which is honest.
+#
+# -----------------------------------------------------------------------------
+# §9. DIRECTIVES VS FIELDS — THE SPLIT, AND THE AUDIT
+# -----------------------------------------------------------------------------
+#
+# The rule I applied: **if the server must enforce it and the client must not
+# re-derive it, it is a directive. If the client must read it to decide what to
+# do next, it is a field.**
+#
+# Directives used, and why each is not a field:
+#
+#   @gated(via:)      — names the only legal writer. A client cannot act on
+#                       this at runtime; it needs it at *design* time, to know
+#                       which mutation to call. Making it a field
+#                       (`writeableVia: String`) would put a constant on every
+#                       response. Directive.
+#     Applied to: TaskClaimPolicy-driven values, TaskLease.epoch,
+#                 RunStep-adjacent iterations, RunArtifact.state,
+#                 Task.outputArtifacts, TaskRun.accepted,
+#                 TaskDependency.state.
+#
+#   @derived(from:)   — declares a rollup. Clients must know a value is derived
+#                       (so they do not try to write it, and so they interpret
+#                       staleness correctly) but must not have to fetch the
+#                       derivation. Directive, with `staleness` where it matters.
+#     Applied to: counters, stats, elapsed, timeInStatus, heartbeatLag,
+#                 isStalled, isLive, gatesReadiness, budgetExhausted,
+#                 destructiveToolInvocations, readyTasks, primaryArtifact sets.
+#
+#   @invariant        — a hard guarantee. Belongs in documentation and codegen,
+#                       not in a response payload. Directive.
+#     Applied to: TaskEvent.seq, RunStep.index, StepEvent.seq, lease epoch
+#                 monotonicity, blockers↔readiness agreement, single active run,
+#                 allowedTransitions as the contract, cycle rejection,
+#                 Query.tasks order preservation, Query.actor exactly-one-arg.
+#
+#   @expected         — a SOFT invariant. This is the honest counterweight to
+#                       @invariant, and the guide's soft/hard distinction made
+#                       concrete. `RunProgress.reportedFraction` and
+#                       `.expectedSteps` are agent self-reports: normally
+#                       present, frequently wrong, and the system will serve a
+#                       violating value rather than fail. `onViolation` tells
+#                       the client what to do instead. A field cannot say "do
+#                       not trust me, trust that other field".
+#
+#   @edge(inverse:)   — declares that a field is a relation with a named
+#                       inverse. Purely structural metadata; a client never
+#                       reads it at runtime, but a codegen can generate the
+#                       reverse traversal from it. Directive.
+#
+#   @immutable        — append-only. Enforcement-side fact. Directive, with
+#                       `except:` naming the one honest exception (PII redaction,
+#                       which appends a marker rather than rewriting).
+#
+#   @absentWhen       — the most-used directive here, and the one that does the
+#                       most work against ID-soup. It converts every nullable
+#                       field from "might be null, good luck" into "null means
+#                       exactly this, and this is structural". Roughly forty
+#                       fields carry it. A client reading
+#                       `RunStep.toolCall == null` knows, from the schema, that
+#                       it means `kind != TOOL_CALL` — not that data is missing.
+#
+# Fields I deliberately did NOT directive-ify: `TaskLease.epoch`,
+# `LeaseRenewalOutcome`, `TaskReadiness.fromCache`, `RunStep.index`. Each looks
+# like metadata but is read at runtime to make a decision. They are fields.
+#
+# -----------------------------------------------------------------------------
+# §10. "WOULD I QUERY THIS?" — THE AUDIT, INCLUDING WHAT I CUT
+# -----------------------------------------------------------------------------
+#
+# Kept, with the question each answers:
+#
+#   Query.readyTasks          "I'm an idle agent; what can I take?"     (hottest)
+#   Query.stalledRuns         "Which runs stopped moving?"              (ops)
+#   Query.expiringLeases      "What is about to be orphaned?"           (reaper)
+#   Query.activeClaimsFor     "I restarted after a crash; what do I hold?"
+#   Query.tasksBlockedBy      "What unblocks if I close this?"          (triage)
+#   Query.dependencyCycles    "Is the graph corrupt?"                   (diagnostic)
+#   Query.searchTasks         every list/filter/sort a UI needs
+#   Query.artifacts(filter:)  "Every unverified destructive output yesterday" (audit)
+#   Query.eventFeed           the global activity stream
+#   Query.stats               the dashboard, in one round trip
+#   Query.taskByKey           `lev-417` — what a human actually types
+#   Query.me                  so `permitted`/`invokableByMe` fields are renderable
+#   Query.blob(digest:)       dedup-aware fetch
+#   Subscription.taskBecameReady   the wake-up signal that removes polling
+#   Subscription.leaseExpiring     the renew-or-die warning
+#   Subscription.runStalled        the operator's alert
+#
+# Cut, and why:
+#
+#   ✗ `Task.descriptionHtml`      — a rendering concern; clients render Markdown.
+#   ✗ `TaskRun.logsUrl`           — `StepEvent` + `runEvents` already serve this,
+#                                  and a URL field would be an unmodelled escape
+#                                  hatch around the trajectory.
+#   ✗ `Task.subtasks`            — `SUBTASK_OF` is a `DependencyKind`; a separate
+#                                  field would be a second source of truth for the
+#                                  same edge. Reachable via `connections(roles:
+#                                  [CHILD])`.
+#   ✗ `Task.watchers`            — write-only in practice (`watchTask`); nobody
+#                                  renders the watcher list. Revisit if a UI needs it.
+#   ✗ `TaskPriority` numeric field alongside the enum — the enum IS the order key.
+#   ✗ `TaskRun.percentComplete`  — see §7; `RunProgress` replaces it.
+#   ✗ `Task.estimatedCost`       — speculative and never compared to actuals by
+#                                  anything real. `RunCost.budget` covers the
+#                                  ceiling that is actually enforced.
+#   ✗ A `Workflow`/`Plan` type   — out of group. A Run is a recording (§7).
+#   ✗ `Agent` as a full type     — `AgentRef` is deliberately thin; agent
+#                                  modelling belongs to another group and a fat
+#                                  Agent type here would be a mirror of it.
+#   ✗ Per-event union types      — §6.
+#   ✗ `Task.parentProject`       — the project is scoping/context, supplied by the
+#                                  server, not a concept this group owns. Adding it
+#                                  would drag in a whole org model.
+#
+# -----------------------------------------------------------------------------
+# §11. WHY THE RESULT ENVELOPES (and why they are not boilerplate)
+# -----------------------------------------------------------------------------
+#
+# Every mutating field returns a typed envelope rather than the mutated object.
+# Normally I would call that ceremony. Here it is required, because these
+# operations are *contested*: two agents claim the same task, a lease expires
+# mid-renewal, a dependency addition races with one from the other direction, a
+# run ends while a step is being recorded.
+#
+# In a contested system the interesting output of a mutation is not the new
+# state — it is *whether you won, and if not, who did and when you may retry*.
+# `ClaimResult` therefore carries `ok`, `claim`, `denial`, `wonBy`,
+# `retryAfter`, and the post-attempt `readiness`. A losing agent can act on
+# that without a second round trip and without parsing a message string.
+#
+# The envelopes also carry the *fan-out*: `TaskTransitionResult.affectedTasks`
+# and `RunEndResult.unblockedTasks` tell the caller which other tasks changed
+# readiness as a consequence. Closing a task is not a local operation — it is a
+# graph mutation — and a client that has to re-query to find out what it
+# unblocked will not bother, which is how blocked work rots.
+#
+# `TaskTransitionResult.illegalTransition` returns `{from, requested, allowed}`
+# rather than an error string, because `allowed` is exactly what the client
+# needs to re-render its action menu. Same reasoning as
+# `TaskLifecycle.allowedTransitions`: the contract is data.
+#
+# `sideEffectFailures: [String!]!` is the one deliberately loose field in the
+# schema. A transition may need to release a claim, emit an event and recompute
+# readiness; if one of those fails after the status committed, the client must
+# know, and the set of possible side effects is open. A string list is the
+# honest model for "here is what went wrong on the periphery".
+#
+# -----------------------------------------------------------------------------
+# §12. THE TYPES THAT LOOK LIKE BOILERPLATE, DEFENDED
+# -----------------------------------------------------------------------------
+#
+# Eight `*Page` types. GraphQL has no generics, so a connection shape per node
+# type is unavoidable. What I controlled is *uniformity*: every page is exactly
+# `{ nodes, pageInfo, totalCount }`, `totalCount` nullable everywhere (it is
+# expensive and often unwanted), and one shared `PageInfo` with a `cursorState`
+# so an expired cursor is distinguishable from an empty page. No page has a
+# bespoke extra field. That uniformity is the difference between eight
+# instances of a pattern and eight near-mirror types.
+#
+# `StatusCount` / `TypeCount` / `PriorityCount`. Three types, three lines each.
+# The alternative — `statusCounts: JSONObject` — is a string-bag on the
+# dashboard's hottest query. The alternative — a single `Count { key, count }`
+# with `key: String` — loses the enum typing that makes the response
+# self-describing. They are not mirrors of each other because their key fields
+# are different enums; they are three instances of "typed histogram row".
+#
+# `TaskCounters` vs `TaskStats`. Not mirrors: `TaskCounters` is per-task and
+# hangs off `Task` for list rendering; `TaskStats` is fleet-scoped, filtered,
+# and carries cycle-time percentiles that have no per-task meaning. Different
+# scope, different fields, different consumer.
+#
+# `TaskLifecycle` vs `Task.status`. Both exist because they answer different
+# questions at different frequencies. `status` is on every list item in every
+# view; `lifecycle` (enteredAt, enteredBy, timeInStatus, reasonCode,
+# reasonSubject, allowedTransitions, history) is read when someone clicks. Five
+# of those fields are heavy or list-valued. Putting them on `Task` directly
+# would tax the hottest type in the schema for the coldest read. `status` is
+# duplicated between them — one field, deliberately, because forcing
+# `task.lifecycle.status` on every list query is a worse sin than one
+# documented redundancy.
+#
+# `TaskNextAction`. One type, one field on Task, and the most opinionated thing
+# here. It answers "what should the UI put on the button?" — which otherwise
+# requires the client to reimplement the scheduler's decision logic from
+# status + readiness + blockers + activeRun. That duplication across N clients
+# is exactly what a schema should prevent. It is `@derived`, `@absentWhen`
+# terminal, and its `gatedBy` reuses `TaskBlocker` rather than inventing a
+# second obstruction type.
+#
+# `RunEnvironment`. Nine fields, read as a unit, and the only way to make "it
+# worked the second time" investigable. `grantedCapabilities` may be a strict
+# subset of `agent.capabilities` — that difference is a security finding, and
+# it is only visible if both are modelled.
+#
+# -----------------------------------------------------------------------------
+# §13. NAMING SNIFF TEST — RESULTS
+# -----------------------------------------------------------------------------
+#
+# Every type and field name was read aloud as a sentence about the domain.
+# Renames made during composition:
+#
+#   `Task.execution`        → `Task.activeRun` / `Task.latestRun`
+#       "execution" is a mass noun; you cannot say "the execution expired".
+#       Two named runs say exactly which one you mean.
+#   `Task.isBlocked`        → `Task.readiness` + `Task.blockers`
+#       a boolean that cannot say why (§3).
+#   `Task.owner`            → `Task.currentClaim.claimant` + `Task.assignees`
+#       "owner" is precisely the ambiguity between claim and assignment (§4).
+#   `Task.dependencies`     → `Task.dependsOn` / `Task.blockers_`
+#       "dependencies" does not say which direction. The trailing underscore on
+#       `blockers_` is deliberate and ugly-on-purpose: `blockers` already means
+#       "obstructions" at the task level (`TaskBlocker`), and having
+#       `Task.blockers` mean *tasks* while `Task.blockers[0].kind` means
+#       *obstruction kinds* would be the worst collision in the schema. The
+#       underscore flags the collision rather than hiding it. (If this were
+#       production I would rename to `dependedOnBy` and drop the underscore;
+#       I kept it visible as a composition note.)
+#   `RunStep.result`        → `RunStep.outcome` + `RunStep.error`
+#       "result" collides with artifact output.
+#   `TaskRun.output`        → `TaskRun.primaryArtifact` + `TaskRun.summary`
+#       "output" was doing double duty for bytes and for prose.
+#   `ClaimTicket`          → `TaskLease`
+#       "ticket" implies a queue position; this is a time-bounded right.
+#   `TaskEventPayload` union → deleted; `TaskEvent.data` + typed refs (§6).
+#   `percentComplete`       → `RunProgress.reportedFraction`
+#       the rename is the point: "reported" says whose number it is.
+#
+# Names that passed unchanged and why: `bead` was NOT used as a type name
+# despite the prompt's parenthetical. "Bead" is a project-local nickname for a
+# task; a schema that names its root type after one implementation's slang
+# fails the sniff test for every other reader. `TaskKey` carries the
+# `lev-417`/`bead-23` surface form instead, which is where the slang actually
+# lives.
+#
+# -----------------------------------------------------------------------------
+# §14. SOFT VS HARD INVARIANTS — THE FULL LEDGER
+# -----------------------------------------------------------------------------
+#
+# HARD (@invariant — the resolver chain guarantees it; a violation is a bug):
+#   1.  TaskEvent.seq strictly increasing per task, no gaps.
+#   2.  RunStep.index dense, monotonic, unique per run.
+#   3.  StepEvent.seq strictly increasing per run.
+#   4.  TaskLease.epoch strictly increasing per lease; renewLease is sole writer.
+#   5.  blockers.isEmpty == readiness.isReady.
+#   6.  At most one live TaskRun per Task (startRun rejects a second).
+#   7.  At most one ACTIVE TaskClaim per Task.
+#   8.  status ∈ lifecycle.allowedTransitions for any accepted transitionTask.
+#   9.  addDependency never creates a cycle.
+#   10. gatesReadiness == (kind ∈ {BLOCKING, DUPLICATE_OF}).
+#   11. Query.tasks preserves input order; unknown ids → null entries.
+#   12. Query.actor takes exactly one of id/handle.
+#   13. A CLOSED/CANCELLED task has closedBy and closedAt; otherwise neither.
+#   14. ArtifactBlob.digest uniquely determines byteSize and algorithm.
+#
+# SOFT (@expected — normally true; the system serves a violation rather than
+# failing, and says what to do instead):
+#   1.  RunProgress.reportedFraction is monotonic and calibrated. It is not.
+#       → prefer stepsSettled/expectedSteps or the artifact record.
+#   2.  RunProgress.expectedSteps matches the final step count. It does not.
+#       → treat as unknown, not as zero.
+#   3.  TaskReadiness.fromCache values are <5s old under load. May not be.
+#       → the field is exposed precisely so a client can detect and force it.
+#   4.  counters/stats are current. They are eventually consistent by directive.
+#       → @derived(staleness: EVENTUALLY_CONSISTENT) declares the contract.
+#   5.  A run's `summary` is present when it settles. An agent may crash first.
+#       → @absentWhen, and endRun accepts it as optional.
+#   6.  ToolCall.touchedPaths is complete. Tools do not always report.
+#       → empty is not "touched nothing"; the field is a best-effort audit aid.
+#
+# The distinction is not decorative. Items HARD-1..3 are what make the streams
+# resumable; if they were soft, every client would need dedup and gap-repair
+# logic. Items SOFT-1..2 are what stop a client from building a schedule on an
+# LLM's self-assessment. Marking them `@expected` with an `onViolation`
+# instruction is the schema saying "I know this is unreliable; here is the
+# reliable neighbour."
+#
+# -----------------------------------------------------------------------------
+# §15. WHERE THE GATED-VALUE PATTERN LANDS
+# -----------------------------------------------------------------------------
+#
+# Five gates, each with a single named writer:
+#
+#   Task.status / lifecycle      ← transitionTask, reopenTask
+#   TaskLease.epoch              ← renewLease
+#   RunArtifact.state            ← promoteArtifact, rejectArtifact
+#   Task.outputArtifacts         ← promoteArtifact, acceptRun
+#   TaskRun.accepted             ← acceptRun
+#   TaskDependency.state         ← the readiness recomputation inside
+#                                   transitionTask / addDependency /
+#                                   removeDependency / reevaluateDependency
+#
+# And two *read-side* gates, which is the less obvious application:
+#
+#   TaskBlocker.remedy           — names the mutation that clears the blocker,
+#                                  plus whether this caller may invoke it.
+#   TaskNextAction               — names the single mutation to offer next,
+#                                  plus `gatedBy` when it is not yet permitted.
+#
+# Together these mean a client never has to infer an action from state. The
+# state says what is true; the gate says what may be done about it and by whom.
+# That is the whole point of the pattern, and it is why `BlockerRemedy.
+# invokableByMe` and `TaskNextAction.permitted` are fields rather than
+# directives: they are per-caller, computed at read time, and the client must
+# see them to render correctly.
+#
+# -----------------------------------------------------------------------------
+# §16. WHAT I WOULD ARGUE WITH A REVIEWER ABOUT
+# -----------------------------------------------------------------------------
+#
+# 1. `Task.blockers_` — the trailing underscore is a scar, not a style. The
+#    name `blockers` is taken by the obstruction list, which is the more
+#    important of the two. Renaming the edge to `dependedOnBy` is the clean fix
+#    and I would take it in review; I left the collision visible because hiding
+#    it behind `dependents` (which reads as "subtasks" to half of all readers)
+#    is worse.
+# 2. `TaskCounters` and `TaskStats` are derived surfaces that will drift. I
+#    accepted that with `@derived(staleness:)` rather than making them strong,
+#    because a dashboard that recomputes fleet-wide percentiles per request
+#    will not survive contact with a Monday morning.
+# 3. `RunProgress.reportedFraction` should arguably not exist at all. I kept it
+#    because agents will report it whether or not the schema has a place for
+#    it, and an unmodelled number becomes a number in a JSON bag where nobody
+#    can see that it is unreliable. Modelled and marked `@expected`, it at
+#    least arrives with a warning label.
+# 4. `StepState` duplicates `phase`+`outcome`. Both are exposed because
+#    different consumers want different things: a UI wants one badge, an
+#    analyst wants the pair. `StepState` is `@derived` from the pair, so there
+#    is one source of truth and no possibility of disagreement. This is the one
+#    place I allowed a convenience duplication, and it is derivation-guarded.
+# 5. `spawnSubtask` bundles three operations. It exists because the unbundled
+#    version can partially fail in a way that leaves a subtask with no edge to
+#    its parent — an orphan that no readiness computation will ever find. The
+#    atomic version is worth the extra mutation surface.
+#
+# -----------------------------------------------------------------------------
+# §17. OPERATIONAL NOTE
+# -----------------------------------------------------------------------------
+#
+# The TASK string specified LABEL=A2 GROUP=TASK, so this draft is written to
+# study/A2.graphql per the stage instructions. study/label.txt contains the
+# unrelated value "canary"; the TASK string is authoritative for the output
+# path and was followed. No other files were read for domain content and no
+# sibling draft (A1/B2/C1/C2) was opened — this composition is blind.
+#
+# =============================================================================
+# END OF DRAFT A2 — GROUP TASK
+# =============================================================================

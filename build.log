@@ -1,0 +1,14 @@
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /data/work/leviath/crates/leviath-cli/Cargo.toml
+workspace: /data/work/leviath/Cargo.toml
+   Compiling leviath-cli v0.5.8 (/data/work/leviath/crates/leviath-cli)
+warning: function `bool_request` is never used
+   --> crates/leviath-cli/src/commands/mcp/serve_tools/mod.rs:422:10
+    |
+422 | async fn bool_request(
+    |          ^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `leviath-cli` (lib) generated 1 warning
+    Finished `release` profile [optimized] target(s) in 5m 15s

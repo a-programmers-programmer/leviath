@@ -1,0 +1,60 @@
+RUN 34666224646 CI | completed | failure | 15dc182e
+jobs: 58
+  Format                                         | completed   | success
+  Test (ubuntu-24.04-arm)                        | completed   | failure
+  Test (macos-latest)                            | completed   | failure
+  Docs                                           | completed   | success
+  Guard re-export-only facade (crates/leviath)   | completed   | success
+  Guard bin entrypoint (main.rs)                 | completed   | success
+  Guard release version bump                     | completed   | success
+  Clippy (windows-latest)                        | completed   | success
+  Clippy (macos-latest)                          | completed   | success
+  Test (ubuntu-latest)                           | completed   | failure
+  Clippy (ubuntu-latest)                         | completed   | success
+  Build with default features                    | completed   | success
+  Check coverage suppression markers             | completed   | success
+  Supply chain                                   | completed   | failure
+  Test (windows-latest)                          | completed   | failure
+  Coverage (macos-latest / leviath-tools)        | completed   | success
+  Coverage (ubuntu-latest / leviath-agent-client) | completed   | success
+  Coverage (ubuntu-latest / leviath-providers)   | completed   | success
+  Coverage (windows-latest / leviath-core)       | completed   | failure
+  Coverage (macos-latest / leviath-cli)          | completed   | failure
+  Coverage (ubuntu-latest / leviath-cli)         | completed   | failure
+  Coverage (windows-latest / leviath-cli)        | completed   | failure
+  Coverage (ubuntu-latest / leviath-alloc)       | completed   | success
+  Coverage (ubuntu-latest / leviath-sys)         | completed   | success
+  Coverage (macos-latest / leviath-agent-client) | completed   | success
+  Coverage (ubuntu-latest / leviath-runtime)     | completed   | failure
+  Coverage (macos-latest / leviath-sys)          | completed   | success
+  Coverage (ubuntu-latest / leviath-core)        | completed   | failure
+  Coverage (ubuntu-latest / leviath-package)     | completed   | success
+  Coverage (windows-latest / leviath-sys)        | completed   | success
+  Coverage (windows-latest / leviath-tools)      | completed   | success
+  Coverage (windows-latest / leviath-runtime)    | completed   | failure
+  Coverage (macos-latest / leviath-alloc)        | completed   | success
+  Coverage (macos-latest / leviath-package)      | completed   | success
+  Coverage (macos-latest / leviath-runtime)      | completed   | failure
+  Coverage (windows-latest / leviath-net)        | completed   | success
+  Coverage (windows-latest / leviath-providers)  | completed   | success
+  Coverage (macos-latest / leviath-scripting)    | completed   | failure
+  Coverage (windows-latest / leviath-alloc)      | completed   | success
+  Coverage (macos-latest / leviath-mcp)          | completed   | success
+  Coverage (ubuntu-latest / leviath-tools)       | completed   | success
+  Coverage (windows-latest / leviath-agent-client) | completed   | success
+  Coverage (macos-latest / leviath-net)          | completed   | success
+  Coverage (windows-latest / leviath-telemetry)  | completed   | success
+  Coverage (ubuntu-latest / leviath-mcp)         | completed   | success
+  Coverage (macos-latest / leviath-core)         | completed   | failure
+  Coverage (windows-latest / leviath-scripting)  | completed   | failure
+  Coverage (windows-latest / leviath-package)    | completed   | success
+  Coverage (ubuntu-latest / leviath-telemetry)   | completed   | success
+  Coverage (windows-latest / leviath-mcp)        | completed   | success
+  Coverage (ubuntu-latest / leviath-scripting)   | completed   | failure
+  Coverage (ubuntu-latest / leviath-net)         | completed   | success
+  Coverage (macos-latest / leviath-telemetry)    | completed   | success
+  Coverage (macos-latest / leviath-providers)    | completed   | success
+  Coverage gate (windows-latest)                 | completed   | success
+  Coverage gate (macos-latest)                   | completed   | success
+  Coverage gate (ubuntu-latest)                  | completed   | success
+  Publish combined test badge                    | completed   | skipped

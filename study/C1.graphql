@@ -1,0 +1,643 @@
+"""
+C1 — CHANNEL group draft
+========================
+
+Blind label : C1
+Group       : CHANNEL
+
+NOTE: group-prompts.md ships prompts for TASK, MEMORY, and PROPOSAL only; the assigned
+CHANNEL prompt was not present in that file. This draft therefore composes the CHANNEL
+group from the Composition Guide's own channel exemplars (accessor field
+`channel.retention`, action field `channel.publish`, enum `ChannelMode`, and the
+cross-group reference `Memory.sourceChannel`), using the same ontology as the sibling
+groups (a durable first-class entity + claimable lifecycle + edge-first trajectory +
+gated state machines).
+
+Domain: a durable COMMUNICATION CHANNEL in an agentic execution system — the mailbox
+agents (and humans) use to publish observations, request help, emit results, and leave
+a retention-governed record of what was said.
+"""
+
+schema {
+  query: Query
+  mutation: Mutation
+  subscription: Subscription
+}
+
+# ======================================================================
+# Scalar & shared vocabulary
+# ======================================================================
+
+"""A moment in time with full timezone/instant semantics."""
+scalar DateTime
+
+"""Rich text body. Rendered server-side; sanitized on ingest."""
+scalar Markdown
+
+"""A positive, unit-labelled length of time (e.g. "7d", "48h"). Non-negative; 0 is only legal where documented."""
+scalar Duration
+
+"""
+The entity receives an ID and is addressable from a query root.
+"""
+interface Node {
+  id: ID!
+}
+
+"""
+The entity carries its own creation and last-modification timeline.
+"""
+interface Timestamped {
+  createdAt: DateTime!
+  updatedAt: DateTime
+}
+
+# ======================================================================
+# Execution-plane directive (single directive, no creep)
+# ======================================================================
+
+"""Execution metadata: how this field may be invoked. Not client-selected data."""
+directive @policy(
+  """Lowest access tier allowed to resolve."""
+  access: AccessTier! = AUTHENTICATED
+  """Channel roles that may resolve."""
+  roles: [ChannelRole!]
+) on FIELD_DEFINITION | OBJECT
+
+enum AccessTier {
+  PUBLIC
+  AUTHENTICATED
+  ADMIN
+}
+
+# ======================================================================
+# Root operations
+# ======================================================================
+
+type Query {
+  """All channels the caller participates in, newest activity first."""
+  channels(
+    after: String
+    before: String
+    first: Int
+    last: Int
+    mode: ChannelMode
+    state: ChannelState
+  ): ChannelConnection! @policy(access: AUTHENTICATED)
+
+  """A single channel by identity (must be a participant or OPEN-mode channel)."""
+  channel(id: ID!): Channel @policy(access: AUTHENTICATED)
+
+  """Full-text search over messages the caller can read."""
+  searchMessages(
+    query: String!
+    channelId: ID!
+    after: String
+    first: Int
+  ): MessageConnection! @policy(access: AUTHENTICATED)
+}
+
+type Mutation {
+  """Create a durable channel. Returns the channel with policy applied."""
+  createChannel(
+    name: String!
+    mode: ChannelMode!
+    description: Markdown
+    retention: RetentionInput!
+  ): Channel! @policy(access: AUTHENTICATED)
+
+  """Publish one message into a channel; queues when the channel is PAUSED."""
+  publishMessage(
+    channelId: ID!
+    body: Markdown!
+    replyTo: ID
+    attachmentIds: [ID!]
+  ): Message! @policy(access: AUTHENTICATED, roles: [MEMBER, MODERATOR, ADMIN])
+
+  """Edit body or attachments of an already-published message."""
+  editMessage(
+    messageId: ID!
+    body: Markdown
+    attachmentIds: [ID!]
+  ): Message! @policy(access: AUTHENTICATED, roles: [MEMBER, MODERATOR, ADMIN])
+
+  """Withdraw a message. Contents stay addressable only as a retraction record."""
+  retractMessage(
+    messageId: ID!
+    reason: RetractionReason!
+    note: Markdown
+  ): Message! @policy(access: AUTHENTICATED, roles: [MEMBER, MODERATOR, ADMIN])
+
+  """Join (or request to join) a channel. DIRECT joins immediately when both slots are open."""
+  joinChannel(channelId: ID!): Membership! @policy(access: AUTHENTICATED)
+
+  """Leave a channel; a forgotten member must be re-invited by an admin."""
+  leaveChannel(channelId: ID!): Boolean @policy(access: AUTHENTICATED)
+
+  """Change a member's role in a channel."""
+  setMembership(
+    channelId: ID!
+    memberId: ID!
+    role: ChannelRole!
+  ): Membership! @policy(access: ADMIN)
+
+  """Mark a channel's oldest unread messages as read for the calling member."""
+  markRead(channelId: ID!, upToMessageId: ID!): Membership! @policy(access: AUTHENTICATED)
+}
+
+type Subscription {
+  """Real-time firehose of newly published (not queued) messages for a channel."""
+  messagePublished(channelId: ID!): Message! @policy(access: AUTHENTICATED, roles: [MEMBER, MODERATOR, ADMIN])
+}
+
+# ======================================================================
+# Channel
+# ======================================================================
+
+"""
+A durable communication channel: the shared mailbox agents and humans publish into.
+One concept, one type — memberships, messages, and policy are reachable by traversal.
+"""
+type Channel implements Node & Timestamped {
+  id: ID!
+
+  """Human-readable name."""
+  name: String!
+
+  """Markdown description shown to members."""
+  description: Markdown
+
+  """
+  Routing/semantics of the conversation. DIRECT is a one-to-one conduit; GROUP is a
+  team room with MODERATORs; TOPIC is a broadcast stream with OBSERVER members.
+  """
+  mode: ChannelMode!
+
+  """Lifecycle of the channel itself (independent from member lifecycle)."""
+  state: ChannelState!
+
+  """How long messages survive in this channel. Always present; shape is the gated variant."""
+  retention: RetentionPolicy!
+
+  createdAt: DateTime!
+  updatedAt: DateTime
+
+  """When the most recent message was published, or null when the channel is silent since creation."""
+  lastActivityAt: DateTime
+
+  """Who participates and in what role (edge-first: membership carries its own lifecycle)."""
+  memberships: MembershipConnection! @policy(access: AUTHENTICATED, roles: [MEMBER, MODERATOR, ADMIN])
+
+  """Messages in this channel."""
+  messages(
+    after: String
+    first: Int
+    from: DateTime
+    threadOf: ID
+  ): MessageConnection! @policy(access: AUTHENTICATED, roles: [MEMBER, MODERATOR, ADMIN])
+
+  """Count of messages the caller has not yet marked read (computed)."""
+  unreadCount: Int! @policy(access: AUTHENTICATED)
+
+  """The most recent published message, if any."""
+  latestMessage: Message @policy(access: AUTHENTICATED, roles: [MEMBER, MODERATOR, ADMIN])
+}
+
+"""How a channel routes its conversations."""
+enum ChannelMode {
+  DIRECT
+  GROUP
+  TOPIC
+}
+
+"""Channel lifecycle. ARCHIVED = read-only; PAUSED = accept-and-queue (outbox drains on resume)."""
+enum ChannelState {
+  ACTIVE
+  PAUSED
+  ARCHIVED
+  DEGRADED
+}
+
+# ======================================================================
+# Retention (gated-value: a policy is its own sum type)
+# ======================================================================
+
+"""
+What happens to this channel's messages over time. Modeled as a union so that "keep
+forever" and "expire after" are structurally distinct states — a nullable `ttl` field
+on a flat type would smuggle the policy state through null.
+"""
+union RetentionPolicy = RetainIndefinitely | ScheduledRetention
+
+"""Retain every message for the life of the channel. The variant itself is the guarantee."""
+type RetainIndefinitely {
+  """When this channel's permanent-retention promise took effect."""
+  since: DateTime!
+}
+
+"""Messages live exactly `ttl` before the `after` action applies to them."""
+type ScheduledRetention {
+  """How long a message stays readable before the action fires."""
+  ttl: Duration!
+  """What happens when `ttl` elapses: purge, or move to the archive store."""
+  after: ElapseAction!
+}
+
+enum ElapseAction {
+  """Permanently delete the message record."""
+  PURGE
+  """Move the message to the cold archive store; it leaves the live channel view."""
+  ARCHIVE
+}
+
+# ======================================================================
+# Membership — the channel↔actor edge, first-class
+# ======================================================================
+
+"""An actor's participation in a channel. Carries role, join time, and read cursor."""
+type Membership implements Node & Timestamped {
+  id: ID!
+
+  """The channel the membership lives in."""
+  channel: Channel!
+  """The actor this membership describes."""
+  member: Actor!
+
+  """What the member may do in this channel."""
+  role: ChannelRole!
+
+  """How active the participation is — independent from role."""
+  status: MembershipStatus!
+
+  joinedAt: DateTime!
+  updatedAt: DateTime
+
+  """Last message this member marked read (null when nothing read yet)."""
+  lastRead: Message
+
+  """This member's delivery edges across the channel."""
+  receipts(after: String, first: Int): DeliveryConnection!
+}
+
+type MembershipConnection {
+  nodes: [Membership!]!
+  edges: [MembershipEdge!]!
+  pageInfo: PageInfo!
+}
+
+enum ChannelRole {
+  ADMIN
+  MODERATOR
+  MEMBER
+  OBSERVER
+}
+
+enum MembershipStatus {
+  ACTIVE
+  LEFT
+  INVITED
+  SUSPENDED
+}
+
+# ======================================================================
+# Actor
+# ======================================================================
+
+"""A participant on the far side of one or more memberships: agent or human."""
+type Actor implements Node {
+  id: ID!
+
+  """Name shown in the channel; distinct from the system identity underneath."""
+  displayName: String!
+
+  kind: ActorKind!
+
+  """Channels this actor participates in (graph traversal the other way)."""
+  memberships: ChannelConnection!
+}
+
+enum ActorKind {
+  AGENT
+  HUMAN
+}
+
+# ======================================================================
+# Message — the writable payload
+# ======================================================================
+
+type Message implements Node & Timestamped {
+  id: ID!
+
+  """The channel this message was published into — always present, determined by route."""
+  channel: Channel!
+
+  """Who authored this message. SYSTEM stands for system-generated notes."""
+  author: Actor!
+
+  """Rendered text content. Markdown source is sanitized on ingest."""
+  body: String!
+
+  """Ordering key within the channel; monotonically increasing, unique per channel."""
+  sequence: Int!
+
+  """Thread support: the message this one replies to (thread head), else null."""
+  replyTo: Message
+
+  """Attachments (artifacts) carried with this message."""
+  attachments: [Artifact!]!
+
+  """All replies to this message, newest last."""
+  replies(after: String, first: Int): MessageConnection
+
+  createdAt: DateTime!
+  """Set once on the first successful edit (published variant carries firstEditAt)."""
+  updatedAt: DateTime
+
+  """Gated lifecycle: where this message is right now — queued, published, failed, or retracted."""
+  outcome: MessageOutcome!
+}
+
+"""Why a message was retracted (if ever)."""
+enum RetractionReason {
+  AUTHOR_REQUEST
+  MODERATION
+  DUPLICATE
+  VIOLATION
+}
+
+"""Gated-value: the send lifecycle of a message, structurally tied to real data per state."""
+union MessageOutcome =
+  QueuedMessage
+  | PublishedMessage
+  | FailedMessage
+  | RetractedMessage
+
+"""Message accepted and standing in the outbox (channel PAUSED, or transport backlog)."""
+type QueuedMessage {
+  queuedAt: DateTime!
+}
+
+"""Message delivered to the channel inbox; delivery receipts mate elsewhere."""
+type PublishedMessage {
+  publishedAt: DateTime!
+  """First time the message was edited after publishing, if ever (soft invariant)."""
+  editedAt: DateTime
+}
+
+"""Message could not be delivered (hard failure): rejected by the channel or transport."""
+type FailedMessage {
+  failedAt: DateTime!
+  error: PublishError!
+}
+
+type PublishError {
+  code: PublishErrorCode!
+  detail: String!
+}
+
+enum PublishErrorCode {
+  MODERATION_BLOCKED
+  RATE_LIMITED
+  CHANNEL_FULL
+  TRANSPORT_DOWN
+}
+
+"""Message removed from the channel surface; the retraction record stays addressable."""
+type RetractedMessage {
+  retractedAt: DateTime!
+  actor: Actor!
+  reason: RetractionReason!
+  note: String
+}
+
+# ======================================================================
+# Delivery receipts — the message↔recipient edges, first-class
+# ======================================================================
+
+"""One actor's end-to-end state for one message. Created at publish; mutable over time."""
+type DeliveryReceipt implements Node {
+  id: ID!
+  message: Message!
+  recipient: Actor!
+  state: DeliveryState!
+  updatedAt: DateTime!
+}
+
+"""
+Gated-value: where the message is for this recipient. Read implies delivered; we model
+the state machine as a union so illegal transitions (read without delivered) are
+unrepresentable in schema.
+"""
+union DeliveryState =
+  PendingDelivery
+  | DeliveredReceipt
+  | ReadReceipt
+  | FailedDelivery
+
+type PendingDelivery {
+  queuedAt: DateTime!
+  retries: Int!
+}
+
+type DeliveredReceipt {
+  deliveredAt: DateTime!
+}
+
+type ReadReceipt {
+  deliveredAt: DateTime!
+  readAt: DateTime!
+}
+
+type FailedDelivery {
+  failedAt: DateTime!
+  attempts: Int!
+  error: PublishError!
+}
+
+type DeliveryConnection {
+  nodes: [DeliveryReceipt!]!
+  pageInfo: PageInfo!
+}
+
+# ======================================================================
+# Artifacts (attachments)
+# ======================================================================
+
+"""A file artifact attached to a message (result artifact, screenshot, report)."""
+type Artifact implements Node {
+  id: ID!
+
+  """File name as shown to members."""
+  name: String!
+
+  """MIME type, for content negotiation of the download."""
+  mediaType: String!
+
+  """Size in bytes (0 allowed for empty files)."""
+  sizeBytes: Int!
+
+  """Resolvable content URL. URL availability is gated by artifact readiness (soft)."""
+  url: String
+}
+
+# ======================================================================
+# Connections
+# ======================================================================
+
+type PageInfo {
+  startCursor: String
+  endCursor: String
+  hasNextPage: Boolean!
+  hasPreviousPage: Boolean!
+}
+
+type ChannelConnection {
+  nodes: [Channel!]!
+  edges: [ChannelEdge!]!
+  pageInfo: PageInfo!
+}
+
+type ChannelEdge {
+  cursor: String!
+  node: Channel!
+}
+
+type MessageConnection {
+  nodes: [Message!]!
+  edges: [MessageEdge!]!
+  pageInfo: PageInfo!
+}
+
+type MessageEdge {
+  cursor: String!
+  node: Message!
+}
+
+type MembershipEdge {
+  cursor: String!
+  node: Membership!
+}
+
+# ======================================================================
+# Rationale
+# ======================================================================
+
+"""
+## Composition rationale (C1, CHANNEL)
+
+### 1. One concept, one type
+Concepts that earn types: `Channel`, `Membership`, `Message`, `DeliveryReceipt`,
+`Actor`, `Artifact`, plus the gated state machines (`RetentionPolicy`,
+`MessageOutcome`, `DeliveryState`). Everything else went through the "would I query
+this?" filter:
+- *Topic renames / pins / emoji reactions* — real mailbox features, but adding them
+  now would prefix-type the schema rather than sharpen the core; omitted.
+- *`ChannelSummary`* — rejected as a mirror type. Head-of-channel reads →
+  `latestMessage`; member counts → `memberships.pageInfo`; nothing to mirror.
+- *Inputs are not mirrors*: `createChannel(name, mode, description, retention)` is
+  flat intent; `retention` is one structured argument because retention is its own
+  concept the user reasons about ("keep forever" vs "expire in 7d"). No
+  `ChannelInput` clone of the output type exists.
+
+### 2. Naming sniff test (domain-usable without translation)
+A domain expert reads naturally: `channel.messages`, `message.author`,
+`message.replyTo`, `publishMessage(channelId, body)`, `retractMessage(reason)`,
+`retention` ("keep forever" vs "expire after 7d"), `state: ACTIVE/PAUSED/ARCHIVED/
+DEGRADED`, `mode: DIRECT/GROUP/TOPIC`. No storage/protocol names leak in (no
+`KafkaTopic`, `QueueRecord`, `DBRow`). The one deliberate jargon pair,
+`DeliveredReceipt`/`ReadReceipt`, evokes the delivery-domain vocabulary clients
+already understand.
+
+### 3. Decision tree applied
+- **Enum** — closed finite symbol sets: `ChannelMode`, `ChannelState`,
+  `ChannelRole`, `MembershipStatus`, `RetractionReason`, `PublishErrorCode`,
+  `ElapseAction`, `AccessTier`. None carry data.
+- **Interface** — flat, composable: `Node` (identity), `Timestamped` (createdAt/
+  updatedAt). No deep hierarchy `Identifiable → Auditable → Channel`.
+- **Union** — structurally divergent states: `RetentionPolicy` (a promise vs a
+  schedule), `MessageOutcome` (queued/published/failed/retracted, each carrying its
+  own timestamps), `DeliveryState` (pending/delivered/read/failed). These are the
+  gated-value conversions (Section 5).
+- **Scalar** — `DateTime`, `Markdown`, `Duration`. `Duration` earns scalar status
+  via ttl math; `name` is deliberately `String!` — "Name" as a scalar would be a
+  string with a different label.
+
+### 4. No ID-soup, no mirror types, no string bags
+- Relationships are fields returning the related type: `message.channel`,
+  `message.replyTo`, `receipt.message`, `membership.member`. No `channelId: ID!` /
+  `parentMessageId: ID!` data fields anywhere — IDs appear only as mutation
+  arguments (the honest handle to a side effect).
+- Inputs express intent once; nothing mirrors `Channel`'s shape.
+- No `metadata: JSON` or `attributes: JSON` buckets. `body` is `String!` on the way
+  out (sanitized Markdown); error `detail` is narrow; retraction `note` is singular
+  and described.
+
+### 5. Gated-value pattern (applied three times)
+- `Message.outcome: MessageOutcome!` — "what state is this message in" is not three
+  nullable fields that contradict each other (`publishedAt`/`failedAt`/`retractedAt`);
+  it is a union whose payload exists exactly where the state allows. A retracted
+  message cannot also expose `publishedAt`, and a failed message must carry its
+  `PublishError`.
+- `DeliveryReceipt.state: DeliveryState!` — `ReadReceipt` structurally requires both
+  `deliveredAt` and `readAt`; "read but never arrived" is unrepresentable.
+- `Channel.retention: RetentionPolicy!` — "keep forever" vs "expire" is explicit;
+  there is no nullable `ttl` field whose `null` silently means "keep."
+- Remaining nullables are documented soft nulls, not state leaks: `lastActivityAt`
+  (silent since creation), `updatedAt` (never edited), `Member.lastRead` (nothing
+  read yet), `Artifact.url` (content streams in later).
+
+### 6. Edge-first where warranted, plain field where not
+Promoted to first-class edge types because they carry own lifecycle/metadata that
+clients query independently:
+- `Membership` — role, status, join time, lastRead cursor (the channel↔actor edge).
+- `DeliveryReceipt` — per-recipient delivery state machine (the message↔actor edge).
+Kept as plain fields: `replyTo` (thread edge, no metadata of its own), `author`
+(actor link, no own state), `channel` (containment). The promotion test — "does the
+relationship own state or lifecycle queried separately?" — decides each. Edge
+invariants are enforced at the edge level: membership unique per (channel, actor);
+receipt unique per (message, recipient).
+
+### 6–7. Soft vs hard invariants
+Hard (rejected at GraphQL validation): `id: ID!`, `Message.channel: Channel!`,
+`Message.sequence: Int!`, `RetainIndefinitely.since: DateTime!`,
+`QueuedMessage.queuedAt: DateTime!` — removing any of these makes the type
+semantically incoherent.
+Soft (resolver + description, business rules): unique DIRECT pair per (a,b); name
+length cap; `ttl` non-zero for `ScheduledRetention`; leaving the last admin of a
+channel rejected; writes into `ARCHIVED` channels rejected; retracted messages
+cannot be edited. The gated-value pattern converted two would-be soft rules into
+hard structure (Section 5). Balance: hard only where the type itself would lie;
+soft everywhere else.
+
+### 8. Directives vs fields — one directive, no creep
+- One directive, `@policy(access, roles)`, applied to root-operation fields and the
+  artifact URL. It modulates *execution*: "may you resolve this?" There is no
+  `@authenticated`/`@cached`/`@rateLimit` spread.
+- Client-queryable concerns stay fields: `unreadCount` (clients show it),
+  `memberships` (clients reason over membership), `retentionPolicy` (clients read
+  it). Only execution behavior gets gated by the directive, never selectable data.
+
+### 9. Guided, not enforced
+The schema *prompts* — names and unions tell a helper about the message state
+machine before opening docs. It *enforces* only coherence. Business rules
+(name uniqueness, last-admin protection, ttl sanity, sequence generation) live in
+the resolver with descriptions; tightening them later needs no migration. The
+schema↔code drift test holds: every type has a resolver (Sequencer, receipt ledger,
+outbox drain), and the code data model maps 1:1 onto the types — nothing exists
+only on one side.
+
+### 10. Would I query this?
+- Yes: `channels { latestMessage { body outcome } }` (inbox glance); `receipts`
+  (an operator asks who has read a critical result); `retention` (clients must
+  know whether messages disappear); `replyTo`/`replies` (thread trees); search
+  (mailbox find); `membership.status` (who has actually joined).
+- No, and therefore omitted: per-member last-seen at list level, JSON metadata
+  blobs, internal identifiers on every node, per-channel cached stats. Each is
+  backend-only or a contrived query.
+
+### Left to code, not schema
+The outbox lifecycle of `PAUSED` channels (drain on resume) is execution behavior:
+clients subscribe to the first published message, the engine drains. Read-cursor
+continuation (`lastRead`) is a traversal + documented soft projection; all sharp
+business rules (uniqueness, caps) are resolver invariants with descriptions.
+"""

@@ -1,0 +1,900 @@
+schema {
+  query: Query
+  mutation: Mutation
+}
+
+"""
+An RFC 3339 instant with an explicit UTC offset. Serialized in UTC; comparisons
+use the instant rather than its textual representation.
+"""
+scalar DateTime
+
+"""
+Exactly one member must be supplied, and that member must be non-null.
+The server must support one-of input coercion, including variable validation;
+this declaration alone does not implement that behavior in older engines.
+"""
+directive @oneOf on INPUT_OBJECT
+
+"""
+Cross-cutting identity contract. Every entity a client may link to, cache, or
+select inside a fragment over heterogeneous results exposes its stable identity
+here, so identity is selected once instead of repeating '... on X { id }' per
+concrete type. This is deliberately flat: one field, no hierarchy, no metadata
+base fields such as createdAt, updatedAt, or storage keys.
+"""
+interface Node {
+  id: ID!
+}
+
+"""A person or agent that can be named in proposal provenance."""
+interface Actor implements Node {
+  id: ID!
+  displayName: String!
+}
+
+"""
+A human identity. Only an authenticated human can issue a review verdict.
+"""
+type Human implements Actor & Node {
+  id: ID!
+  displayName: String!
+}
+
+"""An agent identity responsible for proposing and revising content."""
+type Agent implements Actor & Node {
+  id: ID!
+  displayName: String!
+}
+
+"""
+The subject of the proposed decision, not its lifecycle or gate shape.
+The initial application taxonomy is intentionally finite.
+"""
+enum ProposalKind {
+  ACTION
+  PLAN
+  CHANGE
+  EXCEPTION
+}
+
+enum ProposalStatus {
+  DRAFT
+  AWAITING_REVIEW
+  APPROVED
+  REJECTED
+  CHANGES_REQUESTED
+}
+
+"""
+The durable proposal: the envelope a human decision is requested about. Its
+currentRevision carries the title, description, and exact decision gate.
+Revisions, rounds, reviews, and reviewer bindings remain traversable after the
+proposal reaches a terminal state, so history is never rewritten or hidden.
+"""
+type Proposal implements Node {
+  id: ID!
+  """Fixed at creation; no command in this group changes it."""
+  kind: ProposalKind!
+  """
+  The agent that created this proposal, taken from the execution context.
+  """
+  author: Agent!
+  createdAt: DateTime!
+  """
+  Time of the most recent content, lifecycle, or reviewer-binding change.
+  """
+  updatedAt: DateTime!
+  """
+  Optimistic concurrency token, beginning at 1. Every accepted command that
+  changes this proposal or its reviewer bindings increments it atomically.
+  Visible because conflict detection is an editing and review need; it is not a
+  claim of idempotent retry for creation.
+  """
+  version: Int!
+  """The revision a client should read, decide on, or revise. Never null."""
+  currentRevision: ProposalRevision!
+  """
+  The lifecycle state as a variant carrying the data that belongs to that state.
+  Uniform renderers read status; state-specific views select the variant, so no
+  nullable approvedAt, rejectionReason, or currentReviewer field is needed.
+  """
+  state: ProposalState!
+  """Immutable revisions, ordered by increasing revision number."""
+  revisions(
+    """
+    Maximum page size; must be positive. The server may clamp larger values.
+    """
+    first: Int = 50
+    """
+    Opaque forward cursor from an earlier page of this same revision history.
+    """
+    after: String
+  ): ProposalRevisionConnection!
+  """
+  Review attempts, ordered by increasing round number, including withdrawn
+  rounds. Resubmitting unchanged content adds a round, not a revision.
+  """
+  reviewRounds(
+    """
+    Maximum page size; must be positive. The server may clamp larger values.
+    """
+    first: Int = 50
+    """Opaque forward cursor from an earlier page of this same round history."""
+    after: String
+  ): ReviewRoundConnection!
+  """
+  Authorization relationships, including retained revocations by default. Pass
+  status to narrow the page to bindings that are currently effective. At most
+  one AUTHORIZED binding exists per proposal and human pair.
+  """
+  reviewerBindings(
+    """Omitted returns both AUTHORIZED and REVOKED bindings."""
+    status: ReviewerBindingStatus
+    """
+    Maximum page size; must be positive. The server may clamp larger values.
+    """
+    first: Int = 50
+    """
+    Opaque forward cursor from an earlier page of this same binding collection.
+    """
+    after: String
+  ): ReviewerBindingConnection!
+}
+
+"""
+A queryable current lifecycle state. status is useful for uniform rendering;
+concrete types make state-specific data available without nullable sentinels.
+"""
+interface ProposalState {
+  status: ProposalStatus!
+  since: DateTime!
+}
+
+type ProposalDraft implements ProposalState {
+  """Always DRAFT."""
+  status: ProposalStatus!
+  since: DateTime!
+}
+
+type ProposalAwaitingReview implements ProposalState {
+  """Always AWAITING_REVIEW."""
+  status: ProposalStatus!
+  since: DateTime!
+  round: ReviewRound!
+}
+
+type ProposalApproved implements ProposalState {
+  """Always APPROVED."""
+  status: ProposalStatus!
+  since: DateTime!
+  decision: ApprovalReview!
+}
+
+type ProposalRejected implements ProposalState {
+  """Always REJECTED."""
+  status: ProposalStatus!
+  since: DateTime!
+  decision: RejectionReview!
+}
+
+type ProposalChangesRequested implements ProposalState {
+  """Always CHANGES_REQUESTED."""
+  status: ProposalStatus!
+  since: DateTime!
+  request: RevisionRequestReview!
+}
+
+"""
+An immutable version of the material the human is being asked to decide on.
+Every edit creates another revision, including edits while still in draft.
+"""
+type ProposalRevision implements Node {
+  id: ID!
+  proposal: Proposal!
+  number: Int!
+  title: String!
+  description: String!
+  gate: DecisionGate!
+  author: Agent!
+  createdAt: DateTime!
+  """
+  Null means this is the initial revision; never means inaccessible history.
+  """
+  previous: ProposalRevision
+  """
+  The human revision request addressed by this revision. Null means no request
+  prompted this revision. Draft edits in the same response retain this link
+  until that response is submitted. The server sets the link, not the caller.
+  """
+  respondsTo: RevisionRequestReview
+}
+
+"""
+The precise question in one revision. Approval either confirms a stated action
+or selects exactly one offered option. Rejection and requests for changes are
+review verdicts, not disguised options in a selection gate.
+"""
+interface DecisionGate implements Node {
+  id: ID!
+  question: String!
+  """Optional human-facing decision guidance; null means none was supplied."""
+  instructions: String
+}
+
+"""A yes/no approval of a concrete, described action or commitment."""
+type ConfirmationGate implements DecisionGate & Node {
+  id: ID!
+  question: String!
+  instructions: String
+  requestedAction: String!
+}
+
+"""
+A decision among mutually exclusive alternatives. At least two distinguishable
+options must exist. Approving this gate means choosing exactly one of them.
+"""
+type ChoiceGate implements DecisionGate & Node {
+  id: ID!
+  question: String!
+  instructions: String
+  """
+  Nonempty, immutable, and ordered for presentation; order is not preference.
+  """
+  options: [DecisionOption!]!
+}
+
+"""
+A substantive alternative within one immutable choice gate. This is not an enum:
+it has its own identity and human-facing explanation supplied by the agent.
+"""
+type DecisionOption implements Node {
+  id: ID!
+  gate: ChoiceGate!
+  label: String!
+  description: String!
+}
+
+"""The answer recorded by an approving human, with a traversable gate."""
+interface DecisionAnswer {
+  gate: DecisionGate!
+}
+
+"""Affirmative confirmation of exactly this revision's requested action."""
+type ConfirmationAnswer implements DecisionAnswer {
+  gate: ConfirmationGate!
+}
+
+"""Approval of exactly one alternative belonging to this revision's gate."""
+type ChoiceAnswer implements DecisionAnswer {
+  gate: ChoiceGate!
+  option: DecisionOption!
+}
+
+"""
+One submission of an immutable revision for human review. A withdrawn revision
+may be submitted again in a new round without inventing another content edit.
+Exactly one accepted human review closes a round; any authorized reviewer may
+supply it. This group does not assume quorum or multi-stage approval semantics.
+"""
+type ReviewRound implements Node {
+  id: ID!
+  proposal: Proposal!
+  number: Int!
+  revision: ProposalRevision!
+  openedAt: DateTime!
+  openedBy: Agent!
+  outcome: ReviewOutcome!
+}
+
+"""
+A round is awaiting a decision, has one canonical human review, or was withdrawn.
+There is no nullable decision/error pair and no second copy of a review object.
+"""
+union ReviewOutcome = ReviewPending | ApprovalReview | RejectionReview | RevisionRequestReview | ReviewWithdrawal
+
+"""No human verdict has been accepted for this open round."""
+type ReviewPending {
+  since: DateTime!
+}
+
+"""Withdrawal closes a round without claiming that a human rejected it."""
+type ReviewWithdrawal {
+  withdrawnAt: DateTime!
+  withdrawnBy: Agent!
+  """Null means the agent supplied no withdrawal explanation."""
+  reason: String
+}
+
+enum ReviewVerdict {
+  APPROVED
+  REJECTED
+  CHANGES_REQUESTED
+}
+
+"""
+An immutable, authenticated human verdict on a specific submitted revision.
+reviewerBinding is the authorization edge that permitted the decision when it was
+accepted; revoking that binding later does not invalidate this historical verdict.
+"""
+interface Review implements Node {
+  id: ID!
+  round: ReviewRound!
+  reviewerBinding: ReviewerBinding!
+  decidedAt: DateTime!
+  verdict: ReviewVerdict!
+  """The authorization that permitted this verdict at decision time."""
+  reviewer: ReviewerBinding!
+}
+
+"""
+An approval always records a structurally valid answer, never a null result.
+"""
+type ApprovalReview implements Node {
+  id: ID!
+  round: ReviewRound!
+  reviewerBinding: ReviewerBinding!
+  decidedAt: DateTime!
+  """Always APPROVED."""
+  verdict: ReviewVerdict!
+  answer: DecisionAnswer!
+  reviewer: ReviewerBinding!
+}
+
+"""A rejection closes the proposal and explains the negative decision."""
+type RejectionReview implements Node {
+  id: ID!
+  round: ReviewRound!
+  reviewerBinding: ReviewerBinding!
+  decidedAt: DateTime!
+  """Always REJECTED."""
+  verdict: ReviewVerdict!
+  reason: String!
+  reviewer: ReviewerBinding!
+}
+
+"""
+A request returns the proposal to its agent with actionable revision guidance.
+"""
+type RevisionRequestReview implements Node {
+  id: ID!
+  round: ReviewRound!
+  reviewerBinding: ReviewerBinding!
+  decidedAt: DateTime!
+  """Always CHANGES_REQUESTED."""
+  verdict: ReviewVerdict!
+  instructions: String!
+  reviewer: ReviewerBinding!
+}
+
+enum ReviewerBindingStatus {
+  AUTHORIZED
+  REVOKED
+}
+
+"""
+A first-class authorization edge from a proposal to a human, with its own identity,
+provenance, and lifecycle. Each human can have at most one authorized binding to
+one proposal. Reauthorization after revocation creates a new binding.
+"""
+type ReviewerBinding implements Node {
+  id: ID!
+  proposal: Proposal!
+  reviewer: Human!
+  assignedAt: DateTime!
+  assignedBy: Actor!
+  state: ReviewerBindingState!
+}
+
+interface ReviewerBindingState {
+  status: ReviewerBindingStatus!
+  since: DateTime!
+}
+
+type ReviewerAuthorized implements ReviewerBindingState {
+  """Always AUTHORIZED."""
+  status: ReviewerBindingStatus!
+  """
+  When this authorization took effect, equal to the binding's assignedAt.
+  """
+  since: DateTime!
+}
+
+type ReviewerRevoked implements ReviewerBindingState {
+  """Always REVOKED."""
+  status: ReviewerBindingStatus!
+  """When this authorization was revoked."""
+  since: DateTime!
+  revokedBy: Actor!
+  """Null means the revoker supplied no explanation."""
+  reason: String
+}
+
+"""
+Group-local query entry points. Null on an identity lookup means no resource is
+visible under that identifier, including deliberate concealment by access
+policy. Operational failures use GraphQL errors rather than pretending the
+object is absent.
+"""
+type Query {
+  """
+  One proposal by identity. Null when no proposal is visible to the caller under
+  this identifier.
+  """
+  proposal(id: ID!): Proposal
+  """
+  One immutable revision by identity. Null when it is absent or not visible.
+  """
+  revision(id: ID!): ProposalRevision
+  """One review attempt by identity. Null when it is absent or not visible."""
+  reviewRound(id: ID!): ReviewRound
+  """
+  One human verdict by identity, resolved through the Review interface so that
+  verdict-specific fields remain selectable.
+  """
+  review(id: ID!): Review
+  """
+  One authorization relationship by identity, authorized or revoked. Revoked
+  bindings stay addressable so historical decisions remain explainable.
+  """
+  reviewerBinding(id: ID!): ReviewerBinding
+  """
+  Search the visible review inbox or proposal history. Ordering is createdAt
+  descending, then id descending. All supplied filters are combined with AND.
+  This is a live query over current state, not a snapshot service.
+  """
+  proposals(
+    """Omitted means unfiltered; every supplied member is combined with AND."""
+    filter: ProposalFilter
+    """
+    Maximum page size; must be positive. The server may clamp larger values.
+    """
+    first: Int = 50
+    """Opaque forward cursor scoped to this exact filter and ordering."""
+    after: String
+  ): ProposalConnection!
+  """
+  Resolve a human named by a binding, a filter, or a review, for display or for
+  use as bindReviewer's reviewerId. Null follows the same rule as every other
+  identity lookup here: no such human is visible under this identifier.
+  """
+  human(id: ID!): Human
+}
+
+input ProposalFilter {
+  """Omitted means all statuses; an empty list matches nothing."""
+  statuses: [ProposalStatus!]
+  """Omitted means all kinds; an empty list matches nothing."""
+  kinds: [ProposalKind!]
+  authorId: ID
+  """
+  Match proposals with an AUTHORIZED binding to this human. Combine with
+  AWAITING_REVIEW for that person's current decision inbox.
+  """
+  reviewerId: ID
+  """
+  Case-insensitive text search over the current revision's title and description.
+  """
+  text: String
+}
+
+"""
+Forward cursor pagination. first must be positive. Cursors are opaque and scoped
+to a particular collection, filter, and ordering; invalid cursors are errors.
+"""
+type PageInfo {
+  hasNextPage: Boolean!
+  """Null only when the returned page has no edges."""
+  endCursor: String
+}
+
+type ProposalConnection {
+  edges: [ProposalEdge!]!
+  pageInfo: PageInfo!
+}
+
+type ProposalEdge {
+  cursor: String!
+  node: Proposal!
+}
+
+type ProposalRevisionConnection {
+  edges: [ProposalRevisionEdge!]!
+  pageInfo: PageInfo!
+}
+
+type ProposalRevisionEdge {
+  cursor: String!
+  node: ProposalRevision!
+}
+
+type ReviewRoundConnection {
+  edges: [ReviewRoundEdge!]!
+  pageInfo: PageInfo!
+}
+
+type ReviewRoundEdge {
+  cursor: String!
+  node: ReviewRound!
+}
+
+"""Bindings are ordered by assignedAt ascending, then id ascending."""
+type ReviewerBindingConnection {
+  edges: [ReviewerBindingEdge!]!
+  pageInfo: PageInfo!
+}
+
+"""
+A pagination edge only. The node is the actual domain authorization edge; cursor
+metadata must not be confused with its authorization history.
+"""
+type ReviewerBindingEdge {
+  cursor: String!
+  node: ReviewerBinding!
+}
+
+"""
+Complete proposed content for a new immutable revision. This is intentionally
+not a patch: omitted optional instructions mean no instructions in the new
+revision. Whitespace-only titles, descriptions, and questions are rejected.
+"""
+input RevisionInput {
+  title: String!
+  description: String!
+  gate: DecisionGateInput!
+}
+
+input DecisionGateInput @oneOf {
+  confirmation: ConfirmationGateInput
+  choice: ChoiceGateInput
+}
+
+input ConfirmationGateInput {
+  question: String!
+  """
+  Optional guidance for the deciding human; null means none was supplied.
+  """
+  instructions: String
+  requestedAction: String!
+}
+
+input ChoiceGateInput {
+  question: String!
+  """
+  Optional guidance for the deciding human; null means none was supplied.
+  """
+  instructions: String
+  """At least two options; labels must be nonblank and distinguishable."""
+  options: [DecisionOptionInput!]!
+}
+
+input DecisionOptionInput {
+  label: String!
+  description: String!
+}
+
+"""
+A recoverable application error, not an infrastructure or authentication error.
+Every failure variant carries a human-readable message, so a client can render
+any problem uniformly without first knowing its concrete type. Success objects
+are deliberately outside this contract.
+"""
+interface ProposalProblem {
+  message: String!
+}
+
+enum ProposalResource {
+  PROPOSAL
+  HUMAN
+  REVIEWER_BINDING
+  DECISION_OPTION
+}
+
+type ProposalNotFound implements ProposalProblem {
+  message: String!
+  resource: ProposalResource!
+  """Echo of the command's lookup argument, not an output relationship."""
+  requestedId: ID!
+}
+
+"""
+The proposal moved since the caller read it. The payload carries the current
+proposal and both versions so that a client can refresh, re-render, and decide
+whether a new command is still appropriate.
+"""
+type ProposalConflict implements CommandProblem {
+  message: String!
+  """The proposal as it exists now."""
+  proposal: Proposal!
+  """The version the caller supplied."""
+  expectedVersion: Int!
+  """The version currently stored for the proposal."""
+  actualVersion: Int!
+}
+
+enum ProposalRule {
+  TRANSITION_NOT_ALLOWED
+  REVIEWER_REQUIRED
+  REVIEWER_ALREADY_AUTHORIZED
+  REVIEWER_BINDING_REVOKED
+  LAST_REVIEWER_CANNOT_BE_REVOKED
+  WRONG_GATE_KIND
+  OPTION_NOT_IN_CURRENT_GATE
+  ACTOR_NOT_AUTHORIZED
+  REVIEW_ALREADY_DECIDED
+}
+
+"""The command was current and well-formed, but violated a domain rule."""
+type ProposalRuleViolation implements CommandProblem {
+  message: String!
+  rule: ProposalRule!
+  """
+  The proposal the rule was evaluated against, so a client can refresh on failure.
+  """
+  proposal: Proposal!
+}
+
+enum ProposalInputRule {
+  REQUIRED_TEXT
+  TOO_FEW_OPTIONS
+  DUPLICATE_OPTION_LABEL
+  DUPLICATE_REVIEWER
+  INVALID_VERSION
+}
+
+"""
+One argument-level problem, addressed by a path whose list indices are decimal
+strings. The path is a presentation address for a form field, not a domain
+relationship.
+"""
+type ProposalInputViolation implements CommandProblem {
+  """
+  Argument and input path segments, with list indices as decimal strings.
+  """
+  path: [String!]!
+  rule: ProposalInputRule!
+  message: String!
+}
+
+"""
+The arguments were structurally valid GraphQL but violated input rules. Every
+violation found is returned together, so a client can annotate each offending
+field in a single round trip.
+"""
+type InvalidProposalInput implements CommandProblem {
+  message: String!
+  """Contains at least one violation."""
+  violations: [ProposalInputViolation!]!
+}
+
+"""
+The result of every command that can change a proposal: the canonical current
+proposal, or one of the ways the command could fail. Successful commands return
+the domain object itself, never a wrapper with nullable success and error fields.
+"""
+union ProposalChange = Proposal | ResourceNotFound | ProposalConflict | ProposalRuleViolation | InvalidProposalInput
+
+"""
+The result of the two reviewer-binding commands: the binding in its resulting
+state, or one of the same typed failures.
+"""
+union ReviewerBindingChange = ReviewerBinding | ResourceNotFound | ProposalConflict | ProposalRuleViolation | InvalidProposalInput
+
+"""
+The shared result of the four human decision commands. It is deliberately
+broader than any single command's postcondition: confirm and choose succeed with
+ApprovalReview, reject with RejectionReview, and requestProposalChanges with
+RevisionRequestReview. That narrower postcondition is a resolver and contract
+test invariant, not something this union can express, and it avoids four
+near-identical result unions.
+"""
+union ReviewDecision = ApprovalReview | RejectionReview | RevisionRequestReview | ResourceNotFound | ProposalConflict | ProposalRuleViolation | InvalidProposalInput
+
+"""
+All commands are atomic. Actor identities come from the authenticated execution
+context, never from caller-supplied author or decider fields. Commands on an
+existing proposal require its current expectedVersion; the version check and the
+update happen in the same transaction as content, binding, round, and verdict
+changes. A failed command makes no change. Authorization applies even when the
+arguments contain a valid identity.
+"""
+type Mutation {
+  """
+  An agent creates a DRAFT proposal and revision 1. The kind is fixed for the
+  life of the proposal. Initial reviewer bindings are created atomically and
+  record the creating agent.
+  """
+  createProposal(
+    """What is being proposed; immutable thereafter."""
+    kind: ProposalKind!
+    """Complete proposed content for revision 1."""
+    content: RevisionInput!
+    """
+    Human identities to authorize initially. The empty default permits an
+    unassigned draft; an unknown or non-human identity fails the command.
+    """
+    reviewerIds: [ID!]! = []
+  ): ProposalChange!
+  """
+  The owning agent creates a new immutable revision from complete content.
+  Allowed in DRAFT or CHANGES_REQUESTED only; the resulting state is DRAFT.
+  In CHANGES_REQUESTED, respondsTo is set to the closing revision request.
+  Subsequent draft edits retain that request link until submission. A draft
+  reached by withdrawing a submission starts a new, unprompted edit chain.
+  Existing gates and options are never edited; each revision receives fresh ones.
+  """
+  reviseProposal(
+    """The proposal to revise."""
+    proposalId: ID!
+    """
+    The version the caller last read; a mismatch fails with ProposalConflict and changes nothing.
+    """
+    expectedVersion: Int!
+    """
+    Complete replacement content; revisions are immutable, so this is never a patch.
+    """
+    content: RevisionInput!
+  ): ProposalChange!
+  """
+  The owning agent submits the current DRAFT revision, opening a new review round
+  and moving to AWAITING_REVIEW. At least one authorized human binding is
+  required. CHANGES_REQUESTED must first receive a revision; it cannot be
+  resubmitted as-is.
+  """
+  submitProposal(
+    """The proposal to submit."""
+    proposalId: ID!
+    """
+    The version the caller last read; a mismatch fails with ProposalConflict and changes nothing.
+    """
+    expectedVersion: Int!
+  ): ProposalChange!
+  """
+  The owning agent withdraws the open round and returns to DRAFT, keeping the
+  same current revision. A completed round cannot be withdrawn or rewritten.
+  """
+  withdrawProposal(
+    """The proposal whose open round is withdrawn."""
+    proposalId: ID!
+    """
+    The version the caller last read; a mismatch fails with ProposalConflict and changes nothing.
+    """
+    expectedVersion: Int!
+    """
+    Optional explanation recorded on the withdrawn round; omitted records none.
+    """
+    reason: String
+  ): ProposalChange!
+  """
+  Bind a human to this proposal. The caller must be allowed to manage reviewers.
+  Allowed in DRAFT, AWAITING_REVIEW, or CHANGES_REQUESTED; the binding is
+  immediately effective, so a human bound during an open round can decide it.
+  Duplicate active bindings are rejected. Rebinding a revoked human creates a
+  new binding so that historical review provenance is preserved.
+  """
+  bindReviewer(
+    """The proposal to authorize a reviewer on."""
+    proposalId: ID!
+    """
+    The version the caller last read; a mismatch fails with ProposalConflict and changes nothing.
+    """
+    expectedVersion: Int!
+    """The human to authorize; an agent or unknown identity cannot be bound."""
+    reviewerId: ID!
+  ): ReviewerBindingChange!
+  """
+  Revoke a binding without deleting its history. expectedVersion refers to the
+  proposal reached through bindingId. The caller must be allowed to manage
+  reviewers. The last authorized reviewer cannot be revoked while awaiting
+  review, and binding maintenance is allowed only in DRAFT, AWAITING_REVIEW, or
+  CHANGES_REQUESTED.
+  """
+  revokeReviewer(
+    """The authorization edge to revoke."""
+    bindingId: ID!
+    """
+    The version of the proposal reached through bindingId; a mismatch fails with ProposalConflict.
+    """
+    expectedVersion: Int!
+    """
+    Optional explanation recorded on the revoked binding; omitted records none.
+    """
+    reason: String
+  ): ReviewerBindingChange!
+  """
+  An authorized human approves the current open round's ConfirmationGate.
+  Records an ApprovalReview with a ConfirmationAnswer and moves to APPROVED.
+  """
+  confirmProposal(
+    """The proposal whose current revision is being approved."""
+    proposalId: ID!
+    """
+    The version the reviewer last read; a mismatch fails with ProposalConflict and records no verdict.
+    """
+    expectedVersion: Int!
+  ): ReviewDecision!
+  """
+  An authorized human approves one option of the current open round's ChoiceGate.
+  optionId must belong to that exact immutable gate, not a previous revision.
+  Records an ApprovalReview with a ChoiceAnswer and moves to APPROVED.
+  """
+  chooseProposalOption(
+    """The proposal whose current revision is being approved."""
+    proposalId: ID!
+    """
+    The version the reviewer last read; a mismatch fails with ProposalConflict and records no verdict.
+    """
+    expectedVersion: Int!
+    """The chosen option; it must belong to the gate of the current revision."""
+    optionId: ID!
+  ): ReviewDecision!
+  """
+  An authorized human rejects the current open round. Records a RejectionReview
+  and moves to terminal REJECTED.
+  """
+  rejectProposal(
+    """The proposal whose current revision is being rejected."""
+    proposalId: ID!
+    """
+    The version the reviewer last read; a mismatch fails with ProposalConflict and records no verdict.
+    """
+    expectedVersion: Int!
+    """Why the revision is rejected; must be nonblank."""
+    reason: String!
+  ): ReviewDecision!
+  """
+  An authorized human requests changes to the current submitted revision.
+  Records a RevisionRequestReview, closes the round, and moves to
+  CHANGES_REQUESTED. The next revision points back at this review.
+  """
+  requestProposalChanges(
+    """The proposal whose current revision needs changes."""
+    proposalId: ID!
+    """
+    The version the reviewer last read; a mismatch fails with ProposalConflict and records no verdict.
+    """
+    expectedVersion: Int!
+    """What the human wants changed; must be nonblank."""
+    instructions: String!
+  ): ReviewDecision!
+}
+
+"""
+A recoverable problem with a command the caller was allowed to attempt: the
+named object is missing, the proposal moved underneath the caller, or a domain
+rule or input rule was violated. Authentication and infrastructure failures are
+not part of this contract and surface as GraphQL errors instead. Each problem
+carries a human-readable message alongside a finite machine-readable code.
+"""
+interface CommandProblem {
+  message: String!
+}
+
+"""
+The kinds of thing a command can name and fail to find. These are exactly the
+lookup targets of the commands in this group, which is why there is no REVISION,
+REVIEW, or REVIEW_ROUND value: objects reached by traversal express absence as
+null, so they are never the subject of a not-found result.
+"""
+enum ResourceKind {
+  """A proposal named by identity."""
+  PROPOSAL
+  """A human named as a reviewer or binding target."""
+  HUMAN
+  """An existing authorization edge named by identity."""
+  REVIEWER_BINDING
+  """A decision option named by identity when choosing."""
+  DECISION_OPTION
+}
+
+"""
+The command named an object that does not exist or is not visible to the caller.
+resource says which kind of identity was looked up, so the caller is not told
+that a proposal is missing when the human they named is the missing object.
+"""
+type ResourceNotFound implements CommandProblem {
+  message: String!
+  resource: ResourceKind!
+  """Echo of the command's lookup argument, not an output relationship."""
+  requestedId: ID!
+}

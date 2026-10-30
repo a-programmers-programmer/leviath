@@ -14781,6 +14781,171 @@ fn an_exhausted_budget_proceeds_even_with_nowhere_to_record_it() {
     );
 }
 
+/// The mirror of the live probe3 run: a stage that exhausts its output budget
+/// with nothing but the runtime's own `[System]` nudges in the conversation must
+/// NOT adopt the nag as its final output.
+///
+/// probe3 (`/data/.leviath/runs/probe3-1789522240-aae5d58bf122`) is the live
+/// shape this reproduces in miniature: the model answered with the empty string,
+/// the runtime injected "[System] Your previous reply was cut off..." and three
+/// "[System] This stage is not finished..." nudges, and the run then reported
+/// `produced_output: true`, `output_forced: 0` and a 218-byte `final_output`
+/// that was the nudge verbatim - success claimed, nothing delivered. The helper
+/// walked every entry kind; a system nudge is not the model's turn and must be
+/// walked past.
+#[test]
+fn an_exhausted_budget_does_not_adopt_an_injected_system_nudge() {
+    let mut world = World::new();
+    let mut conv = conversation_window();
+    // probe3's shape exactly: the model answered with the empty string, so the
+    // assistant turn contributes no text, and then the runtime injected its own
+    // nudges - a cut-off one plus three "not finished" ones.
+    conv.add_typed_entry(
+        "conversation",
+        leviath_core::EntryKind::AssistantTurn { tool_calls: vec![] },
+        String::new(),
+        0,
+    )
+    .unwrap();
+    inject_system_nudge(&mut conv, "Your previous reply was cut off before it finished.");
+    inject_system_nudge(&mut conv, MISSING_OUTPUT_NUDGE);
+    inject_system_nudge(&mut conv, MISSING_OUTPUT_NUDGE);
+    inject_system_nudge(&mut conv, MISSING_OUTPUT_NUDGE);
+    let e = world
+        .spawn((
+            owing_bp(Some(2)),
+            StageCursor { index: 0 },
+            owing_state(),
+            conv,
+            ResolveTransition,
+            OutputReentries(leviath_core::blueprint::DEFAULT_OUTPUT_REENTRY_CAP),
+            crate::persistence::RunOutcomeFlags::default(),
+        ))
+        .id();
+    run_require_output(&mut world);
+    assert!(
+        world.get::<crate::persistence::FinalOutput>(e).is_none(),
+        "the runtime's own nag must never be handed back as the answer"
+    );
+    assert_eq!(
+        world
+            .get::<crate::persistence::RunOutcomeFlags>(e)
+            .expect("flags")
+            .0
+            .output_forced,
+        1,
+        "with nothing the model said to adopt, the flag is the honest signal"
+    );
+}
+
+/// The other half: a nudge must not *shadow* a genuine partial answer. The
+/// adoption exists to keep the model's last real turn, which frequently sits
+/// just before the nudge that followed it.
+#[test]
+fn an_exhausted_budget_adopts_the_model_turn_before_the_nudge() {
+    let mut world = World::new();
+    let mut conv = conversation_window();
+    conv.add_typed_entry(
+        "conversation",
+        leviath_core::EntryKind::AssistantTurn { tool_calls: vec![] },
+        "the rows are loaded; the merge is not written".to_string(),
+        9,
+    )
+    .unwrap();
+    inject_system_nudge(&mut conv, MISSING_OUTPUT_NUDGE);
+    let e = world
+        .spawn((
+            owing_bp(Some(2)),
+            StageCursor { index: 0 },
+            owing_state(),
+            conv,
+            ResolveTransition,
+            OutputReentries(leviath_core::blueprint::DEFAULT_OUTPUT_REENTRY_CAP),
+            crate::persistence::RunOutcomeFlags::default(),
+        ))
+        .id();
+    run_require_output(&mut world);
+    let output = world
+        .get::<crate::persistence::FinalOutput>(e)
+        .expect("the model's turn before the nudge is adopted");
+    assert_eq!(output.0.content, "the rows are loaded; the merge is not written");
+    assert_eq!(
+        world
+            .get::<crate::persistence::RunOutcomeFlags>(e)
+            .expect("flags")
+            .0
+            .output_forced,
+        0
+    );
+}
+
+/// The predicate is narrow: it skips *injected* nudges (`Text` carrying the
+/// `[System]` prefix), not every `Text` entry. An unprefixed summary or scratch
+/// note in the conversation is still a candidate, so the fix does not silently
+/// disable the adoption it was meant to bound.
+#[test]
+fn a_text_entry_that_is_not_a_nudge_is_still_adoptable() {
+    let mut world = World::new();
+    let mut conv = conversation_window();
+    conv.add_typed_entry(
+        "conversation",
+        leviath_core::EntryKind::Text,
+        "summary of work done so far".to_string(),
+        6,
+    )
+    .unwrap();
+    let e = world
+        .spawn((
+            owing_bp(Some(2)),
+            StageCursor { index: 0 },
+            owing_state(),
+            conv,
+            ResolveTransition,
+            OutputReentries(leviath_core::blueprint::DEFAULT_OUTPUT_REENTRY_CAP),
+            crate::persistence::RunOutcomeFlags::default(),
+        ))
+        .id();
+    run_require_output(&mut world);
+    let output = world
+        .get::<crate::persistence::FinalOutput>(e)
+        .expect("an unprefixed Text entry is not an injected nudge");
+    assert_eq!(output.0.content, "summary of work done so far");
+}
+
+/// The iteration-cap branch shares `last_conversation_text`, so it inherits the
+/// same filter. A capped stage whose conversation holds only nudges must say so
+/// rather than report the nag as its answer.
+#[test]
+fn a_capped_stage_does_not_adopt_an_injected_system_nudge() {
+    let mut world = World::new();
+    let mut conv = conversation_window();
+    inject_system_nudge(&mut conv, MISSING_OUTPUT_NUDGE);
+    let e = world
+        .spawn((
+            owing_bp(None),
+            StageCursor { index: 0 },
+            owing_state(),
+            conv,
+            ResolveTransition,
+            StageOutcome::MaxIterations,
+            crate::persistence::RunOutcomeFlags::default(),
+        ))
+        .id();
+    run_require_output(&mut world);
+    assert!(
+        world.get::<crate::persistence::FinalOutput>(e).is_none(),
+        "the cap branch shares the helper and must filter too"
+    );
+    assert_eq!(
+        world
+            .get::<crate::persistence::RunOutcomeFlags>(e)
+            .expect("flags")
+            .0
+            .output_forced,
+        1
+    );
+}
+
 /// An agent that already failed should follow its error edge, not be told to
 /// summarise.
 #[test]

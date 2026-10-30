@@ -1,0 +1,43 @@
+{
+  "work_item": "wire-0160",
+  "mechanism": "existing only: lev run (nonblocking, no --wait) + lev ps + lev result + run store /data/.leviath/runs",
+  "bd_present": false,
+  "bd_note": "`which bd` exit 1 - beads CLI NOT on PATH. FINDING, not a blocker. Fell back to the existing spawn_agent/check_agent semantics via the lev run + run store primitives.",
+  "parent_run_id": "hivemind-1789339438-1083d0ffd3b3",
+  "grandparent_run_id": "hivemind-1789338291-ad3831600bcd",
+  "checkout": "/data/work/leviath",
+  "dispatches": [
+    {
+      "task_id": "wire-0160-check-1",
+      "agent": "investigator",
+      "nonblocking": true,
+      "launch_command": "lev run investigator --workdir /data/work/leviath --task .hivemind/wire-0160-worker-task.txt --json",
+      "child_run_id": "investigator-1789339768-6f33646874c1",
+      "parent_run_id": "hivemind-1789339438-1083d0ffd3b3",
+      "grandparent_run_id": "hivemind-1789338291-ad3831600bcd",
+      "meta_path": "/data/.leviath/runs/investigator-1789339768-6f33646874c1/meta.json",
+      "dispatched_at_epoch": 1789339768,
+      "status": "complete",
+      "result": "Confirmed run store layout /data/.leviath/runs/<run_id>/meta.json; read parent meta.json (parent_run_id=hivemind-1789338291-ad3831600bcd, workdir /data/work/leviath)."
+    },
+    {
+      "task_id": "wire-0160-check-2",
+      "agent": "investigator",
+      "nonblocking": true,
+      "launch_command": "lev run investigator --workdir /data/work/leviath --task .hivemind/wire-0160-worker-task-2.txt --json",
+      "child_run_id": "investigator-1789339802-0c89c5b8abd7",
+      "parent_run_id": "hivemind-1789339438-1083d0ffd3b3",
+      "grandparent_run_id": "hivemind-1789338291-ad3831600bcd",
+      "meta_path": "/data/.leviath/runs/investigator-1789339802-0c89c5b8abd7/meta.json",
+      "dispatched_at_epoch": 1789339802,
+      "status": "complete",
+      "progress_checks": [
+        {"t": "~3s", "lev_ps": "active | stage answer 1/2 | iter 1 | tools 3", "meta_status": "running"},
+        {"t": "~25s", "lev_ps": "complete | stage answer 1/2 | iter 3 | tools 4", "meta_status": "complete"}
+      ],
+      "result": "Confirmed run store layout; enumerated meta.json + stages.json for a sibling run; read parent hivemind meta.json (status running, depth 1, parent_run_id=hivemind-1789338291-ad3831600bcd)."
+    }
+  ],
+  "parent_association_note": "Run store meta.json sets parent_run_id=null for CLI-dispatched runs (lev run exposes no --parent-run-id flag). The parent/task association is therefore persisted by the CALLER in this coordination file, not by the run store.",
+  "no_new_scaffolding": "No scheduler, queue, framework, dashboard, or architecture package added. Only existing primitives used."
+}

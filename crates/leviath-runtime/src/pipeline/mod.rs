@@ -63,7 +63,9 @@ pub(crate) use watchdog::{
 };
 mod requirements;
 #[cfg(test)]
-pub(crate) use requirements::{DEFAULT_REQUIRED_REENTRY_CAP, unmet_required_regions};
+pub(crate) use requirements::{
+    DEFAULT_REQUIRED_REENTRY_CAP, MISSING_OUTPUT_NUDGE, unmet_required_regions,
+};
 pub(crate) use requirements::{
     FanOutReentries, GateDecision, OutputReentries, RequiredReentries, gate_requires_children,
     require_context_regions, require_fan_out, require_final_output,
