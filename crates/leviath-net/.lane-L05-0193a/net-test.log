@@ -1,0 +1,47 @@
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /data/work/graphql-realization/gql-00/wt/L05-0193a/crates/leviath-cli/Cargo.toml
+workspace: /data/work/graphql-realization/gql-00/wt/L05-0193a/Cargo.toml
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.14s
+     Running unittests src/lib.rs (target/debug/deps/leviath_net-b6224c48a27e95ac)
+
+running 30 tests
+test read_caps::tests::caps_are_described_in_mib_or_bytes ... ok
+test read_caps::tests::frames_and_lines_are_judged_against_the_cap ... ok
+test read_caps::tests::the_charset_parameter_is_found_or_absent ... ok
+test tests::a_hostname_resolving_publicly_is_allowed ... ok
+test tests::allow_local_waives_the_address_check_but_not_the_scheme ... ok
+test tests::a_redirect_loop_is_bounded_regardless_of_destination ... ok
+test tests::allows_public_literals ... ok
+test tests::a_hostname_resolving_to_both_public_and_private_is_refused ... ok
+test tests::a_redirect_hop_is_checked_like_any_other_url ... ok
+test tests::each_rejection_has_its_own_kind ... ok
+test tests::no_addresses_reads_as_unresolvable ... ok
+test tests::rejects_cloud_metadata_endpoint ... ok
+test tests::rejection_messages_name_the_fix ... ok
+test tests::rejects_ipv4_mapped_loopback ... ok
+test tests::rejects_loopback_and_private_literals ... ok
+test tests::rejects_localhost_by_name ... ok
+test tests::restricted_classification_covers_reserved_ranges ... ok
+test tests::rejects_non_http_schemes ... ok
+test tests::the_scheme_is_checked_before_anything_is_resolved ... ok
+test tests::the_default_timeouts_are_a_real_floor ... ok
+test tests::unresolvable_host_is_reported_as_such ... ok
+test read_caps::tests::a_body_over_the_cap_fails_naming_the_cap_and_the_peer ... ok
+test read_caps::tests::a_body_under_the_cap_is_read_whole ... ok
+test read_caps::tests::the_peer_is_the_host_or_the_whole_url ... ok
+test read_caps::tests::a_body_that_stops_early_is_a_transport_failure ... ok
+test read_caps::tests::text_is_decoded_by_the_declared_charset ... ok
+test tests::checked_client_follows_a_permitted_redirect ... ok
+test read_caps::tests::text_past_the_cap_is_the_same_error ... ok
+test tests::checked_client_refuses_a_redirect_to_a_restricted_address ... ok
+test tests::the_client_builder_produces_a_usable_client ... ok
+
+test result: ok. 30 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+
+   Doc-tests leviath_net
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+EXIT:0

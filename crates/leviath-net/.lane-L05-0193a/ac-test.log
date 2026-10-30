@@ -1,0 +1,60 @@
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /data/work/graphql-realization/gql-00/wt/L05-0193a/crates/leviath-cli/Cargo.toml
+workspace: /data/work/graphql-realization/gql-00/wt/L05-0193a/Cargo.toml
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.16s
+     Running unittests src/lib.rs (target/debug/deps/leviath_agent_client-2d8aa47b216816de)
+
+running 43 tests
+test mapping::tests::flatten_drops_unsupported_block_kinds ... ok
+test mapping::tests::a_resource_link_is_described_not_followed ... ok
+test mapping::tests::empty_region_blocks_are_dropped ... ok
+test mapping::tests::every_classified_tool_name_is_a_real_tool ... ok
+test mapping::tests::flatten_headers_resource_blocks_with_their_uri ... ok
+test mapping::tests::flatten_of_nothing_usable_is_empty ... ok
+test mapping::tests::flatten_joins_text_blocks_with_a_blank_line ... ok
+test mapping::tests::flatten_skips_a_resource_block_with_no_inlined_text ... ok
+test mapping::tests::flatten_of_a_single_block_is_just_its_text ... ok
+test mapping::tests::flatten_skips_a_resource_block_with_no_resource_field ... ok
+test mapping::tests::flatten_skips_a_text_block_with_no_text_field ... ok
+test mapping::tests::flatten_trims_each_text_block ... ok
+test mapping::tests::flatten_skips_blank_and_whitespace_only_text_blocks ... ok
+test mapping::tests::leading_text_before_first_marker_becomes_task ... ok
+test mapping::tests::markers_absent_empty_text_yields_empty_map ... ok
+test mapping::tests::markers_absent_puts_whole_text_in_task ... ok
+test mapping::tests::only_tool_approvals_are_permission_requests ... ok
+test mapping::tests::multiple_regions_and_end_marker_with_trailing_text_dropped ... ok
+test mapping::tests::permission_request_falls_back_to_the_prompt_when_there_is_no_tool_name ... ok
+test mapping::tests::permission_request_offers_once_session_and_reject ... ok
+test mapping::tests::stop_reason_label_matches_the_status_mapping ... ok
+test mapping::tests::stop_reason_maps_every_run_status ... ok
+test mapping::tests::tool_kinds_cover_every_classification_arm ... ok
+test protocol::tests::agent_capability_defaults_are_all_false ... ok
+test protocol::tests::a_response_with_neither_id_nor_method_is_not_a_notification ... ok
+test protocol::tests::content_block_text_constructor_and_round_trip ... ok
+test protocol::tests::notification_has_no_id ... ok
+test protocol::tests::request_has_both_id_and_method ... ok
+test protocol::tests::embedded_resource_round_trips_with_and_without_optionals ... ok
+test protocol::tests::error_response_carries_code_and_message ... ok
+test protocol::tests::initialize_params_tolerate_a_bare_protocol_version ... ok
+test protocol::tests::every_tool_and_permission_enum_value_round_trips ... ok
+test protocol::tests::prompt_params_accept_unknown_block_kinds ... ok
+test protocol::tests::permission_outcomes_round_trip ... ok
+test protocol::tests::stop_reasons_use_snake_case ... ok
+test mapping::tests::prompt_bytes_become_named_typed_parts ... ok
+test protocol::tests::session_new_params_default_every_field ... ok
+test protocol::tests::session_cancel_params_default_the_session_id ... ok
+test protocol::tests::session_update_round_trips ... ok
+test protocol::tests::response_carries_id_and_result_and_omits_everything_else ... ok
+test protocol::tests::permission_request_serializes_the_spec_shape ... ok
+test protocol::tests::initialize_result_serializes_the_spec_shape ... ok
+test protocol::tests::usage_update_uses_camel_case_fields ... ok
+
+test result: ok. 43 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests leviath_agent_client
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+EXIT:0
