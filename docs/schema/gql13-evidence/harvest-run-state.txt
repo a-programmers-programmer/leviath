@@ -1,0 +1,323 @@
+def _run_state(row: dict | None, now: float, answered: bool) -> str:
+    """Where the run named by a receipt has got to.
+
+    A row that is GONE (swept, archived out of the log) is not a mystery: if a
+    report landed under it the run finished, and if none did we cannot claim it
+    did — that is `queued`, the same thing the receipt said on its own.
+    """
+    if not row:
+        return "done" if answered else "queued"
+    state = row.get("state") or ""
+    if state == "archived":
+        # An archive is BOARD HYGIENE, not an outcome, so it must not be read
+        # as one. `sweep_released()` archives a released row an hour after it
+        # lapsed (RELEASED_TTL_SEC), and until now that flipped the desk node
+        # from "Stopped" to "Done" on a prompt that was never answered: every
+        # one of the nine rows `queue_why.py --dropped` listed on 2026-09-05
+        # was sitting on a thread reading Done with no report under it. That is
+        # the worst direction for this to be wrong in — silent false green on
+        # exactly the runs Andy is hunting for.
+        #
+        # The row keeps the column it left (`archived_from`) and its
+        # timestamps, so the outcome is still on it: `done_at` means it really
+        # finished, and a sweep out of Released without one is still a stop —
+        # it just stopped an hour ago.
+        left_released = ((row.get("archived_from") or "") == "released"
+                         or bool(row.get("released_at")))
+        return "stopped" if left_released and not row.get("done_at") else "done"
+    if state == "done":
+        return "done"
+    if state == "released":
+        return "stopped"
+    if state == "claimed" and float(row.get("lease_until") or 0) > now:
+        return "working"
+    # a claimed row whose lease expired is back on the queue in every way that
+    # matters (the sweeper re-queues it), so it reads as waiting, not working.
+    return "queued"
+
+
+# ---- "waiting for a runner" has to STOP being news ---------------------------
+# The three surfaces agree about a claim now (`test_desk_claim_tandem`), but all
+# three read a row that has sat queued for forty minutes exactly the way they
+# read one queued eight seconds ago: "waiting for a runner to claim it". That
+# sentence is true of both and useful about neither — it is the stale text Andy
+# keeps reporting, and the receipt's own comment named the follow-on it needed
+# ("a receipt that AGES — 'queued 12 min, unclaimed'").
+#
+# So the wait is a NUMBER, computed once, and every surface says the same number.
+# The threshold is `claim_watch.SLOW_CLAIM_SEC`'s: the coordinator beats every
+# 60 s (`queue_watchdog.PERIOD_S`), so a healthy row is claimed inside two beats
+# and anything past that waited on something else. Below it nothing changes —
+# a fresh receipt reads exactly as it always did, which is what keeps
+# `RECEIPT_BODY` honest at the moment it is written.
+STALE_QUEUE_SEC = float(os.environ.get("DESK_STALE_QUEUE_SEC", "") or 120)
+
+
+def _waiting_since(row: dict | None) -> float:
+    """When the current wait STARTED, or 0 when the row cannot say.
+
+    Not always `queued_at`: a claimed row whose lease lapsed is counted as
+    waiting by `_run_state` and `_queue_census`, and the wait a human is asking
+    about there began when the lease ran out, not when the row was first filed.
+    Otherwise a reclaimed row would report the whole round trip as one stall and
+    read far worse than it is.
+    """
+    if not row:
+        return 0.0
+    lease = float(row.get("lease_until") or 0)
+    if row.get("state") == "claimed" and lease > 0:
+        return lease
+    return float(row.get("queued_at") or 0)
+
+
+def _stale_wait(row: dict | None, now: float,
+                threshold: float | None = None) -> float:
+    """Seconds this row has been waiting unclaimed PAST the threshold, else 0.
+
+    0 means "nothing to say": either the row is not waiting, or the wait is
+    still inside the window a healthy dispatch takes. Callers can therefore
+    treat it as the boolean "has this gone stale" and as the number in the same
+    breath, which is what keeps the surfaces quoting one figure.
+    """
+    since = _waiting_since(row)
+    if not since:
+        return 0.0
+    waited = now - since
+    return waited if waited > (STALE_QUEUE_SEC if threshold is None
+                               else threshold) else 0.0
+
+
+def _wait_words(sec: float) -> str:
+    """A wait in the units a person would say it in — never "2437 seconds"."""
+    if sec < 90:
+        return "%d seconds" % int(sec)
+    if sec < 3600:
+        return "%d minutes" % round(sec / 60.0)
+    hours = sec / 3600.0
+    return "1 hour" if round(hours) == 1 else "%d hours" % round(hours)
+
+
+#: How long a claim may run before "In progress" stops being self-explanatory.
+#: A lane is capped at ~45 turns and a healthy one closes its row in minutes;
+#: past this the amber card is EITHER a long run OR a lane that died without
+#: closing anything, and the desk cannot tell those apart — so it must stop
+#: showing them as the same card. Andy, thread d-fd8965ef8d73: "City layout
+#: task which is in progress, is also, seemingly stuck."
+STALE_CLAIM_SEC = float(os.environ.get("DESK_STALE_CLAIM_SEC", "600"))
+
+#: `lease_keeper.BEAT_FRACTION` — the keeper beats every lease/3, so two beats
+#: may be missed before the row is at risk. One missed beat is the earliest
+#: point at which "quiet" means anything, and the same number is restated here
+#: rather than imported because desk_pub must not depend on scripts/.
+_BEAT_FRACTION = 3.0
+
+
+def _claim_age(row: dict | None, now: float) -> float:
+    """Seconds this claim has been held. 0 when there is nothing to say.
+
+    `claimed_at` is the moment a runner took the row; `queued_at` is the
+    fallback for a row claimed before the store recorded that stamp. Never
+    `lease_until` — the lease moves every time the keeper renews, so it dates
+    the last heartbeat, not the start of the work.
+    """
+    if not row:
+        return 0.0
+    started = float(row.get("claimed_at") or row.get("queued_at") or 0)
+    if not started:
+        return 0.0
+    return max(0.0, now - started)
+
+
+def _claim_quiet(row: dict | None, now: float) -> float:
+    """Seconds since this claim last showed a sign of life, else 0.
+
+    A claimed row is renewed by `scripts/lease_keeper.py` on a lease/3 cadence
+    while the worker's process is alive, and each renewal pushes `lease_until`
+    forward — so `lease_until - lease_sec` is the last beat, and how long ago
+    THAT was is the only liveness the board actually holds. A row that has
+    never renewed reports its age from the claim itself, which is the same
+    question asked of a worker that never spoke at all.
+    """
+    if not row or row.get("state") != "claimed":
+        return 0.0
+    lease_until = float(row.get("lease_until") or 0)
+    lease_sec = float(row.get("lease_sec") or 0)
+    if lease_until <= 0 or lease_sec <= 0:
+        return 0.0
+    return max(0.0, now - (lease_until - lease_sec))
+
+
+def _run_label(state: str, row: dict | None, now: float | None = None) -> str:
+    """The badge text. `state` is unchanged (it is also the CSS class), but a
+    row on its second runner says so.
+
+    Andy's report was "we keep hitting this, waiting for a runner to claim it —
+    I get a feeling it doesn't get reclaimed properly". Since queue_store's
+    RECLAIM_ATTEMPTS a dead claim IS handed back to the claim door, and a badge
+    that reads the same "Queued — waiting for a runner" both times hides the
+    one fact he was asking for. `attempts` is on the row; use it.
+@queue_bp.post("/inbound")
+def queue_inbound():
+    """Enqueue ONE actionable chat instruction as a `chat-task` row.
+
+    `actionable` must be literally True, not truthy: a misfiring gateway posting
+    "true"/1 must be visible as a 400, not quietly flood the To-Do column.
+    `source:ref` is the idempotency key, so a repeat delivery or a retry
+    returns the existing row with created=false instead of doubling it.
+    """
+    body = request.get_json(silent=True) or {}
+    if body.get("actionable") is not True:
+        return jsonify({"ok": False, "error": "actionable must be true"}), 400
+    title = (body.get("title") or "").strip()
+    if not title:
+        return jsonify({"ok": False, "error": "title required"}), 400
+    ref = (body.get("ref") or "").strip()
+    if not ref:
+        return jsonify({"ok": False, "error": "ref required"}), 400
+    source = (body.get("source") or "").strip() or "chat"
+    if is_tool_noise(title, ref):
+        return jsonify({"ok": True, "item": None, "created": False,
+                        "suppressed": "auto-tool-noise"})
+    source_item = f"{source}:{ref}"
+    # WHO asked for this. Optional and pass-through only: the coordinator knows
+    # whose message it classified, the app does not guess. The board resolves a
+    # known handle/mailbox to a name ("Josh") and shows the lane ("Chat") for
+    # anything it does not recognise.
+    owner = (body.get("owner") or "").strip() or None
+
+    existing = qs.active_by_source(source_item)
+    if existing:
+        return jsonify({"ok": True, "item": _visible(existing), "created": False})
+
+    rec = qs.enqueue_item(title, kind="chat-task", source_item=source_item,
+                          lease_sec=(body.get("lease_sec") or CHAT_TASK_LEASE_SEC),
+                          origin_url=((body.get("origin_url") or "").strip() or None),
+                          owner=owner)
+    return jsonify({"ok": True, "item": _visible(rec), "created": True})
+
+
+# Declared immediately after queue_inbound and ABOVE queue_done/queue_release,
+# for the same reason the inbound/done comment gives: /queue/inbound/start must
+# never fall through to /queue/<item_id>/done's sibling rules.
+@queue_bp.post("/inbound/start")
+def queue_inbound_start():
+    """START the work for a chat ref — the move that makes the board drive
+    itself. Nobody presses anything: the worker that picks the task up posts
+    here, renews while it runs, and posts /queue/inbound/done when it finishes.
+
+        POST /queue/inbound        -> the row exists (queued)
+        POST /queue/inbound/start  -> claimed by <holder>      <-- here
+        POST /queue/renew          -> every renew_every seconds
+        POST /queue/inbound/done   -> done (or released, ok:false)
+
+    Idempotent for the SAME holder (200, `started:false`), so a retry is not a
+    409; a DIFFERENT holder is a 409 that names who holds it. A row sitting in
+    Released/Reclaimable is revived here — that is the promise that column
+    makes, and it is why a lapsed lease is never auto-requeued behind your back.
+    """
+    body = request.get_json(silent=True) or {}
+    ref = (body.get("ref") or "").strip()
+    if not ref:
+        return jsonify({"ok": False, "error": "ref required"}), 400
+    source = (body.get("source") or "").strip() or "chat"
+    holder = (body.get("holder") or "").strip() or "jarvis"
+    source_item = f"{source}:{ref}"
+    # OPTIONAL and additive: nothing passed `kind` before this existed, and
+    # `kind=None` still means "whatever live row has that source_item", so
+    # every existing caller behaves exactly as it did. It is here because this
+    # is the OTHER claim door, and it was the only one on which a worker could
+    # not say which kind of row it came for.
+    #
+    # That asymmetry is load-bearing. `queue_store.NAMED_KIND_ONLY` stops a
+    # blind /queue/claim from taking an `advisor-plan-moa` / `director-review`
+    # row, but an advisor row's source_item is a bare draft id (`pd-…`) while a
+    # director row's carries a colon (`publish:pd-…`) — and the box-side
+    # watchdog routes on exactly that colon, so the publish path arrives HERE
+    # instead. A by-source claim names one row, so it cannot be refused the way
+    # a blind sweep can; naming the kind is what lets a caller SAY it came for
+    # that row on purpose. See PROPOSAL_DRAFT_ADVISOR_STALL.md.
+    #
+    # Saying is not proving, and that gap cost a coding lane on 2026-09-07.
+    # `kind` is only a match filter, and the watchdog fills it in from the
+    # board — so `/data/bin/queue_watchdog.py`, stale at 05cbfc94 and unable to
+    # know `waiting-3d` was off limits, named the kind correctly and was served
+    # `q-1788781449456` three times. The refusal that holds is on the HOLDER
+    # (`queue_store.named_kind_refusal`, applied inside `start_by_source`),
+    # because a worker that can do the row says which worker it is.
+    kind = (body.get("kind") or "").strip() or None
+    lease_sec = body.get("lease_sec")
+    if lease_sec is not None:
+        try:
+            lease_sec = float(lease_sec)
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "lease_sec must be a number"}), 400
+
+    row, started, err = qs.start_by_source(source_item, holder=holder,
+                                           kind=kind, lease_sec=lease_sec)
+    if row is None:
+        return _fail("not found" if err == "no live row for that ref" else err)
+    # the heartbeat cadence the worker should keep: a third of the lease, so two
+    # renews can be missed before the row falls back to Released
+    effective = float(lease_sec or row.get("lease_sec") or CLAIM_LEASE_SEC)
+    return jsonify({
+        "ok": True,
+        "item": _visible(row),
+        "started": started,
+        "lease_until": row.get("lease_until"),
+        "renew_every": round(effective / 3.0, 3),
+    })
+
+
+# Declared ABOVE queue_done on purpose. Werkzeug weights a static rule above one
+# with a converter, so /queue/inbound/done wins over /queue/<item_id>/done
+# either way — but a silent fall-through would call transition("inbound", ...)
+# and 404 misleadingly, so the order is pinned here and by test_chat_bridge.
+@queue_bp.post("/inbound/done")
+def queue_inbound_done():
+    """Close a chat-task by its chat ref — the coordinator holds the ref, not
+    the `q-…` id. Delegates to queue_store's by-source helpers so the write
+    keeps the one `_lock` discipline and the row's own lease_sec.
+
+    *report ≠ done*: the success path requires the row to be `claimed` first.
+    Reporting a task complete that nobody ever started is the bug this whole
+    change exists to make visible — it is a 409 that names the fix, not a
+    silent queued → done jump the 2 s board poll can never see.
+
+    The FAILURE path (`ok:false` → release) is deliberately unchanged: saying
+    "this failed" about unstarted work is legal and useful.
+    """
+    body = request.get_json(silent=True) or {}
+    ref = (body.get("ref") or "").strip()
+    if not ref:
+        return jsonify({"ok": False, "error": "ref required"}), 400
+    source = (body.get("source") or "").strip() or "chat"
+    source_item = f"{source}:{ref}"
+    reason = (body.get("reason") or "").strip() or None
+
+    if body.get("ok") is False:
+        rows = qs.release_by_source(source_item, kind="chat-task",
+                                    reason=reason or "chat-task failed")
+    else:
+        rows = qs.complete_by_source(source_item, kind="chat-task",
+                                     require_claimed=True)
+    if not rows:
+        live = qs.active_by_source(source_item)
+        if live is not None and live.get("state") == "queued":
+            return jsonify({
+                "ok": False,
+                "error": "row not claimed — call /queue/claim first",
+                "item": _visible(live),
+            }), 409
+        return jsonify({"ok": False, "error": "no live row for that ref"}), 404
+    return jsonify({"ok": True, "items": [_visible(r) for r in rows]})
+
+
+@queue_bp.post("/renew")
+def queue_renew():
+    """Heartbeat: extend a live claim's lease without moving its state.
+
+    Machine surface by design (main._SYNC_POST) — a heartbeat comes from the
+    worker holding the row, which has a token, not a browser session. Long work
+    that renews stays honestly In-progress instead of lapsing into Waiting and
+    being re-claimed as duplicate work.
+    """

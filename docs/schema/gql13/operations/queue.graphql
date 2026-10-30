@@ -1,0 +1,63 @@
+# Claim-queue operations. The queue store owns queue state; these commands
+# only project it and go through the same rules.
+
+fragment QueueRow on QueueItem {
+  id
+  title
+  kind
+  state
+  holder
+  leaseUntil
+  attempts
+  renewals
+  reason
+  sourceItem
+}
+
+query BrowseQueue($first: Int, $after: String) {
+  queueItems(first: $first, after: $after) {
+    edges { cursor node { ...QueueRow } }
+    pageInfo { hasNextPage endCursor }
+  }
+}
+
+mutation ClaimQueueItem($input: ClaimQueueItemInput!) {
+  claimQueueItem(input: $input) {
+    __typename
+    ... on ClaimStarted {
+      item { id state holder leaseUntil attempts }
+      leaseUntil
+      renewEvery
+    }
+    ... on ClaimConflict { holder reason }
+    ... on OperationRejected { message }
+  }
+}
+
+mutation RenewClaim($input: RenewClaimInput!) {
+  renewClaim(input: $input) {
+    __typename
+    ... on RenewAcknowledged {
+      item { id state holder leaseUntil renewals }
+      leaseUntil
+      renewEvery
+    }
+    ... on OperationRejected { message }
+  }
+}
+
+mutation CompleteQueueItem($input: CompleteQueueItemInput!) {
+  completeQueueItem(input: $input) {
+    __typename
+    ... on QueueCompleted { items { id state doneAt attempts } }
+    ... on OperationRejected { message }
+  }
+}
+
+mutation ReleaseQueueItem($input: ReleaseQueueItemInput!) {
+  releaseQueueItem(input: $input) {
+    __typename
+    ... on QueueReleased { items { id state releasedAt reason } }
+    ... on OperationRejected { message }
+  }
+}

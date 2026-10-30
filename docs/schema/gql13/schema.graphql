@@ -1,0 +1,528 @@
+"""Desk, claim-queue, run and decision reads and writes.
+
+The claim queue remains the queue-state authority; this schema only projects
+queue rows and commands transitions through the same rules the store enforces.
+Desk slips own filing, review and decisions; planning dependencies stay in the
+existing planning tool and are never duplicated here.
+"""
+type Query {
+  """Read one desk slip by its canonical desk identity."""
+  slip("""Canonical desk slip identity such as d-0123456789ab.""" id: ID!): Slip
+  """Browse desk slips in stable slip-identity order."""
+  slips("""Page size between 1 and 100; defaults to 20 when omitted or null.""" first: Int = 20, """Opaque cursor bound to this desk and this ordering.""" after: String): SlipConnection!
+  """Browse claim-queue rows in stable row-identity order."""
+  queueItems("""Page size between 1 and 100; defaults to 20 when omitted or null.""" first: Int = 20, """Opaque cursor bound to this desk and this ordering.""" after: String): QueueConnection!
+  """Read one slip thread; entries are append-only and returned oldest first."""
+  thread("""Canonical desk slip identity whose thread is read.""" slipId: ID!, """Page size between 1 and 200; defaults to 50 when omitted or null.""" first: Int = 50, """Opaque cursor bound to this slip and this ordering.""" after: String): ThreadConnection!
+  """Read the derived lifecycle status of one slip."""
+  status("""Canonical desk slip identity whose status is derived.""" slipId: ID!): SlipStatus!
+}
+
+"""Intent-based desk and queue commands.
+
+Every command carries a caller retry key so a replayed delivery returns the
+original committed outcome instead of acting twice.
+"""
+type Mutation {
+  """File one desk slip and enqueue it when its delivery lane has a runner."""
+  fileSlip("""Slip content, routing and optional provenance.""" input: FileSlipInput!): FileSlipResult!
+  """Claim one queued row for a named holder, reviving a released row."""
+  claimQueueItem("""Row identity or source item, plus the claiming holder.""" input: ClaimQueueItemInput!): ClaimResult!
+  """Extend a live claim without moving its state."""
+  renewClaim("""Row identity and the holder that already owns the claim.""" input: RenewClaimInput!): RenewResult!
+  """Complete a claimed row after a report, never from queued."""
+  completeQueueItem("""Row identity, holder and the completed run's digest.""" input: CompleteQueueItemInput!): CompleteResult!
+  """Release a claimed row with a reason instead of waiting out the lease."""
+  releaseQueueItem("""Row identity, holder and the human-readable reason.""" input: ReleaseQueueItemInput!): ReleaseResult!
+  """Record the human answer to a decide slip and route it onward."""
+  recordDecision("""Slip identity, the decision text and the observed revision.""" input: RecordDecisionInput!): DecisionResult!
+}
+
+"""Live slip-status changes pushed to one desk client."""
+type Subscription {
+  """Subscribe to status changes for one slip, or for every open slip."""
+  slipStatusChanged("""Slip to watch; omit to watch every open slip.""" slipId: ID): SlipStatusEvent!
+}
+
+"""One desk slip: the record of truth for a unit of work or an ask."""
+type Slip {
+  """Canonical desk slip identity."""
+  id: ID!
+  """Product lane the slip belongs to."""
+  product: Product!
+  """Desk kind, which decides the slip's tab and who may answer it."""
+  kind: SlipKind!
+  """Desk the slip is routed to, or both desks."""
+  owner: SlipOwner!
+  """Filing state of the slip itself, independent of any run."""
+  state: SlipState!
+  """Short human-visible title."""
+  title: String!
+  """Free-form filing note; empty string when the filer wrote none."""
+  note: String!
+  """Optional link the filer attached to the slip."""
+  href: String!
+  """Filer-supplied labels; empty list when none were supplied."""
+  labels: [String!]!
+  """Runner lane the slip's prompts are routed to; AUTO lets dispatch pick."""
+  delivery: Delivery!
+  """Identity that filed the slip, such as andy, josh or jarvis."""
+  filedBy: String!
+  """ISO-8601 filing timestamp in UTC."""
+  filedAt: String!
+  """ISO-8601 timestamp of the last slip mutation."""
+  updatedAt: String!
+  """Provenance of the slip, or null when it was filed by hand."""
+  origin: SlipOrigin
+  """Recorded human decision, or null while the slip is unanswered."""
+  decision: ThreadDecision
+  """Derived lifecycle light for this slip."""
+  status: SlipStatus!
+}
+
+"""The derived lifecycle light shown on one desk card."""
+type SlipStatus {
+  """Which lifecycle light the card is wearing."""
+  status: LifecycleStatus!
+  """Human badge text, including claim-age wording once a claim runs long."""
+  label: String!
+  """Runner lane the slip is currently dispatched to; empty when unknown."""
+  dispatch: String!
+  """Seconds the live claim has been held; 0 when nothing is claimed."""
+  workingForSec: Int!
+  """Seconds since the claimed worker last renewed; 0 when not claimed."""
+  quietForSec: Int!
+  """Seconds a sent card has waited unclaimed; 0 while inside the window."""
+  waitingForSec: Int!
+}
+
+"""Where a slip came from, when a producer filed it instead of a person."""
+type SlipOrigin {
+  """Provenance kind such as plan-build, decision or proposal-draft."""
+  kind: String!
+  """Stable producer key for this slip, such as a plan ref or draft id."""
+  reference: String!
+  """Working goal this slip serves; empty when it serves no goal."""
+  goal: String!
+  """Stage name when this slip is one stage of a custom lifecycle."""
+  stage: String!
+  """What this slip is waiting on, when it is a parking marker."""
+  waitingOn: String!
+}
+
+"""One claim-queue row, projected from the queue-state authority."""
+type QueueItem {
+  """Canonical queue row identity such as q-1788781449456."""
+  id: ID!
+  """Row title, carrying the desk link for slip-filed rows."""
+  title: String!
+  """Row kind, such as desk-prompt, desk-decision or chat-task."""
+  kind: String!
+  """Queue state owned by the queue store, never by this API."""
+  state: QueueState!
+  """Holder that currently owns the claim; empty while unclaimed."""
+  holder: String!
+  """Desk the row is routed to; empty when the coordinator picks."""
+  owner: String!
+  """Runner lane the row is restricted to; AUTO means no restriction."""
+  delivery: Delivery!
+  """Unix epoch seconds when the row was enqueued."""
+  queuedAt: Float!
+  """Unix epoch seconds of the current claim; 0 when never claimed."""
+  claimedAt: Float!
+  """Unix epoch seconds of completion; 0 when the row never completed."""
+  doneAt: Float!
+  """Unix epoch seconds of release; 0 when the row was never released."""
+  releasedAt: Float!
+  """Unix epoch seconds the live claim expires; 0 when there is no claim."""
+  leaseUntil: Float!
+  """Lease length in seconds granted to the current claim."""
+  leaseSec: Float!
+  """How many runners have been handed this row."""
+  attempts: Int!
+  """How many times the current claim has been renewed."""
+  renewals: Int!
+  """Release reason or refusal detail; empty when there is none."""
+  reason: String!
+  """Idempotency key that produced this row, such as a slip identity."""
+  sourceItem: String!
+}
+
+"""One append-only thread entry on a desk slip."""
+type ThreadEntry {
+  """Canonical thread entry identity."""
+  id: ID!
+  """Slip this entry belongs to."""
+  slipId: ID!
+  """Server-set author identity such as andy, josh, jarvis or system."""
+  who: String!
+  """Entry kind, which decides how the desk reads it."""
+  kind: ThreadKind!
+  """Full entry body."""
+  body: String!
+  """Short preview shown beside the timeline node."""
+  oneLine: String!
+  """Optional link carried by the entry."""
+  href: String!
+  """Actor recorded for the entry when it differs from the author."""
+  actor: String!
+  """ISO-8601 entry timestamp in UTC."""
+  at: String!
+}
+
+"""The human answer recorded on a decide slip."""
+type ThreadDecision {
+  """The decision text the human wrote."""
+  text: String!
+  """Option chosen, when the ask offered named options."""
+  option: String!
+  """Identity that made the decision."""
+  decidedBy: String!
+  """ISO-8601 timestamp of the decision."""
+  decidedAt: String!
+}
+
+"""One bounded page of desk slips."""
+type SlipConnection {
+  """At most the requested page size, in stable slip-identity order."""
+  edges: [SlipEdge!]!
+  """Information needed to fetch the next page."""
+  pageInfo: PageInfo!
+}
+
+"""A slip together with its position in this connection."""
+type SlipEdge {
+  """Cursor scoped to this desk, this ordering and this slip identity."""
+  cursor: String!
+  """Slip visible to this desk."""
+  node: Slip!
+}
+
+"""One bounded page of claim-queue rows."""
+type QueueConnection {
+  """At most the requested page size, in stable row-identity order."""
+  edges: [QueueEdge!]!
+  """Information needed to fetch the next page."""
+  pageInfo: PageInfo!
+}
+
+"""A queue row together with its position in this connection."""
+type QueueEdge {
+  """Cursor scoped to this desk, this ordering and this row identity."""
+  cursor: String!
+  """Queue row visible to this desk."""
+  node: QueueItem!
+}
+
+"""One bounded page of thread entries."""
+type ThreadConnection {
+  """At most the requested page size, in oldest-first order."""
+  edges: [ThreadEdge!]!
+  """Information needed to fetch the next page."""
+  pageInfo: PageInfo!
+}
+
+"""A thread entry together with its position in this connection."""
+type ThreadEdge {
+  """Cursor scoped to this slip, this ordering and this entry identity."""
+  cursor: String!
+  """Thread entry visible to this desk."""
+  node: ThreadEntry!
+}
+
+"""Forward pagination metadata, including empty pages."""
+type PageInfo {
+  """Whether another page contains further rows."""
+  hasNextPage: Boolean!
+  """Last edge cursor, or null when the page is empty."""
+  endCursor: String
+}
+
+"""The slip was filed, and enqueued when its lane has a runner."""
+type SlipFiled {
+  """Slip after the committed filing."""
+  slip: Slip!
+}
+
+"""An authorized row exists but this holder or state cannot take it."""
+type ClaimConflict {
+  """Holder that currently owns the row, when a holder owns it."""
+  holder: String!
+  """Why the claim was refused; never discloses an unauthorized row."""
+  reason: String!
+}
+
+"""The row is now claimed by this holder."""
+type ClaimStarted {
+  """Row after the committed claim."""
+  item: QueueItem!
+  """Unix epoch seconds when this claim expires."""
+  leaseUntil: Float!
+  """Seconds the worker should wait between renewals."""
+  renewEvery: Float!
+}
+
+"""The live claim was extended and its state did not move."""
+type RenewAcknowledged {
+  """Row after the committed renewal."""
+  item: QueueItem!
+  """Unix epoch seconds when the extended claim expires."""
+  leaseUntil: Float!
+  """Seconds the worker should wait between the next renewals."""
+  renewEvery: Float!
+}
+
+"""The claimed row completed and closed."""
+type QueueCompleted {
+  """Rows closed by this completion, newest outcome last."""
+  items: [QueueItem!]!
+}
+
+"""The claimed row was released and carries a reason."""
+type QueueReleased {
+  """Rows released by this command, newest outcome last."""
+  items: [QueueItem!]!
+}
+
+"""The decision was recorded and the slip was routed onward."""
+type DecisionRecorded {
+  """The appended decision thread entry."""
+  entry: ThreadEntry!
+  """The decision as stored on the slip."""
+  decision: ThreadDecision!
+  """Desk the slip was routed to after the decision."""
+  routedTo: SlipOwner!
+}
+
+"""The command was refused; absent and unauthorized look identical here."""
+type OperationRejected {
+  """Safe user-facing explanation without object-existence disclosure."""
+  message: String!
+}
+
+"""One slip-status change delivered to a streaming client."""
+type SlipStatusEvent {
+  """Slip whose status changed."""
+  slipId: ID!
+  """Status after the change."""
+  status: SlipStatus!
+  """ISO-8601 timestamp of the change in UTC."""
+  changedAt: String!
+  """Monotonic sequence number an agent can assert ordering on."""
+  sequence: Int!
+}
+
+"""Expected outcome of filing a slip."""
+union FileSlipResult = SlipFiled | OperationRejected
+"""Expected outcome of claiming a queue row."""
+union ClaimResult = ClaimStarted | ClaimConflict | OperationRejected
+"""Expected outcome of renewing a live claim."""
+union RenewResult = RenewAcknowledged | OperationRejected
+"""Expected outcome of completing a claimed row."""
+union CompleteResult = QueueCompleted | OperationRejected
+"""Expected outcome of releasing a claimed row."""
+union ReleaseResult = QueueReleased | OperationRejected
+"""Expected outcome of recording a decision."""
+union DecisionResult = DecisionRecorded | OperationRejected
+
+"""Product lane a slip belongs to."""
+enum Product {
+  """Andy's product lane for flagship client work."""
+  ANW
+  """Parlour product lane."""
+  PARLOUR
+  """Shared platform lane used when no product owns the work."""
+  PLATFORM
+}
+
+"""Desk kind, which decides the tab and who may answer."""
+enum SlipKind {
+  """Plain job somebody does."""
+  TASK
+  """Work somebody reviews."""
+  REVIEW
+  """An ask to a person that waits on a human answer."""
+  DECIDE
+  """Work that unblocks something else."""
+  UNBLOCK
+  """A quick look that does not need a full job card."""
+  LOOK
+}
+
+"""Desk a slip is routed to."""
+enum SlipOwner {
+  """Routed to Andy's desk."""
+  ANDY
+  """Routed to Josh's desk."""
+  JOSH
+  """Visible on both desks."""
+  BOTH
+}
+
+"""Filing state of the slip itself, independent of any run."""
+enum SlipState {
+  """Filed and available to be worked or answered."""
+  OPEN
+  """Deliberately deferred by the filer."""
+  LATER
+  """Closed by the filer without a run outcome."""
+  DONE
+}
+
+"""Runner lane a row is routed to."""
+enum Delivery {
+  """No restriction; dispatch picks the runner."""
+  AUTO
+  """Restricted to the Simple City runner lane."""
+  SIMPLE_CITY
+  """Restricted to the Hive runner lane."""
+  HIVE
+}
+
+"""Queue state owned by the queue store."""
+enum QueueState {
+  """Waiting for a runner to claim it."""
+  QUEUED
+  """Held by a holder under a live lease."""
+  CLAIMED
+  """Lapsed or failed, and reclaimable by a named worker."""
+  RELEASED
+  """Closed because the work finished."""
+  DONE
+  """Archived by board hygiene, which is not an outcome."""
+  ARCHIVED
+}
+
+"""Kind of thread entry, which decides how the desk reads it."""
+enum ThreadKind {
+  """The owner handing the task out."""
+  PROMPT
+  """A report from a run, including progress reports."""
+  REPORT
+  """A lifecycle event such as a claim or a completion."""
+  EVENT
+  """A digest of several reports."""
+  DIGEST
+  """The human answer to a decide slip."""
+  DECISION
+  """Words captured off-desk and matched to this slip."""
+  TG_PROMPT
+  """A note captured off-desk and matched to this slip."""
+  TG_NOTE
+}
+
+"""The lifecycle light a desk card wears."""
+enum LifecycleStatus {
+  """Nothing has been sent for this slip yet."""
+  IDLE
+  """Sent and waiting for a runner to claim it."""
+  SENT
+  """Claimed by a runner under a live lease."""
+  WORKING
+  """A run answered, so the card needs review."""
+  REPORTED
+  """The work genuinely completed."""
+  DONE
+}
+
+"""Everything needed to file one desk slip."""
+input FileSlipInput {
+  """Short human-visible title; required."""
+  title: String!
+  """Product lane; defaults to platform."""
+  product: Product
+  """Desk kind; defaults to look."""
+  kind: SlipKind
+  """Desk the slip is routed to; defaults to both."""
+  owner: SlipOwner
+  """Runner lane for the slip's prompts; defaults to AUTO."""
+  delivery: Delivery
+  """Free-form filing note."""
+  note: String
+  """Optional link the filer attaches."""
+  href: String
+  """Filer-supplied labels; a comma-separated string is also accepted."""
+  labels: [String!]
+  """Provenance, when a producer files the slip instead of a person."""
+  origin: SlipOriginInput
+}
+
+"""Provenance supplied by a producer that files a slip."""
+input SlipOriginInput {
+  """Provenance kind such as plan-build or proposal-draft; required."""
+  kind: String!
+  """Stable producer key for this slip."""
+  reference: String
+  """Working goal this slip serves."""
+  goal: String
+  """Stage name when this slip is one stage of a custom lifecycle."""
+  stage: String
+  """What this slip is waiting on, when it is a parking marker."""
+  waitingOn: String
+}
+
+"""Everything needed to claim one queue row."""
+input ClaimQueueItemInput {
+  """Canonical row identity, used when the caller holds the q- id."""
+  rowId: ID
+  """Producer key of the row, used when the caller holds only that key."""
+  sourceItem: String
+  """Holder identity claiming the row; required and never inferred."""
+  holder: String!
+  """Expected row kind; a wrong kind is refused rather than silently matched."""
+  kind: String
+  """Lease length in seconds to grant this claim."""
+  leaseSec: Float
+  """Caller-generated retry key, unique for a command payload."""
+  idempotencyKey: ID!
+}
+
+"""Everything needed to renew one live claim."""
+input RenewClaimInput {
+  """Canonical row identity being renewed."""
+  rowId: ID!
+  """Holder identity that already owns the claim; required."""
+  holder: String!
+  """New lease length in seconds; omitted keeps the row's own lease."""
+  leaseSec: Float
+  """Caller-generated retry key, unique for a command payload."""
+  idempotencyKey: ID!
+}
+
+"""Everything needed to complete one claimed row."""
+input CompleteQueueItemInput {
+  """Canonical row identity being completed."""
+  rowId: ID!
+  """Holder identity that owns the claim; completion from queued is refused."""
+  holder: String!
+  """Digest of the report that finished the run, for duplicate detection."""
+  resultDigest: String
+  """Caller-generated retry key, unique for a command payload."""
+  idempotencyKey: ID!
+}
+
+"""Everything needed to release one claimed row."""
+input ReleaseQueueItemInput {
+  """Canonical row identity being released."""
+  rowId: ID!
+  """Holder identity that owns the claim."""
+  holder: String!
+  """Human-readable reason; required so a release is never silent."""
+  reason: String!
+  """Caller-generated retry key, unique for a command payload."""
+  idempotencyKey: ID!
+}
+
+"""Everything needed to record the answer to a decide slip."""
+input RecordDecisionInput {
+  """Slip identity the decision answers."""
+  slipId: ID!
+  """The decision text as the human wrote it; required."""
+  text: String!
+  """Option chosen, when the ask offered named options."""
+  option: String
+  """Revision observed by the client before this command."""
+  expectedRevision: Int!
+  """Caller-generated retry key, unique for a command payload."""
+  idempotencyKey: ID!
+}

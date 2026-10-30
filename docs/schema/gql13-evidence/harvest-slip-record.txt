@@ -1,0 +1,267 @@
+def _slip_record(body: dict, actor: str) -> dict:
+    """Validate a filing and build the row — NO I/O and NO LOCK.
+
+    Split out of file_slip() so a caller that is already holding `_lock` (the
+    merge, which mints its slip and stamps its members in ONE write) gets the
+    same validation without deadlocking on a non-reentrant lock. file_slip is
+    this plus the append, and remains the only door for everybody else.
+    """
+    title = (body.get("title") or "").strip()
+    if not title:
+        raise ValueError("title required")
+    product = (body.get("product") or "platform").strip().lower()
+    kind = (body.get("kind") or "look").strip().lower()
+    owner = (body.get("owner") or "both").strip().lower()
+    if product not in PRODUCTS:
+        raise ValueError("product must be anw, parlour, or platform")
+    if kind not in KINDS:
+        # spelled out from KINDS so growing the vocabulary cannot leave the
+        # error message lying about what the desk accepts
+        raise ValueError("kind must be one of: " + ", ".join(KINDS))
+    if owner not in OWNERS:
+        raise ValueError("owner must be andy, josh, or both")
+    # Routing is validated here rather than normalised silently: a typo'd lane
+    # is a 400 the filer can see, not a slip that quietly reverts to Auto and
+    # gets worked by the runner they were trying to steer away from.
+    delivery = (body.get("delivery") or "").strip().lower()
+    if delivery not in DELIVERIES:
+        raise ValueError("delivery must be one of: "
+                         + ", ".join(d or '""' for d in DELIVERIES))
+    labels = body.get("labels") or []
+    if isinstance(labels, str):
+        labels = [part.strip() for part in labels.split(",") if part.strip()]
+    labels = [str(item).strip() for item in labels if str(item).strip()]
+    # Optional provenance. Four kinds are understood today: "plan-build" (the
+    # BUILD WORK a settled plan implies — `ref` is its stable key on that plan),
+    # "decision" (the legacy per-lock ticket), "custom-lifecycle" (one stage of a
+    # custom decision's review -> enact -> accept cycle, which is what `stage`
+    # carries) and "proposal-draft" (the advisor ask, and the initial to-dos an
+    # accepted draft files — `draft` is the draft id, `step` its index on the
+    # plan). `goal` rides on any of them, and on the "goal-task" card itself: it
+    # is WHICH WORKING GOAL the slip serves, so the desk can couple a whole goal
+    # into one card without reading a proposal per poll. Anything else is kept
+    # verbatim so a future producer needs no migration.
+    origin = body.get("origin")
+    if origin is not None and not isinstance(origin, dict):
+        raise ValueError("origin must be an object")
+    if isinstance(origin, dict):
+        # `step` is kept when it is 0, which is a real index and a falsy value —
+        # hence the `is not None` rather than folding it into the truthiness
+        # test the string fields use.
+        origin = {k: v for k, v in origin.items()
+                  if k in ("kind", "proposal", "decision_id", "option", "stage",
+                           "draft", "step", "ref", "goal", "step_id",
+                           "waiting_on")
+                  and (v or (k == "step" and v is not None))}
+        if not origin.get("kind"):
+            raise ValueError("origin needs a kind")
+    now = _now()
+    rec = {
+        "id": "d-" + uuid.uuid4().hex[:12],
+        "product": product,
+        "kind": kind,
+        "owner": owner,
+        "state": "open",
+        "title": title,
+        "note": (body.get("note") or "").strip(),
+        "href": (body.get("href") or "").strip(),
+        "labels": labels,
+        # "" = the coordinator picks. Stored on every new slip so the toggle has
+        # something to read back; slips filed before this simply have no key and
+        # `.get` reads them as "" — the same answer, no migration.
+        "delivery": delivery,
+        "filed_by": actor or "jarvis",
+        "filed_at": now,
+        "updated_at": now,
+        "cleared_at": None,
+        "decision": None,
+        "origin": origin or None,
+    }
+    return rec
+
+
+def autoqueue_slip(rec: dict) -> dict | None:
+    """The desk -> claim-queue bridge for SIMPLE CITY slips.
+
+    Filing a slip used to be the end of it: the slip sat on the board in `open`
+    and nothing ever enqueued it, so a task the owner explicitly ROUTED to
+    Simple City was never claimed and never worked. A prompt typed into an
+    existing thread enqueued (api_thread_prompt); the filing that STARTED the
+    work did not. This closes that half.
+
+    Deliberately narrow — only the lane that has a runner behind it:
+
+      - `delivery == "simple-city"` only. Hive is a separate lane with its own
+        (unfinished) dispatch, and a row enqueued for a runner that will never
+        claim it is worse than an unqueued slip: it looks started and isn't.
+      - never a `decide` slip. That kind is an ASK TO A PERSON, and handing a
+        human question to a runner answers the wrong question.
+      - never a slip that is already `done`/`later`.
+
+    Idempotent on the SLIP ID (`source_item`): re-filing, a retried POST or a
+    double-click returns the row that already exists instead of enqueueing a
+    second one, which is the same key `active_by_source` guards the chat bridge
+    with. The title carries "[desk:<slip_id>] " because that prefix is how the
+    desk finds a slip's rows again (`_row_is_for_slip`) — which is what lets
+    the report/completion path advance and answer the right thread.
+
+    Best-effort: a queue that cannot be written must never lose the slip. The
+    filing has already landed by the time we get here, so a failure logs and
+    returns None rather than 500-ing a slip the owner can see on their desk.
+    """
+    if (rec.get("delivery") or "") != qs.SIMPLE_CITY:
+        return None
+    if rec.get("kind") == DECIDE_KIND:
+        return None
+    if rec.get("state") not in (None, "", "open"):
+        return None
+    slip_id = rec.get("id") or ""
+    if not slip_id:
+        return None
+    try:
+        existing = qs.active_by_source(slip_id)
+        if existing is not None:
+            return existing
+        return qs.enqueue_item(
+            title="[desk:%s] %s" % (slip_id, (rec.get("title") or "")[:80]),
+            # the same kind a desk prompt enqueues, so one set of rules covers
+            # both doors: the board labels it "Desk", and the report path
+            # (_advance_queue_row) already knows how to close it.
+            kind="desk-prompt",
+            source_item=slip_id,
+            lease_sec=DESK_PROMPT_LEASE_SEC,
+            owner=rec.get("owner") or None,
+            delivery=qs.SIMPLE_CITY,
+        )
+    except Exception:
+        log.exception("desk: auto-enqueue for slip %s failed", slip_id)
+        return None
+
+
+def file_slip(body: dict, actor: str) -> dict:
+    rec = _slip_record(body, actor)
+    with _lock:
+        rows = _load()
+        rows.append(rec)
+        _save(rows)
+    # AFTER the save and OUTSIDE the lock: the slip is the record of truth and
+    # must exist before anything is told to work it, and the queue write takes
+    # its own lock.
+    autoqueue_slip(rec)
+    return rec
+
+
+def close_draft_slips(draft_id: str, kinds=("look",)) -> list[str]:
+    """Finish the slips a DRAFT filed to ask a question that is now answered.
+
+def _status_of(rec: dict, queue_rows: list[dict], now: float,
+               coord: dict | None = None) -> dict:
+    """The lifecycle light for ONE slip, given a queue snapshot to read.
+
+    `queue_rows` is passed in rather than fetched because the stream resolves
+    every open slip at once and the claim queue is ONE read for all of them —
+    the per-slip route hands in its own and gets the identical answer. `coord`
+    is the coordinator's state, resolved once for the same reason.
+    """
+    item_id = rec.get("id")
+    th = desk_threads.thread_state(item_id)
+    entries = th.get("entries") or []
+    has_prompt = any(e.get("kind") == "prompt" for e in entries)
+    # SINCE THE NEWEST PROMPT, not ever (thread d-fd8965ef8d73). A prompt is the
+    # owner handing the task back out, so what came back BEFORE it is history:
+    # reading the whole thread meant the first report a slip ever grew outranked
+    # every later prompt, and the status-sorted desk pinned the card in "Needs
+    # review" for good — "tasks aren't changing tabs". Entries are appended in
+    # order, so the window is everything after the last `prompt`; a slip that
+    # was never prompted has no window and keeps the whole thread.
+    since = _since_last_prompt(entries)
+    has_report = any(e.get("kind") in ("report", "digest") for e in since)
+    prompt_at = _epoch(_last_entry_at(entries, ("prompt",)))
+    # The rows the PREVIOUS prompts filed. A queue row names the prompt entry it
+    # was filed from (`source_item`), which dates it exactly — the ISO stamps on
+    # the thread are second-resolution, so a re-prompt in the same second as the
+    # finish it answers cannot be told apart by clock alone.
+    spent_rows = _rows_of_spent_prompts(entries)
+    # an active claimed queue item whose source_item == this slip's thread,
+    # plus what the slip's rows say about REAL completion: a report in the
+    # thread is not proof the work finished (progress reports and sitreps are
+    # kind "report" too), but a queue row reaching terminal `done` is — only
+    # an explicit /queue/done (or archive of a finished row) puts it there.
+    active_claim = None
+    done_row = None
+    row_seen = False
+    row_done = False
+    mine: list[dict] = []
+    for r in queue_rows:
+        if r.get("kind") not in ("desk-prompt", "desk-decision"):
+            continue
+        title = r.get("title") or ""
+        # the slip link lives in the title: "[desk:<slip_id>] ..."
+        link = title.split("]")[0][len("[desk:"):].strip() if "[desk:" in title else ""
+        src = r.get("source_item") or ""
+        if not (link == item_id or (item_id and item_id in src)):
+            continue
+        row_seen = True
+        mine.append(r)
+        # A finish only speaks for the CURRENT run: a row filed by an earlier
+        # prompt was the previous round trip, and letting it keep the card blue
+        # is the other half of the stuck-band bug above. A row this thread
+        # cannot date (no `source_item` on any prompt, no `done_at`) still
+        # counts — the old answer is the safe one where there is no window.
+        stale = (r.get("source_item") in spent_rows
+                 or (prompt_at and r.get("done_at")
+                     and (r.get("done_at") or 0) < prompt_at))
+        if r.get("state") in ("done", "archived") and not stale:
+            row_done = True
+            # several rows can belong to one slip (a re-prompt files another);
+            # the newest finish is the one "finished two minutes ago" means.
+            if (done_row is None
+                    or (r.get("done_at") or 0) > (done_row.get("done_at") or 0)):
+                done_row = r
+        if (active_claim is None
+                and r.get("kind") == "desk-prompt" and r.get("state") == "claimed"
+                and (r.get("lease_until") or 0) > now):
+            active_claim = r
+    # THE LEASE IS NOT THE WORK. A claim outranks everything below it, and it
+    # has to — an in-flight report must not turn a live card blue. But the row
+    # is closed by the REPORT that finishes it, and every way that close can
+    # fail leaves the lease behind: a lane that hit its turn cap, a report the
+    # completion scan read as a progress note, a watchdog that died between the
+    # report and the /queue/done, a POST that 502'd against a Railway rebuild.
+    # The lease then runs its full 900 s, and for those fifteen minutes the desk
+    # shows a finished task under "In progress" — then several cards flip at
+    # once as their leases lapse together. That is thread d-361749998eff: "this
+    # task was delivered and completed, but I just found it in the in progress
+    # tab along with the three others… something refreshed and all these tasks
+    # moved to needs review".
+    #
+    # So a claim speaks for the work only until the run answers over the top of
+    # it. A report that landed after THIS CLAIM BEGAN is the run's own answer,
+    # and the lease behind it is a leftover; the row stays claimed — closing it
+    # is the queue's business, not the card's — but the card stops claiming
+    # somebody is working, and reads `reported`: ran, needs review.
+    #
+    # This was ordered against the claim's last BEAT until d-361749998eff's
+    # fourth round, and that is why the round trip repeated: the lease keeper
+    # renews on "the worker's process is alive", and a lane is alive for the
+    # seconds between posting its final report and exiting, so its own beat
+    # routinely outran its own answer and the card stayed amber anyway. What a
+    # renewing worker proves is that a process exists, never that the work is
+    # unfinished — the two things that DO prove that are read by
+    # `_run_came_back_at` itself (an explicit `progress` meta, or prose that
+    # says so), and they still hold the card at `working`.
+    if active_claim:
+        came_back = _run_came_back_at(since)
+        if came_back and came_back > _claim_started(active_claim):
+            active_claim = None
+    # "done" is genuine when the slip's queue row reached terminal state, or
+    # the slip itself was cleared via /done. Slips that were never enqueued
+    # have no row to consult, so they keep the old has_report answer — the
+    # premature-done case always involves a live in-flight row.
+    genuine_done = row_done or rec.get("state") == "done"
+    if not row_seen:
+        genuine_done = genuine_done or has_report
+    # An active (unexpired) claim lease means the task is mid-flight: show it
+    # as claimed/working (amber) even if an in-progress report has landed. The
+    # "done" (blue) state only resolves once the work GENUINELY completed.
+    #

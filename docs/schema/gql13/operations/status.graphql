@@ -1,0 +1,40 @@
+# Thread, status and decision operations.
+
+query GetThread($slipId: ID!, $first: Int, $after: String) {
+  thread(slipId: $slipId, first: $first, after: $after) {
+    edges { cursor node { id kind who body oneLine href actor at } }
+    pageInfo { hasNextPage endCursor }
+  }
+}
+
+query GetSlipStatus($slipId: ID!) {
+  status(slipId: $slipId) {
+    status
+    label
+    dispatch
+    workingForSec
+    quietForSec
+    waitingForSec
+  }
+}
+
+subscription WatchSlipStatus($slipId: ID) {
+  slipStatusChanged(slipId: $slipId) {
+    slipId
+    changedAt
+    sequence
+    status { status label dispatch }
+  }
+}
+
+mutation RecordDecision($input: RecordDecisionInput!) {
+  recordDecision(input: $input) {
+    __typename
+    ... on DecisionRecorded {
+      entry { id kind body oneLine at }
+      decision { text option decidedBy decidedAt }
+      routedTo
+    }
+    ... on OperationRejected { message }
+  }
+}

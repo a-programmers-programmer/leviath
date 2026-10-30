@@ -1,0 +1,36 @@
+# Desk filing and reading operations.
+
+fragment SlipSummary on Slip {
+  id
+  title
+  state
+  product
+  kind
+  delivery
+  status { status label }
+}
+
+query BrowseSlips($first: Int, $after: String) {
+  slips(first: $first, after: $after) {
+    edges { cursor node { ...SlipSummary } }
+    pageInfo { hasNextPage endCursor }
+  }
+}
+
+query GetSlip($id: ID!) {
+  slip(id: $id) {
+    id
+    title
+    state
+    status { status label dispatch }
+    origin { kind goal }
+  }
+}
+
+mutation FileSlip($input: FileSlipInput!) {
+  fileSlip(input: $input) {
+    __typename
+    ... on SlipFiled { slip { id kind state status { status label } } }
+    ... on OperationRejected { message }
+  }
+}

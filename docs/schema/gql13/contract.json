@@ -1,0 +1,859 @@
+{
+  "version": 1,
+  "mode": "new",
+  "assumptions": [
+    "The Desk, claim queue, run and thread services already exist and stay the sources of truth; this contract only projects them.",
+    "queue_store remains the queue-state authority; no state machine is re-implemented here.",
+    "Planning dependencies stay in the existing planning tool and are not duplicated in this schema.",
+    "Caller compatibility is with the existing Desk and queue HTTP callers, not with the memory or kit SDL, which are unrelated APIs."
+  ],
+  "open_questions": [],
+  "requirements": [
+    {
+      "id": "R-file",
+      "description": "A desk member files a slip and it is enqueued only when its lane has a runner.",
+      "operations": [
+        "FileSlip"
+      ],
+      "coordinates": [
+        "Mutation.fileSlip",
+        "SlipFiled.slip",
+        "OperationRejected.message"
+      ]
+    },
+    {
+      "id": "R-browse-slips",
+      "description": "A desk member pages through slips without duplicates in stable identity order.",
+      "operations": [
+        "BrowseSlips"
+      ],
+      "coordinates": [
+        "Query.slips",
+        "Slip.id",
+        "PageInfo.endCursor"
+      ]
+    },
+    {
+      "id": "R-read-slip",
+      "description": "A desk member reads one slip with its derived status and provenance.",
+      "operations": [
+        "GetSlip"
+      ],
+      "coordinates": [
+        "Query.slip",
+        "Slip.status",
+        "Slip.origin"
+      ]
+    },
+    {
+      "id": "R-queue-read",
+      "description": "A desk member pages claim-queue rows and takes one for a named holder.",
+      "operations": [
+        "BrowseQueue",
+        "ClaimQueueItem"
+      ],
+      "coordinates": [
+        "Query.queueItems",
+        "QueueItem.id",
+        "ClaimStarted.item",
+        "ClaimStarted.leaseUntil",
+        "ClaimConflict.reason"
+      ]
+    },
+    {
+      "id": "R-renew",
+      "description": "A holder extends a live claim so long work stays honestly in progress.",
+      "operations": [
+        "ClaimQueueItem",
+        "RenewClaim"
+      ],
+      "coordinates": [
+        "Mutation.claimQueueItem",
+        "Mutation.renewClaim",
+        "RenewAcknowledged.item",
+        "RenewAcknowledged.renewEvery"
+      ]
+    },
+    {
+      "id": "R-close-run",
+      "description": "A holder completes a claimed row after a report, or releases it with a reason.",
+      "operations": [
+        "CompleteQueueItem",
+        "ReleaseQueueItem"
+      ],
+      "coordinates": [
+        "Mutation.completeQueueItem",
+        "Mutation.releaseQueueItem",
+        "QueueCompleted.items",
+        "QueueReleased.items"
+      ]
+    },
+    {
+      "id": "R-thread",
+      "description": "A desk member reads a slip thread oldest first, with full body and preview.",
+      "operations": [
+        "GetThread"
+      ],
+      "coordinates": [
+        "Query.thread",
+        "ThreadEntry.body",
+        "ThreadEntry.oneLine"
+      ]
+    },
+    {
+      "id": "R-status",
+      "description": "A desk member reads the derived lifecycle light and its age wording.",
+      "operations": [
+        "GetSlipStatus"
+      ],
+      "coordinates": [
+        "Query.status",
+        "SlipStatus.status",
+        "SlipStatus.label",
+        "SlipStatus.waitingForSec"
+      ]
+    },
+    {
+      "id": "R-stream",
+      "description": "A desk client streams slip-status changes in sequence order.",
+      "operations": [
+        "WatchSlipStatus"
+      ],
+      "coordinates": [
+        "Subscription.slipStatusChanged",
+        "SlipStatusEvent.slipId",
+        "SlipStatusEvent.sequence"
+      ]
+    },
+    {
+      "id": "R-decide",
+      "description": "A human records the answer to a decide slip and it routes onward.",
+      "operations": [
+        "RecordDecision"
+      ],
+      "coordinates": [
+        "Mutation.recordDecision",
+        "DecisionRecorded.entry",
+        "DecisionRecorded.decision",
+        "DecisionRecorded.routedTo"
+      ]
+    }
+  ],
+  "fields": {
+    "Query.slip": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Null on an empty page, absent object or unanswered ask; never used to signal an authorization failure, which is masked.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "Query.slips": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "Query.queueItems": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "Query.thread": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "Query.status": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "Mutation.fileSlip": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "Mutation.claimQueueItem": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "Mutation.renewClaim": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "Mutation.completeQueueItem": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "Mutation.releaseQueueItem": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "Mutation.recordDecision": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "Subscription.slipStatusChanged": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "Slip.id": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "Slip.product": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "Slip.kind": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "Slip.owner": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "Slip.state": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "Slip.title": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "Slip.note": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "Slip.href": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "Slip.labels": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "Slip.delivery": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "Slip.filedBy": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "Slip.filedAt": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "Slip.updatedAt": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "Slip.origin": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Null on an empty page, absent object or unanswered ask; never used to signal an authorization failure, which is masked.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "Slip.decision": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Null on an empty page, absent object or unanswered ask; never used to signal an authorization failure, which is masked.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "Slip.status": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "SlipStatus.status": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "SlipStatus.label": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "SlipStatus.dispatch": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "SlipStatus.workingForSec": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "SlipStatus.quietForSec": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "SlipStatus.waitingForSec": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "SlipOrigin.kind": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "SlipOrigin.reference": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "SlipOrigin.goal": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "SlipOrigin.stage": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "SlipOrigin.waitingOn": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "QueueItem.id": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "QueueItem.title": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "QueueItem.kind": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "QueueItem.state": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "QueueItem.holder": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "QueueItem.owner": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "QueueItem.delivery": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "QueueItem.queuedAt": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "QueueItem.claimedAt": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "QueueItem.doneAt": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "QueueItem.releasedAt": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "QueueItem.leaseUntil": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "QueueItem.leaseSec": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "QueueItem.attempts": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "QueueItem.renewals": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "QueueItem.reason": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "QueueItem.sourceItem": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "ThreadEntry.id": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "ThreadEntry.slipId": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "ThreadEntry.who": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "ThreadEntry.kind": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "ThreadEntry.body": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "ThreadEntry.oneLine": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "ThreadEntry.href": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "ThreadEntry.actor": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "ThreadEntry.at": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "ThreadDecision.text": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "ThreadDecision.option": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "ThreadDecision.decidedBy": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "ThreadDecision.decidedAt": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "SlipConnection.edges": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "SlipConnection.pageInfo": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "SlipEdge.cursor": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "SlipEdge.node": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "QueueConnection.edges": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "QueueConnection.pageInfo": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "QueueEdge.cursor": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "QueueEdge.node": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "ThreadConnection.edges": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "ThreadConnection.pageInfo": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "ThreadEdge.cursor": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "ThreadEdge.node": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "PageInfo.hasNextPage": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "PageInfo.endCursor": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Null on an empty page, absent object or unanswered ask; never used to signal an authorization failure, which is masked.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "SlipFiled.slip": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "ClaimConflict.holder": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "ClaimConflict.reason": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "ClaimStarted.item": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "ClaimStarted.leaseUntil": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "ClaimStarted.renewEvery": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "RenewAcknowledged.item": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "RenewAcknowledged.leaseUntil": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "RenewAcknowledged.renewEvery": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "QueueCompleted.items": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "QueueReleased.items": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "DecisionRecorded.entry": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "DecisionRecorded.decision": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "DecisionRecorded.routedTo": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "OperationRejected.message": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "SlipStatusEvent.slipId": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "SlipStatusEvent.status": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "SlipStatusEvent.changedAt": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    },
+    "SlipStatusEvent.sequence": {
+      "authorization": "Any authenticated desk member may read. Commands additionally require the caller to hold editor rights on the slip's product lane. Missing and unauthorized rows both return OperationRejected, so absence is never disclosed.",
+      "nullability": "Locally persisted or derived value guaranteed once the parent row is authorized, hence non-null; a fault bubbles to its nearest nullable ancestor.",
+      "source": "Read from the already-loaded parent row or one bounded store query. Queue rows project the queue-state authority; no resolver re-reads the store per row.",
+      "batching": "Resolved from the loaded parent or one bounded query; no per-row remote calls. Request-local cache keys include the desk identity."
+    }
+  },
+  "collections": {
+    "Query.slips": {
+      "kind": "cursor",
+      "max_items": 100,
+      "enforcement": "Resolver defaults omitted or null first to 20 (50 for thread); rejects values outside 1..100 (1..200 for thread). The store query uses LIMIT first+1.",
+      "order": "Ascending immutable identity using binary string comparison over the same key the cursor encodes.",
+      "tie_breaker": "The row identity is unique and is its own final tie-breaker.",
+      "cursor_scope": "Signed opaque cursor binds the desk identity, the ordering version and the last row identity; a cursor from another slip, desk or ordering is rejected."
+    },
+    "Query.queueItems": {
+      "kind": "cursor",
+      "max_items": 100,
+      "enforcement": "Resolver defaults omitted or null first to 20 (50 for thread); rejects values outside 1..100 (1..200 for thread). The store query uses LIMIT first+1.",
+      "order": "Ascending immutable identity using binary string comparison over the same key the cursor encodes.",
+      "tie_breaker": "The row identity is unique and is its own final tie-breaker.",
+      "cursor_scope": "Signed opaque cursor binds the desk identity, the ordering version and the last row identity; a cursor from another slip, desk or ordering is rejected."
+    },
+    "Query.thread": {
+      "kind": "cursor",
+      "max_items": 200,
+      "enforcement": "Resolver defaults omitted or null first to 20 (50 for thread); rejects values outside 1..100 (1..200 for thread). The store query uses LIMIT first+1.",
+      "order": "Ascending immutable identity using binary string comparison over the same key the cursor encodes.",
+      "tie_breaker": "The row identity is unique and is its own final tie-breaker.",
+      "cursor_scope": "Signed opaque cursor binds the desk identity, the ordering version and the last row identity; a cursor from another slip, desk or ordering is rejected."
+    },
+    "Slip.labels": {
+      "kind": "bounded",
+      "max_items": 100,
+      "enforcement": "Built only from an already-bounded source: the parent page, the fixed enum set, or the rows this single command closed."
+    },
+    "SlipConnection.edges": {
+      "kind": "bounded",
+      "max_items": 100,
+      "enforcement": "Built only from an already-bounded source: the parent page, the fixed enum set, or the rows this single command closed."
+    },
+    "QueueConnection.edges": {
+      "kind": "bounded",
+      "max_items": 100,
+      "enforcement": "Built only from an already-bounded source: the parent page, the fixed enum set, or the rows this single command closed."
+    },
+    "ThreadConnection.edges": {
+      "kind": "bounded",
+      "max_items": 100,
+      "enforcement": "Built only from an already-bounded source: the parent page, the fixed enum set, or the rows this single command closed."
+    },
+    "QueueCompleted.items": {
+      "kind": "bounded",
+      "max_items": 100,
+      "enforcement": "Built only from an already-bounded source: the parent page, the fixed enum set, or the rows this single command closed."
+    },
+    "QueueReleased.items": {
+      "kind": "bounded",
+      "max_items": 100,
+      "enforcement": "Built only from an already-bounded source: the parent page, the fixed enum set, or the rows this single command closed."
+    }
+  },
+  "mutations": {
+    "Mutation.fileSlip": {
+      "intent": "Apply exactly one desk or queue transition and return the committed rows; no side write outside the store's lock.",
+      "idempotency": "Caller retry key scoped to holder/desk, recorded with the committed outcome atomically; an identical replay returns the original result, a changed payload is a masked BAD_USER_INPUT error.",
+      "concurrency": "Runs inside the queue store's single lock. Completion requires a live claim held by the caller; a claim held by another holder is refused and named.",
+      "errors": "Typed refusals for expected cases; absent and unauthorized rows share one masked message; unexpected faults stay masked top-level errors."
+    },
+    "Mutation.claimQueueItem": {
+      "intent": "Apply exactly one desk or queue transition and return the committed rows; no side write outside the store's lock.",
+      "idempotency": "Caller retry key scoped to holder/desk, recorded with the committed outcome atomically; an identical replay returns the original result, a changed payload is a masked BAD_USER_INPUT error.",
+      "concurrency": "Runs inside the queue store's single lock. Completion requires a live claim held by the caller; a claim held by another holder is refused and named.",
+      "errors": "Typed refusals for expected cases; absent and unauthorized rows share one masked message; unexpected faults stay masked top-level errors."
+    },
+    "Mutation.renewClaim": {
+      "intent": "Apply exactly one desk or queue transition and return the committed rows; no side write outside the store's lock.",
+      "idempotency": "Caller retry key scoped to holder/desk, recorded with the committed outcome atomically; an identical replay returns the original result, a changed payload is a masked BAD_USER_INPUT error.",
+      "concurrency": "Runs inside the queue store's single lock. Completion requires a live claim held by the caller; a claim held by another holder is refused and named.",
+      "errors": "Typed refusals for expected cases; absent and unauthorized rows share one masked message; unexpected faults stay masked top-level errors."
+    },
+    "Mutation.completeQueueItem": {
+      "intent": "Apply exactly one desk or queue transition and return the committed rows; no side write outside the store's lock.",
+      "idempotency": "Caller retry key scoped to holder/desk, recorded with the committed outcome atomically; an identical replay returns the original result, a changed payload is a masked BAD_USER_INPUT error.",
+      "concurrency": "Runs inside the queue store's single lock. Completion requires a live claim held by the caller; a claim held by another holder is refused and named.",
+      "errors": "Typed refusals for expected cases; absent and unauthorized rows share one masked message; unexpected faults stay masked top-level errors."
+    },
+    "Mutation.releaseQueueItem": {
+      "intent": "Apply exactly one desk or queue transition and return the committed rows; no side write outside the store's lock.",
+      "idempotency": "Caller retry key scoped to holder/desk, recorded with the committed outcome atomically; an identical replay returns the original result, a changed payload is a masked BAD_USER_INPUT error.",
+      "concurrency": "Runs inside the queue store's single lock. Completion requires a live claim held by the caller; a claim held by another holder is refused and named.",
+      "errors": "Typed refusals for expected cases; absent and unauthorized rows share one masked message; unexpected faults stay masked top-level errors."
+    },
+    "Mutation.recordDecision": {
+      "intent": "Apply exactly one desk or queue transition and return the committed rows; no side write outside the store's lock.",
+      "idempotency": "Caller retry key scoped to holder/desk, recorded with the committed outcome atomically; an identical replay returns the original result, a changed payload is a masked BAD_USER_INPUT error.",
+      "concurrency": "Runs inside the queue store's single lock. Completion requires a live claim held by the caller; a claim held by another holder is refused and named.",
+      "errors": "Typed refusals for expected cases; absent and unauthorized rows share one masked message; unexpected faults stay masked top-level errors."
+    }
+  },
+  "scalars": {},
+  "runtime": {
+    "demand_control": "Enforce first<=100 (200 for thread), depth<=8, aliases<=20, HTTP batches<=5 and multiplicative list cost<=1000; calibrate against real desk traffic.",
+    "tenant_isolation": "Desk identity is taken from the authenticated principal, never from a caller-supplied id; every read, command, cursor and request-local cache is scoped by it.",
+    "authorization_tests": "Cover cross-desk slip and row ids, forged cursors, a claim held by another holder and a revoked membership; assert absent and unauthorized rows cannot be told apart.",
+    "performance_tests": "Compare query counts for 1 and 100 rows; both page reads stay constant. Check the plan uses the cursor index and that no resolver loops.",
+    "schema_codegen": "Generate client types from this exact SDL and the operation documents, compile the clients and check their mocks match the operation shapes.",
+    "subscriptions": "Status changes stream one event per change with a monotonic sequence number; a client that reconnects must be able to drop anything it already painted."
+  }
+}

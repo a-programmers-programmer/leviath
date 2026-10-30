@@ -1,0 +1,187 @@
+[
+  {
+    "operation": "BrowseSlips",
+    "variables": {
+      "first": 20,
+      "after": null
+    },
+    "expected": "valid"
+  },
+  {
+    "operation": "GetSlip",
+    "variables": {
+      "id": "d-0123456789ab"
+    },
+    "expected": "valid"
+  },
+  {
+    "operation": "BrowseQueue",
+    "variables": {
+      "first": 20,
+      "after": null
+    },
+    "expected": "valid"
+  },
+  {
+    "operation": "GetThread",
+    "variables": {
+      "slipId": "d-0123456789ab",
+      "first": 50,
+      "after": null
+    },
+    "expected": "valid"
+  },
+  {
+    "operation": "GetSlipStatus",
+    "variables": {
+      "slipId": "d-0123456789ab"
+    },
+    "expected": "valid"
+  },
+  {
+    "operation": "FileSlip",
+    "variables": {
+      "input": {
+        "title": "Fix the board",
+        "product": "PLATFORM",
+        "kind": "TASK",
+        "owner": "BOTH",
+        "delivery": "SIMPLE_CITY",
+        "labels": [
+          "desk"
+        ]
+      }
+    },
+    "expected": "valid"
+  },
+  {
+    "operation": "FileSlip",
+    "variables": {
+      "input": {
+        "title": "Fix the board",
+        "product": "NOPE"
+      }
+    },
+    "expected": "invalid"
+  },
+  {
+    "operation": "FileSlip",
+    "variables": {
+      "input": {
+        "product": "PLATFORM"
+      }
+    },
+    "expected": "invalid"
+  },
+  {
+    "operation": "ClaimQueueItem",
+    "variables": {
+      "input": {
+        "rowId": "q-1788781449456",
+        "holder": "worker-1",
+        "kind": "desk-prompt",
+        "leaseSec": 900,
+        "idempotencyKey": "claim-1"
+      }
+    },
+    "expected": "valid"
+  },
+  {
+    "operation": "ClaimQueueItem",
+    "variables": {
+      "input": {
+        "rowId": "q-1788781449456",
+        "holder": "worker-1",
+        "leaseSec": "not-a-number",
+        "idempotencyKey": "claim-1"
+      }
+    },
+    "expected": "invalid"
+  },
+  {
+    "operation": "RenewClaim",
+    "variables": {
+      "input": {
+        "rowId": "q-1788781449456",
+        "holder": "worker-1",
+        "leaseSec": 900,
+        "idempotencyKey": "renew-1"
+      }
+    },
+    "expected": "valid"
+  },
+  {
+    "operation": "CompleteQueueItem",
+    "variables": {
+      "input": {
+        "rowId": "q-1788781449456",
+        "holder": "worker-1",
+        "resultDigest": "abc123",
+        "idempotencyKey": "done-1"
+      }
+    },
+    "expected": "valid"
+  },
+  {
+    "operation": "ReleaseQueueItem",
+    "variables": {
+      "input": {
+        "rowId": "q-1788781449456",
+        "holder": "worker-1",
+        "reason": "lane died without closing the row",
+        "idempotencyKey": "release-1"
+      }
+    },
+    "expected": "valid"
+  },
+  {
+    "operation": "ReleaseQueueItem",
+    "variables": {
+      "input": {
+        "rowId": "q-1788781449456",
+        "holder": "worker-1",
+        "idempotencyKey": "release-1"
+      }
+    },
+    "expected": "invalid"
+  },
+  {
+    "operation": "RecordDecision",
+    "variables": {
+      "input": {
+        "slipId": "d-0123456789ab",
+        "text": "Ship option B",
+        "option": "B",
+        "expectedRevision": 3,
+        "idempotencyKey": "decide-1"
+      }
+    },
+    "expected": "valid"
+  },
+  {
+    "operation": "RecordDecision",
+    "variables": {
+      "input": {
+        "slipId": "d-0123456789ab",
+        "text": "Ship option B",
+        "expectedRevision": "bad",
+        "idempotencyKey": "decide-1"
+      }
+    },
+    "expected": "invalid"
+  },
+  {
+    "operation": "WatchSlipStatus",
+    "variables": {
+      "slipId": null
+    },
+    "expected": "valid"
+  },
+  {
+    "operation": "WatchSlipStatus",
+    "variables": {
+      "slipId": "d-0123456789ab"
+    },
+    "expected": "valid"
+  }
+]
