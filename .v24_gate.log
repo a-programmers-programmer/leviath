@@ -1,0 +1,85 @@
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /data/work/graphql-realization/gql-00/wt/L01-gql24/crates/leviath-cli/Cargo.toml
+workspace: /data/work/graphql-realization/gql-00/wt/L01-gql24/Cargo.toml
+   Compiling leviath-cli v0.5.9 (/data/work/graphql-realization/gql-00/wt/L01-gql24/crates/leviath-cli)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 12.09s
+     Running unittests src/lib.rs (target/debug/deps/leviath_cli-77f63f92dcb149c6)
+
+running 73 tests
+test commands::serve::tests::a_server_test_cannot_run_an_upgrade_command ... ok
+test commands::serve::tests::assert_connected_with_bad_api_key_panics_when_not_connected - should panic ... ok
+test commands::serve::tests::assert_error_says_panics_when_the_message_is_missing - should panic ... ok
+test commands::serve::tests::assert_execute_failed_on_port_in_use_panics_when_ok - should panic ... ok
+test commands::serve::tests::assert_execute_failed_on_malformed_config_panics_when_ok - should panic ... ok
+test commands::serve::tests::assert_response_ok_panics_when_not_200 - should panic ... ok
+test commands::serve::tests::assert_execute_with_shutdown_returned_ok_panics_when_err - should panic ... ok
+test commands::serve::tests::assert_execute_returned_ok_after_shutdown_panics_when_err - should panic ... ok
+test commands::serve::tests::execute_refuses_to_start_without_a_token ... ok
+test commands::serve::tests::every_deadline_exemption_is_a_served_route_the_guide_names ... ok
+test commands::serve::tests::every_announced_capability_is_explained_in_the_guide ... ok
+test commands::serve::tests::test_agent_context_not_found ... ok
+test commands::serve::tests::test_agent_result_not_found ... ok
+test commands::serve::tests::test_agent_logs_not_found ... ok
+test commands::serve::tests::test_agent_files_route_is_mounted ... ok
+test commands::serve::tests::test_app_state_clone ... ok
+test commands::serve::tests::test_cors_wildcard_vs_specific ... ok
+test commands::serve::tests::test_cors_invalid_origin_falls_back ... ok
+test commands::serve::tests::test_fs_dirs_route_is_mounted ... ok
+test commands::serve::tests::test_delete_blueprint_not_found ... ok
+test commands::serve::tests::test_full_router_create_blueprint_invalid ... ok
+test commands::serve::tests::test_full_router_kill_agent_reaches_daemon ... ok
+test commands::serve::tests::test_full_router_send_message_reaches_daemon ... ok
+test commands::serve::tests::test_full_router_update_blueprint_not_found ... ok
+test commands::serve::tests::test_get_agent_not_found ... ok
+test commands::serve::tests::test_get_config ... ok
+test commands::serve::tests::test_interaction_route_reaches_daemon ... ok
+test commands::serve::tests::a_bad_tls_configuration_stops_the_server_before_it_binds ... ok
+test commands::serve::tests::test_full_router_get_models ... ok
+test commands::serve::tests::execute_with_bad_api_key_logs_warning_and_serves ... ok
+test commands::serve::tests::test_pause_and_resume_routes_are_mounted ... ok
+test commands::serve::tests::test_serve_args_defaults ... ok
+test commands::serve::tests::test_server_event_serialization ... ok
+test commands::serve::tests::test_router_serves_routes_the_old_hand_copy_missed ... ok
+test commands::serve::tests::test_tree_building ... ok
+test commands::serve::tests::test_submit_interaction_full_router_reaches_daemon ... ok
+test commands::serve::tests::test_validate_blueprint_invalid ... ok
+test commands::serve::tests::the_api_version_matches_the_spec_it_names ... ok
+test commands::serve::tests::the_handler_reader_names_the_function_behind_each_method ... ok
+test commands::serve::tests::test_validate_blueprint_valid ... ok
+test commands::serve::tests::test_agent_children_empty ... ok
+test commands::serve::tests::execute_with_shutdown_signal_returns_ok ... ok
+test commands::serve::tests::the_openapi_spec_documents_exactly_the_routes_this_router_serves ... ok
+test commands::serve::tests::the_route_reader_finds_the_routes_that_are_actually_there ... ok
+test commands::serve::tests::the_route_reader_ignores_text_that_is_not_a_route ... ok
+test commands::serve::tests::the_route_reader_reads_nothing_out_of_source_with_no_routes ... ok
+test commands::serve::tests::test_agents_tree ... ok
+test commands::serve::tests::the_status_code_scan_reads_a_crlf_checkout_the_same ... ok
+test commands::serve::tests::the_openapi_spec_documents_every_status_a_handler_can_answer ... ok
+test commands::serve::tests::test_agent_tree_status_not_found ... ok
+test commands::serve::tests::test_get_blueprint_not_found ... ok
+test commands::serve::tests::test_full_router_spawn_agent_blueprint_not_found ... ok
+test commands::serve::tests::test_list_blueprints ... ok
+test commands::serve::tests::execute_with_shutdown_no_ready_observer_returns_ok ... ok
+test commands::serve::tests::test_agent_list_with_status_filter_full_router ... ok
+test commands::serve::tests::execute_with_specific_cors_origin_serves ... ok
+test commands::serve::tests::execute_with_unbindable_address_returns_bind_error ... ok
+test commands::serve::tests::execute_on_a_taken_port_names_the_port_flag ... ok
+test commands::serve::tests::execute_with_unparseable_addr_returns_err ... ok
+test commands::serve::tests::test_list_agents ... ok
+test commands::serve::tests::cors_is_off_by_default_explicit_when_asked_and_fatal_when_malformed ... ok
+test commands::serve::tests::execute_binds_and_serves_with_wildcard_cors ... ok
+test commands::serve::tests::execute_cors_preflight_allows_authorization_header ... ok
+test commands::serve::tests::execute_with_malformed_config_returns_err ... ok
+test commands::serve::tests::execute_serves_https_and_the_status_page_needs_no_token ... ok
+test commands::serve::tests::https_shuts_down_when_its_signal_resolves ... ok
+test commands::serve::tests::request_limits_default_to_64_in_flight_and_30_seconds ... ok
+test commands::serve::tests::request_limits_come_from_the_flag_then_the_config_then_the_default ... ok
+test commands::serve::tests::the_mcp_admin_routes_are_mounted_only_with_allow_admin ... ok
+test commands::serve::tests::the_models_probe_is_mounted_only_with_allow_admin ... ok
+test commands::serve::tests::the_script_write_routes_are_mounted_only_with_allow_admin ... ok
+test commands::serve::tests::the_update_admin_routes_are_mounted_only_with_allow_admin ... ok
+test commands::serve::tests::the_websocket_outlives_the_deadline_and_holds_no_slot ... ok
+
+test result: ok. 73 passed; 0 failed; 0 ignored; 0 measured; 4773 filtered out; finished in 2.57s
+
+EXIT=0

@@ -1,0 +1,12 @@
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /data/work/graphql-realization/gql-00/wt/L01-gql24/crates/leviath-cli/Cargo.toml
+workspace: /data/work/graphql-realization/gql-00/wt/L01-gql24/Cargo.toml
+   Compiling leviath-cli v0.5.9 (/data/work/graphql-realization/gql-00/wt/L01-gql24/crates/leviath-cli)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 12.29s
+     Running unittests src/lib.rs (target/debug/deps/leviath_cli-77f63f92dcb149c6)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4846 filtered out; finished in 0.00s
+
+EXIT=0
