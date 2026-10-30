@@ -1,0 +1,9 @@
+[workspace]
+[package]
+name = "no_grant_deserialize"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+leviath-confirm = { path = "/data/work/graphql-realization/gql-06/repo/crates/leviath-confirm" }
+serde_json = "1"

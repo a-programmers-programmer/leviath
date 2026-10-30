@@ -16,6 +16,7 @@ members = [
     "crates/leviath-sys",
     "crates/leviath-telemetry",
     "crates/leviath-testkit",
+    "crates/leviath-confirm",
     "xtask",
 ]
 
