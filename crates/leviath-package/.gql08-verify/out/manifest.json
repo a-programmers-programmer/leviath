@@ -1,0 +1,65 @@
+{
+  "contract_fingerprint": "ff9df4e32b05747ee3605042407dcc7e17a347f41bc1464ce567c2f484813559",
+  "files": {
+    "contract/operations.graphql": "1642968ac695c5087c6a99636d4b28e595ec6ee27f450e3a77e3c63a897e3cc7",
+    "contract/schema.graphql": "ff9df4e32b05747ee3605042407dcc7e17a347f41bc1464ce567c2f484813559",
+    "python/leviath_generated/__init__.py": "2d65f2ff1d1c4aaefa0ea343cd774fadfdb39455a7bccd83596096785b774d2f",
+    "python/leviath_generated/interfaces.py": "f0410e9797eea6d4226c44bfc94d3ca69bab4f8580f96410770d0967b96ba43c",
+    "python/leviath_generated/operations.py": "1b991eb477f332a14d2a5f7b1a70ca677bf0a344d8ec52a42676688f6fb7db15",
+    "python/leviath_generated/py.typed": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "python/leviath_generated/scalars.py": "a4802729802868043e16fb648a697d26e3e082278b72d6e9e64c61b5a164dcca",
+    "sourcemap.json": "44e82acdf283a3a419be8c86d82ced894d2b9b3a7fcaa862bb7c3a724552f49c",
+    "typescript/src/index.ts": "ddeee04f7b73d3a6a9d9d4ec8ab21d626c902f2d6cb8bbd7f4394fe49d6812fa",
+    "typescript/src/interfaces.ts": "8ef0f9b13bcf4e3ea65a0ef8ee3ae7687e6170ed640d3c56dca0d5b95db4f3cf",
+    "typescript/src/operations.ts": "8fc236b762c293bf4a4032cda50906e8ea11cd81f103fca5f93b869c0cfa6f8a",
+    "typescript/src/scalars.ts": "db0b6d5ab7c36d602158fb6e0dcf2b739a9d8098c02a90803a567b25f82ed98d",
+    "typescript/tsconfig.json": "ae0c8c05523371bf974d4402269475f9eee28480fd5b9b8edb96d46a4f9d33b0"
+  },
+  "format": "leviath-codegen-manifest/v1",
+  "generated_paths": [
+    "contract/operations.graphql",
+    "contract/schema.graphql",
+    "python/leviath_generated/__init__.py",
+    "python/leviath_generated/interfaces.py",
+    "python/leviath_generated/operations.py",
+    "python/leviath_generated/py.typed",
+    "python/leviath_generated/scalars.py",
+    "sourcemap.json",
+    "typescript/src/index.ts",
+    "typescript/src/interfaces.ts",
+    "typescript/src/operations.ts",
+    "typescript/src/scalars.ts",
+    "typescript/tsconfig.json"
+  ],
+  "generator": "leviath_codegen 1.0.0",
+  "handwritten_paths": [
+    "handwritten/README.md",
+    "handwritten/python/leviath_handwritten/resolvers.py",
+    "handwritten/typescript/resolvers.ts"
+  ],
+  "operations": [
+    "SearchWorkflows",
+    "Workflows",
+    "Workflow",
+    "WorkflowByName",
+    "WorkflowRun",
+    "EdgeInvariantRules",
+    "DispatchWorkflow",
+    "RunWorkflowStep",
+    "RespondToGate"
+  ],
+  "pinned_fingerprint": "ff9df4e32b05747ee3605042407dcc7e17a347f41bc1464ce567c2f484813559",
+  "scalars": [
+    "Boolean",
+    "Confidential",
+    "DateTime",
+    "Decimal",
+    "Duration",
+    "Float",
+    "ID",
+    "Int",
+    "PortValue",
+    "String",
+    "URI"
+  ]
+}
