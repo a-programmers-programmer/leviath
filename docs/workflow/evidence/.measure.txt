@@ -1,0 +1,42 @@
+### readings
+A worktree-contract:  2 files changed, 249 insertions(+), 27 deletions(-)
+B e48f48d0:  22 files changed, 6328 insertions(+)
+B' 67e16649:  2 files changed, 180 insertions(+), 1 deletion(-)
+B'' 5ed2ba6c:  3 files changed, 83 insertions(+), 29 deletions(-)
+B''' 7b6e050e:  2 files changed, 35 insertions(+), 24 deletions(-)
+E python+tools @7b6e050e:  19 files changed, 6096 insertions(+)
+C python+tools+evidence @7b6e050e:  22 files changed, 6571 insertions(+)
+D all @7b6e050e:  23 files changed, 6572 insertions(+)
+I evidence only @7b6e050e:  3 files changed, 475 insertions(+)
+### HEAD blobs
+e5097265b1d2cc413eec9b40f76e5315ea287f94c08c256d9d0c289a24d822d7 4101 docs/workflow/evidence/run-gql02-acceptance.sh
+d49529634b69b3537b4f7b95d45e24f38dc67ae5a752468475f54ef81ba7e46e 8485 docs/workflow/evidence/gql-02-acceptance-run.txt
+ec9cc7c367be7b7dba02d3bf14761786e24cea2b86f047f2477f23fc2cd0a260 13126 docs/workflow/evidence/gql-02-acceptance.md
+### worktree
+2b9458fcf53a020ca2c8283c037c7f834977740b11db374e7fcee0386c18788b  docs/workflow/evidence/run-evidence.sh
+f64bfe2f0bd78b5a9586f85604bd9080201dc95a2b22bfeca11b09583f269c59  docs/workflow/evidence/run-gql02-acceptance.sh
+64bad9bb4a09777a449caa2942de647c3941e551909134fad6092a5d6afcf95b  docs/workflow/evidence/gql-02-acceptance-run.txt
+48dbe36c69886df88969f0ff72fda1501211b53de79795594fc6e63b3a1c8b4f  docs/workflow/evidence/gql-02-acceptance.md
+ 2516 docs/workflow/evidence/run-evidence.sh
+ 4245 docs/workflow/evidence/run-gql02-acceptance.sh
+ 8476 docs/workflow/evidence/gql-02-acceptance-run.txt
+13893 docs/workflow/evidence/gql-02-acceptance.md
+29130 total
+### head-transcript line3
+== HEAD: 7b6e050e89e6aea7b51453e633fbe9209c50a844
+### HEAD-transcript line3
+== HEAD: 5ed2ba6c69ee4b55d5a8dbbfb25fbf27b4a6b649
+### HEAD packet own-commit greps
+19:`5ed2ba6c69ee4b55d5a8dbbfb25fbf27b4a6b649`
+21:top of `67e16649` (transcript + first diff-stat correction), on top of
+56:| B' | commit `67e16649` only | first evidence correction | 2 files, 180 insertions(+), 1 deletion(-) |
+58:| C | `67e16649` vs base | committed `python`+`tools`+`evidence` | 22 files, 6506 insertions(+) |
+59:| D | `67e16649` vs base | committed all | 23 files, 6507 insertions(+) |
+60:| I | `67e16649` vs base | committed `docs/workflow/evidence` only | 3 files, 410 insertions(+) |
+62:The readings at `67e16649` reconcile exactly:
+66:`5ed2ba6c` they are C = 6560, D = 6561, I = 464. Reading E is unchanged at
+77:correction is `67e16649`. Neither is pushed.
+124:== HEAD: 5ed2ba6c69ee4b55d5a8dbbfb25fbf27b4a6b649
+180:Superseded at `67e16649` (earlier revision of the same two files):
+### bd
+bd not installed

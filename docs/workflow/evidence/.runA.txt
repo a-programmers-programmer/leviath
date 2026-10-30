@@ -1,0 +1,151 @@
+== GQL-02 acceptance: shared reconciliation rules and conflict detection
+== repo: /data/work/graphql-realization/gql-02/repo
+== HEAD: 7b6e050e89e6aea7b51453e633fbe9209c50a844
+== base: 15dc182e0bc6c28dfa93f4b8dd3c423372808f61
+== python: Python 3.12.14  graphql-core: 3.2.5
+
+=== [1] DoD clause: symmetry, concurrent conflicts, staleness, idempotence (selftest)
+leviath-reconcile 1.0.0 — self-test: PASS
+  [PASS] symmetry     both directions rename with zero conflicts; each run resolves on the editing projection only; the untouched side keeps its agreed value; both directions reach a fixed point; both directions retype with zero conflicts; re-reconciling unchanged projections applies nothing
+  [PASS] concurrent   rename-divergence -> ['rename-divergence']; both rename proposals preserved verbatim; rename-vs-delete -> ['rename-vs-delete']; add-vs-delete -> ['add-vs-delete']; delete-vs-edit -> ['delete-vs-edit']; type-divergence -> ['type-divergence']; existence-divergence -> ['existence-divergence']; ambiguous-identity -> ['ambiguous-identity']; disjoint edits (rename here, retype there) apply on both sides
+  [PASS] staleness    superseded document blocks the merge and leaves the body untouched; accept() raises StaleView for a stale view; the same edit from the current document reconciles; an empty projection is refused instead of deleting everything; BaselineStore.commit refuses a stale revision (compare-and-set); the refused commit left the accepted state intact
+  [PASS] idempotence  3 rounds re-reconciled; body digest stable at d67c23bb0217f529; zero changes after the first
+  crosswalk: PASS (21 cases)
+  invariants: PASS (9 cases)
+exit=0
+
+=== [2] contract pin re-verification (GQL-01 accepted fingerprint)
+{
+  "artifact_fingerprint": "1a884c8bb6c21d6f48c56d7a59a51ff6eb3bb12200d0d9df7c28331bfce4e46d",
+  "expected": "ff9df4e32b05747ee3605042407dcc7e17a347f41bc1464ce567c2f484813559",
+  "observed": "ff9df4e32b05747ee3605042407dcc7e17a347f41bc1464ce567c2f484813559",
+  "result": "PASS",
+  "sdl": "docs/workflow/schema-workflow.graphql"
+}
+exit=0
+
+=== [3] real-artifact end-to-end proof (real SDL vs real typed Python)
+{
+  "checks": [
+    "real SDL and real typed-Python pair reconcile with zero conflicts",
+    "a real schema-only rename and its code-only mirror resolve symmetrically",
+    "a real schema-only retype and its code-only mirror resolve symmetrically",
+    "a superseded real document blocks the merge and accept() raises StaleView",
+    "3 rounds re-reconciled the real pair; body digest stable; zero changes after the first"
+  ],
+  "code_warnings": [],
+  "contract": "leviath-reconcile/e2e-real/v1",
+  "metrics": {
+    "body_digest": "0f71ee64d562e67bc0b7c4a91f6678a41b26fe4b0dc9135c90e4c75c528c8ef0",
+    "code": "python/leviath_reconcile/fixtures/workflow_model.py",
+    "code_facts": 1995,
+    "code_mode": "python-ast",
+    "schema_facts": 2136,
+    "sdl": "docs/workflow/schema-workflow.graphql",
+    "sdl_mode": "graphql-core"
+  },
+  "result": "PASS",
+  "schema_warnings": []
+}
+exit=0
+
+=== [4] contract pin + both adapters bound end-to-end + no ping-pong
+{
+  "adapters": [
+    {
+      "adapter": "schema_adapter",
+      "document_identity": "bdfe6d55584452d08f47ccb1f9812c715a0dcf89c6e55a8d84d8e50f60e67329",
+      "fact_count": 2136,
+      "mode": "graphql-core",
+      "projection_name": "schema",
+      "warnings": []
+    },
+    {
+      "adapter": "python_adapter",
+      "document_identity": "1bb94f40bd1caaa80f0b46302e85bc2f230dee7c5eaa9f449e64161fdedd9090",
+      "fact_count": 1995,
+      "mode": "python-ast",
+      "projection_name": "code",
+      "warnings": []
+    }
+  ],
+  "contract": "leviath-reconcile/pin-check/v1",
+  "observed": "ff9df4e32b05747ee3605042407dcc7e17a347f41bc1464ce567c2f484813559",
+  "pin_host": "docs/workflow/workflow-schema-decisions.md",
+  "pin_host_digest": "8c3056bbb91a2fd52af261c25768bc9645ccde24620a59b6a2e3fa32e5f5c9e5",
+  "pingpong": {
+    "changed": [
+      false,
+      false,
+      false
+    ],
+    "detail": "3 rounds re-reconciled the pin-bound pair; body digest stable at 0f71ee64d562; zero changes after the first",
+    "digest_stable": true,
+    "digests": [
+      "0f71ee64d562e67bc0b7c4a91f6678a41b26fe4b0dc9135c90e4c75c528c8ef0",
+      "0f71ee64d562e67bc0b7c4a91f6678a41b26fe4b0dc9135c90e4c75c528c8ef0",
+      "0f71ee64d562e67bc0b7c4a91f6678a41b26fe4b0dc9135c90e4c75c528c8ef0"
+    ],
+    "ok": true,
+    "rounds": 3
+  },
+  "pinned": "ff9df4e32b05747ee3605042407dcc7e17a347f41bc1464ce567c2f484813559",
+  "pinned_before": "GQL-02a (reconciliation code) and GQL-02b (adapter binding)",
+  "result": "PASS",
+  "sdl": "docs/workflow/schema-workflow.graphql"
+}
+exit=0
+
+=== [5] pinned acceptance tests (GQL-02b)
+.............                                                            [100%]
+13 passed
+exit=0
+
+=== [6] gate discrimination: a drifted contract must FAIL loudly
+contract drift: contract drift: expected 0000000000000000000000000000000000000000000000000000000000000000, observed ff9df4e32b05747ee3605042407dcc7e17a347f41bc1464ce567c2f484813559
+verify-contract with wrong pin                 exit=1 (expect 1) OK
+
+=== [7] artifact hashes (sha256)
+2cb5a7653f706bed42d3cd5787a3896701fce24884072afa9063a297db835a4f    16977  docs/workflow/schema-workflow.graphql
+8c3056bbb91a2fd52af261c25768bc9645ccde24620a59b6a2e3fa32e5f5c9e5     2256  docs/workflow/workflow-schema-decisions.md
+0dade7cd2e878839326996940174f713b7d7b5b18a9437f120755cf21bd11dd3    15043  python/leviath_reconcile/pin.py
+3c3711333d006161e1c353ea45c386e336b70618b77c1b6709b37d1b47cafa77     6941  python/leviath_reconcile/test_pin.py
+a4bc37f8ba1e8284655c902122209668be5a16bf2b38692f1401027deb75651a    14930  python/leviath_reconcile/cli.py
+a01b062cb3d4be11461557eb629bdab70d091f904691b9c908b9923e15e3cd8c     2207  python/leviath_reconcile/__init__.py
+5e3525c125b6419c3cf864aed2fee79a5096d3a678d3809cea5bdfc9fcf810c8    38088  python/leviath_reconcile/reconcile.py
+fbda5372c826d1a0ba651b9bbbe6c0088170468f5da12f3b9ce02c85119e6fb1    21158  python/leviath_reconcile/identity.py
+806fa6e6fc9786d2a5ef68c9574315a6c297e0cd173f0a7987bb3de46fcaec7d    12786  python/leviath_reconcile/crosswalk.py
+218848d582059cc034192a158353adb8132ea8b45b6fb913caa517ac92b0e163    28532  python/leviath_reconcile/scenarios.py
+9576c71e65700f82c7453ef0868917d4d2a0fbbaab6ebd9dac4d61ab8e6bd9f9     9822  python/leviath_reconcile/e2e_real.py
+655c3f4987cda0bb82ad4120541823e880f9bc6c155f3b5c9ecdaa2c43611dff    18604  python/leviath_reconcile/adapters/schema_adapter.py
+543159bdc9fc933eb4fa09441825df24835f4351dd359dc5e028f43353c36672    15975  python/leviath_reconcile/adapters/python_adapter.py
+79479ed622614dfa87b54fe91501bad003a36c9d1aed0c07e5b3cc3e34b3b672     8503  python/leviath_reconcile/fixtures/workflow_model.py
+ea1965f49ff83b85812a2a691058aeb235713c0935c3a7856cce6b4901b56fbe     8550  tools/generate_code_counterpart.py
+
+=== [8] resulting diff stat vs base (committed only; reproducible)
+ python/leviath_reconcile/__init__.py               |  65 ++
+ python/leviath_reconcile/__main__.py               |  17 +
+ python/leviath_reconcile/adapters/__init__.py      |  27 +
+ .../leviath_reconcile/adapters/python_adapter.py   | 405 +++++++++
+ .../leviath_reconcile/adapters/schema_adapter.py   | 405 +++++++++
+ python/leviath_reconcile/baseline.py               | 173 ++++
+ python/leviath_reconcile/cli.py                    | 388 +++++++++
+ python/leviath_reconcile/crosswalk.py              | 278 +++++++
+ python/leviath_reconcile/diff.py                   | 232 ++++++
+ python/leviath_reconcile/e2e_real.py               | 223 +++++
+ .../leviath_reconcile/fixtures/workflow_model.py   | 391 +++++++++
+ python/leviath_reconcile/identity.py               | 517 ++++++++++++
+ python/leviath_reconcile/invariants.py             | 278 +++++++
+ python/leviath_reconcile/model.py                  | 298 +++++++
+ python/leviath_reconcile/pin.py                    | 404 +++++++++
+ python/leviath_reconcile/reconcile.py              | 912 +++++++++++++++++++++
+ python/leviath_reconcile/scenarios.py              | 663 +++++++++++++++
+ python/leviath_reconcile/test_pin.py               | 189 +++++
+ tools/generate_code_counterpart.py                 | 231 ++++++
+ 19 files changed, 6096 insertions(+)
+informational, grows with each evidence commit:
+ 23 files changed, 6572 insertions(+)
+informational, worktree contract files vs base (GQL-01, uncommitted):
+ 2 files changed, 249 insertions(+), 27 deletions(-)
+
+GQL-02 acceptance: PASS
