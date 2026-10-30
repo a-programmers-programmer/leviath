@@ -1,0 +1,468 @@
+=== SEARCH LOG node 0002 recovery, 2026-09-15T04:37:27Z ===
+Lane B2-0002 | branch lane/B2-0002 | worktree /data/work/graphql-realization/gql-00/wt/B2-0002
+Base commit 7b6e050e89e6aea7b51453e633fbe9209c50a844
+Model path: openrouter/deepseek/deepseek-v4.1-flash
+
+--- S1: grep -rln 'railway-credential-live' /data /root /opt /tmp ---
+(no output)
+RC=0
+RESULT: zero hits. Cited source 0008-railway-credential-live.md not found by content.
+
+--- S2: find /data /root /opt /tmp -name "0008-railway-credential-live.md" ---
+(no output)
+RC=0
+RESULT: zero hits. Cited source 0008 absent by name.
+
+--- S3: ls -la /data/work/ceo-bus/inbox ---
+ls: cannot access '/data/work/ceo-bus/inbox': No such file or directory
+RC=2
+RESULT: original inbox folder absent.
+
+--- S4: grep -rl "Early Fleet operations" /data/work/ceo-bus /data/state ---
+(no output)
+RC=0
+RESULT: zero hits. No original 0002 body carrying the parent name.
+
+--- S5: find /data -xdev -name "*0002*" ---
+(only npm cache hash paths, no 0002 assignment body)
+RC=0
+
+--- S6: grep -rln -iE "(close|closed|withdraw|supersed|retire)" /data/work/ceo-bus --include=*.md | xargs grep -ln "0002" ---
+/data/work/ceo-bus/outbox/0049-gql-00-report.md
+/data/work/ceo-bus/outbox/0186-progress-1.md
+/data/work/ceo-bus/outbox/0168-handoff-2.md
+/data/work/ceo-bus/outbox/fleet-sustained-throughput-20260914T1448Z-reply.md
+/data/work/ceo-bus/outbox/0193-progress-20260915T0245Z.md
+RC=0
+RESULT: all false hits — "0002" occurs inside floats/model names, not as node 0002.
+
+--- S7: per-file grep -n "0002" on the five S6 hits ---
+/data/work/ceo-bus/outbox/0049-gql-00-report.md:77: `openai/gpt-5.5-pro` and `openai/gpt-5.4-pro` (0.00003/0.00018), `openai/o3-pro` (0.00002/0.00008),
+/data/work/ceo-bus/outbox/0186-progress-1.md:25: | 6 | `/data/work/graphql-realization/gql-00/HANDOFF.md` | ... | `6d84ca0002eb21af3a9dfa83dc87c6ebbb5bf97bccaef394093fdc5cd837dc15` |
+/data/work/ceo-bus/outbox/0186-progress-1.md:37: stage_index 2, iteration 161, tool_calls 243, cost_usd `0.8573669580000002`,
+/data/work/ceo-bus/outbox/0168-handoff-2.md:102: pricing line (0.00002/0.00008)
+/data/work/ceo-bus/outbox/fleet-sustained-throughput-20260914T1448Z-reply.md:118: model `openrouter/deepseek/deepseek-v4-pro`
+/data/work/ceo-bus/outbox/0193-progress-20260915T0245Z.md:75: | cost_usd | 1.8223442040000002 (exact, from meta) |
+RC=0
+RESULT: confirmed false hits. No close decision, no assignment body.
+
+--- S8: real 0002 references (backlog-shape + addendum) ---
+/data/work/ceo-bus/tmp/route-20260915T0013/backlog-shape-20260915T0000Z-residuals.md:56-65
+/data/work/ceo-bus/tmp/tick20260915T0102/inbox/backlog-shape-20260915T0000Z-comprehensive-goals.md:52
+/data/work/ceo-bus/outbox-staging/0193-addendum-20260915T0424Z.md:7 (names lane B2-0002)
+RC=0
+
+--- S9: cited source 1 local copy ---
+f=/data/work/ceo-bus/0001-progress-railway-unblocked.md
+59 /data/work/ceo-bus/0001-progress-railway-unblocked.md
+4a9f72c2d5c2db36467272fedf72f5fcbf4c70d20c846796a6c645d504174976  /data/work/ceo-bus/0001-progress-railway-unblocked.md
+RC=0
+RESULT: exists. Full body read and quoted in report.md.
+
+--- S10: supporting 0001-family hashes ---
+46  /data/work/ceo-bus/0001-ack-bus-online.md
+4f6cd6bae882d64cab1330c6ab02eb0646ef8879604a0cf07603e8f7c005a834  /data/work/ceo-bus/0001-ack-bus-online.md
+58  /data/work/ceo-bus/0001-progress-github-unblocked.md
+6a0637cf17646a849ae3981b5bf98a8585ad46f39dd6e1087324471eb74feb4e  /data/work/ceo-bus/0001-progress-github-unblocked.md
+4759  /data/work/ceo-bus/state.md
+406614dda6c117a75b75b55dcd1300763589d2fd9645267c2b1c2630452ea203  /data/work/ceo-bus/state.md
+149  /data/work/ceo-bus/capabilities.md
+32dc47ed379de0f66ff136617d95d53381337f88b89eb34e885560b92ebee07b  /data/work/ceo-bus/capabilities.md
+RC=0
+
+--- S11: backlog-shape artifact hashes ---
+691  /data/work/ceo-bus/tmp/route-20260915T0013/backlog-shape-20260915T0000Z-residuals.md
+405186f630ad09e506c73fcc5ab4bfed31b892159981e938c45f4cde14ba38cb  .../backlog-shape-20260915T0000Z-residuals.md
+166  /data/work/ceo-bus/tmp/tick20260915T0102/inbox/backlog-shape-20260915T0000Z-comprehensive-goals.md
+1877acc4c6672087e76021cdb381d85ea72140461698994af574390db6fd6398  .../backlog-shape-20260915T0000Z-comprehensive-goals.md
+17  /data/work/ceo-bus/outbox-staging/0193-addendum-20260915T0424Z.md
+05fa5de702d2ad447a20371a8d4f90ff7394c4ac8df0833c560632bcaeb0ff6b  /data/work/ceo-bus/outbox-staging/0193-addendum-20260915T0424Z.md
+RC=0
+
+--- S12: grep -n "0002" /data/work/ceo-bus/state.md ---
+112:1. ~~0002 and 0005 blocked on a Railway credential~~ — **RESOLVED 2026-09-11.** A
+115:   projects, services, deployments, buildLogs, deploymentLogs. Directive **0002 is
+130:## Open question for the CEO — 0002's premise looks stale
+132:0002 states `hermes-gateway` has been build-failing and crash-looping "since Aug 24,
+RC=0
+
+--- S13: grep -rln "0008" /data/work/ceo-bus --include=*.md ---
+(only false hits from numeric substrings; no 0008-railway-credential-live.md)
+RC=0
+
+=== SUMMARY ===
+Q1 original 0002 body exists locally: NO
+Q2 explicit close decision for 0002 exists locally: NO
+Q3 cited source 0001-progress-railway-unblocked.md: EXISTS, hashed, quoted
+   cited source 0008-railway-credential-live.md: ABSENT (zero hits; only a Drive link)
+External fetch: NOT performed (not permitted).
+Railway call: NOT performed. Credential read: NOT performed.
+Writes: only inside docs/recovery/0002.
+/data/profiles/jarvos/state.db
+/data/profiles/jarvos/sessions/request_dump_20260825_202520_447f5122_20260911_045656_168413.json
+/data/profiles/jarvos/sessions/request_dump_20260825_202520_447f5122_20260911_045757_027407.json
+/data/profiles/jarvos/sessions/request_dump_20260825_202520_447f5122_20260911_045704_254510.json
+/data/profiles/jarvos/sessions/request_dump_20260825_202520_447f5122_20260911_040742_523617.json
+/data/profiles/jarvos/sessions/request_dump_20260825_202520_447f5122_20260911_053903_117564.json
+/data/profiles/jarvos/logs/agent.log.1
+/data/profiles/jarvos/logs/errors.log
+/data/.leviath/runs/qwen-worker-1789187752-3231c54c317f/blobs/38cdbc3e37432b11bbcd4c34787f12bbfe8b18c85cafa0505fcd534ac197d375
+/data/.leviath/runs/qwen-worker-1789187752-3231c54c317f/run.lvr
+/data/.leviath/runs/worker-1789441046-534169699f17/blobs/d279960c18a8b71f9d2adc1d7bf5e35b0f087ec29fb638fca26132ed8df8cc83
+/data/.leviath/runs/worker-1789441046-534169699f17/context.json
+/data/.leviath/runs/worker-1789441046-534169699f17/run.lvr
+/data/.leviath/runs/qwen-worker-1789115390-69a87fd3bc5c/run.lvr
+/data/.leviath/runs/worker-1789435152-e9f88bd19b0c/run.lvr
+/data/.leviath/runs/worker-1789446185-edb274e0f4ca/stages/0/output.log
+/data/.leviath/runs/worker-1789446185-edb274e0f4ca/stages/0/logs.log
+/data/.leviath/runs/worker-1789446185-edb274e0f4ca/meta.json
+/data/.leviath/runs/worker-1789446185-edb274e0f4ca/context.json
+/data/.leviath/runs/worker-1789446185-edb274e0f4ca/run.lvr
+/data/work/ceo-bus/outbox/_evidence/after_tests.txt
+/data/work/ceo-bus/outbox/0025-progress-1.md
+/data/work/ceo-bus/0003-scratch/demo-transcript-1.txt
+/data/work/ceo-bus/tasks/0193-lane-B2-0002-terminal-result-msg-20260915T0445Z.txt
+/data/work/ceo-bus/tmp/route-20260915T0013/backlog-shape-20260915T0000Z-residuals.md
+/data/work/graphql-realization/gql-00/tmp/lane-tasks/B2-0002.task.md
+/data/work/graphql-realization/gql-00/wt/B2-0002/docs/recovery/0002/report.md
+/data/work/graphql-realization/gql-00/wt/B2-0002/docs/recovery/0002/searchlog.txt
+/data/work/throughput/tp3/test_ceo_bus_mcp.py.out
+/data/work/throughput/tp3/mcp.out
+/tmp/inbox.txt
+/tmp/outbox_drive.txt
+/tmp/outb.txt
+/tmp/inb_raw.txt
+/tmp/inbox_list.txt
+/tmp/outbox_files.txt
+/tmp/inbox_ids.txt
+/tmp/ob.txt
+/tmp/outbox_names.txt
+/tmp/outbox.txt
+/tmp/in_ids.txt
+/tmp/inbox_names.txt
+/tmp/ib.txt
+/tmp/outbox_ids.txt
+/tmp/inb.txt
+/tmp/drive_outbox.txt
+/tmp/outbox_list.txt
+/tmp/_ob.txt
+rc=0
+
+--- S2: grep -rln '0001-progress-railway-unblocked' /data ---
+/data/state.db
+/data/profiles/review/cache/terminal-output/out-1789412283-117-43b0.log
+/data/profiles/review/state.db
+/data/profiles/jarvos/cache/terminal-output/out-1789426739-118-1bb0.log
+/data/profiles/jarvos/cache/terminal-output/out-1789438164-118-9370.log
+/data/profiles/jarvos/cache/terminal-output/out-1789440824-118-c6e0.log
+/data/profiles/jarvos/cache/terminal-output/out-1789436967-118-84a0.log
+/data/profiles/jarvos/cache/terminal-output/out-1789434116-118-de20.log
+/data/profiles/jarvos/cache/terminal-output/out-1789449387-118-9190.log
+/data/profiles/jarvos/cache/terminal-output/out-1789446502-118-2990.log
+/data/profiles/jarvos/cache/terminal-output/out-1789422775-118-e7e0.log
+/data/profiles/jarvos/cache/terminal-output/out-1789448748-118-a1e0.log
+/data/profiles/jarvos/cache/terminal-output/out-1789423828-118-5160.log
+/data/profiles/jarvos/cache/terminal-output/out-1789442930-118-3050.log
+/data/profiles/jarvos/cache/terminal-output/out-1789447337-118-3680.log
+/data/profiles/jarvos/cache/terminal-output/out-1789445353-118-f410.log
+/data/profiles/jarvos/cache/terminal-output/out-1789423376-118-9550.log
+/data/profiles/jarvos/cache/terminal-output/out-1789444397-118-8620.log
+/data/profiles/jarvos/cache/terminal-output/out-1789440461-118-2330.log
+/data/profiles/jarvos/cache/terminal-output/out-1789443780-118-1220.log
+/data/profiles/jarvos/cache/terminal-output/out-1789438350-118-baa0.log
+/data/profiles/jarvos/cache/terminal-output/out-1789450408-118-3800.log
+/data/profiles/jarvos/cache/terminal-output/out-1789452038-118-12e0.log
+/data/profiles/jarvos/cache/terminal-output/out-1789439619-118-da60.log
+/data/profiles/jarvos/cache/terminal-output/out-1789431195-118-f680.log
+/data/profiles/jarvos/cache/terminal-output/out-1789436665-118-46e0.log
+/data/profiles/jarvos/cache/terminal-output/out-1789449046-118-a9c0.log
+/data/profiles/jarvos/cache/terminal-output/out-1789375819-118-ad50.log
+/data/profiles/jarvos/cache/terminal-output/out-1789415814-118-4140.log
+/data/profiles/jarvos/cache/terminal-output/out-1789444683-118-2060.log
+/data/profiles/jarvos/cache/terminal-output/out-1789414721-118-89e0.log
+/data/profiles/jarvos/cache/terminal-output/out-1789439910-118-8950.log
+/data/profiles/jarvos/cache/terminal-output/out-1789429286-118-5970.log
+/data/profiles/jarvos/cache/terminal-output/out-1789432277-118-7f80.log
+/data/profiles/jarvos/cache/terminal-output/out-1789444094-118-fb60.log
+/data/profiles/jarvos/cache/terminal-output/out-1789449864-118-f9e0.log
+/data/profiles/jarvos/cache/terminal-output/out-1789413685-118-8ad0.log
+/data/profiles/jarvos/cache/terminal-output/out-1789362818-118-f770.log
+/data/profiles/jarvos/cache/terminal-output/out-1789428129-118-6600.log
+/data/profiles/jarvos/cache/terminal-output/out-1789405813-118-79e0.log
+/data/profiles/jarvos/cache/terminal-output/out-1789448186-118-d460.log
+/data/profiles/jarvos/cache/terminal-output/out-1789427767-118-2420.log
+/data/profiles/jarvos/cache/terminal-output/out-1789449641-118-7500.log
+/data/profiles/jarvos/cache/terminal-output/out-1789428873-118-11c0.log
+/data/profiles/jarvos/cache/terminal-output/out-1789450850-118-4110.log
+/data/profiles/jarvos/cache/terminal-output/out-1789414295-118-2900.log
+/data/profiles/jarvos/cache/terminal-output/out-1789385742-118-590.log
+/data/profiles/jarvos/cache/terminal-output/out-1789429946-118-76b0.log
+/data/profiles/jarvos/cache/terminal-output/out-1789437926-118-1220.log
+/data/profiles/jarvos/cache/terminal-output/out-1789442140-118-c500.log
+/data/profiles/jarvos/cache/terminal-output/out-1789438645-118-7110.log
+/data/profiles/jarvos/cache/terminal-output/out-1789450235-118-dbb0.log
+/data/profiles/jarvos/cache/terminal-output/out-1789426033-118-1790.log
+/data/profiles/jarvos/cache/terminal-output/out-1789441301-118-dcd0.log
+/data/profiles/jarvos/cache/terminal-output/out-1789444869-118-3620.log
+/data/profiles/jarvos/cache/terminal-output/out-1789451452-118-8bc0.log
+/data/profiles/jarvos/cache/terminal-output/out-1789439252-118-55b0.log
+/data/profiles/jarvos/cache/terminal-output/out-1789437685-118-dc70.log
+/data/profiles/jarvos/cache/terminal-output/out-1789451107-118-6a80.log
+/data/profiles/jarvos/cache/terminal-output/out-1789419113-118-2ea0.log
+/data/profiles/jarvos/cache/terminal-output/out-1789443291-118-3b60.log
+/data/profiles/jarvos/cache/terminal-output/out-1789427423-118-6a50.log
+/data/profiles/jarvos/cache/terminal-output/out-1789441844-118-5430.log
+/data/profiles/jarvos/cache/terminal-output/out-1789446034-118-efc0.log
+/data/profiles/jarvos/cache/terminal-output/out-1789438946-118-6e0.log
+/data/profiles/jarvos/state.db
+/data/profiles/jarvos/sessions/request_dump_20260825_202520_447f5122_20260911_045656_168413.json
+/data/profiles/jarvos/sessions/request_dump_20260825_202520_447f5122_20260911_045757_027407.json
+/data/profiles/jarvos/sessions/request_dump_20260825_202520_447f5122_20260911_045704_254510.json
+/data/profiles/jarvos/sessions/request_dump_20260825_202520_447f5122_20260911_040742_523617.json
+/data/profiles/jarvos/sessions/request_dump_20260825_202520_447f5122_20260911_053903_117564.json
+/data/profiles/jarvos/logs/agent.log.1
+/data/profiles/jarvos/logs/errors.log
+/data/.leviath/runs/hivemind-1789339438-28d9b8c17e32/stages/4/logs.log
+/data/.leviath/runs/hivemind-1789339438-28d9b8c17e32/run.lvr
+/data/.leviath/runs/gql-06-1789234187-a7c2ade99942/run.lvr
+/data/.leviath/runs/worker-1789259813-d49a1492c452/stages/3/logs.log
+/data/.leviath/runs/worker-1789259813-d49a1492c452/stages/0/logs.log
+/data/.leviath/runs/worker-1789259813-d49a1492c452/context.json
+/data/.leviath/runs/worker-1789259813-d49a1492c452/run.lvr
+/data/.leviath/runs/harness-smith-1789194340-9951079e4f17/stages/0/logs.log
+/data/.leviath/runs/harness-smith-1789194340-9951079e4f17/run.lvr
+/data/.leviath/runs/qwen-worker-1789206441-3d52a9ff1c22/stages/0/logs.log
+/data/.leviath/runs/qwen-worker-1789206441-3d52a9ff1c22/context.json
+/data/.leviath/runs/qwen-worker-1789206441-3d52a9ff1c22/run.lvr
+/data/.leviath/runs/worker-1789372234-91a436e28fb0/stages/1/logs.log
+/data/.leviath/runs/worker-1789372234-91a436e28fb0/context.json
+/data/.leviath/runs/worker-1789372234-91a436e28fb0/run.lvr
+/data/.leviath/runs/hivemind-1789356103-1aea0f9082aa/stages/0/logs.log
+/data/.leviath/runs/hivemind-1789356103-1aea0f9082aa/stages/1/logs.log
+/data/.leviath/runs/hivemind-1789356103-1aea0f9082aa/context.json
+/data/.leviath/runs/hivemind-1789356103-1aea0f9082aa/run.lvr
+/data/.leviath/runs/qwen-worker-1789200845-0125ecbbf908/stages/0/logs.log
+/data/.leviath/runs/qwen-worker-1789200845-0125ecbbf908/run.lvr
+/data/.leviath/runs/gql-35-1789241254-75e83af5297b/run.lvr
+/data/.leviath/runs/worker-1789108172-3eb6d2d19414/stages/1/logs.log
+/data/.leviath/runs/worker-1789108172-3eb6d2d19414/context.json
+/data/.leviath/runs/worker-1789108172-3eb6d2d19414/run.lvr
+/data/.leviath/runs/hivemind-1789338291-ad3831600bcd/stages/0/logs.log
+/data/.leviath/runs/hivemind-1789338291-ad3831600bcd/run.lvr
+/data/.leviath/runs/worker-1789349290-47a35bd870c3/stages/0/logs.log
+/data/.leviath/runs/worker-1789349290-47a35bd870c3/context.json
+/data/.leviath/runs/worker-1789349290-47a35bd870c3/run.lvr
+/data/.leviath/runs/qwen-worker-1789187752-3231c54c317f/stages/0/logs.log
+/data/.leviath/runs/qwen-worker-1789187752-3231c54c317f/blobs/38cdbc3e37432b11bbcd4c34787f12bbfe8b18c85cafa0505fcd534ac197d375
+/data/.leviath/runs/qwen-worker-1789187752-3231c54c317f/run.lvr
+/data/.leviath/runs/qwen-worker-1789200730-416f5ab99c7b/stages/0/logs.log
+/data/.leviath/runs/qwen-worker-1789200730-416f5ab99c7b/run.lvr
+/data/.leviath/runs/worker-1789417750-bbdd49c26b12/stages/0/logs.log
+/data/.leviath/runs/worker-1789417750-bbdd49c26b12/run.lvr
+/data/.leviath/runs/qwen-worker-1789187745-168a7c8abca1/context.json
+/data/.leviath/runs/qwen-worker-1789187745-168a7c8abca1/run.lvr
+/data/.leviath/runs/worker-1789347782-5656e1990f41/stages/0/logs.log
+/data/.leviath/runs/worker-1789347782-5656e1990f41/run.lvr
+/data/.leviath/runs/investigator-1789342156-422e8b72750b/stages/0/logs.log
+/data/.leviath/runs/investigator-1789342156-422e8b72750b/run.lvr
+/data/.leviath/runs/worker-1789380193-f7f048f64102/run.lvr
+/data/.leviath/runs/qwen-worker-1789225298-0c93a6d0a77f/stages/0/logs.log
+/data/.leviath/runs/qwen-worker-1789225298-0c93a6d0a77f/run.lvr
+/data/.leviath/runs/qwen-worker-1789362372-c60d939316e0/context.json
+/data/.leviath/runs/qwen-worker-1789362372-c60d939316e0/run.lvr
+/data/.leviath/runs/worker-1789263330-95a466b7dcd8/stages/0/logs.log
+/data/.leviath/runs/worker-1789263330-95a466b7dcd8/run.lvr
+/data/.leviath/runs/qwen-worker-1789208826-fa2b16324eb0/context.json
+/data/.leviath/runs/qwen-worker-1789208826-fa2b16324eb0/run.lvr
+/data/.leviath/runs/worker-1789256008-e82d7d72708f/stages/0/logs.log
+/data/.leviath/runs/worker-1789256008-e82d7d72708f/run.lvr
+/data/.leviath/runs/qwen-worker-1789361698-f0faa8447d07/context.json
+/data/.leviath/runs/qwen-worker-1789361698-f0faa8447d07/run.lvr
+/data/.leviath/runs/worker-1789250684-1aaec0036768/stages/0/logs.log
+/data/.leviath/runs/worker-1789250684-1aaec0036768/run.lvr
+/data/.leviath/runs/qwen-worker-1789184412-cdf893d71be9/stages/0/logs.log
+/data/.leviath/runs/qwen-worker-1789184412-cdf893d71be9/run.lvr
+/data/.leviath/runs/worker-1789349595-8252d4a450ba/stages/0/logs.log
+/data/.leviath/runs/worker-1789349595-8252d4a450ba/run.lvr
+/data/.leviath/runs/worker-1789362922-6ec13faa9ccc/run.lvr
+/data/.leviath/runs/qwen-worker-1789160896-362777a830c6/stages/0/logs.log
+/data/.leviath/runs/qwen-worker-1789160896-362777a830c6/run.lvr
+/data/.leviath/runs/queue-worker-1789361487-d2c85168a82b/run.lvr
+/data/.leviath/runs/worker-1789197106-365b5025ad47/stages/1/logs.log
+/data/.leviath/runs/worker-1789197106-365b5025ad47/context.json
+/data/.leviath/runs/worker-1789197106-365b5025ad47/run.lvr
+/data/.leviath/runs/worker-1789367114-16650e72c22e/stages/0/logs.log
+/data/.leviath/runs/worker-1789367114-16650e72c22e/run.lvr
+/data/.leviath/runs/worker-1789256068-3d8cea3dcdd6/stages/0/logs.log
+/data/.leviath/runs/worker-1789256068-3d8cea3dcdd6/run.lvr
+/data/.leviath/runs/worker-1789422003-9a10cb5dfeaf/stages/0/logs.log
+/data/.leviath/runs/worker-1789422003-9a10cb5dfeaf/run.lvr
+/data/.leviath/runs/gql-02-1789241254-1e0323a2213d/run.lvr
+/data/.leviath/runs/harness-smith-1789191725-d9102cdc990f/stages/1/logs.log
+/data/.leviath/runs/harness-smith-1789191725-d9102cdc990f/context.json
+/data/.leviath/runs/harness-smith-1789191725-d9102cdc990f/run.lvr
+/data/.leviath/runs/drop-selftest-1789241339-2d8e658bec4e/context.json
+/data/.leviath/runs/drop-selftest-1789241339-2d8e658bec4e/run.lvr
+/data/.leviath/runs/worker-1789417379-2e77760ab512/run.lvr
+/data/.leviath/runs/qwen-worker-1789178349-534d7dce1883/run.lvr
+/data/.leviath/runs/worker-1789447060-7d48b504deaf/stages/0/logs.log
+/data/.leviath/runs/worker-1789447060-7d48b504deaf/blobs/f7b1c4def690b6ba2e57849204fd43c0b1f46ddb502037127eabeb39ce1a14d8
+/data/.leviath/runs/worker-1789447060-7d48b504deaf/blobs/407aa66b00a35c6fa17900432d89cec38f62bf896bf0bcacd69c49326d3b8f7f
+/data/.leviath/runs/worker-1789447060-7d48b504deaf/context.json
+/data/.leviath/runs/worker-1789447060-7d48b504deaf/run.lvr
+/data/.leviath/runs/worker-1789441046-534169699f17/blobs/d279960c18a8b71f9d2adc1d7bf5e35b0f087ec29fb638fca26132ed8df8cc83
+/data/.leviath/runs/worker-1789441046-534169699f17/context.json
+/data/.leviath/runs/worker-1789441046-534169699f17/run.lvr
+/data/.leviath/runs/qwen-worker-1789107682-1ad9ea0fca52/run.lvr
+/data/.leviath/runs/queue-worker-1789361156-84087ce8750d/run.lvr
+/data/.leviath/runs/fleet-auditor-1789250688-b4de4689dbbb/run.lvr
+/data/.leviath/runs/qwen-worker-1789362372-6bfe02b0ce7a/stages/0/logs.log
+/data/.leviath/runs/qwen-worker-1789362372-6bfe02b0ce7a/run.lvr
+/data/.leviath/runs/worker-1789385868-93c7340fea81/run.lvr
+/data/.leviath/runs/gql-09-1789234187-1a6b3ba0bb5d/stages/0/logs.log
+/data/.leviath/runs/gql-09-1789234187-1a6b3ba0bb5d/run.lvr
+/data/.leviath/runs/worker-1789250608-80a875d4ad11/stages/1/logs.log
+/data/.leviath/runs/worker-1789250608-80a875d4ad11/run.lvr
+/data/.leviath/runs/hivemind-1789339438-d78943f64c8e/stages/4/logs.log
+/data/.leviath/runs/hivemind-1789339438-d78943f64c8e/run.lvr
+/data/.leviath/runs/fleet-auditor-1789246314-4854b16dd90c/context.json
+/data/.leviath/runs/fleet-auditor-1789246314-4854b16dd90c/run.lvr
+/data/.leviath/runs/investigator-1789342156-f561e24f8595/stages/0/logs.log
+/data/.leviath/runs/investigator-1789342156-f561e24f8595/run.lvr
+/data/.leviath/runs/qwen-worker-1789362372-8713253ed7e9/run.lvr
+/data/.leviath/runs/gql-06-1789324771-2ffbe60b6676/stages/0/logs.log
+/data/.leviath/runs/gql-06-1789324771-2ffbe60b6676/context.json
+/data/.leviath/runs/gql-06-1789324771-2ffbe60b6676/run.lvr
+/data/.leviath/runs/worker-1789430207-005e1fda7407/stages/0/logs.log
+/data/.leviath/runs/worker-1789430207-005e1fda7407/run.lvr
+/data/.leviath/runs/hivemind-1789339438-f95c22a2b108/stages/5/logs.log
+/data/.leviath/runs/hivemind-1789339438-f95c22a2b108/run.lvr
+/data/.leviath/runs/worker-1789349321-a0086d4e286f/stages/0/logs.log
+/data/.leviath/runs/worker-1789349321-a0086d4e286f/stages/1/logs.log
+/data/.leviath/runs/worker-1789349321-a0086d4e286f/run.lvr
+/data/.leviath/runs/worker-1789349290-5df12ec7aaa9/stages/3/logs.log
+/data/.leviath/runs/worker-1789349290-5df12ec7aaa9/stages/0/logs.log
+/data/.leviath/runs/worker-1789349290-5df12ec7aaa9/stages/1/logs.log
+/data/.leviath/runs/worker-1789349290-5df12ec7aaa9/context.json
+/data/.leviath/runs/worker-1789349290-5df12ec7aaa9/run.lvr
+/data/.leviath/runs/harness-smith-1789437129-f5678ebf12a1/stages/0/logs.log
+/data/.leviath/runs/harness-smith-1789437129-f5678ebf12a1/run.lvr
+/data/.leviath/runs/worker-1789251858-a7a318b58256/stages/0/logs.log
+/data/.leviath/runs/worker-1789251858-a7a318b58256/run.lvr
+/data/.leviath/runs/worker-1789438986-c61f1f5864ee/context.json
+/data/.leviath/runs/worker-1789438986-c61f1f5864ee/run.lvr
+/data/.leviath/runs/split-fix-1789233979-c73e41299fef/stages/0/logs.log
+/data/.leviath/runs/split-fix-1789233979-c73e41299fef/run.lvr
+/data/.leviath/runs/qwen-worker-1789160657-f4feaf11207e/context.json
+/data/.leviath/runs/qwen-worker-1789160657-f4feaf11207e/run.lvr
+/data/.leviath/runs/hivemind-1789339438-ca12a3628420/stages/4/logs.log
+/data/.leviath/runs/hivemind-1789339438-ca12a3628420/stages/5/logs.log
+/data/.leviath/runs/hivemind-1789339438-ca12a3628420/stages/6/logs.log
+/data/.leviath/runs/hivemind-1789339438-ca12a3628420/stages/7/logs.log
+/data/.leviath/runs/hivemind-1789339438-ca12a3628420/run.lvr
+/data/.leviath/runs/worker-1789438986-d278cf35724e/stages/0/logs.log
+/data/.leviath/runs/worker-1789438986-d278cf35724e/run.lvr
+/data/.leviath/runs/qwen-worker-1789115390-69a87fd3bc5c/run.lvr
+/data/.leviath/runs/investigator-1789342156-c4c5c982bea1/stages/0/logs.log
+/data/.leviath/runs/investigator-1789342156-c4c5c982bea1/run.lvr
+/data/.leviath/runs/qwen-worker-1789363816-4a2604789119/stages/0/logs.log
+/data/.leviath/runs/qwen-worker-1789363816-4a2604789119/context.json
+/data/.leviath/runs/qwen-worker-1789363816-4a2604789119/run.lvr
+/data/.leviath/runs/gql-worker-1789208874-e649156349c2/run.lvr
+/data/.leviath/runs/harness-smith-1789194340-283a07707559/run.lvr
+/data/.leviath/runs/worker-1789349290-3c1a904e38c6/stages/0/logs.log
+/data/.leviath/runs/worker-1789349290-3c1a904e38c6/run.lvr
+/data/.leviath/runs/qwen-worker-1789208776-a1dd9b481066/run.lvr
+/data/.leviath/runs/qwen-worker-1789127038-0240ba825906/stages/0/logs.log
+/data/.leviath/runs/qwen-worker-1789127038-0240ba825906/context.json
+/data/.leviath/runs/qwen-worker-1789127038-0240ba825906/run.lvr
+/data/.leviath/runs/qwen-worker-1789200730-96c56eb00432/stages/0/logs.log
+/data/.leviath/runs/qwen-worker-1789200730-96c56eb00432/run.lvr
+/data/.leviath/runs/harness-smith-1789194203-179ed6cc38a1/stages/0/logs.log
+/data/.leviath/runs/harness-smith-1789194203-179ed6cc38a1/context.json
+/data/.leviath/runs/harness-smith-1789194203-179ed6cc38a1/run.lvr
+/data/.leviath/runs/worker-1789435152-e9f88bd19b0c/stages/0/logs.log
+/data/.leviath/runs/worker-1789435152-e9f88bd19b0c/run.lvr
+/data/.leviath/runs/worker-1789438986-6ddd9b638e7b/stages/0/logs.log
+/data/.leviath/runs/worker-1789438986-6ddd9b638e7b/run.lvr
+/data/.leviath/runs/harness-smith-1789191910-6a683f2ab908/stages/0/logs.log
+/data/.leviath/runs/harness-smith-1789191910-6a683f2ab908/stages/1/logs.log
+/data/.leviath/runs/harness-smith-1789191910-6a683f2ab908/context.json
+/data/.leviath/runs/harness-smith-1789191910-6a683f2ab908/run.lvr
+/data/.leviath/runs/worker-1789251858-6ad0a00e1a1a/stages/3/logs.log
+/data/.leviath/runs/worker-1789251858-6ad0a00e1a1a/stages/0/logs.log
+/data/.leviath/runs/worker-1789251858-6ad0a00e1a1a/context.json
+/data/.leviath/runs/worker-1789251858-6ad0a00e1a1a/run.lvr
+/data/.leviath/runs/worker-1789374970-3201b1caa5aa/stages/0/logs.log
+/data/.leviath/runs/worker-1789374970-3201b1caa5aa/run.lvr
+/data/.leviath/runs/qwen-worker-1789362011-3a68f49bb334/run.lvr
+/data/.leviath/runs/worker-1789194689-b07949684dd3/run.lvr
+/data/.leviath/runs/harness-smith-1789194340-95ef7b5ce49e/stages/0/logs.log
+/data/.leviath/runs/harness-smith-1789194340-95ef7b5ce49e/run.lvr
+/data/.leviath/runs/harness-smith-1789191053-fb768c5ac336/run.lvr
+/data/.leviath/runs/coder-1789250563-a0e9b472a186/context.json
+/data/.leviath/runs/coder-1789250563-a0e9b472a186/run.lvr
+/data/.leviath/runs/scout-1789163347-55e852f616c0/stages/1/logs.log
+/data/.leviath/runs/scout-1789163347-55e852f616c0/context.json
+/data/.leviath/runs/scout-1789163347-55e852f616c0/run.lvr
+/data/.leviath/runs/harness-smith-1789194203-7972ff63da68/stages/0/logs.log
+/data/.leviath/runs/harness-smith-1789194203-7972ff63da68/context.json
+/data/.leviath/runs/harness-smith-1789194203-7972ff63da68/run.lvr
+/data/.leviath/runs/worker-1789446185-edb274e0f4ca/final_output
+/data/.leviath/runs/worker-1789446185-edb274e0f4ca/stages/0/output.log
+/data/.leviath/runs/worker-1789446185-edb274e0f4ca/stages/0/logs.log
+/data/.leviath/runs/worker-1789446185-edb274e0f4ca/stages/1/output.log
+/data/.leviath/runs/worker-1789446185-edb274e0f4ca/meta.json
+/data/.leviath/runs/worker-1789446185-edb274e0f4ca/blobs/beb1688491d670042206a67ceb8fd00ff776be8b893899571d454c7c6612b852
+/data/.leviath/runs/worker-1789446185-edb274e0f4ca/blobs/40473645882134c87cbb69f59aa9dd701e2c8c641d93ed9853087a1a645a68a7
+/data/.leviath/runs/worker-1789446185-edb274e0f4ca/context.json
+/data/.leviath/runs/worker-1789446185-edb274e0f4ca/run.lvr
+/data/.leviath/runs/worker-1789421967-b6bd71cfc5a4/stages/0/logs.log
+/data/.leviath/runs/worker-1789421967-b6bd71cfc5a4/run.lvr
+/data/.leviath/runs/qwen-worker-1789225298-1cc3063a7ffa/run.lvr
+/data/.leviath/runs/worker-1789438986-1127e2f62084/run.lvr
+/data/.leviath/runs/queue-worker-1789361156-1cc5653ba1e3/run.lvr
+/data/.leviath/runs/worker-1789168986-d58058ef8a1f/stages/1/logs.log
+/data/.leviath/runs/worker-1789168986-d58058ef8a1f/context.json
+/data/.leviath/runs/worker-1789168986-d58058ef8a1f/run.lvr
+/data/.leviath/runs/worker-1789357421-53fd62b114b3/stages/3/logs.log
+/data/.leviath/runs/worker-1789357421-53fd62b114b3/run.lvr
+/data/.leviath/runs/qwen-worker-1789171608-3cd346e76c2b/stages/0/logs.log
+/data/.leviath/runs/qwen-worker-1789171608-3cd346e76c2b/run.lvr
+/data/.leviath/runs/gql-35-1789229471-68c024465cac/run.lvr
+/data/.leviath/runs/qwen-worker-1789363436-e45875bde806/stages/0/logs.log
+/data/.leviath/runs/qwen-worker-1789363436-e45875bde806/run.lvr
+/data/0105-ab-home/.leviath/runs/worker-1789253082-b7d8c4dca225/run.lvr
+/data/work/ceo-bus/outbox/_evidence/after_tests.txt
+/data/work/ceo-bus/outbox/daily-2026-09-11.md
+/data/work/ceo-bus/outbox/0168-handoff-1.md
+/data/work/ceo-bus/outbox/0025-progress-1.md
+/data/work/ceo-bus/outbox/0173-child-associations-relay.json
+/data/work/ceo-bus/_c6_stage1.log
+/data/work/ceo-bus/daily-2026-09-11.md
+/data/work/ceo-bus/0057/0057-sft-train.jsonl
+/data/work/ceo-bus/_c6_s1_head.txt
+/data/work/ceo-bus/0003-scratch/demo-transcript-1.txt
+/data/work/ceo-bus/tasks/0193-lane-B2-0002-terminal-result-msg-20260915T0445Z.txt
+/data/work/ceo-bus/cap-probe-iso2/home/.leviath/runs/cap-probe-r1-1789206553-aac12ea66201/stages/0/logs.log
+/data/work/ceo-bus/cap-probe-iso2/home/.leviath/runs/cap-probe-r1-1789206553-aac12ea66201/context.json
+/data/work/ceo-bus/cap-probe-iso2/home/.leviath/runs/cap-probe-r1-1789206553-aac12ea66201/run.lvr
+/data/work/ceo-bus/tmp/0173-relay.json
+/data/work/ceo-bus/tmp/route-20260915T0013/backlog-shape-20260915T0000Z-residuals.md
+/data/work/ceo-bus/HANDOFF.md
+/data/work/graphql-realization/gql-00/HANDOFF-0193-s30.md
+/data/work/graphql-realization/gql-00/tmp/s30/RULINGS-0193-lane-batch2-s30.json
+/data/work/graphql-realization/gql-00/tmp/lane-tasks/B2-0002.task.md
+/data/work/graphql-realization/gql-00/wt/B2-0002/docs/recovery/0002/report.md
+/data/work/graphql-realization/gql-00/wt/B2-0002/docs/recovery/0002/searchlog.txt
+/data/work/graphql-realization/gql-00/evidence/own-hermes-ceobus.txt
+/data/work/graphql-realization/tmp/lane_ctx.txt
+/data/work/throughput/tp3/test_ceo_bus_mcp.py.out
+/data/work/throughput/tp3/mcp.out
+rc=0
+
+--- S3: find / -xdev -name '*0008*railway*' ---
+rc=0
+
+--- S4: find / -xdev -name '*0001-progress*' ---
+rc=0
