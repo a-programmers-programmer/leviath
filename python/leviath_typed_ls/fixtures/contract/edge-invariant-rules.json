@@ -1,0 +1,20 @@
+{
+  "contract": "workflow-edge-invariant-rules/v1",
+  "note": "Fixed rule -> (severity, enforcement location, waivable) contract. Severity is a function of the rule, never chosen per edge instance. `waivable` is true iff severity is WARN. ACYCLIC is ERROR and therefore not waivable: an ERROR cycle can never be acknowledged into a DAG.",
+  "rules": [
+    {
+      "rule": "NO_TRANSITIVE_ANCESTOR",
+      "severity": "WARN",
+      "enforcedAt": ["AUTHORING_RECONCILER"],
+      "waivable": true,
+      "statement": "No transitive ancestor relation may be re-declared as a direct edge. Violations are acknowledged with a reason and by an authenticated principal."
+    },
+    {
+      "rule": "ACYCLIC",
+      "severity": "ERROR",
+      "enforcedAt": ["AUTHORING_RECONCILER", "RUN_PREFLIGHT"],
+      "waivable": false,
+      "statement": "The steps+edges graph must be acyclic. A violation is rejected at both authoring reconciliation and run pre-flight, and rejects dispatch. There is no waiver arm."
+    }
+  ]
+}

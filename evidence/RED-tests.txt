@@ -1,0 +1,13 @@
+F
+=================================== FAILURES ===================================
+__________________ test_python_edit_updates_schema_projection __________________
+
+    def test_python_edit_updates_schema_projection():
+>       from leviath_typed_ls import projection, typed_code_adapter
+E       ImportError: cannot import name 'projection' from 'leviath_typed_ls' (unknown location)
+
+python/leviath_typed_ls/tests/test_roundtrip.py:102: ImportError
+=========================== short test summary info ============================
+FAILED python/leviath_typed_ls/tests/test_roundtrip.py::test_python_edit_updates_schema_projection
+!!!!!!!!!!!!!!!!!!!!!!!!!! stopping after 1 failures !!!!!!!!!!!!!!!!!!!!!!!!!!!
+1 failed in 0.03s
