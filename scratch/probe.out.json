@@ -1,0 +1,62 @@
+{
+  "repo": "/data/work/graphql-realization/gql-03/repo",
+  "head": "7b6e050e89e6aea7b51453e633fbe9209c50a844",
+  "log": [
+    "7b6e050e GQL-02c: commit corrected acceptance packet (row C 6506, reproducible step 8, hashes by commit)",
+    "5ed2ba6c GQL-02c: correct acceptance diff readings and make step 8 reproducible",
+    "67e16649 GQL-02c: acceptance run transcript + diff-stat correction"
+  ],
+  "status": [
+    "?? scratch/"
+  ],
+  "docs_workflow_files": [
+    "evidence",
+    "schema-workflow.graphql",
+    "workflow-schema-decisions.md"
+  ],
+  "docs_workflow_git_ls": [
+    "docs/workflow/evidence/gql-02-acceptance-run.txt",
+    "docs/workflow/evidence/gql-02-acceptance.md",
+    "docs/workflow/evidence/run-gql02-acceptance.sh",
+    "docs/workflow/schema-workflow.graphql",
+    "docs/workflow/workflow-schema-decisions.md"
+  ],
+  "python_git_ls": [
+    "python/leviath_reconcile/__init__.py",
+    "python/leviath_reconcile/__main__.py",
+    "python/leviath_reconcile/adapters/__init__.py",
+    "python/leviath_reconcile/adapters/python_adapter.py",
+    "python/leviath_reconcile/adapters/schema_adapter.py",
+    "python/leviath_reconcile/baseline.py",
+    "python/leviath_reconcile/cli.py",
+    "python/leviath_reconcile/crosswalk.py",
+    "python/leviath_reconcile/diff.py",
+    "python/leviath_reconcile/e2e_real.py",
+    "python/leviath_reconcile/fixtures/workflow_model.py",
+    "python/leviath_reconcile/identity.py",
+    "python/leviath_reconcile/invariants.py",
+    "python/leviath_reconcile/model.py",
+    "python/leviath_reconcile/pin.py",
+    "python/leviath_reconcile/reconcile.py",
+    "python/leviath_reconcile/scenarios.py",
+    "python/leviath_reconcile/test_pin.py"
+  ],
+  "python_dir": [
+    "python/leviath_reconcile"
+  ],
+  "worktree_sdl_parse": "FAIL GraphQLSyntaxError: Syntax Error: Expected Name, found ')'.\n\nGraphQL request:36:87\n35 |   by: String!\n36 |   \"\"\"Hard-coded by implementation of the monad; a directive DECLARES, code unwraps.\"\"\"\n   |                                                                                       ^\n37 | ) on FIELD_DEFINITION | ARGUMENT_DEFINITION",
+  "worktree_sdl_sha": "22c36aebe46b012c001a6bd492c6ff53f6fbf5173ef3947811d5387da4eb46f8",
+  "gql02_exists": true,
+  "gql02_python_packages": [
+    "leviath_reconcile"
+  ],
+  "gql02_sdl_parse": "OK",
+  "workdir_root": [
+    "HANDOFF.md",
+    "evidence",
+    "repo",
+    "tmp"
+  ],
+  "workdir_evidence": [],
+  "graphql_core": "3.2.5"
+}

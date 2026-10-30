@@ -1,0 +1,183 @@
+{
+  "gql03": {
+    "parse": "FAIL",
+    "error": "Syntax Error: Expected Name, found ')'.",
+    "context": [
+      "33: directive @user_confirmation(",
+      "34:   \"\"\"Who/what must confirm to unwrap the monadic value (e.g. the step Runner / a human gate).\"\"\"",
+      "35:   by: String!",
+      "36:   \"\"\"Hard-coded by implementation of the monad; a directive DECLARES, code unwraps.\"\"\"",
+      "37: ) on FIELD_DEFINITION | ARGUMENT_DEFINITION",
+      "38: "
+    ]
+  },
+  "gql02": {
+    "parse": "OK",
+    "definitions": 63
+  },
+  "gql02_status": [
+    " M crates/leviath-cli/agents/bake-off/references/composition-guide.md",
+    " M docs/workflow/evidence/gql-02-acceptance-run.txt",
+    " M docs/workflow/evidence/gql-02-acceptance.md",
+    " M docs/workflow/evidence/run-gql02-acceptance.sh",
+    " M docs/workflow/schema-workflow.graphql",
+    " M docs/workflow/workflow-schema-decisions.md",
+    "?? .gql01-base",
+    "?? docs/workflow/.tmp",
+    "?? docs/workflow/check-workflow-contract.py",
+    "?? docs/workflow/edge-invariant-rules.json",
+    "?? docs/workflow/edge_invariants.py",
+    "?? docs/workflow/evidence/.head-packet.md",
+    "?? docs/workflow/evidence/.head-script.sh",
+    "?? docs/workflow/evidence/.head-transcript.txt",
+    "?? docs/workflow/evidence/.measure.txt",
+    "?? docs/workflow/evidence/.runA.txt",
+    "?? docs/workflow/evidence/.runB.txt",
+    "?? docs/workflow/evidence/composition-guide.base-15dc182e.md",
+    "?? docs/workflow/evidence/run-evidence.sh",
+    "?? docs/workflow/evidence/schema-workflow.as-found-copy.graphql",
+    "?? docs/workflow/evidence/schema-workflow.base-15dc182e.graphql",
+    "?? docs/workflow/evidence/workflow-schema-decisions.base-15dc182e.md",
+    "?? docs/workflow/workflow-reconciliation-v1.md"
+  ],
+  "gql03_status": [
+    "?? scratch/"
+  ],
+  "gql02_head": "7b6e050e89e6aea7b51453e633fbe9209c50a844",
+  "sdl_same_as_gql02": false,
+  "tracked_sdl_sha": "22c36aebe46b012c001a6bd492c6ff53f6fbf5173ef3947811d5387da4eb46f8  -",
+  "grep_confirmation": [
+    "python/leviath_reconcile/adapters/python_adapter.py:7:warning is preserved in the extraction, so the caller can require confirmation",
+    "python/leviath_reconcile/fixtures/workflow_model.py:45:class ConfirmationAuthority(Enum):"
+  ],
+  "grep_sensitive": [],
+  "invariants_public": [
+    "AUTHORING_RECONCILER",
+    "Dict",
+    "ERROR",
+    "InvariantDisposition",
+    "InvariantRejection",
+    "InvariantSatisfied",
+    "InvariantWaiver",
+    "Iterable",
+    "List",
+    "Mapping",
+    "Optional",
+    "Path",
+    "RECONCILE_RULES",
+    "RUN_PREFLIGHT",
+    "Sequence",
+    "Tuple",
+    "WARN",
+    "annotations",
+    "blocks",
+    "check_acyclic_aliases",
+    "check_unique_aliases",
+    "dataclass",
+    "disposition_for",
+    "field",
+    "json",
+    "load_contract_rules",
+    "rules_index",
+    "selftest",
+    "validate_rule_row",
+    "verify_contract"
+  ],
+  "reconcile_public": [
+    "ABSENT",
+    "ACCEPTED",
+    "ADD",
+    "Baseline",
+    "CATEGORY_PREFIXES",
+    "CONVERGING",
+    "Change",
+    "Conflict",
+    "DEFAULT_POLICY",
+    "DELETE",
+    "DISJOINT",
+    "Dict",
+    "Fact",
+    "FactSet",
+    "IdentityReport",
+    "IdentityResolver",
+    "InvariantRejection",
+    "Iterable",
+    "List",
+    "Mapping",
+    "Optional",
+    "Outcome",
+    "POLICY",
+    "PRESERVE_BOTH",
+    "Plan",
+    "Projection",
+    "ReconcileConflict",
+    "Reconciler",
+    "Resolution",
+    "SINGLE_SIDE",
+    "SemanticEdit",
+    "Sequence",
+    "Set",
+    "SourceRef",
+    "StaleView",
+    "Tuple",
+    "annotations",
+    "categories",
+    "check_acyclic_aliases",
+    "check_unique_aliases",
+    "classify_symbols",
+    "cross_value",
+    "cross_values_differ",
+    "dataclass",
+    "field",
+    "identity_diff",
+    "is_local",
+    "match_identities",
+    "plan_reconciliation",
+    "reconciler_for",
+    "replace",
+    "synthesize"
+  ],
+  "rules_exists": true,
+  "rules": {
+    "contract": "workflow-edge-invariant-rules/v1",
+    "note": "Fixed rule -> (severity, enforcement location, waivable) contract. Severity is a function of the rule, never chosen per edge instance. `waivable` is true iff severity is WARN. ACYCLIC is ERROR and therefore not waivable: an ERROR cycle can never be acknowledged into a DAG.",
+    "rules": [
+      {
+        "rule": "NO_TRANSITIVE_ANCESTOR",
+        "severity": "WARN",
+        "enforcedAt": [
+          "AUTHORING_RECONCILER"
+        ],
+        "waivable": true,
+        "statement": "No transitive ancestor relation may be re-declared as a direct edge. Violations are acknowledged with a reason and by an authenticated principal."
+      },
+      {
+        "rule": "ACYCLIC",
+        "severity": "ERROR",
+        "enforcedAt": [
+          "AUTHORING_RECONCILER",
+          "RUN_PREFLIGHT"
+        ],
+        "waivable": false,
+        "statement": "The steps+edges graph must be acyclic. A violation is rejected at both authoring reconciliation and run pre-flight, and rejects dispatch. There is no waiver arm."
+      }
+    ]
+  },
+  "gql02_docs_workflow": [
+    ".tmp",
+    "check-workflow-contract.py",
+    "edge-invariant-rules.json",
+    "edge_invariants.py",
+    "evidence",
+    "schema-workflow.graphql",
+    "workflow-reconciliation-v1.md",
+    "workflow-schema-decisions.md"
+  ],
+  "gql02_root": [
+    "HANDOFF.md",
+    "contract-pin-host.txt",
+    "repo",
+    "scratch",
+    "tmp"
+  ]
+}
