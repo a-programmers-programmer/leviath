@@ -1,0 +1,2 @@
+962:#[test]
+963:fn the_installed_tool_name_is_read_from_the_summary_prefix() {
