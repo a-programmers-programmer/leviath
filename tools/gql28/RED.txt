@@ -1,0 +1,156 @@
+FFFFFFFFFFF                                                              [100%]
+=================================== FAILURES ===================================
+____________________ test_empty_root_is_blocked_with_exit_2 ____________________
+
+tmp_path = PosixPath('/tmp/pytest-of-root/pytest-150/test_empty_root_is_blocked_wit0')
+
+    def test_empty_root_is_blocked_with_exit_2(tmp_path):
+        spec = write_spec(tmp_path)
+        code, payload, _ = run(tmp_path, spec)
+        assert code == 2, "an empty root must be BLOCKED, not ready"
+>       assert payload["node"] == "GQL-28"
+               ^^^^^^^^^^^^^^^
+E       TypeError: 'NoneType' object is not subscriptable
+
+tools/gql28/test_check_contract_ready.py:78: TypeError
+_________________ test_no_checkout_reports_every_path_missing __________________
+
+tmp_path = PosixPath('/tmp/pytest-of-root/pytest-150/test_no_checkout_reports_every0')
+
+    def test_no_checkout_reports_every_path_missing(tmp_path):
+        spec = write_spec(tmp_path)
+        _, payload, _ = run(tmp_path, spec)
+>       by_name = {c["name"]: c for c in payload["checks"]}
+                                         ^^^^^^^^^^^^^^^^^
+E       TypeError: 'NoneType' object is not subscriptable
+
+tools/gql28/test_check_contract_ready.py:88: TypeError
+________________ test_missing_checkout_never_claims_a_contract _________________
+
+tmp_path = PosixPath('/tmp/pytest-of-root/pytest-150/test_missing_checkout_never_cl0')
+
+    def test_missing_checkout_never_claims_a_contract(tmp_path):
+        spec = write_spec(tmp_path)
+        _, payload, _ = run(tmp_path, spec)
+>       by_name = {c["name"]: c for c in payload["checks"]}
+                                         ^^^^^^^^^^^^^^^^^
+E       TypeError: 'NoneType' object is not subscriptable
+
+tools/gql28/test_check_contract_ready.py:98: TypeError
+_________________ test_complete_checkout_is_ready_with_exit_0 __________________
+
+tmp_path = PosixPath('/tmp/pytest-of-root/pytest-150/test_complete_checkout_is_read0')
+
+    def test_complete_checkout_is_ready_with_exit_0(tmp_path):
+        plant_checkout(tmp_path)
+        spec = write_spec(tmp_path)
+        code, payload, _ = run(tmp_path, spec)
+>       assert code == 0, payload
+E       AssertionError: None
+E       assert 2 == 0
+
+tools/gql28/test_check_contract_ready.py:110: AssertionError
+___________________ test_ready_requires_a_real_contract_file ___________________
+
+tmp_path = PosixPath('/tmp/pytest-of-root/pytest-150/test_ready_requires_a_real_con0')
+
+    def test_ready_requires_a_real_contract_file(tmp_path):
+        plant_checkout(tmp_path, with_contract=False)
+        spec = write_spec(tmp_path)
+        code, payload, _ = run(tmp_path, spec)
+        assert code == 2
+>       by_name = {c["name"]: c for c in payload["checks"]}
+                                         ^^^^^^^^^^^^^^^^^
+E       TypeError: 'NoneType' object is not subscriptable
+
+tools/gql28/test_check_contract_ready.py:121: TypeError
+_______________________ test_ready_requires_trpc_markers _______________________
+
+tmp_path = PosixPath('/tmp/pytest-of-root/pytest-150/test_ready_requires_trpc_marke0')
+
+    def test_ready_requires_trpc_markers(tmp_path):
+        plant_checkout(tmp_path, with_trpc=False)
+        spec = write_spec(tmp_path)
+        code, payload, _ = run(tmp_path, spec)
+        assert code == 2
+>       by_name = {c["name"]: c for c in payload["checks"]}
+                                         ^^^^^^^^^^^^^^^^^
+E       TypeError: 'NoneType' object is not subscriptable
+
+tools/gql28/test_check_contract_ready.py:130: TypeError
+___________________ test_ready_requires_every_existing_path ____________________
+
+tmp_path = PosixPath('/tmp/pytest-of-root/pytest-150/test_ready_requires_every_exis0')
+
+    def test_ready_requires_every_existing_path(tmp_path):
+        repo = plant_checkout(tmp_path)
+        (repo / "server" / "eventRuntime.ts").unlink()
+        spec = write_spec(tmp_path)
+        code, payload, _ = run(tmp_path, spec)
+        assert code == 2
+>       by_name = {c["name"]: c for c in payload["checks"]}
+                                         ^^^^^^^^^^^^^^^^^
+E       TypeError: 'NoneType' object is not subscriptable
+
+tools/gql28/test_check_contract_ready.py:140: TypeError
+____________________ test_gate_records_the_root_it_scanned _____________________
+
+tmp_path = PosixPath('/tmp/pytest-of-root/pytest-150/test_gate_records_the_root_it_0')
+
+    def test_gate_records_the_root_it_scanned(tmp_path):
+        plant_checkout(tmp_path)
+        spec = write_spec(tmp_path)
+        _, payload, _ = run(tmp_path, spec)
+>       assert payload["root"] == str(tmp_path)
+               ^^^^^^^^^^^^^^^
+E       TypeError: 'NoneType' object is not subscriptable
+
+tools/gql28/test_check_contract_ready.py:151: TypeError
+_____________ test_gate_reports_hashes_of_the_contract_it_observed _____________
+
+tmp_path = PosixPath('/tmp/pytest-of-root/pytest-150/test_gate_reports_hashes_of_th0')
+
+    def test_gate_reports_hashes_of_the_contract_it_observed(tmp_path):
+        plant_checkout(tmp_path)
+        spec = write_spec(tmp_path)
+        _, payload, _ = run(tmp_path, spec)
+>       art = payload["contract_artifacts"]
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       TypeError: 'NoneType' object is not subscriptable
+
+tools/gql28/test_check_contract_ready.py:159: TypeError
+______________ test_no_contract_artifact_list_when_none_observed _______________
+
+tmp_path = PosixPath('/tmp/pytest-of-root/pytest-150/test_no_contract_artifact_list0')
+
+    def test_no_contract_artifact_list_when_none_observed(tmp_path):
+        spec = write_spec(tmp_path)
+        _, payload, _ = run(tmp_path, spec)
+>       assert payload["contract_artifacts"] == []
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       TypeError: 'NoneType' object is not subscriptable
+
+tools/gql28/test_check_contract_ready.py:168: TypeError
+____________________ test_bad_spec_path_is_an_error_exit_1 _____________________
+
+tmp_path = PosixPath('/tmp/pytest-of-root/pytest-150/test_bad_spec_path_is_an_error0')
+
+    def test_bad_spec_path_is_an_error_exit_1(tmp_path):
+        code, payload, err = run(tmp_path, tmp_path / "nope.json")
+>       assert code == 1
+E       assert 2 == 1
+
+tools/gql28/test_check_contract_ready.py:173: AssertionError
+=========================== short test summary info ============================
+FAILED tools/gql28/test_check_contract_ready.py::test_empty_root_is_blocked_with_exit_2
+FAILED tools/gql28/test_check_contract_ready.py::test_no_checkout_reports_every_path_missing
+FAILED tools/gql28/test_check_contract_ready.py::test_missing_checkout_never_claims_a_contract
+FAILED tools/gql28/test_check_contract_ready.py::test_complete_checkout_is_ready_with_exit_0
+FAILED tools/gql28/test_check_contract_ready.py::test_ready_requires_a_real_contract_file
+FAILED tools/gql28/test_check_contract_ready.py::test_ready_requires_trpc_markers
+FAILED tools/gql28/test_check_contract_ready.py::test_ready_requires_every_existing_path
+FAILED tools/gql28/test_check_contract_ready.py::test_gate_records_the_root_it_scanned
+FAILED tools/gql28/test_check_contract_ready.py::test_gate_reports_hashes_of_the_contract_it_observed
+FAILED tools/gql28/test_check_contract_ready.py::test_no_contract_artifact_list_when_none_observed
+FAILED tools/gql28/test_check_contract_ready.py::test_bad_spec_path_is_an_error_exit_1
+11 failed in 0.30s

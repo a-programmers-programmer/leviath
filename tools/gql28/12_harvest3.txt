@@ -1,0 +1,60 @@
+=== date ===
+Tue Sep 15 03:06:25 UTC 2026
+=== 1. runs with GQL-28 in task/meta ===
+/data/.leviath/runs/worker-1789400025-26ce5cea8218/meta.json
+/data/.leviath/runs/worker-1789397656-b1f5dc2c3fef/meta.json
+/data/.leviath/runs/worker-1789403923-a3aa20d55c50/meta.json
+/data/.leviath/runs/worker-1789413360-fd3e758fb4ed/meta.json
+/data/.leviath/runs/worker-1789405047-d835b53e3237/meta.json
+/data/.leviath/runs/worker-1789417379-2e77760ab512/meta.json
+/data/.leviath/runs/worker-1789410834-545fcf587ace/meta.json
+/data/.leviath/runs/worker-1789441046-534169699f17/meta.json
+/data/.leviath/runs/worker-1789408708-195eafd20bce/meta.json
+/data/.leviath/runs/worker-1789421393-86fde8e56295/meta.json
+/data/.leviath/runs/worker-1789423035-3f59cbd7552a/meta.json
+/data/.leviath/runs/worker-1789425719-f72c83b7b5e9/meta.json
+/data/.leviath/runs/worker-1789438986-1127e2f62084/meta.json
+=== 2. runs dirs named *gql28* ===
+=== 3. product-router / eventRuntime / drizzle refs ===
+=== 4. trial capacity / host judge player ===
+/data/work/graphql-realization/gql-07/repo/crates/leviath-core/src/run_meta.rs
+/data/work/graphql-realization/gql-07/repo/crates/leviath-core/src/write_limits/tests.rs
+/data/work/graphql-realization/gql-07/repo/crates/leviath-core/src/write_limits.rs
+/data/work/graphql-realization/gql-07/repo/crates/leviath-core/src/output.rs
+/data/work/graphql-realization/gql-07/repo/crates/leviath-net/src/read_caps.rs
+/data/work/graphql-realization/gql-07/repo/crates/leviath-cli/agents/orchestrator/agent.leviath
+/data/work/graphql-realization/gql-07/repo/crates/leviath-cli/agents/wide-researcher/agent.leviath
+/data/work/graphql-realization/gql-07/repo/crates/leviath-cli/agents/wide-researcher/tools/web_search.rhai
+/data/work/graphql-realization/gql-07/repo/crates/leviath-cli/agents/researcher/tools/web_search.rhai
+/data/work/graphql-realization/gql-07/repo/crates/leviath-cli/agents/reviewer/agent.leviath
+/data/work/graphql-realization/gql-07/repo/crates/leviath-cli/agents/bake-off/study/C2.graphql
+/data/work/graphql-realization/gql-07/repo/crates/leviath-cli/agents/deep-researcher/tools/web_search.rhai
+/data/work/graphql-realization/gql-07/repo/crates/leviath-cli/agents/data-analyst/tools/web_search.rhai
+/data/work/graphql-realization/gql-07/repo/crates/leviath-cli/src/daemon/lifecycle.rs
+/data/work/graphql-realization/gql-07/repo/crates/leviath-cli/src/daemon/recovery.rs
+/data/work/graphql-realization/gql-07/repo/crates/leviath-cli/src/daemon/config_reload.rs
+/data/work/graphql-realization/gql-07/repo/crates/leviath-cli/src/daemon/tool_service.rs
+/data/work/graphql-realization/gql-07/repo/crates/leviath-cli/src/daemon/spawn/mod.rs
+/data/work/graphql-realization/gql-07/repo/crates/leviath-cli/src/daemon/spawn/seeds.rs
+/data/work/graphql-realization/gql-07/repo/crates/leviath-cli/src/daemon/client.rs
+=== 5. gql-28 dirs ===
+/data/work/graphql-realization/gql-00/
+/data/work/graphql-realization/gql-01/
+/data/work/graphql-realization/gql-02/
+/data/work/graphql-realization/gql-03/
+/data/work/graphql-realization/gql-04/
+/data/work/graphql-realization/gql-05/
+/data/work/graphql-realization/gql-06/
+/data/work/graphql-realization/gql-07/
+/data/work/graphql-realization/gql-08/
+/data/work/graphql-realization/gql-09/
+/data/work/graphql-realization/gql-10/
+/data/work/graphql-realization/gql-12/
+/data/work/graphql-realization/gql-13/
+/data/work/graphql-realization/gql-24/
+/data/work/graphql-realization/gql-35/
+/data/work/graphql-realization/pkg/
+/data/work/graphql-realization/r1/
+/data/work/graphql-realization/r2/
+/data/work/graphql-realization/tmp/
+DONE

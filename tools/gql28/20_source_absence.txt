@@ -1,0 +1,23 @@
+=== date ===
+2026-09-15T03:26:15Z
+=== A1. checkout paths ===
+ABSENT /data/work/parlour
+ABSENT /data/work/graphql-realization/gql-28
+ABSENT /data/work/graphql-realization/gql-00/wt/L07-gql28/repo
+=== A2. required existing_paths anywhere under /data/work (maxdepth 8) ===
+routers.ts hits=0
+productRouter.ts hits=0
+eventRuntime.ts hits=0
+=== A3. drizzle/schema.ts ===
+a3_exit=0
+=== A4. skeleton-parlour.json ===
+{
+  "entries": [],
+  "missing": true,
+  "note": "no checkout at /data/work/parlour",
+  "repo": "parlour"
+}
+=== A5. sha256 of skeleton ===
+215378a9c877d34c0caef1c3b840cb8ca1913b8eb924bc5fd071cfedda176a23  /data/work/graphql-realization/gql-00/skeleton-parlour.json
+=== A6. gql-28 worktree/run dirs ===
+/data/work/graphql-realization/gql-24

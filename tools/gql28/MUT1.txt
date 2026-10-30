@@ -1,0 +1,57 @@
+F...FFF....                                                              [100%]
+=================================== FAILURES ===================================
+____________________ test_empty_root_is_blocked_with_exit_2 ____________________
+
+tmp_path = PosixPath('/tmp/pytest-of-root/pytest-152/test_empty_root_is_blocked_wit0')
+
+    def test_empty_root_is_blocked_with_exit_2(tmp_path):
+        spec = write_spec(tmp_path)
+        code, payload, _ = run(tmp_path, spec)
+>       assert code == 2, "an empty root must be BLOCKED, not ready"
+E       AssertionError: an empty root must be BLOCKED, not ready
+E       assert 0 == 2
+
+tools/gql28/test_check_contract_ready.py:77: AssertionError
+___________________ test_ready_requires_a_real_contract_file ___________________
+
+tmp_path = PosixPath('/tmp/pytest-of-root/pytest-152/test_ready_requires_a_real_con0')
+
+    def test_ready_requires_a_real_contract_file(tmp_path):
+        plant_checkout(tmp_path, with_contract=False)
+        spec = write_spec(tmp_path)
+        code, payload, _ = run(tmp_path, spec)
+>       assert code == 2
+E       assert 0 == 2
+
+tools/gql28/test_check_contract_ready.py:120: AssertionError
+_______________________ test_ready_requires_trpc_markers _______________________
+
+tmp_path = PosixPath('/tmp/pytest-of-root/pytest-152/test_ready_requires_trpc_marke0')
+
+    def test_ready_requires_trpc_markers(tmp_path):
+        plant_checkout(tmp_path, with_trpc=False)
+        spec = write_spec(tmp_path)
+        code, payload, _ = run(tmp_path, spec)
+>       assert code == 2
+E       assert 0 == 2
+
+tools/gql28/test_check_contract_ready.py:129: AssertionError
+___________________ test_ready_requires_every_existing_path ____________________
+
+tmp_path = PosixPath('/tmp/pytest-of-root/pytest-152/test_ready_requires_every_exis0')
+
+    def test_ready_requires_every_existing_path(tmp_path):
+        repo = plant_checkout(tmp_path)
+        (repo / "server" / "eventRuntime.ts").unlink()
+        spec = write_spec(tmp_path)
+        code, payload, _ = run(tmp_path, spec)
+>       assert code == 2
+E       assert 0 == 2
+
+tools/gql28/test_check_contract_ready.py:139: AssertionError
+=========================== short test summary info ============================
+FAILED tools/gql28/test_check_contract_ready.py::test_empty_root_is_blocked_with_exit_2
+FAILED tools/gql28/test_check_contract_ready.py::test_ready_requires_a_real_contract_file
+FAILED tools/gql28/test_check_contract_ready.py::test_ready_requires_trpc_markers
+FAILED tools/gql28/test_check_contract_ready.py::test_ready_requires_every_existing_path
+4 failed, 7 passed in 0.48s

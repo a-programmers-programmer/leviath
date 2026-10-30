@@ -1,0 +1,56 @@
+{
+  "checkout": null,
+  "checks": [
+    {
+      "detail": "no checkout under /data/work",
+      "name": "checkout",
+      "state": "missing"
+    },
+    {
+      "detail": "/data/work/AGENTS.md",
+      "name": "existing_path:AGENTS.md",
+      "state": "missing"
+    },
+    {
+      "detail": "/data/work/wiki",
+      "name": "existing_path:wiki",
+      "state": "missing"
+    },
+    {
+      "detail": "/data/work/server/routers.ts",
+      "name": "existing_path:server/routers.ts",
+      "state": "missing"
+    },
+    {
+      "detail": "/data/work/server/productRouter.ts",
+      "name": "existing_path:server/productRouter.ts",
+      "state": "missing"
+    },
+    {
+      "detail": "/data/work/server/eventRuntime.ts",
+      "name": "existing_path:server/eventRuntime.ts",
+      "state": "missing"
+    },
+    {
+      "detail": "/data/work/drizzle/schema.ts",
+      "name": "existing_path:drizzle/schema.ts",
+      "state": "missing"
+    },
+    {
+      "detail": "no tRPC marker in any router file",
+      "name": "trpc_markers",
+      "state": "missing"
+    },
+    {
+      "detail": "no .graphql artifact observed",
+      "name": "contract_artifact",
+      "state": "missing"
+    }
+  ],
+  "contract_accepted": false,
+  "contract_artifacts": [],
+  "node": "GQL-28",
+  "repository": "a-programmers-programmer/parlour",
+  "root": "/data/work",
+  "state": "blocked"
+}

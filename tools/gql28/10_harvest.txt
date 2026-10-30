@@ -1,0 +1,48 @@
+=== date ===
+Tue Sep 15 03:03:58 UTC 2026
+=== 1. parlour repo candidates ===
+ls: cannot access '/data/work/parlour': No such file or directory
+total 16
+drwxr-xr-x  3 root root 4096 Sep 11 00:20 .
+drwxr-xr-x 31 root root 4096 Sep 14 04:29 ..
+-rw-r--r--  1 root root 4018 Sep 11 00:20 brief.md
+drwxr-xr-x  2 root root 4096 Sep 11 00:39 moa
+=== 2. tRPC file search (bounded) ===
+find_exit=0
+=== 3. drizzle dirs ===
+=== 4. AGENTS.md in parlour-like trees ===
+/data/work/life-ops/AGENTS.md
+/data/work/spring-courts-secret/AGENTS.md
+=== 5. grep GQL-28 in gql-00 ===
+/data/work/graphql-realization/gql-00/HANDOFF-0189z-s15.md
+/data/work/graphql-realization/gql-00/HANDOFF-0193-s19.md
+/data/work/graphql-realization/gql-00/HANDOFF-0189z-s16.md
+/data/work/graphql-realization/gql-00/LANES-0193-s28.json
+/data/work/graphql-realization/gql-00/outbox/s17-outbox-reply.json
+/data/work/graphql-realization/gql-00/outbox/s16-outbox-reply.json
+/data/work/graphql-realization/gql-00/outbox/fleet-sustained-throughput-20260914T1448Z-reply.md
+/data/work/graphql-realization/gql-00/HANDOFF-0193-s21.md
+/data/work/graphql-realization/gql-00/HANDOFF-0193-s22.md
+/data/work/graphql-realization/gql-00/label-bead-map.json
+/data/work/graphql-realization/gql-00/REPORT.md
+/data/work/graphql-realization/gql-00/HANDOFF-0189z-s11.md
+/data/work/graphql-realization/gql-00/HANDOFF-0193-s20.md
+/data/work/graphql-realization/gql-00/DEPENDENCIES.md
+/data/work/graphql-realization/gql-00/HANDOFF-0193-s28.md
+/data/work/graphql-realization/gql-00/HANDOFF-0189z-s12.md
+/data/work/graphql-realization/gql-00/HANDOFF-0193-s23.md
+/data/work/graphql-realization/gql-00/HANDOFF-0189z-s17.md
+/data/work/graphql-realization/gql-00/tasks/0193-coordinator-cont19-20260914T2128Z.txt
+/data/work/graphql-realization/gql-00/tasks/0189z-coordinator-cont17-20260914T1913Z.txt
+=== 6. ceo-bus gql-28 files ===
+0049-gql-01-report.md
+0049-gql-12-report.md
+0049-gql-35-report.md
+0070A2_dispatch_gql12_retry.py
+0103-gql-dispatch.json
+0116-gql-split-dispatch.json
+_tick0100_gqlreply.md
+_tick0102_dispatch_gql12_retry2.py
+_tick0116_dispatch_gql.py
+_tick_0075E_dispatch_gql_retries.py
+DONE

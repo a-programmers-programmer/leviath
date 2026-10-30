@@ -1,0 +1,13 @@
+=== date ===
+Tue Sep 15 02:46:24 UTC 2026
+=== pwd ===
+/data/work/graphql-realization/gql-00/wt/L07-gql28
+=== git head ===
+7b6e050e89e6aea7b51453e633fbe9209c50a844
+lane/L07-gql28
+=== which bd ===
+bd absent
+=== parlour checkout ===
+ls: cannot access '/data/work/parlour': No such file or directory
+=== parlour-asset-review head ===
+3af3cf36aefe7f8c6b5599b133fe578d9a3bda47

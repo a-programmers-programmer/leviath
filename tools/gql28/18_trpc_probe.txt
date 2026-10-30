@@ -1,0 +1,7 @@
+=== date ===
+Tue Sep 15 03:17:49 UTC 2026
+=== A. tRPC markers across bounded roots ===
+grep_exit=0
+=== B. drizzle/schema.ts or server/productRouter.ts ===
+find_exit=0
+DONE

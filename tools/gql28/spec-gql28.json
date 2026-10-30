@@ -1,0 +1,13 @@
+{
+  "id": "GQL-28",
+  "repository": "a-programmers-programmer/parlour",
+  "base_commit_observed": "7b6e050e89e6aea7b51453e633fbe9209c50a844",
+  "existing_paths": [
+    "AGENTS.md",
+    "wiki",
+    "server/routers.ts",
+    "server/productRouter.ts",
+    "server/eventRuntime.ts",
+    "drizzle/schema.ts"
+  ]
+}

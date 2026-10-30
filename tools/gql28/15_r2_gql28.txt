@@ -1,0 +1,48 @@
+TOP KEYS: ['actor', 'architecture', 'authority', 'created_at', 'format', 'latest_rulings', 'request', 'revision', 'source_branch', 'source_commit', 'status', 'tasks', 'updated_at']
+source_commit: 15dc182e0bc6c28dfa93f4b8dd3c423372808f61
+source_branch: sync/upstream-0.6.0
+status: Implementation specification; task labels are not live Bead IDs.
+architecture: {"authoring": "Two cooperating language servers, schema and typed code, with a shared reconciled representation and versioned three-way conflict handling.", "codegen": "One deterministic generator command over a reconciled snapshot; handwritten behavior is separate.", "design": "Diverse cheap proposal lanes and compact explicit merge decisions feed the full static gate and independent high-tier review. Deterministic merge does not prove good design.", "migration": "One logical domain graph with module ownership. UI, agents and scripts use the same operations. Existing HTTP, webhook, file and MCP transports can adapt those operations without duplicating domain rules.", "runtime": "WorkflowDefinition remains a DAG with callable WorkflowStep and first-class edges. Both workflow and step run t
+authority: {"git": "No merge, force-push, production deployment, destructive migration or new external communication is authorized by this package.", "implementation": "User requested full realization and swarm migration work; reversible isolated implementation is authorized.", "models": "Existing approved qwen-worker DeepSeek Flash (and established two-failure Pro escalation) from directive 0046. No new high-tier model selection is inferred from source pins; return exact available choices to Josh before a paid design/review run.", "spend": "Preserve Josh's directive 0046: each line item >= $100 requires explicit OK; report actual spend; do not split a purchase/run to evade threshold. Latest explicit Josh rulings prevail."}
+latest_rulings: ["Josh: the Kanban can be deleted; it is legacy if still present. Retire the Kanban surface rather than migrate its UI. Preserve the active queue controller and move any live legacy-route callers before removing those routes.", "Josh: add telemetry to the site as a backlog task for the swarm. Prepare the task; do not add a vendor/subscription or make it a blocker for the GraphQL realization."]
+N tasks: 36
+{
+  "contract_identity_requirement": "Pin accepted contract fingerprint before dependent implementation; re-verify before acceptance.",
+  "definition_of_done": "Every active tRPC procedure maps to a GraphQL operation or an explicit transport exception. Event isolation, trial capacity, host/judge/player permissions and expected failures are covered by real operations. Contract acceptance precedes implementation.",
+  "depends_on": [
+    "GQL-00",
+    "GQL-10"
+  ],
+  "evidence_required": [
+    "source/base commit and resulting diff",
+    "exact commands, outputs and exit codes",
+    "real Bead ID and Leviath run ID",
+    "log/artifact paths and content hashes",
+    "actual provider spend; blocked/passed/verified states distinguished"
+  ],
+  "execution": "Hermes coordinates. Execute through lev run qwen-worker for implementation; use per-stage approved models for contract design/review. No global model override.",
+  "existing_paths": [
+    "AGENTS.md",
+    "wiki",
+    "server/routers.ts",
+    "server/productRouter.ts",
+    "server/eventRuntime.ts",
+    "drizzle/schema.ts"
+  ],
+  "id": "GQL-28",
+  "outcome": "Accept the Parlour product contract",
+  "owner_role": "contract-design",
+  "proposed_paths": [],
+  "repository": "a-programmers-programmer/parlour",
+  "rollback": "Keep existing source/store and compatibility route intact; revert this isolated change before cutover. No destructive data migration.",
+  "status": "specified_not_imported",
+  "steps": "Inventory all product tRPC procedures, database entities and frontend calls. Design event, host, participant, puzzle, challenge, submission, review, leaderboard, trial and payment-status operations. Preserve existing product rules and tenant boundaries.",
+  "title": "Accept the Parlour product contract",
+  "write_ownership": "One worktree and one writer per owned file set. Shared schema, generated files and routing registrations have one integrating owner."
+}
+---- GQL-28 neighbours ----
+GQL-00 | Inventory active surfaces and attach this program to existing work | specified_not_imported | a-programmers-programmer/life-ops
+GQL-10 | Join proposal/merge work to the deterministic acceptance loop | specified_not_imported | a-programmers-programmer/leviath
+GQL-27 | Migrate registered Windows tools and local development adapters | specified_not_imported | a-programmers-programmer/life-ops
+GQL-29 | Implement Parlour product GraphQL resolvers and compatibility adapters | specified_not_imported | a-programmers-programmer/parlour
+GQL-30 | Migrate all Parlour product frontend data calls | specified_not_imported | a-programmers-programmer/parlour

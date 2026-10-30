@@ -1,0 +1,5 @@
+=== date ===
+Tue Sep 15 02:54:14 UTC 2026
+=== tRPC search across /data /home /root /opt /srv (ts/tsx/js/mjs) ===
+/data/.rustup/toolchains/1.97.1-x86_64-unknown-linux-gnu/share/doc/rust/html/rustc/searchindex-66eceba0.js
+=== exit=0 ===

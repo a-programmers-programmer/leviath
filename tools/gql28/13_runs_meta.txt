@@ -1,0 +1,218 @@
+### worker-1789400025-26ce5cea8218
+  status = complete
+  model = openrouter/deepseek/deepseek-v4-pro
+  started_at = 1789400025
+  cost_usd = 3.12629670158
+  error = None
+  workdir = /data/work/graphql-realization/gql-00
+  task = # 0189z — coordinated acceptance/dispatch continuation, successor #12 (sustained throughput)
+id: 0189z
+correlation: fleet-sustained-throughput-20260914T1448Z (continues fleet-throughput-repair-2026091
+  keys: ['run_id', 'agent_name', 'agent_path', 'task', 'model', 'pid', 'status', 'current_stage', 'stage_index', 'num_stages', 'iteration', 'prompt_tokens', 'completion_tokens', 'cached_tokens', 'cache_write_tokens', 'tool_calls', 'cost_usd', 'unpriced_calls', 'cost_is_exact', 'cost_priced_usd', 'workdir', 'started_at', 'updated_at', 'last_progress_at', 'active', 'error', 'title', 'title_error', 'metadata', 'callback_url', 'callback_secret', 'parent_run_id', 'children', 'depth', 'max_child_depth', 'flags', 'yolo', 'read_paths', 'final_output', 'model_override']
+-rw-------    1 root root     605 Sep 14 16:28 final_output
+-rw-------    1 root root   19862 Sep 14 16:29 meta.json
+-rw-------    1 root root 5975066 Sep 14 16:29 run.lvr
+drwx------    5 root root    4096 Sep 14 16:27 stages
+-rw-------    1 root root    5175 Sep 14 16:29 stages.json
+### worker-1789397656-b1f5dc2c3fef
+  status = complete
+  model = openrouter/deepseek/deepseek-v4-pro
+  started_at = 1789397656
+  cost_usd = 1.8066632110000005
+  error = None
+  workdir = /data/work/graphql-realization/gql-00
+  task = # 0189z — coordinated acceptance/dispatch continuation, successor #11 (sustained throughput)
+id: 0189z
+correlation: fleet-sustained-throughput-20260914T1448Z (continues fleet-throughput-repair-2026091
+  keys: ['run_id', 'agent_name', 'agent_path', 'task', 'model', 'pid', 'status', 'current_stage', 'stage_index', 'num_stages', 'iteration', 'prompt_tokens', 'completion_tokens', 'cached_tokens', 'cache_write_tokens', 'tool_calls', 'cost_usd', 'unpriced_calls', 'cost_is_exact', 'cost_priced_usd', 'workdir', 'started_at', 'updated_at', 'last_progress_at', 'active', 'error', 'title', 'title_error', 'metadata', 'callback_url', 'callback_secret', 'parent_run_id', 'children', 'depth', 'max_child_depth', 'flags', 'yolo', 'read_paths', 'final_output', 'model_override']
+-rw-------    1 root root     950 Sep 14 15:18 final_output
+-rw-------    1 root root   14304 Sep 14 15:18 meta.json
+-rw-------    1 root root 3502699 Sep 14 15:18 run.lvr
+drwx------    5 root root    4096 Sep 14 15:17 stages
+-rw-------    1 root root    5142 Sep 14 15:18 stages.json
+### worker-1789403923-a3aa20d55c50
+  status = complete
+  model = openrouter/deepseek/deepseek-v4-pro
+  started_at = 1789403923
+  cost_usd = 0.7603787343600003
+  error = None
+  workdir = /data/work/graphql-realization/gql-00
+  task = # 0189z — coordinated acceptance/dispatch continuation, successor #13 (sustained throughput)
+id: 0189z
+correlation: fleet-sustained-throughput-20260914T1448Z (continues fleet-throughput-repair-2026091
+  keys: ['run_id', 'agent_name', 'agent_path', 'task', 'model', 'pid', 'status', 'current_stage', 'stage_index', 'num_stages', 'iteration', 'prompt_tokens', 'completion_tokens', 'cached_tokens', 'cache_write_tokens', 'tool_calls', 'cost_usd', 'unpriced_calls', 'cost_is_exact', 'cost_priced_usd', 'workdir', 'started_at', 'updated_at', 'last_progress_at', 'active', 'error', 'title', 'title_error', 'metadata', 'callback_url', 'callback_secret', 'parent_run_id', 'children', 'depth', 'max_child_depth', 'flags', 'yolo', 'read_paths', 'final_output', 'model_override']
+-rw-------    1 root root     442 Sep 14 16:52 final_output
+-rw-------    1 root root   15025 Sep 14 16:52 meta.json
+-rw-------    1 root root 1231108 Sep 14 16:52 run.lvr
+drwx------    5 root root    4096 Sep 14 16:51 stages
+-rw-------    1 root root    5146 Sep 14 16:52 stages.json
+### worker-1789413360-fd3e758fb4ed
+  status = complete
+  model = openrouter/anthropic/claude-opus-5
+  started_at = 1789413360
+  cost_usd = 20.960756147999994
+  error = None
+  workdir = /data/work/graphql-realization/gql-00
+  task = # 0189z — coordinated acceptance/dispatch continuation, successor #17 (runtime repair, Opus-5)
+id: 0189z
+correlation: fleet-sustained-throughput-20260914T1448Z (continues fleet-throughput-repair-20260
+  keys: ['run_id', 'agent_name', 'agent_path', 'task', 'model', 'pid', 'status', 'current_stage', 'stage_index', 'num_stages', 'iteration', 'prompt_tokens', 'completion_tokens', 'cached_tokens', 'cache_write_tokens', 'tool_calls', 'cost_usd', 'unpriced_calls', 'cost_is_exact', 'cost_priced_usd', 'workdir', 'started_at', 'updated_at', 'last_progress_at', 'active', 'error', 'title', 'title_error', 'metadata', 'callback_url', 'callback_secret', 'parent_run_id', 'children', 'depth', 'max_child_depth', 'flags', 'yolo', 'read_paths', 'final_output', 'model_override']
+-rw-------    1 root root    3144 Sep 14 20:11 final_output
+-rw-------    1 root root   15007 Sep 14 20:11 meta.json
+-rw-------    1 root root 3859102 Sep 14 20:11 run.lvr
+drwx------    5 root root    4096 Sep 14 20:11 stages
+-rw-------    1 root root    5983 Sep 14 20:11 stages.json
+### worker-1789405047-d835b53e3237
+  status = complete
+  model = openrouter/deepseek/deepseek-v4-pro
+  started_at = 1789405047
+  cost_usd = 1.5687200260800003
+  error = None
+  workdir = /data/work/graphql-realization/gql-00
+  task = # 0189z — coordinated acceptance/dispatch continuation, successor #14 (sustained throughput)
+id: 0189z
+correlation: fleet-sustained-throughput-20260914T1448Z (continues fleet-throughput-repair-2026091
+  keys: ['run_id', 'agent_name', 'agent_path', 'task', 'model', 'pid', 'status', 'current_stage', 'stage_index', 'num_stages', 'iteration', 'prompt_tokens', 'completion_tokens', 'cached_tokens', 'cache_write_tokens', 'tool_calls', 'cost_usd', 'unpriced_calls', 'cost_is_exact', 'cost_priced_usd', 'workdir', 'started_at', 'updated_at', 'last_progress_at', 'active', 'error', 'title', 'title_error', 'metadata', 'callback_url', 'callback_secret', 'parent_run_id', 'children', 'depth', 'max_child_depth', 'flags', 'yolo', 'read_paths', 'final_output', 'model_override']
+-rw-------    1 root root     247 Sep 14 17:31 final_output
+-rw-------    1 root root   13635 Sep 14 17:31 meta.json
+-rw-------    1 root root 4012633 Sep 14 17:31 run.lvr
+drwx------    5 root root    4096 Sep 14 17:15 stages
+-rw-------    1 root root    5196 Sep 14 17:31 stages.json
+### worker-1789417379-2e77760ab512
+  status = complete
+  model = openrouter/anthropic/claude-opus-5
+  started_at = 1789417379
+  cost_usd = 13.718711946
+  error = None
+  workdir = /data/work/graphql-realization/gql-00
+  task = # TASK — 0192 coordinator continuation #18 (current-state-first)
+
+Authorization id: **0192** (author Codex, issued 2026-09-14T20:06Z)
+Correlation: `fleet-sustained-throughput-20260914T1448Z`
+Parent ch
+  keys: ['run_id', 'agent_name', 'agent_path', 'task', 'model', 'pid', 'status', 'current_stage', 'stage_index', 'num_stages', 'iteration', 'prompt_tokens', 'completion_tokens', 'cached_tokens', 'cache_write_tokens', 'tool_calls', 'cost_usd', 'unpriced_calls', 'cost_is_exact', 'cost_priced_usd', 'workdir', 'started_at', 'updated_at', 'last_progress_at', 'active', 'error', 'title', 'title_error', 'metadata', 'callback_url', 'callback_secret', 'parent_run_id', 'children', 'depth', 'max_child_depth', 'flags', 'yolo', 'read_paths', 'final_output', 'model_override']
+-rw-------    1 root root    2185 Sep 14 21:17 final_output
+-rw-------    1 root root   17006 Sep 14 21:17 meta.json
+-rw-------    1 root root 3982677 Sep 14 21:17 run.lvr
+drwx------    5 root root    4096 Sep 14 21:17 stages
+-rw-------    1 root root    5114 Sep 14 21:17 stages.json
+### worker-1789410834-545fcf587ace
+  status = complete
+  model = openrouter/deepseek/deepseek-v4-pro
+  started_at = 1789410834
+  cost_usd = 0.6975609802899998
+  error = None
+  workdir = /data/work/graphql-realization/gql-00
+  task = # 0189z — coordinated acceptance/dispatch continuation, successor #16 (sustained throughput)
+id: 0189z
+correlation: fleet-sustained-throughput-20260914T1448Z (continues fleet-throughput-repair-2026091
+  keys: ['run_id', 'agent_name', 'agent_path', 'task', 'model', 'pid', 'status', 'current_stage', 'stage_index', 'num_stages', 'iteration', 'prompt_tokens', 'completion_tokens', 'cached_tokens', 'cache_write_tokens', 'tool_calls', 'cost_usd', 'unpriced_calls', 'cost_is_exact', 'cost_priced_usd', 'workdir', 'started_at', 'updated_at', 'last_progress_at', 'active', 'error', 'title', 'title_error', 'metadata', 'callback_url', 'callback_secret', 'parent_run_id', 'children', 'depth', 'max_child_depth', 'flags', 'yolo', 'read_paths', 'final_output', 'model_override']
+-rw-------    1 root root     380 Sep 14 19:11 final_output
+-rw-------    1 root root   11920 Sep 14 19:11 meta.json
+-rw-------    1 root root 2599618 Sep 14 19:11 run.lvr
+drwx------    5 root root    4096 Sep 14 19:10 stages
+-rw-------    1 root root    5153 Sep 14 19:11 stages.json
+### worker-1789441046-534169699f17
+  status = running
+  model = openrouter/deepseek/deepseek-v4.1-flash
+  started_at = 1789441046
+  cost_usd = 0.270886608
+  error = None
+  workdir = /data/work/graphql-realization/gql-00
+  task = # 0193 — COORDINATOR SUCCESSOR #29 (continuation of #28; #28 completed cleanly)
+
+Authorization: directive 0193 (P0, author Codex, requires_ack) + amendments.
+**Amendments win over any older handoff, i
+  keys: ['run_id', 'agent_name', 'agent_path', 'task', 'model', 'pid', 'status', 'current_stage', 'stage_index', 'num_stages', 'iteration', 'prompt_tokens', 'completion_tokens', 'cached_tokens', 'cache_write_tokens', 'tool_calls', 'cost_usd', 'unpriced_calls', 'cost_is_exact', 'cost_priced_usd', 'workdir', 'started_at', 'updated_at', 'last_progress_at', 'active', 'error', 'title', 'title_error', 'metadata', 'callback_url', 'callback_secret', 'parent_run_id', 'children', 'depth', 'max_child_depth', 'flags', 'yolo', 'read_paths', 'model_override']
+-rw-------    1 root root  186162 Sep 15 03:07 context.json
+-rw-------    1 root root   13773 Sep 15 03:07 meta.json
+-rw-------    1 root root 3157626 Sep 15 03:07 run.lvr
+drwx------    3 root root    4096 Sep 15 02:57 stages
+-rw-------    1 root root    3240 Sep 15 03:07 stages.json
+### worker-1789408708-195eafd20bce
+  status = complete
+  model = openrouter/deepseek/deepseek-v4-pro
+  started_at = 1789408708
+  cost_usd = 1.09782909284
+  error = None
+  workdir = /data/work/graphql-realization/gql-00
+  task = # 0189z — coordinated acceptance/dispatch continuation, successor #15 (sustained throughput)
+id: 0189z
+correlation: fleet-sustained-throughput-20260914T1448Z (continues fleet-throughput-repair-2026091
+  keys: ['run_id', 'agent_name', 'agent_path', 'task', 'model', 'pid', 'status', 'current_stage', 'stage_index', 'num_stages', 'iteration', 'prompt_tokens', 'completion_tokens', 'cached_tokens', 'cache_write_tokens', 'tool_calls', 'cost_usd', 'unpriced_calls', 'cost_is_exact', 'cost_priced_usd', 'workdir', 'started_at', 'updated_at', 'last_progress_at', 'active', 'error', 'title', 'title_error', 'metadata', 'callback_url', 'callback_secret', 'parent_run_id', 'children', 'depth', 'max_child_depth', 'flags', 'yolo', 'read_paths', 'final_output', 'model_override']
+-rw-------    1 root root     895 Sep 14 18:25 final_output
+-rw-------    1 root root   14359 Sep 14 18:25 meta.json
+-rw-------    1 root root 2688523 Sep 14 18:25 run.lvr
+drwx------    5 root root    4096 Sep 14 18:22 stages
+-rw-------    1 root root    5187 Sep 14 18:25 stages.json
+### worker-1789421393-86fde8e56295
+  status = complete
+  model = openrouter/anthropic/claude-opus-5
+  started_at = 1789421393
+  cost_usd = 12.638894519999997
+  error = None
+  workdir = /data/work/graphql-realization/gql-00
+  task = # TASK — 0193 coordinator continuation #19 (current-state-first)
+
+Authorization id: **0193** (author Codex, issued 2026-09-14T21:21Z, P0, requires_ack)
+Correlation: `fleet-sustained-throughput-2026091
+  keys: ['run_id', 'agent_name', 'agent_path', 'task', 'model', 'pid', 'status', 'current_stage', 'stage_index', 'num_stages', 'iteration', 'prompt_tokens', 'completion_tokens', 'cached_tokens', 'cache_write_tokens', 'tool_calls', 'cost_usd', 'unpriced_calls', 'cost_is_exact', 'cost_priced_usd', 'workdir', 'started_at', 'updated_at', 'last_progress_at', 'active', 'error', 'title', 'title_error', 'metadata', 'callback_url', 'callback_secret', 'parent_run_id', 'children', 'depth', 'max_child_depth', 'flags', 'yolo', 'read_paths', 'final_output', 'model_override']
+-rw-------    1 root root    2721 Sep 14 21:51 final_output
+-rw-------    1 root root   24867 Sep 14 21:51 meta.json
+-rw-------    1 root root 2804378 Sep 14 21:51 run.lvr
+drwx------    5 root root    4096 Sep 14 21:51 stages
+-rw-------    1 root root    5132 Sep 14 21:51 stages.json
+### worker-1789423035-3f59cbd7552a
+  status = complete
+  model = openrouter/anthropic/claude-opus-5
+  started_at = 1789423035
+  cost_usd = 8.290552930000004
+  error = None
+  workdir = /data/work/graphql-realization/gql-00
+  task = # TASK — 0193 coordinator continuation #20 (current-state-first)
+
+Authorization id: **0193** (author Codex, issued 2026-09-14T21:21Z, P0, requires_ack),
+amended by `0193-native-mcp-reuse-20260914T2127
+  keys: ['run_id', 'agent_name', 'agent_path', 'task', 'model', 'pid', 'status', 'current_stage', 'stage_index', 'num_stages', 'iteration', 'prompt_tokens', 'completion_tokens', 'cached_tokens', 'cache_write_tokens', 'tool_calls', 'cost_usd', 'unpriced_calls', 'cost_is_exact', 'cost_priced_usd', 'workdir', 'started_at', 'updated_at', 'last_progress_at', 'active', 'error', 'title', 'title_error', 'metadata', 'callback_url', 'callback_secret', 'parent_run_id', 'children', 'depth', 'max_child_depth', 'flags', 'yolo', 'read_paths', 'final_output', 'model_override']
+-rw-------    1 root root    3132 Sep 14 22:14 final_output
+-rw-------    1 root root   16750 Sep 14 22:14 meta.json
+-rw-------    1 root root 1625080 Sep 14 22:14 run.lvr
+drwx------    5 root root    4096 Sep 14 22:14 stages
+-rw-------    1 root root    5097 Sep 14 22:14 stages.json
+### worker-1789425719-f72c83b7b5e9
+  status = complete
+  model = openrouter/anthropic/claude-opus-5
+  started_at = 1789425719
+  cost_usd = 8.600839349999998
+  error = None
+  workdir = /data/work/graphql-realization/gql-00
+  task = # 0193 — COORDINATOR SUCCESSOR #22 (continuation of #21)
+
+Authorization: *** (P0, author Codex, requires_ack), plus amendment
+`0193-native-mcp-reuse-20260914T2127Z.md`
+(2360 B, sha256 59c2480a1c380415
+  keys: ['run_id', 'agent_name', 'agent_path', 'task', 'model', 'pid', 'status', 'current_stage', 'stage_index', 'num_stages', 'iteration', 'prompt_tokens', 'completion_tokens', 'cached_tokens', 'cache_write_tokens', 'tool_calls', 'cost_usd', 'unpriced_calls', 'cost_is_exact', 'cost_priced_usd', 'workdir', 'started_at', 'updated_at', 'last_progress_at', 'active', 'error', 'title', 'title_error', 'metadata', 'callback_url', 'callback_secret', 'parent_run_id', 'children', 'depth', 'max_child_depth', 'flags', 'yolo', 'read_paths', 'final_output', 'model_override']
+-rw-------    1 root root    5175 Sep 14 23:02 final_output
+-rw-------    1 root root   18822 Sep 14 23:02 meta.json
+-rw-------    1 root root 1610542 Sep 14 23:02 run.lvr
+drwx------    5 root root    4096 Sep 14 23:02 stages
+-rw-------    1 root root    5055 Sep 14 23:02 stages.json
+### worker-1789438986-1127e2f62084
+  status = running
+  model = openrouter/deepseek/deepseek-v4.1-flash
+  started_at = 1789438986
+  cost_usd = 0.8936330400000004
+  error = None
+  workdir = /data/work/graphql-realization/gql-00/wt/L07-gql28
+  task = # Lane L07-gql28 — node GQL-28
+
+Directive 0193 + amendments 00:55Z (worktrees), 01:05Z (lane count 12),
+01:12Z (0104 ceiling retired). Amendments win over any older handoff.
+
+## Model gate — POSITIVE 
+  keys: ['run_id', 'agent_name', 'agent_path', 'task', 'model', 'pid', 'status', 'current_stage', 'stage_index', 'num_stages', 'iteration', 'prompt_tokens', 'completion_tokens', 'cached_tokens', 'cache_write_tokens', 'tool_calls', 'cost_usd', 'unpriced_calls', 'cost_is_exact', 'cost_priced_usd', 'workdir', 'started_at', 'updated_at', 'last_progress_at', 'active', 'error', 'title', 'title_error', 'metadata', 'callback_url', 'callback_secret', 'parent_run_id', 'children', 'depth', 'max_child_depth', 'flags', 'yolo', 'read_paths', 'model_override']
+-rw-------    1 root root   207134 Sep 15 03:07 context.json
+-rw-------    1 root root     6358 Sep 15 03:07 meta.json
+-rw-------    1 root root 11372033 Sep 15 03:07 run.lvr
+drwx------    3 root root     4096 Sep 15 02:23 stages
+-rw-------    1 root root     3272 Sep 15 03:07 stages.json

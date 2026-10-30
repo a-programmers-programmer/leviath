@@ -1,0 +1,138 @@
+=== date ===
+Tue Sep 15 03:07:50 UTC 2026
+=== A. GQL-28 existing_paths on disk ===
+-- server/routers.ts
+-- server/productRouter.ts
+-- server/eventRuntime.ts
+-- drizzle/schema.ts
+=== B. any file named productRouter/eventRuntime ===
+=== C. parlour product repo remote ===
+=== D. accepted Parlour contract artifacts ===
+=== E. gql-00 subdirs ===
+total 3664
+drwxr-xr-x 12 root root    4096 Sep 15 02:43 .
+drwxr-xr-x 21 root root    4096 Sep 14 21:36 ..
+-rw-r--r--  1 root root    1383 Sep 14 20:29 .dispatch-s18.err
+-rw-r--r--  1 root root     166 Sep 14 20:29 .dispatch-s18.json
+drwxr-xr-x  2 root root    4096 Sep 14 10:57 0185z-logs
+-rw-r--r--  1 root root    1383 Sep 14 15:33 0189z-cont12-launch.err
+-rw-r--r--  1 root root     185 Sep 14 15:33 0189z-cont12-launch.out
+-rw-r--r--  1 root root    1383 Sep 14 13:09 0189z-gql03-launch.err
+-rw-r--r--  1 root root     185 Sep 14 13:09 0189z-gql03-launch.json
+-rw-r--r--  1 root root    1383 Sep 14 13:09 0189z-gql04-launch.err
+-rw-r--r--  1 root root     185 Sep 14 13:09 0189z-gql04-launch.json
+-rw-r--r--  1 root root    1383 Sep 14 14:33 0189z-gql07-launch.err
+-rw-r--r--  1 root root     185 Sep 14 14:33 0189z-gql07-launch.json
+-rw-r--r--  1 root root    1383 Sep 14 12:25 0189z-gql10-launch.err
+-rw-r--r--  1 root root     185 Sep 14 12:25 0189z-gql10-launch.json
+-rw-r--r--  1 root root    5585 Sep 14 22:11 ACCEPTANCE-0193-A-bridge-s20.json
+-rw-r--r--  1 root root    9799 Sep 14 22:29 ACCEPTANCE-0193-B-gateway-s21.json
+-rw-r--r--  1 root root    5014 Sep 14 23:42 ACCEPTANCE-0193-C-gql05-node0-s24.json
+-rw-r--r--  1 root root    7238 Sep 15 02:42 ACCEPTANCE-0193-C-gql05-nodea-s28.json
+-rw-r--r--  1 root root    8559 Sep 14 22:35 ACCEPTANCE-0193-C-gql05-s21.json
+-rw-r--r--  1 root root    8376 Sep 14 13:06 ACCEPTANCE-GQL-02-0189z.json
+-rw-r--r--  1 root root    2668 Sep 14 18:11 ACCEPTANCE-GQL-03-0189z-s15.json
+-rw-r--r--  1 root root   10447 Sep 14 20:06 ACCEPTANCE-GQL-03-0189z-s17.json
+-rw-r--r--  1 root root    1832 Sep 14 14:58 ACCEPTANCE-GQL-03-0189z.json
+-rw-r--r--  1 root root    4830 Sep 14 17:12 ACCEPTANCE-GQL-04-0189z-s14.json
+-rw-r--r--  1 root root    2362 Sep 14 14:58 ACCEPTANCE-GQL-04-0189z.json
+-rw-r--r--  1 root root    2692 Sep 14 16:44 ACCEPTANCE-GQL-07-0189z.json
+-rw-r--r--  1 root root    3969 Sep 14 22:01 ACCEPTANCE-GQL-08-0193-s20.json
+-rw-r--r--  1 root root    7501 Sep 14 13:21 ACCEPTANCE-GQL-09-0189z-confirm.json
+-rw-r--r--  1 root root    6872 Sep 14 12:22 ACCEPTANCE-GQL-09-0189z.json
+-rw-r--r--  1 root root    9723 Sep 14 14:35 ACCEPTANCE-GQL-10-0189z.json
+-rw-r--r--  1 root root    3292 Sep 14 16:44 ACCEPTANCE-GQL-12-0189z.json
+-rw-r--r--  1 root root    3125 Sep 14 18:11 ACCEPTANCE-GQL-13-0189z-s15.json
+-rw-r--r--  1 root root    2865 Sep 14 18:55 ACCEPTANCE-GQL-13-0189z-s16.json
+-rw-r--r--  1 root root    1049 Sep 14 18:55 ACCEPTANCE-GQL-24-0189z-s16.json
+-rw-r--r--  1 root root    2652 Sep 14 22:30 DECISION-REQUEST-0193-activation-s21.json
+-rw-r--r--  1 root root    6208 Sep 15 00:38 DECISION-REQUEST-0193-outbox-conflict-s25.json
+-rw-r--r--  1 root root    6182 Sep 12 16:10 DEPENDENCIES.md
+-rw-r--r--  1 root root    3395 Sep 14 20:27 DISPATCH-GATEWAY-REPAIR-0192-s18.md
+-rw-r--r--  1 root root    2277 Sep 14 18:36 DISPATCH-GQL-03-0189z-s16.json
+-rw-r--r--  1 root root    5500 Sep 14 13:10 DISPATCH-GQL-03-GQL-04-0189z-9.json
+-rw-r--r--  1 root root    3123 Sep 14 12:25 DISPATCH-GQL-10-0189z.json
+-rw-r--r--  1 root root    5211 Sep 14 13:22 DISPATCH-RECEIPT-GQL-10-0189z-confirm.json
+-rw-r--r--  1 root root    8083 Sep 14 20:06 DISPATCH-RUNTIME-REPAIR-0189z-s17.json
+-rw-r--r--  1 root root   20698 Sep 14 20:06 EVIDENCE-RUNTIME-REPAIR-0189z-s17.json
+-rw-r--r--  1 root root    5407 Sep 15 00:14 FINDING-0193-queue-a3-violation-s25.json
+-rw-r--r--  1 root root    5370 Sep 15 00:07 FINDING-0193-ts7-compiler-api-s25.json
+-rw-r--r--  1 root root    3440 Sep 14 08:36 HANDOFF-0184z.md
+-rw-r--r--  1 root root    8112 Sep 14 13:11 HANDOFF-0189z-9.md
+-rw-r--r--  1 root root    8461 Sep 14 13:22 HANDOFF-0189z-s10.md
+-rw-r--r--  1 root root    5110 Sep 14 15:03 HANDOFF-0189z-s11.md
+-rw-r--r--  1 root root   11959 Sep 14 16:08 HANDOFF-0189z-s12.md
+-rw-r--r--  1 root root    6766 Sep 14 16:46 HANDOFF-0189z-s13.md
+-rw-r--r--  1 root root    6411 Sep 14 17:13 HANDOFF-0189z-s14.md
+-rw-r--r--  1 root root    6304 Sep 14 18:12 HANDOFF-0189z-s15.md
+-rw-r--r--  1 root root    7642 Sep 14 18:56 HANDOFF-0189z-s16.md
+-rw-r--r--  1 root root   18673 Sep 14 20:07 HANDOFF-0189z-s17.md
+-rw-r--r--  1 root root    7378 Sep 14 12:26 HANDOFF-0189z.md
+-rw-r--r--  1 root root    9670 Sep 14 21:43 HANDOFF-0193-s19.md
+-rw-r--r--  1 root root   11176 Sep 14 22:12 HANDOFF-0193-s20.md
+-rw-r--r--  1 root root   12130 Sep 14 22:35 HANDOFF-0193-s21.md
+-rw-r--r--  1 root root   14292 Sep 14 23:00 HANDOFF-0193-s22.md
+-rw-r--r--  1 root root   15908 Sep 14 23:22 HANDOFF-0193-s23.md
+-rw-r--r--  1 root root   14548 Sep 14 23:48 HANDOFF-0193-s24.md
+-rw-r--r--  1 root root   11364 Sep 15 01:00 HANDOFF-0193-s26.md
+-rw-r--r--  1 root root    2112 Sep 15 01:09 HANDOFF-0193-s27.md
+-rw-r--r--  1 root root    9900 Sep 15 02:44 HANDOFF-0193-s28.md
+-rw-r--r--  1 root root    3326 Sep 14 08:50 HANDOFF.md
+-rw-r--r--  1 root root   13025 Sep 15 02:39 LANES-0193-s28.json
+-rw-r--r--  1 root root    6259 Sep 14 20:47 RECEIPT-0192-s18.draft.md
+-rw-r--r--  1 root root    9069 Sep 14 20:56 RECEIPT-0192-s18.md
+-rw-r--r--  1 root root    6551 Sep 14 23:21 RECONCILIATION-0193-activation-s23.json
+-rw-r--r--  1 root root    3410 Sep 14 22:30 RECORD-0193-A-runtime-registration-s21.json
+-rw-r--r--  1 root root    3580 Sep 12 15:03 REPORT-prepass.md
+-rw-r--r--  1 root root   14576 Sep 12 15:10 REPORT.md
+-rw-r--r--  1 root root    8074 Sep 14 23:17 RESIDUALS-0193-s23.json
+-rw-r--r--  1 root root    4663 Sep 15 02:43 RULING-0193-0104-retirement-s28.json
+-rw-r--r--  1 root root   11500 Sep 14 22:59 RULING-0193-B-gateway-s22.json
+-rw-r--r--  1 root root    7228 Sep 14 20:07 RULINGS-0189z-s17.json
+-rw-r--r--  1 root root    3539 Sep 14 20:04 STATUS-GQL-03-0189z-s17.json
+-rw-r--r--  1 root root    1112 Sep 14 18:36 STATUS-GQL-13-0189z-s16.json
+-rw-r--r--  1 root root    2467 Sep 14 20:24 WEDGE-CANDIDATE-0192-s18.patch
+-rw-r--r--  1 root root    3095 Sep 12 14:32 classify_leviath.py
+-rw-r--r--  1 root root   29072 Sep 12 14:38 classify_parlour.py
+drwxr-xr-x  2 root root   12288 Sep 12 11:07 evidence
+drwxr-xr-x  2 root root    4096 Sep 14 12:03 evidence-0185z
+-rw-r--r--  1 root root    1463 Sep 14 10:37 g7_artifacts.txt
+-rw-r--r--  1 root root    3358 Sep 14 10:37 g7_inspect.txt
+-rw-r--r--  1 root root   16928 Sep 12 14:30 gen_inv.py
+-rw-r--r--  1 root root   29564 Sep 12 14:32 gen_inventory.py
+drwxr-xr-x  3 root root    4096 Sep 14 17:04 harvest
+-rw-r--r--  1 root root  159396 Sep 12 14:32 inventory-hermes-gateway.md
+-rw-r--r--  1 root root   20508 Sep 12 14:34 inventory-leviath.md
+-rw-r--r--  1 root root   41091 Sep 12 14:30 inventory-life-ops.md
+-rw-r--r--  1 root root   37162 Sep 12 14:38 inventory-parlour-asset-review.md
+-rw-r--r--  1 root root  258602 Sep 12 15:03 inventory.md
+-rw-r--r--  1 root root    8009 Sep 12 15:03 label-bead-map.json
+-rw-r--r--  1 root root    3091 Sep 12 15:03 merge.py
+-rw-r--r--  1 root root    7646 Sep 14 13:21 mk_accept_confirm.py
+-rw-r--r--  1 root root    5191 Sep 14 13:21 mk_dispatch_receipt.py
+drwxr-xr-x  2 root root    4096 Sep 14 19:27 outbox
+drwxr-xr-x  3 root root    4096 Sep 14 23:11 preserved
+-rw-r--r--  1 root root    3516 Sep 14 10:57 ps_now.json
+-rw-r--r--  1 root root    2892 Sep 14 11:23 ps_now2.json
+-rw-r--r--  1 root root    3515 Sep 14 11:54 ps_now3.json
+-rw-r--r--  1 root root    3515 Sep 14 11:57 ps_now4.json
+-rw-r--r--  1 root root    3606 Sep 14 10:35 ps_raw.txt
+-rw-r--r--  1 root root       2 Sep 14 10:35 ps_tmp.json
+-rw-r--r--  1 root root    8477 Sep 14 22:03 receipt-0193-s20.md
+drwxr-xr-x  2 root root    4096 Sep 12 15:03 rpt
+-rw-r--r--  1 root root   15409 Sep 12 13:20 scan.py
+-rw-r--r--  1 root root  120841 Sep 12 13:22 skeleton-hermes-gateway.json
+-rw-r--r--  1 root root 2043695 Sep 12 13:22 skeleton-leviath.json
+-rw-r--r--  1 root root   36054 Sep 12 13:22 skeleton-life-ops.json
+-rw-r--r--  1 root root   76700 Sep 12 13:22 skeleton-parlour-asset-review.json
+-rw-r--r--  1 root root     107 Sep 12 13:22 skeleton-parlour.json
+-rw-r--r--  1 root root    3255 Sep 14 10:37 spec_gql10_07.txt
+drwxr-xr-x  2 root root    4096 Sep 14 22:23 tasks
+drwxr-xr-x  6 root root    4096 Sep 15 03:04 tmp
+-rw-r--r--  1 root root   17709 Sep 14 11:21 tmp_gql02_result.json
+-rw-r--r--  1 root root    4825 Sep 14 10:38 verify_gql09_accept.py
+-rw-r--r--  1 root root    4724 Sep 14 10:49 verify_gql09_final.py
+-rw-r--r--  1 root root    7707 Sep 14 11:25 wo_0314_07_10.txt
+-rw-r--r--  1 root root    5775 Sep 14 11:28 wo_gql02_03_04.txt
+drwxr-xr-x 14 root root    4096 Sep 15 02:17 wt
+DONE

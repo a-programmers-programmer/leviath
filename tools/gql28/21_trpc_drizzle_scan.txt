@@ -1,0 +1,47 @@
+=== date ===
+2026-09-15T03:27:02Z
+=== B1. ts/tsx count under graphql-realization ===
+377
+=== B2. files containing trpc (case-insensitive) under graphql-realization ===
+/data/work/graphql-realization/gql-00/skeleton-life-ops.json
+/data/work/graphql-realization/gql-00/gen_inv.py
+/data/work/graphql-realization/gql-00/inventory-hermes-gateway.md
+/data/work/graphql-realization/gql-00/inventory.md
+/data/work/graphql-realization/gql-00/inventory-leviath.md
+/data/work/graphql-realization/gql-00/scan.py
+/data/work/graphql-realization/gql-00/REPORT-prepass.md
+/data/work/graphql-realization/gql-00/REPORT.md
+/data/work/graphql-realization/gql-00/skeleton-parlour-asset-review.json
+/data/work/graphql-realization/gql-00/classify_parlour.py
+/data/work/graphql-realization/gql-00/gen_inventory.py
+/data/work/graphql-realization/gql-00/skeleton-leviath.json
+/data/work/graphql-realization/gql-00/inventory-parlour-asset-review.md
+/data/work/graphql-realization/gql-00/tmp/s28-goal-tree.json
+/data/work/graphql-realization/gql-00/tmp/lane-tasks/L07-gql28.task.md
+/data/work/graphql-realization/gql-00/wt/L07-gql28/tools/gql28/21_trpc_drizzle_scan.txt
+/data/work/graphql-realization/gql-00/wt/L07-gql28/tools/gql28/02_trpc_search.txt
+/data/work/graphql-realization/gql-00/wt/L07-gql28/tools/gql28/11_harvest2.txt
+/data/work/graphql-realization/gql-00/wt/L07-gql28/tools/gql28/10_harvest.txt
+/data/work/graphql-realization/gql-00/wt/L07-gql28/tools/gql28/15_r2_gql28.txt
+b2_exit=0
+=== B3. drizzle dirs under graphql-realization ===
+=== B4. ts/tsx under parlour-asset-review (bounded) ===
+b4_done
+=== B5. server/ or drizzle/ dirs in parlour-asset-review ===
+ls: cannot access '/data/work/parlour-asset-review/server': No such file or directory
+ls: cannot access '/data/work/parlour-asset-review/drizzle': No such file or directory
+=== B6. templates/parlour.html ===
+514 /data/work/parlour-asset-review/templates/parlour.html
+{% extends "base.html" %}
+{% block title %}Parlour · Xelor{% endblock %}
+{% block content %}
+{# base.html supplies <main class="page">; .measure only shortens the line
+   length, it does not move the left edge. #}
+<div class="measure" data-surface="parlour" data-parlour-page="true">
+  <h1 style="font-size:26px;font-weight:800;letter-spacing:-.02em;margin:6px 0 6px">Parlour</h1>
+  <p style="color:var(--muted);font-size:15px;margin:0 0 24px">Bespoke product business hub. Coming soon.</p>
+</div>
+{% endblock %}
+n.</p>
+</div>
+{% endblock %}

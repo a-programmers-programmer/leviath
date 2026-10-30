@@ -1,0 +1,27 @@
+=== date ===
+Tue Sep 15 03:19:10 UTC 2026
+=== refs ===
+refs/heads/lane/L01-gql24 7b6e050e89e6aea7b51453e633fbe9209c50a844
+refs/heads/lane/L02-gql13 7b6e050e89e6aea7b51453e633fbe9209c50a844
+refs/heads/lane/L03-gql08 7b6e050e89e6aea7b51453e633fbe9209c50a844
+refs/heads/lane/L04-gql35 7b6e050e89e6aea7b51453e633fbe9209c50a844
+refs/heads/lane/L05-0193a 7b6e050e89e6aea7b51453e633fbe9209c50a844
+refs/heads/lane/L06-0193b 7b6e050e89e6aea7b51453e633fbe9209c50a844
+refs/heads/lane/L07-gql28 7b6e050e89e6aea7b51453e633fbe9209c50a844
+refs/heads/lane/L08-0081refl 7b6e050e89e6aea7b51453e633fbe9209c50a844
+refs/heads/lane/L09-0150b 7b6e050e89e6aea7b51453e633fbe9209c50a844
+refs/heads/lane/L10-0193d 7b6e050e89e6aea7b51453e633fbe9209c50a844
+refs/heads/lane/L11-0090grp 7b6e050e89e6aea7b51453e633fbe9209c50a844
+refs/heads/lane/L12-gc300cloud 7b6e050e89e6aea7b51453e633fbe9209c50a844
+refs/heads/sync/upstream-0.6.0 7b6e050e89e6aea7b51453e633fbe9209c50a844
+refs/remotes/origin/HEAD 7b6e050e89e6aea7b51453e633fbe9209c50a844
+refs/remotes/origin/sync/upstream-0.6.0 7b6e050e89e6aea7b51453e633fbe9209c50a844
+refs/tags/alpha e8f43590755a015bbcda26afed62b43cea9db84a
+refs/tags/beta e8f43590755a015bbcda26afed62b43cea9db84a
+refs/tags/draft/restack-split2-4ef42314 4ef423145e1be68c7f01bc79cf1727ea3d3180f3
+refs/tags/latest e8f43590755a015bbcda26afed62b43cea9db84a
+refs/tags/v0.1.0 4d0008947d60233b9902274d37f2a7878ba9a69f
+=== any object path server/routers.ts in any ref ===
+ls_exit=0
+=== grep parlour in all tree paths ===
+DONE

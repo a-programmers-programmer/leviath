@@ -1,0 +1,34 @@
+=== date === 2026-09-15T03:10:47Z
+-- AGENTS.md: exit=0 hits=9
+    /data/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fancy-regex-0.19.0/AGENTS.md
+    /data/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zerocopy-0.8.55/AGENTS.md
+    /data/AGENTS.md
+    /data/tmp/0126-full/llm-wiki/AGENTS.md
+    /data/tmp/0126-shallow/llm-wiki/AGENTS.md
+-- wiki: exit=0 hits=5
+    /data/tmp/0126-full/llm-wiki/wiki
+    /data/tmp/0126-shallow/llm-wiki/wiki
+    /data/work/life-ops/life-ops/wiki
+    /data/work/life-ops/life-city-archived-20260820/wiki
+    /data/work/life-ops/life-city/wiki
+-- server/routers.ts: exit=0 hits=0
+-- server/productRouter.ts: exit=0 hits=0
+-- server/eventRuntime.ts: exit=0 hits=0
+-- drizzle/schema.ts: exit=0 hits=0
+=== parlour dirs (maxdepth 6) ===
+/tmp/pa-main/templates/parlour.html
+
+=== parlour product repo string ===
+Traceback (most recent call last):
+  File "<stdin>", line 14, in <module>
+  File "/usr/local/lib/python3.12/subprocess.py", line 550, in run
+    stdout, stderr = process.communicate(input, timeout=timeout)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/subprocess.py", line 1209, in communicate
+    stdout, stderr = self._communicate(input, endtime, timeout)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/subprocess.py", line 2116, in _communicate
+    self._check_timeout(endtime, orig_timeout, stdout, stderr)
+  File "/usr/local/lib/python3.12/subprocess.py", line 1253, in _check_timeout
+    raise TimeoutExpired(
+subprocess.TimeoutExpired: Command '['grep', '-rIl', '--exclude-dir=.git', '--exclude-dir=.rustup', 'a-programmers-programmer/parlour', '/data', '/root', '/home', '/opt']' timed out after 40 seconds
