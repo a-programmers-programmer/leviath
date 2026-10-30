@@ -1,0 +1,122 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://xelor.local/contract/site-events-v1.schema.json",
+  "title": "Site telemetry event contract v1",
+  "description": "Versioned telemetry envelope for the Parlour admin site (parlour-asset-review) and the Parlour product. OWNED FILE (one writer). additionalProperties:false is load-bearing: the contract is a closed allow-list, so raw request variables, headers, cookies, tokens and free-form user content have nowhere to land. Correlation identity is trace_id (browser -> API -> queue -> Leviath); retry/reconnect is joinable by (trace_id, attempt) and de-duplicated by event_id.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["v", "event", "ts", "surface", "app", "actor_kind"],
+  "properties": {
+    "v": {"const": 1, "description": "contract version; a new shape requires v2, never a silent field"},
+    "event": {
+      "enum": [
+        "page.view",
+        "ui.action",
+        "api.operation",
+        "client.error",
+        "server.error",
+        "run.transition",
+        "confirmation.outcome",
+        "legacy.endpoint",
+        "instrumentation.gap",
+        "privacy.reject"
+      ]
+    },
+    "ts": {"type": "number", "description": "server receive time, epoch seconds (reader's clock is authoritative)"},
+    "client_ts": {"type": "number", "description": "client clock, kept only so drift is measurable"},
+    "surface": {"enum": ["admin", "product"], "description": "which site surface emitted this"},
+    "app": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-z0-9][a-z0-9._-]*$"},
+    "route": {
+      "type": "string", "maxLength": 120,
+      "pattern": "^/[A-Za-z0-9_\\-./:<>()|]*$",
+      "description": "bounded PATH ONLY. No query string, no fragment, no '='. Raw request variables are not representable."
+    },
+    "method": {"enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]},
+    "op": {
+      "type": "string", "maxLength": 120,
+      "pattern": "^[A-Za-z_][A-Za-z0-9_./-]*$",
+      "description": "named GraphQL operation, or a named UI action. Never a document body."
+    },
+    "op_type": {"enum": ["query", "mutation", "subscription", "action", "view", "transition", "confirmation"]},
+    "action": {
+      "type": "string", "maxLength": 64,
+      "pattern": "^[a-z][a-z0-9_.-]*$",
+      "description": "bounded UI action name, e.g. desk.claim, proposal.approve"
+    },
+    "status": {"enum": ["ok", "error", "cancelled"]},
+    "http_status": {"type": "integer", "minimum": 100, "maximum": 599},
+    "latency_ms": {"type": "number", "minimum": 0, "maximum": 600000},
+    "err_class": {
+      "type": "string", "maxLength": 64,
+      "pattern": "^[A-Za-z_][A-Za-z0-9_.]*$",
+      "description": "exception CLASS name only. A message can carry thread text across a public seam."
+    },
+    "actor_kind": {"enum": ["human", "machine", "unknown"]},
+    "actor_ref": {"type": "string", "pattern": "^(h|m):sha256:[0-9a-f]{16,64}$", "description": "pseudonymous actor handle, salted hash of the identity; never the identity"},
+    "session_ref": {"type": "string", "pattern": "^s:sha256:[0-9a-f]{16,64}$", "description": "pseudonymous session handle; the join key for UI -> API inside one visit"},
+    "trace_id": {"type": "string", "pattern": "^t:[0-9a-f]{32}$", "description": "bounded correlation id spanning browser -> API -> queue -> Leviath"},
+    "run_ref": {"type": "string", "maxLength": 80, "pattern": "^[A-Za-z0-9._:-]+$", "description": "Leviath run id (or a bounded reference to it), not a path and not an argv"},
+    "queue_ref": {"type": "string", "maxLength": 80, "pattern": "^[A-Za-z0-9._:-]+$", "description": "queue item id"},
+    "event_id": {"type": "string", "pattern": "^[0-9a-f]{32}$", "description": "client-assigned id; the de-duplication key that stops a reconnected beacon double-counting"},
+    "seq": {"type": "integer", "minimum": 0, "maximum": 1000000, "description": "monotonic within (trace_id, session_ref); with event_id it fences a replayed spool flush"},
+    "attempt": {"type": "integer", "minimum": 0, "maximum": 100, "description": "0 for the first try; a reconnect/retry is attempt+1 with the SAME trace_id"},
+    "continuation": {"type": "boolean", "description": "true when this event is another attempt at work already traced; usage/completion must count it once"},
+    "from_state": {"type": "string", "maxLength": 40, "pattern": "^[a-z][a-z0-9_.-]*$"},
+    "to_state": {"type": "string", "maxLength": 40, "pattern": "^[a-z][a-z0-9_.-]*$"},
+    "outcome": {"enum": ["confirmed", "refused", "expired", "pending"]},
+    "tokens_in": {"type": "integer", "minimum": 0, "maximum": 100000000},
+    "tokens_out": {"type": "integer", "minimum": 0, "maximum": 100000000},
+    "cost_usd": {"type": "number", "minimum": 0, "maximum": 100000},
+    "legacy": {"type": "boolean", "description": "true for a route/endpoint on the retirement list (adds a usage counter, nothing else)"},
+    "detail": {
+      "type": "object",
+      "maxProperties": 8,
+      "additionalProperties": false,
+      "description": "bounded, allow-listed detail only. Unknown keys are dropped by the store, never widened.",
+      "properties": {
+        "count": {"type": "integer", "minimum": 0, "maximum": 100000},
+        "kind": {"type": "string", "maxLength": 40, "pattern": "^[a-z][a-z0-9_.-]*$"},
+        "column": {"type": "string", "maxLength": 40, "pattern": "^[a-z][a-z0-9_.-]*$"},
+        "reason": {"type": "string", "maxLength": 120, "pattern": "^[A-Za-z0-9 _.\\-:,()\\[\\]]*$"},
+        "method": {"enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]},
+        "bytes": {"type": "integer", "minimum": 0, "maximum": 100000000},
+        "ok": {"type": "boolean"},
+        "expected_period_s": {"type": "number", "minimum": 0, "maximum": 86400}
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"event": {"const": "page.view"}}},
+      "then": {"required": ["route"]}
+    },
+    {
+      "if": {"properties": {"event": {"const": "ui.action"}}},
+      "then": {"required": ["action"]}
+    },
+    {
+      "if": {"properties": {"event": {"const": "api.operation"}}},
+      "then": {"required": ["status", "latency_ms"], "anyOf": [{"required": ["op"]}, {"required": ["route"]}]}
+    },
+    {
+      "if": {"properties": {"event": {"enum": ["client.error", "server.error"]}}},
+      "then": {"required": ["err_class"]}
+    },
+    {
+      "if": {"properties": {"event": {"const": "run.transition"}}},
+      "then": {"required": ["run_ref", "to_state"]}
+    },
+    {
+      "if": {"properties": {"event": {"const": "confirmation.outcome"}}},
+      "then": {"required": ["outcome"]}
+    },
+    {
+      "if": {"properties": {"event": {"const": "legacy.endpoint"}}},
+      "then": {"required": ["route", "method", "legacy"], "properties": {"legacy": {"const": true}}}
+    },
+    {
+      "if": {"properties": {"event": {"const": "instrumentation.gap"}}},
+      "then": {"required": ["surface", "detail"]}
+    }
+  ]
+}

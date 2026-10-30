@@ -1,0 +1,31 @@
+### cmd: python3 cross-check against base-commit app
+### app cwd: /data/work/graphql-realization/gql-35/repo
+### base commit: 3af3cf36aefe7f8c6b5599b133fe578d9a3bda47
+2026-09-15 02:36:45,731 INFO xelor-admin ACCOUNT PREFERENCES mounted at /api/prefs (Google-OAuth session only; stored at /data/anw/user_prefs.json)
+2026-09-15 02:36:45,734 INFO xelor-admin ROOMS mounted at /rooms (Google-OAuth gated; 3 rooms, packs from /data/work/graphql-realization/gql-35/repo/packs)
+2026-09-15 02:36:45,740 INFO xelor-admin PROPOSAL PUBLISHER mounted at /proposals (Google-OAuth gated)
+2026-09-15 02:36:45,743 INFO xelor-admin KANBAN + /queue mounted at /kanban and /queue (Google-OAuth gated, queue-as-SOT)
+2026-09-15 02:36:45,747 INFO xelor-admin HUMAN DESK mounted at / and /api/desk (Google-OAuth gated; Jarvis files via sync token)
+2026-09-15 02:36:45,748 INFO xelor-admin DEV TOOLS mounted at /devtools (Google-OAuth gated)
+2026-09-15 02:36:45,749 INFO xelor-admin.pub pub: migration not needed: no legacy directory (/data/pub)
+2026-09-15 02:36:45,749 INFO xelor-admin PUBLISH mounted at POST /api/publish (sync token) + /pub, /pub/<slug> (Google-OAuth gated; artifacts stored at /data/anw/pub)
+2026-09-15 02:36:45,750 INFO xelor-admin SIMPLE CITY roster mounted at /city (Google-OAuth gated)
+2026-09-15 02:36:45,750 INFO xelor-admin ANW WORLD DEFINITION mounted at /api/anw/game (Google-OAuth session only; overlay at /data/anw/world/game.json)
+2026-09-15 02:36:45,751 INFO xelor-admin CITY MOOD BOARDS mounted at /api/anw/moodboard/<city> (Google-OAuth session only; photos stored at /data/anw/moodboard)
+2026-09-15 02:36:45,752 INFO xelor-admin MEMORY GRAPH mounted at /graphql (Google-OAuth + sync-token gated)
+2026-09-15 02:36:45,780 INFO xelor-admin.telemetry SITE TELEMETRY mounted at POST /api/site/event + GET /api/site/telemetry (contract site-events-v1; admin surfaces instrumented; product surfaces reported missing in the coverage map)
+2026-09-15 02:36:45,780 INFO xelor-admin SITE TELEMETRY mount: {'mounted': True, 'contract': 'site-events-v1'}
+2026-09-15 02:36:45,781 INFO xelor-admin MESH LANE mounted at /api/mesh (lane=opus; opus = no-op)
+2026-09-15 02:36:45,784 INFO mockup-review mockup review: 24 sheet(s) from /data/anw-assets/mockups, /data/work/graphql-realization/gql-35/repo/assets/mockups -> SM_Bar_Chair_PortProvidence, beam_brace_L, beam_brace_R, beam_end_cap, beam_mid_beam, beam_plate_beam, beam_sill_beam, beam_stud, door_arched_plank, house_5view_consistent, joint_lap, kit_corner_post, kit_gable_end, kit_roof_plane, kit_wall_arched_door, kit_wall_ff_blank, kit_wall_gf_blank, kit_wall_window_tall, trim_jetty_bracket, trim_lintel, trim_quoin, trim_sill, window_small_static, window_tall_static
+2026-09-15 02:36:45,784 INFO mockup-review mockup review: 1 legacy mock-up(s) from /data/work/graphql-realization/gql-35/repo/anw-legacy-app-backup/gui/renders -> SM_Bar_Chair_PortProvidence
+2026-09-15 02:36:45,784 INFO xelor-admin MOCKUP REVIEW mounted INSIDE the ANW tab at /anw/review (Google-OAuth gated; human verdicts only; native — nothing embedded)
+2026-09-15 02:36:45,786 WARNING xelor-admin ANW assets root not found; /anw opens on the committed mockup review
+2026-09-15 02:36:45,786 INFO xelor-admin MOCKUPS served from repo-tracked /data/work/graphql-realization/gql-35/repo/assets (no ANW volume)
+2026-09-15 02:36:45,850 INFO xelor-admin CITY LAYOUT served from the preserved app at /data/work/graphql-realization/gql-35/repo/anw-legacy-app-backup/gui (no volume); city record in /data/work/graphql-realization/gql-35/repo/data/city-layout/layout
+2026-09-15 02:36:46,035 INFO mockup-stage MOCKUP STAGE: 23 asset(s) reflected onto the volume at /data/anw-assets (0 file(s) copied, 115 already current)
+2026-09-15 02:36:46,036 INFO queue_store queue expiry sweeper started: every 30s
+url_map rules: 176
+coverage routes checked: 21
+absent routes: []
+RESULT: PASS
+python EXIT=0

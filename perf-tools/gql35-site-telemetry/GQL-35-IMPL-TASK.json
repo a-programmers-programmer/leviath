@@ -1,0 +1,118 @@
+{
+  "record": "TASK-GQL-35-IMPL-0193",
+  "directive": "0193",
+  "work_order": "GQL-35",
+  "title": "Implement site usage, reliability and workflow telemetry",
+  "repository": "a-programmers-programmer/parlour-asset-review",
+  "parent_node": "GQL-35",
+  "parent_status": "partially complete (backlog prepared this lane)",
+  "kind": "child implementation task",
+  "phase": "implementation",
+  "depends_on": ["GQL-00", "GQL-01"],
+  "dependency_notes": {
+    "GQL-00": "satisfied (closed by directive 0069 item 5)",
+    "GQL-01": "needed for the token/cost fields and the run identity before MeshGenerate and /api/publish can be instrumented"
+  },
+  "base_commit": "3af3cf36aefe7f8c6b5599b133fe578d9a3bda47",
+  "fleet_base_commit": "7b6e050e",
+  "model": "openrouter/deepseek/deepseek-v4.1-flash",
+  "model_gate": "POSITIVE ALLOWLIST: openrouter/deepseek/deepseek-v4.1-flash only, every role",
+  "owner": "telemetry-worker",
+  "workdir": "/data/work/graphql-realization/gql-35",
+  "harvest_source": "/data/work/graphql-realization/gql-00/wt/L04-gql35/perf-tools/gql35-site-telemetry",
+
+  "definition_of_done": [
+    "One synthetic browser workflow produces correlated UI/API/run events under a single trace_id.",
+    "The dashboard shows usage, errors, request latency and completion.",
+    "Reconnect/retry does not overcount usage or completion.",
+    "Missing instrumentation is visible in the health rollup.",
+    "Logging contains no tokens, sensitive strings, raw request variables or free-form user content.",
+    "Both the admin site and the product are accounted for in the coverage map.",
+    "A measured overhead check accompanies rollout."
+  ],
+
+  "inputs_ready": {
+    "contract/site-events-v1.schema.json": "sha256 58c7ac28bcf1ee780b657b5e54d2873c7384a52dd4ed7274eefa066c58229525",
+    "contract/coverage.json": "sha256 ccfb5bb14dd51e07e1070e160bf33b64a894c37a10d79b93669bcb04ffaec589",
+    "src/site_events.py": "sha256 e1770eb070a3acc4a9fb9417f23893094fa63a125241c1d5c220eb03e55f974f",
+    "src/telemetry_mount.py": "sha256 61baea7615d059f82d235693ed11cfe88f28b3c7de346b6826b20fc23c84df69",
+    "src/test_site_events.py": "sha256 191142d8f5ef8262c3369fb6acc47ba54eb512b6bc5a3ecfacf769940e47f2c0",
+    "src/site_events.js": "sha256 d17b651a531b26c27c4b8230cf72b2f3cc0b386f93d540d8ea90705a1e80ccf3",
+    "src/overhead.json": "sha256 e22ddf02796e49d261b29c770d201e400366d89e5a5f322bc42eb6f7bf63bf92"
+  },
+
+  "steps": [
+    {
+      "n": 1,
+      "do": "Copy contract/site-events-v1.schema.json and contract/coverage.json into the product repo at contract/. Do not change a byte; a shape change needs v2.",
+      "verify": "sha256 of both files matches the inputs above"
+    },
+    {
+      "n": 2,
+      "do": "Add telemetry_mount.register(app) to main.py AFTER the OAuth guard is installed. One line.",
+      "verify": "app startup logs 'SITE TELEMETRY mounted'; SITE_TELEMETRY_DISABLED=1 rolls it back"
+    },
+    {
+      "n": 3,
+      "do": "Copy site_events.js to the repo static/js/ and add one <script> tag to base.html.",
+      "verify": "GET /static/js/site_events.js returns the file; no page content changed"
+    },
+    {
+      "n": 4,
+      "do": "Run one headless synthetic browser workflow through the app.",
+      "verify": "one trace_id spans page.view, ui.action, api.operation and run.transition; JSON captured to evidence/"
+    },
+    {
+      "n": 5,
+      "do": "Instrument MeshGenerate and /api/publish once GQL-01's envelope supplies run identity and token/cost fields.",
+      "verify": "counters() shows both ops; coverage.json flips their instrumented flag to true"
+    },
+    {
+      "n": 6,
+      "do": "Instrument the product /graphql endpoint with its own hook on the same contract.",
+      "verify": "counters(surface='product') returns rows; health() stops reporting the product as missing"
+    },
+    {
+      "n": 7,
+      "do": "Set XELOR_TELEMETRY_SALT in the deployed environment.",
+      "verify": "pseudonym() is stable across a process restart"
+    },
+    {
+      "n": 8,
+      "do": "Take the rollout overhead check before and after, same machine, using the perf-tools measuring sticks.",
+      "verify": "a before/after number pair is written next to this task"
+    }
+  ],
+
+  "hard_constraints": [
+    "No write outside the declared path set.",
+    "No edit to /data/.leviath/config.toml, ceo_bus_metrics.py, or any sweeper script.",
+    "No write under /data/work/ceo-bus, /data/bin, /opt/hermes, /data/state.",
+    "No admission file, no outbox write, no bus write.",
+    "No new scheduler, queue, service or dashboard.",
+    "No credential or permission change. No secret read or write.",
+    "No Railway mutation, no restart, no redeploy.",
+    "No commit, push, deploy or infra change from this lane.",
+    "Never --wait, never --yolo. Never spawn another coordinator.",
+    "Do not touch /data/work/graphql-realization/gql-05/repo/integrations/typed-ls-ts.",
+    "Do not cite the retired 0104 numeric ceiling."
+  ],
+
+  "evidence_required": [
+    "a written report on disk, with paths and hashes",
+    "exact commands, their outputs and exit codes",
+    "the source/base commit and the resulting diff",
+    "actual provider spend, with blocked/passed/verified states distinguished"
+  ],
+
+  "open_items_kept_honestly": [
+    "No Bead: bd is not installed on this box ('bd: command not found'). This is a real task file, not an invented bead id.",
+    "No live browser workflow was run during backlog prep.",
+    "No dashboard was rendered during backlog prep.",
+    "No rollout overhead check exists yet.",
+    "The product /graphql endpoint is listed and marked missing, not instrumented."
+  ],
+
+  "written_by": "lane/L04-gql35 (GQL-35 backlog prep)",
+  "written_at_utc": "2026-09-15T02:50:00Z"
+}

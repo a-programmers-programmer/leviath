@@ -1,0 +1,19 @@
+### cmd: python3 validate_contract.py
+### cwd: /data/work/graphql-realization/gql-00/wt/L04-gql35/perf-tools/gql35-site-telemetry
+PASS  schema parses as JSON (7025 bytes)
+PASS  schema is a valid draft 2020-12 JSON Schema
+PASS  top level is a closed allow-list (additionalProperties: false)
+PASS  detail is a closed allow-list (additionalProperties: false)
+PASS  all ten contract events are named
+PASS  eight conditional (allOf) rules are present
+PASS  coverage.json parses as JSON (7530 bytes)
+PASS  coverage map accounts for both surfaces: admin and product
+PASS  every coverage entry names an owner (33 entries)
+PASS  every coverage entry has an explicit instrumented boolean
+PASS  instrumented:false is a FINDING for 10 surfaces: admin MeshGenerate, admin /api/publish, admin /api/selfcheck, admin /login, admin /oauth2callback, product /graphql, product /parlour, product MemoryFact, product MemoryEdge, product MemoryFactUpsert
+PASS  the product side is present and honestly marked missing (5 entries)
+PASS  legacy retirement watch list is present (5 routes)
+PASS  app cross-check skipped (import failed: ModuleNotFoundError)
+
+14 checks, 0 failures
+EXIT=0

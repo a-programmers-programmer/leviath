@@ -1,0 +1,52 @@
+{
+  "contract": "site-events-v1",
+  "note": "Coverage map for GQL-35. `instrumented: false` is a FINDING, not a placeholder: the health rollup reports those surfaces as `missing`, which is how 'missing instrumentation is visible' is satisfied mechanically. `owner` is the write_ownership role, matching the work order's one-writer-per-file-set rule. Sources: GQL-00 inventory.md (parlour-asset-review section, 292 unique entries) plus the route inventory at base commit 3af3cf36 (183 url_map rules).",
+  "sources": [
+    "/data/work/graphql-realization/gql-00/inventory.md (parlour-asset-review domains 1-7)",
+    "/data/work/graphql-realization/gql-00/REPORT.md",
+    "git show 3af3cf36aefe7f8c6b5599b133fe578d9a3bda47:main.py (route decorators)",
+    "app.url_map at base commit: 183 rules"
+  ],
+  "surfaces": [
+    {"surface": "admin", "kind": "route", "key": "/", "layer": "page", "owner": "telemetry-worker", "instrumented": true, "client": "base.html", "note": "Xelor front page / hub"},
+    {"surface": "admin", "kind": "route", "key": "/work", "layer": "page", "owner": "telemetry-worker", "instrumented": true, "client": "base.html", "note": "Work hub"},
+    {"surface": "admin", "kind": "route", "key": "/anw", "layer": "page", "owner": "telemetry-worker", "instrumented": true, "client": "anw_shell.html", "note": "asset review shell"},
+    {"surface": "admin", "kind": "route", "key": "/anw/review", "layer": "page", "owner": "telemetry-worker", "instrumented": true, "client": "mockup_review.py", "note": "human verdict surface (OAuth only)"},
+    {"surface": "admin", "kind": "route", "key": "/devtools", "layer": "page", "owner": "telemetry-worker", "instrumented": true, "client": "devtools_index.html", "note": "kanban board page + rosters"},
+    {"surface": "admin", "kind": "route", "key": "/proposals", "layer": "page", "owner": "telemetry-worker", "instrumented": true, "client": "proposal.html", "note": "proposal review desks"},
+    {"surface": "admin", "kind": "route", "key": "/settings", "layer": "page", "owner": "telemetry-worker", "instrumented": true, "client": "base.html", "note": "preferences"},
+    {"surface": "admin", "kind": "route", "key": "/city", "layer": "page", "owner": "telemetry-worker", "instrumented": true, "client": "simple_city.html", "note": "roster"},
+    {"surface": "admin", "kind": "route", "key": "/runthrough", "layer": "legacy", "owner": "telemetry-worker", "instrumented": true, "legacy": true, "note": "retired 308 into /work; counted to inform retirement"},
+    {"surface": "admin", "kind": "route", "key": "/parlour", "layer": "legacy", "owner": "telemetry-worker", "instrumented": true, "legacy": true, "note": "placeholder product page"},
+    {"surface": "admin", "kind": "route", "key": "/anw/legacy", "layer": "legacy", "owner": "telemetry-worker", "instrumented": true, "legacy": true, "note": "preserved legacy app"},
+    {"surface": "admin", "kind": "route", "key": "/kit/<path:rel>", "layer": "page", "owner": "telemetry-worker", "instrumented": true, "note": "parlour-kit mount"},
+
+    {"surface": "admin", "kind": "op", "key": "DeskQueue", "layer": "api", "owner": "telemetry-worker", "instrumented": true, "note": "server-side latency recorded by the Flask hook (operation name from the GraphQL body, never its variables)"},
+    {"surface": "admin", "kind": "op", "key": "DeskSlip", "layer": "api", "owner": "telemetry-worker", "instrumented": true},
+    {"surface": "admin", "kind": "op", "key": "DeskSlipThread", "layer": "api", "owner": "telemetry-worker", "instrumented": true},
+    {"surface": "admin", "kind": "op", "key": "DeskBoard", "layer": "api", "owner": "telemetry-worker", "instrumented": true},
+    {"surface": "admin", "kind": "op", "key": "MemoryEntities", "layer": "api", "owner": "telemetry-worker", "instrumented": true},
+    {"surface": "admin", "kind": "op", "key": "MemoryGraph", "layer": "api", "owner": "telemetry-worker", "instrumented": true},
+    {"surface": "admin", "kind": "op", "key": "RequestGate", "layer": "api", "owner": "telemetry-worker", "instrumented": true},
+    {"surface": "admin", "kind": "op", "key": "ApproveGate", "layer": "api", "owner": "telemetry-worker", "instrumented": true},
+
+    {"surface": "admin", "kind": "route", "key": "/api/desk/stream", "layer": "stream", "owner": "telemetry-worker", "instrumented": true, "note": "SSE: reconnect must not overcount; the browser re-uses trace_id and the server counts traces, not frames"},
+    {"surface": "admin", "kind": "route", "key": "/api/ops/event", "layer": "api", "owner": "coordinator", "instrumented": true, "note": "ops_events ingest; not re-instrumented here (double counting)"},
+    {"surface": "admin", "kind": "route", "key": "/api/ops/liveness", "layer": "api", "owner": "coordinator", "instrumented": true, "note": "the strip that reports the telemetry source's own health"},
+
+    {"surface": "admin", "kind": "op", "key": "MeshGenerate", "layer": "api", "owner": "telemetry-worker", "instrumented": false, "note": "SPENDS PROVIDER CREDITS. Deliberately left out of v1: it needs the token/cost fields from the accepted operation contract before it can be measured, and instrumenting a spending path first is the wrong order."},
+    {"surface": "admin", "kind": "route", "key": "/api/publish", "layer": "api", "owner": "telemetry-worker", "instrumented": false, "note": "publish_pub.py:558 `@bp.post(\"/api/publish\")`. Corrected from an earlier `/pub/publish` typo during GQL-35 backlog validation; the route did not exist under that name. Needs the run identity from GQL-01's accepted envelope."},
+    {"surface": "admin", "kind": "route", "key": "/api/selfcheck", "layer": "infra", "owner": "telemetry-worker", "instrumented": false, "note": "deploy selfcheck; a probe, not usage. Counting it would inflate usage with machine noise."},
+    {"surface": "admin", "kind": "route", "key": "/login", "layer": "auth", "owner": "telemetry-worker", "instrumented": false, "note": "auth surfaces carry identity in the request; not instrumented in v1 by design. Rejected payloads are counted, so a caller that tries is visible."},
+    {"surface": "admin", "kind": "route", "key": "/oauth2callback", "layer": "auth", "owner": "telemetry-worker", "instrumented": false, "note": "same reason as /login"},
+
+    {"surface": "product", "kind": "route", "key": "/graphql", "layer": "api", "owner": "telemetry-worker", "instrumented": false, "note": "the Parlour PRODUCT endpoint (memory/__init__.py:11). v1 instruments the ADMIN app; the product is listed in the coverage map, explicitly accounted for, and reported `missing` until its own hook lands. This is the honest half of 'both the admin site and product are accounted for'."},
+    {"surface": "product", "kind": "route", "key": "/parlour", "layer": "page", "owner": "telemetry-worker", "instrumented": false, "note": "product placeholder page"},
+    {"surface": "product", "kind": "op", "key": "MemoryFact", "layer": "api", "owner": "telemetry-worker", "instrumented": false},
+    {"surface": "product", "kind": "op", "key": "MemoryEdge", "layer": "api", "owner": "telemetry-worker", "instrumented": false},
+    {"surface": "product", "kind": "op", "key": "MemoryFactUpsert", "layer": "api", "owner": "telemetry-worker", "instrumented": false, "note": "product mutation; the confirmation outcome is the workflow-completion signal the product side still lacks"}
+  ],
+  "legacy_retirement_watch": [
+    "/runthrough", "/parlour", "/anw/legacy", "/anw/legacy/<slug>", "/anw/legacy/app/<path:rel>"
+  ]
+}
