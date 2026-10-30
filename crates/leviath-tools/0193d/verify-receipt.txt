@@ -1,0 +1,69 @@
+=== acceptance-gap search: does ANY record name the collector run or its receipt? ===
+Scan: python3 bounded byte-scan over /data/work/graphql-realization/gql-00 (excluding /wt/),
+/data/work/ceo-bus/outbox (665 files), /data/work/ceo-bus/tasks (196 files). Files >3MB skipped.
+
+-- needle "1789426305-859645918bae" (collector run id): 6 hits --
+    /data/work/ceo-bus/outbox/0193-progress-20260914T2247Z.md
+    /data/work/ceo-bus/outbox/0193-progress-20260914T2259Z.md
+    /data/work/ceo-bus/tasks/0193-coordinator-s24-20260914T2326Z.txt
+    /data/work/ceo-bus/tasks/0193-relay-s22-20260914T2253Z.txt
+    /data/work/ceo-bus/tasks/0193-relay-s22-receipt.json
+    /data/work/ceo-bus/tasks/0193-coordinator-s23-20260914T2305Z.txt
+
+-- needle "0193-worker-evidence-harvest-20260914T2252Z" (receipt name): 5 hits --
+    /data/work/ceo-bus/outbox/0193-progress-20260914T2247Z.md
+    /data/work/ceo-bus/tasks/0193-coordinator-s24-20260914T2326Z.txt
+    /data/work/ceo-bus/tasks/0193-evidence-harvest-20260914T2252Z.txt
+    /data/work/ceo-bus/tasks/0193-relay-s22-20260914T2253Z.txt
+    /data/work/ceo-bus/tasks/0193-coordinator-s23-20260914T2305Z.txt
+
+-- needle "collector": 70 hits (gql-00 + outbox + tasks), all prose/dispatch mentions.
+   No hit is an ACCEPTANCE-* ruling file.
+
+FINDING: every hit is a DISPATCH or PROGRESS record. Zero hits are an acceptance ruling.
+The collector run and its receipt are named only by records that describe the work,
+never by a record that accepts it. => ACCEPTANCE FOR NODE 0193 D IS ABSENT.
+
+=== deliverable presence: published outbox receipt ===
+-rw-r--r-- 1 root root 12403 Sep 14 22:53 /data/work/ceo-bus/outbox/0193-worker-evidence-harvest-20260914T2252Z.md
+LS_EXIT=0
+
+=== receipt line count / headings order (bounded-under-250-lines claim) ===
+229 /data/work/ceo-bus/outbox/0193-worker-evidence-harvest-20260914T2252Z.md
+WC_EXIT=0
+13:## Terminal facts
+38:## A - reported build evidence
+90:## A - exact saved activation requirement
+118:## B - reported evidence
+168:## C - reported evidence
+193:## Independent verification
+224:## Out of scope
+All 7 required sections present, in order.
+
+=== secret-shape grep in published receipt (token/key/password/secret/cookie) ===
+221:No owner reported a secret, token, key, cookie or password. Nothing was
+GREP_SECRET_EXIT=0
+The single hit is the receipt's own negative assertion, not a secret value.
+
+=== redaction marker present? ===
+222:redacted.
+GREP_REDACT_EXIT=0
+
+=== NOT REPORTED markers (C section PARTIAL proof) ===
+grep -c "NOT REPORTED" -> 5
+  134:| .../tmp/jobs.json.bak-0193-20260914T221543Z | NOT REPORTED | c6383e99... |
+  176:- changed / created file paths: NOT REPORTED (C's final names no path).
+  177:- code hashes for those paths: NOT REPORTED. ...
+  181:  NOT REPORTED.
+  182:- TypeScript / GQL-08 evidence: NOT REPORTED in C's final_output. ...
+
+=== C-named report path ===
+/data/work/graphql-realization/gql-05/REPORT-GQL-05.md -> ABSENT
+(C named no path; recorded as not-reported, not as a mismatch.)
+
+=== moving-target file: jobs.json raw observations (raw lines, not a count) ===
+stat: size 9799, mtime 2026-09-15T02:52:39Z
+sha256: 1d89a0f0897fd5cb0b0ff01222dd3af73c01fd62dacfb69d70e6117257592532
+B reported after-hash be9bec2d...2ad3f at 8424 B. The file now has a DIFFERENT size (9799)
+and a different hash. It carries repeat.completed, which increments each 1-minute tick,
+so a whole-file hash is the wrong fingerprint. Recorded as drift; not explained as a defect.

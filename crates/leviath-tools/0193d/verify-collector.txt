@@ -1,0 +1,48 @@
+=== harvest UTC ===
+2026-09-15T02:56:53Z
+=== base commit / worktree ===
+7b6e050e89e6aea7b51453e633fbe9209c50a844
+lane/L10-0193d
+=== collector run meta ===
+run_id               = 'worker-1789426305-859645918bae'
+model                = 'openrouter/deepseek/deepseek-v4.1-flash'
+model_override       = 'openrouter/deepseek/deepseek-v4.1-flash'
+status               = 'complete'
+current_stage        = 'complete'
+stage_index          = 2
+iteration            = 23
+tool_calls           = 29
+cost_usd             = 0.12550181600000002
+cost_is_exact        = True
+error                = None
+children             = []
+workdir              = '/data/work/ceo-bus/tmp/0193-evidence-harvest-20260914T2252Z'
+started_at           = 1789426305
+last_progress_at     = 1789426737
+prompt_tokens        = 296342
+completion_tokens    = 36822
+cached_tokens        = 243968
+yolo                 = False
+flags = {"modified_files": ["/data/work/ceo-bus/tmp/0193-evidence-harvest-20260914T2252Z/receipt.md", "receipt.md"], "modified_file_count": 1, "empty_output": false, "no_output_tools": false, "searches_run": 0, "searches_empty": 0, "max_iterations_hit": 0, "gates_forced": 0, "required_regions_abandoned": [], "workspace_lost": false, "produced_output": true, "output_forced": 0, "splits_degraded": 0}
+=== collector final_output ===
+Built: published Fleet-outbox receipt `0193-worker-evidence-harvest-20260914T2252Z.md` (copy also at /data/work/ceo-bus/outbox/0193-worker-evidence-harvest-20260914T2252Z.md, byte-identical to the scratch receipt.md) exposing the already-saved evidence of the three finished 0193 owner runs (A native-MCP bridge, B gateway loop cap + intake, C GQL-05) — read-only, no acceptance and no scheduling d
+=== owner-named paths: bytes|sha256|path ===
+20702|1052529db03ec6ff9ea018c7aa47cf6d2d5d64352dafb6a17aa10d4890daf0ff|/data/bin/leviath_bridge_0193.py
+46550|a809715bd9f13444a9f1b017a44896a3c0030ab061bd011d05b04e76f09bf42a|/data/bin/hermes_boot.py
+44703|8ca3795dfd9003c141a922c30d55a365d3dc3461f0e14b44aa5345a346ea5517|/data/bin/hermes_boot.py.bak-0193-20260914T214955Z
+14724|d1de2699178f51377e35ab329761361d19eb11b3c599b722139cb2588c3c9473|/data/bin/test_0193_bridge.py
+11251|1f6b61e00a696e9cbfee6d50586a59e2508faf8b82c73e2312f52bcd68ab7122|/data/bin/REPORT-0193-BRIDGE.md
+51902|ebad507409348e7891303b6e4ceb3dd2176b7af2ee4cb5400f8629ae91007d24|/data/work/ceo-bus/ceo_bus.py
+47871|65ec4bc02e7c5e5ca3becaba87787f603f38c2379f7bd0bfda3575f39370e227|/data/work/ceo-bus/ceo_bus.py.bak-0193-20260914T220801Z
+6102|c5de1fefb2274292a4a23a193f50d9049429104c0c95cf6d7a6121624fc52560|/data/work/ceo-bus/test_ceo_bus_bounded_pass.py
+3758|f9fbb4dc9d74a43e5da81f7b85114a69a2ac9539747518727bd36d798fbf2e18|/data/work/ceo-bus/test_ceo_bus_dedup.py
+10272|d266152868c2511291e95a02e13d1d2536240b386cb6197a8ba6a209e68c609c|/data/work/ceo-bus/REPORT-0193-GATEWAY.md
+8417|c6383e991fc5319b536c9170929eb1856d19cef931edff8d65fddbe46c196f3f|/data/work/ceo-bus/tmp/jobs.json.bak-0193-20260914T221543Z
+9799|1d89a0f0897fd5cb0b0ff01222dd3af73c01fd62dacfb69d70e6117257592532|/data/profiles/jarvos/cron/jobs.json
+=== scratch receipt vs published outbox ===
+12403 /data/work/ceo-bus/tmp/0193-evidence-harvest-20260914T2252Z/receipt.md
+12403 /data/work/ceo-bus/outbox/0193-worker-evidence-harvest-20260914T2252Z.md
+24806 total
+464622ac00305b15142e044288b625f29b93bb42b33f3b4110a81f54fa3d3ebb  /data/work/ceo-bus/tmp/0193-evidence-harvest-20260914T2252Z/receipt.md
+464622ac00305b15142e044288b625f29b93bb42b33f3b4110a81f54fa3d3ebb  /data/work/ceo-bus/outbox/0193-worker-evidence-harvest-20260914T2252Z.md
+CMP_EXIT=0
