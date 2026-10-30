@@ -10,6 +10,12 @@ fn on_stage_enter(ctx) {
     if ctx.stage == "check" || ctx.stage == "accept" { edits.gate_result = ""; }
     if ctx.stage == "check" { edits.review = ""; }
     if ctx.stage == "review" { edits.review = ""; }
+    if ctx.stage == "revise" {
+        // Count each repair pass in the pinned repairs region. Two passes are allowed.
+        let used = 0;
+        if ctx.regions.repairs.trim() != "" { used = ctx.regions.repairs.trim().parse_int(); }
+        edits.repairs = `${used + 1}`;
+    }
     #{ action: "modify", value: edits }
 }
 
@@ -53,6 +59,12 @@ fn on_stage_exit(ctx) {
         let route = "revise";
         if ctx.stage == "check" && result.status == "checked" { route = "review"; }
         if ctx.stage == "accept" && result.status == "accepted" { route = "done"; }
+        // Explicit terminal failure route: no third repair pass exists.
+        if route == "revise" {
+            let used = 0;
+            if ctx.regions.repairs.trim() != "" { used = ctx.regions.repairs.trim().parse_int(); }
+            if used >= 2 { route = "blocked"; }
+        }
         let edits = #{ route: route };
         if ctx.stage == "check" { edits.checked = to_json(result); }
         return #{ action: "modify", value: edits };

@@ -293,5 +293,6 @@ route = { kind = "pinned", max_tokens = 64 }
 checked = { kind = "pinned", max_tokens = 16000 }
 gate_result = { kind = "pinned", max_tokens = 16000 }
 review = { kind = "pinned", max_tokens = 8000 }
+repairs = { kind = "pinned", max_tokens = 256 }
 conversation = { kind = "sliding_window", max_items = 30, max_tokens = 30000 }
 error_report = { kind = "pinned", max_tokens = 4000 }
