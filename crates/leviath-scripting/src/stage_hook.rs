@@ -53,6 +53,11 @@ const STAGE_HOOK_MAX_OPERATIONS: u64 = 100_000;
 /// The blueprint field and the Rhai function share a name on purpose: a
 /// blueprint saying `on_stage_enter = "hooks.rhai"` means "call
 /// `fn on_stage_enter(ctx)` in that file", with nothing in between to look up.
+///
+/// `on_terminal` is the one hook that fires on **every** terminal status -
+/// `complete`, `error` and `cancelled` - and it carries `ctx.status` so the
+/// script can tell them apart. `on_completion` and `on_error` stay as they
+/// were and still fire alongside it.
 pub(crate) const HOOK_NAMES: &[&str] = &[
     "on_stage_enter",
     "on_stage_exit",
@@ -61,6 +66,7 @@ pub(crate) const HOOK_NAMES: &[&str] = &[
     "on_tool_call",
     "on_completion",
     "on_error",
+    "on_terminal",
 ];
 
 /// What a hook decided.
@@ -253,10 +259,32 @@ mod tests {
 
     #[test]
     fn a_script_records_every_hook_it_defines() {
-        let s = script("fn on_stage_enter(ctx) { () } fn on_stage_exit(ctx) { () }");
+        let s = script(
+            "fn on_stage_enter(ctx) { () } fn on_stage_exit(ctx) { () } \
+             fn on_terminal(ctx) { () }",
+        );
         assert!(s.defines("on_stage_enter"));
         assert!(s.defines("on_stage_exit"));
-        assert_eq!(s.defined(), ["on_stage_enter", "on_stage_exit"]);
+        assert!(s.defines("on_terminal"));
+        assert_eq!(
+            s.defined(),
+            ["on_stage_enter", "on_stage_exit", "on_terminal"]
+        );
+    }
+
+    /// `on_terminal` is a first-class hook name: a file named for it must
+    /// define `fn on_terminal(ctx)`, and one that does is accepted.
+    #[test]
+    fn an_on_terminal_hook_is_recognised_by_compile() {
+        let s = script("fn on_terminal(ctx) { () }");
+        assert!(s.defines("on_terminal"));
+        assert!(
+            compile("hooks.rhai", "fn on_terminal(ctx) { () }", &["on_terminal"]).is_ok()
+        );
+        let err = compile("hooks.rhai", "fn on_stage_exit(ctx) { () }", &["on_terminal"])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("on_terminal"), "{err}");
     }
 
     #[test]

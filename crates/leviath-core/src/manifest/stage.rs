@@ -77,6 +77,7 @@ pub(super) const HOOK_KEYS: &[&str] = &[
     "on_tool_call",
     "on_completion",
     "on_error",
+    "on_terminal",
 ];
 
 /// Every key read off `[stages.<name>.tool_routing]`.
@@ -957,6 +958,7 @@ pub(super) fn parse_stage_hooks(
             "on_tool_call" => hooks.on_tool_call = Some(path.to_string()),
             "on_completion" => hooks.on_completion = Some(path.to_string()),
             "on_error" => hooks.on_error = Some(path.to_string()),
+            "on_terminal" => hooks.on_terminal = Some(path.to_string()),
             other => {
                 return Err(Error::Other(format!(
                     "stage '{stage_name}': unknown hook '{other}' \

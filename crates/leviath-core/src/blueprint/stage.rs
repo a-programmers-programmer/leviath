@@ -419,6 +419,15 @@ pub struct StageHooks {
     /// Fires once when the run finishes in error.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_error: Option<String>,
+    /// Fires once on **every** terminal status: complete, error and cancelled.
+    ///
+    /// Carries `ctx.status` (`"complete"`, `"error"`, `"cancelled"`) so the
+    /// script can tell them apart, plus `ctx.output` and `ctx.error` filled as
+    /// they are for `on_completion`/`on_error`. It runs *after* whichever of
+    /// those two the status selects, so a rewriting `on_completion` is what
+    /// `on_terminal` sees.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_terminal: Option<String>,
 }
 
 impl StageHooks {
@@ -432,6 +441,7 @@ impl StageHooks {
             && self.on_tool_call.is_none()
             && self.on_completion.is_none()
             && self.on_error.is_none()
+            && self.on_terminal.is_none()
     }
 
     /// Every script path this stage declares, with the hook it backs.
@@ -460,6 +470,9 @@ impl StageHooks {
         }
         if let Some(p) = self.on_error.as_deref() {
             out.push(("on_error", p));
+        }
+        if let Some(p) = self.on_terminal.as_deref() {
+            out.push(("on_terminal", p));
         }
         out
     }
