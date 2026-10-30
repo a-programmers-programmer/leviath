@@ -81,6 +81,17 @@ pub enum HookOutcome {
     /// Do the thing again. Not every caller can honour this; one that cannot
     /// says so rather than silently treating it as `Allow`.
     Retry,
+    /// Park the run for `secs` seconds, then fire this hook again.
+    ///
+    /// The caller does no inference and spends no tokens while it waits, so a
+    /// hook can hold a run back for a while without buying a turn to do it.
+    /// `reason` is shown to the operator.
+    Wait {
+        /// How long to park for, in whole seconds.
+        secs: u64,
+        /// Why, for the operator. Optional.
+        reason: Option<String>,
+    },
 }
 
 /// A compiled stage-hook script, ready to call.
@@ -214,13 +225,27 @@ fn outcome_from(path: &str, hook: &str, value: serde_json::Value) -> crate::Resu
     };
     let Some(action) = obj.get("action").and_then(|a| a.as_str()) else {
         return Err(bad(
-            "the returned map has no 'action' (expected allow, modify, cancel, or retry)"
+            "the returned map has no 'action' (expected allow, modify, cancel, retry, or wait)"
                 .to_string(),
         ));
     };
     match action {
         "allow" => Ok(HookOutcome::Allow),
         "retry" => Ok(HookOutcome::Retry),
+        // A `wait` with no `secs`, or with a `secs` that is not a whole number
+        // of seconds, is rejected rather than read as a zero-second wait:
+        // the script asked to pause and named no usable duration, which is a
+        // bug in it, not an instruction to proceed immediately.
+        "wait" => match obj.get("secs").and_then(serde_json::Value::as_u64) {
+            Some(secs) => Ok(HookOutcome::Wait {
+                secs,
+                reason: obj.get("reason").and_then(|r| r.as_str()).map(str::to_string),
+            }),
+            None => Err(bad(
+                "action 'wait' needs a 'secs' saying how many whole seconds to park for"
+                    .to_string(),
+            )),
+        },
         "cancel" => Ok(HookOutcome::Cancel(
             obj.get("reason")
                 .and_then(|r| r.as_str())
@@ -236,7 +261,7 @@ fn outcome_from(path: &str, hook: &str, value: serde_json::Value) -> crate::Resu
             )),
         },
         other => Err(bad(format!(
-            "unknown action '{other}' (expected allow, modify, cancel, or retry)"
+            "unknown action '{other}' (expected allow, modify, cancel, retry, or wait)"
         ))),
     }
 }
@@ -361,6 +386,51 @@ mod tests {
             run_returning(r#"#{ action: "cancel" }"#).unwrap(),
             HookOutcome::Cancel(None)
         );
+    }
+
+    /// The `wait` action carries both halves of what it was asked for, so the
+    /// caller can park for the right time and show the operator why.
+    #[test]
+    fn wait_carries_its_secs_and_reason() {
+        assert_eq!(
+            run_returning(r#"#{ action: "wait", secs: 30, reason: "rate limited" }"#).unwrap(),
+            HookOutcome::Wait {
+                secs: 30,
+                reason: Some("rate limited".to_string())
+            }
+        );
+        assert_eq!(
+            run_returning(r#"#{ action: "wait", secs: 5 }"#).unwrap(),
+            HookOutcome::Wait {
+                secs: 5,
+                reason: None
+            }
+        );
+    }
+
+    /// A `wait` naming no duration is a bug in the script, not an instruction
+    /// to proceed. Reading it as a zero-second wait would make the hook look
+    /// like it ran and allowed everything.
+    #[test]
+    fn wait_without_secs_is_an_error() {
+        let err = run_returning(r#"#{ action: "wait", reason: "later" }"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("needs a 'secs'"), "{err}");
+    }
+
+    /// A `secs` that is not a whole number of seconds is refused for the same
+    /// reason. Rhai would happily hand over a string or a float here.
+    #[test]
+    fn wait_with_a_non_numeric_secs_is_an_error() {
+        for body in [
+            r#"#{ action: "wait", secs: "soon" }"#,
+            r#"#{ action: "wait", secs: 1.5 }"#,
+            r#"#{ action: "wait", secs: -1 }"#,
+        ] {
+            let err = run_returning(body).unwrap_err().to_string();
+            assert!(err.contains("needs a 'secs'"), "{body}: {err}");
+        }
     }
 
     #[test]
