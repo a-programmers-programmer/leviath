@@ -1,0 +1,5 @@
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /data/work/graphql-realization/gql-00/wt/L11-0090grp/crates/leviath-cli/Cargo.toml
+workspace: /data/work/graphql-realization/gql-00/wt/L11-0090grp/Cargo.toml
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.15s
+CLIPPY_RC=0

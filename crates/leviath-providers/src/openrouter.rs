@@ -9,6 +9,7 @@ use crate::capabilities::{Match, Row};
 use crate::learned::LearnedModels;
 use crate::openai_compat::{
     openai_sse_stream, parse_openai_response, send_chat_request, temperature_refused,
+    tool_choice_refused,
 };
 use crate::provider::{
     InferenceRequest, InferenceResponse, LimitsSource, ModelCapabilities, ModelCapabilityOverride,
@@ -48,6 +49,13 @@ pub struct OpenRouterProvider {
     /// static list can stay right about which of their models take one, and
     /// this build's table already names only a few dozen of hundreds.
     temperature_unsupported: crate::provider::ModelMemo,
+
+    /// Models the gateway has refused a `tool_choice` for.
+    ///
+    /// The same argument as [`Self::temperature_unsupported`]: an upstream that
+    /// takes only `"auto"` is not in any list this build ships. Six of the
+    /// eight r7 Muse runs died at `verify` on exactly this refusal.
+    tool_choice_unsupported: crate::provider::ModelMemo,
 
     /// What OpenRouter's own `/models` endpoint says about each model, filled
     /// once by [`Provider::prime_capabilities`].
@@ -93,6 +101,7 @@ impl OpenRouterProvider {
             capability_overrides: HashMap::new(),
             warned_unknown: Default::default(),
             temperature_unsupported: Default::default(),
+            tool_choice_unsupported: Default::default(),
             learned: Default::default(),
         }
     }
@@ -112,6 +121,7 @@ impl OpenRouterProvider {
             capability_overrides: overrides,
             warned_unknown: Default::default(),
             temperature_unsupported: Default::default(),
+            tool_choice_unsupported: Default::default(),
             learned: Default::default(),
         }
     }
@@ -487,6 +497,16 @@ impl OpenRouterProvider {
         self.temperature_unsupported.insert(model);
     }
 
+    /// Whether this model has already refused a `tool_choice`.
+    fn tool_choice_is_unsupported(&self, model: &str) -> bool {
+        self.tool_choice_unsupported.contains(model)
+    }
+
+    /// Record that it did, for the rest of this process.
+    fn remember_tool_choice_unsupported(&self, model: &str) {
+        self.tool_choice_unsupported.insert(model);
+    }
+
     /// GET `/models`, shared by [`Provider::list_models`] and
     /// [`Provider::prime_capabilities`] so the two cannot disagree about what
     /// the endpoint is or how its failures read.
@@ -573,6 +593,13 @@ impl Provider for OpenRouterProvider {
         {
             fields.remove("temperature");
         }
+        // Same for a refused `tool_choice`: the value is already known to be
+        // one this upstream will not take.
+        if self.tool_choice_is_unsupported(&request.model)
+            && let Some(fields) = body.as_object_mut()
+        {
+            fields.remove("tool_choice");
+        }
         let headers = self.chat_headers();
 
         let mut sent = send_chat_request(
@@ -598,6 +625,34 @@ impl Provider for OpenRouterProvider {
             self.remember_temperature_unsupported(&request.model);
             if let Some(fields) = body.as_object_mut() {
                 fields.remove("temperature");
+            }
+            sent = send_chat_request(
+                &self.client,
+                "openrouter",
+                &url,
+                &headers,
+                &body,
+                self.rate_limiter.as_ref(),
+                request.request_timeout_secs,
+            )
+            .await;
+        }
+        // And the same for a `tool_choice` only `"auto"` is accepted for. This
+        // is what killed six of the eight r7 Muse runs, each at `verify` with
+        // a 400 and no output: the runtime sets `"none"` on a routing
+        // transition, and the upstream refuses the value rather than the call.
+        // Dropping the field leaves the request's own tools in place, so a
+        // model that must not route still answers.
+        if let Err(crate::ProviderError::ApiError(detail)) = &sent
+            && tool_choice_refused(detail)
+        {
+            tracing::debug!(
+                model = %request.model,
+                "the API refused the tool_choice we sent; retrying without it"
+            );
+            self.remember_tool_choice_unsupported(&request.model);
+            if let Some(fields) = body.as_object_mut() {
+                fields.remove("tool_choice");
             }
             sent = send_chat_request(
                 &self.client,
@@ -1771,6 +1826,83 @@ mod tests {
         assert!(provider.temperature_is_unsupported("openai/gpt-5.5"));
     }
 
+    /// The `tool_choice` refusal, recovered the same way.
+    ///
+    /// This is the r7 failure verbatim: an upstream that takes only `"auto"`
+    /// rejects the `"none"` a routing transition sets, with a 400 and no
+    /// output. The retry drops the field and the call goes through.
+    #[tokio::test]
+    async fn a_refused_tool_choice_is_retried_without_one() {
+        let refusal = br#"{"error":{"message":"Provider returned error","code":400,"metadata":{"raw":"{\"error\":{\"code\":null,\"message\":\"only `\\\"auto\\\"` is supported for `tool_choice`. `\\\"none\\\"`, `\\\"required\\\"`, and named function choices are not currently supported.\"}}"}}}"#;
+        let ok = br#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2}}"#;
+        let (url, bodies) = leviath_testkit::spawn_mock_sequence(vec![
+            (400, "Bad Request", refusal.to_vec()),
+            (200, "OK", ok.to_vec()),
+        ])
+        .await;
+
+        let provider = provider_with_url(url);
+        let mut request = simple_request();
+        request.model = "meta/muse-spark-1.3-contributor".to_string();
+        request.tools = vec![crate::provider::Tool {
+            name: "submit_output".to_string(),
+            description: "hand in the result".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        }];
+        request.extra = serde_json::json!({ "tool_choice": "none" });
+
+        let out = provider.infer(&request).await;
+        assert!(out.is_ok(), "the retry has to rescue the call: {out:?}");
+
+        let sent = leviath_core::sync::lock(&bodies).clone();
+        let carried: Vec<bool> = sent.iter().map(|b| b.contains("tool_choice")).collect();
+        assert_eq!(
+            carried,
+            vec![true, false],
+            "the first request carries tool_choice and the retry drops it: {sent:?}"
+        );
+        assert!(
+            sent[1].contains("tools"),
+            "the tools themselves stay, so the model can still answer: {sent:?}"
+        );
+        assert!(provider.tool_choice_is_unsupported("meta/muse-spark-1.3-contributor"));
+    }
+
+    /// The refusal is not a general "any 400" retry: a body the API refused
+    /// for another reason must come straight back.
+    #[tokio::test]
+    async fn an_unrelated_api_error_is_not_retried() {
+        let url = spawn_mock_server(400, "Bad Request", b"{\"error\":\"model not found\"}").await;
+        let provider = provider_with_url(url);
+        let err = provider.infer(&simple_request()).await.unwrap_err();
+        assert!(err.to_string().contains("API error:"), "got: {err}");
+    }
+
+    /// And a second call to the same model never spends the refused round trip
+    /// again, because the memo says so.
+    #[tokio::test]
+    async fn a_remembered_tool_choice_is_dropped_up_front() {
+        let ok = br#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2}}"#;
+        let (url, bodies) = leviath_testkit::spawn_mock_sequence(vec![
+            (200, "OK", ok.to_vec()),
+            (200, "OK", ok.to_vec()),
+        ])
+        .await;
+
+        let provider = provider_with_url(url);
+        let mut request = simple_request();
+        request.model = "meta/muse-spark-1.3-contributor".to_string();
+        request.extra = serde_json::json!({ "tool_choice": "none" });
+        provider.remember_tool_choice_unsupported(&request.model);
+
+        provider.infer(&request).await.expect("goes through");
+        let sent = leviath_core::sync::lock(&bodies).clone();
+        assert_eq!(sent.len(), 1, "one request, not two: {sent:?}");
+        assert!(
+            !sent[0].contains("tool_choice"),
+            "the memo dropped it before the call: {sent:?}"
+        );
+    }
     #[tokio::test]
     async fn infer_success_parses_response() {
         // Registers a real Subscriber so the tracing::debug! call's field

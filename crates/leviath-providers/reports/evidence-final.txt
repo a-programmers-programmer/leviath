@@ -1,0 +1,20 @@
+== base commit ==
+7b6e050e89e6aea7b51453e633fbe9209c50a844
+== branch ==
+lane/L11-0090grp
+== status --porcelain ==
+ M crates/leviath-providers/src/openai_compat.rs
+ M crates/leviath-providers/src/openrouter.rs
+?? crates/leviath-providers/reports/
+== diff --stat ==
+ crates/leviath-providers/src/openai_compat.rs |  51 ++++++++++
+ crates/leviath-providers/src/openrouter.rs    | 132 ++++++++++++++++++++++++++
+ 2 files changed, 183 insertions(+)
+== diff sha256 ==
+1ec849b0da734f5ced6b2280bf2ded742b6df2ce6f8098de76c2d3330b06736e  -
+== base blob sha256 (pre-image, from object store) ==
+2c79aff294ac49833af29e8466ccb7785e20ef53c3469f2fd10c2733142eac9c  -
+0226e938017894aba67007fb70ba2a3b4ed5980e7e4c2424acdbdf89d77ebb7c  -
+== working sha256 (post) ==
+dbe33f7689130ae25cc5cf1ea496ad1d6e001523af2dc3256931213fc53beb1b  crates/leviath-providers/src/openrouter.rs
+03f8f506c9763d7691eea9f083decacdddda530b2c1d7845537ff7935b589524  crates/leviath-providers/src/openai_compat.rs

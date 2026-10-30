@@ -1,0 +1,27 @@
+== base commit ==
+7b6e050e89e6aea7b51453e633fbe9209c50a844
+== branch ==
+lane/L11-0090grp
+== status --porcelain ==
+ M crates/leviath-providers/src/openai_compat.rs
+ M crates/leviath-providers/src/openrouter.rs
+?? crates/leviath-providers/reports/
+== fmt ==
+FMT_RC=0
+== green (leviath-providers lib) ==
+
+test result: ok. 1269 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 7.22s
+
+GREEN_RC=0
+== focused ==
+running 3 tests
+test openai_compat::tests::a_tool_choice_refusal_is_told_apart_from_other_errors ... ok
+test openrouter::tests::a_remembered_tool_choice_is_dropped_up_front ... ok
+test openrouter::tests::a_refused_tool_choice_is_retried_without_one ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 1267 filtered out; finished in 0.03s
+
+FOCUS_RC=0
+== sha256 ==
+dbe33f7689130ae25cc5cf1ea496ad1d6e001523af2dc3256931213fc53beb1b  crates/leviath-providers/src/openrouter.rs
+03f8f506c9763d7691eea9f083decacdddda530b2c1d7845537ff7935b589524  crates/leviath-providers/src/openai_compat.rs

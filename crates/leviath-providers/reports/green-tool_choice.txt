@@ -1,0 +1,14 @@
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /data/work/graphql-realization/gql-00/wt/L11-0090grp/crates/leviath-cli/Cargo.toml
+workspace: /data/work/graphql-realization/gql-00/wt/L11-0090grp/Cargo.toml
+   Compiling leviath-providers v0.5.9 (/data/work/graphql-realization/gql-00/wt/L11-0090grp/crates/leviath-providers)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.75s
+     Running unittests src/lib.rs (target/debug/deps/leviath_providers-43ee159c5dff0f0c)
+
+running 3 tests
+test openai_compat::tests::a_tool_choice_refusal_is_told_apart_from_other_errors ... ok
+test openrouter::tests::a_refused_tool_choice_is_retried_without_one ... ok
+test openrouter::tests::a_remembered_tool_choice_is_dropped_up_front ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 1267 filtered out; finished in 0.04s
+

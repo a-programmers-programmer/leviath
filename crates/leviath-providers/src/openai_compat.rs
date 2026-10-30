@@ -653,6 +653,31 @@ pub(crate) fn temperature_refused(detail: &str) -> bool {
     detail.contains("temperature") && detail.contains("does not support")
 }
 
+/// Whether the API refused the request over the `tool_choice` value we sent.
+///
+/// An upstream reached through a gateway may accept only `"auto"` and refuse
+/// every other value:
+///
+/// ```text
+/// only `"auto"` is supported for `tool_choice`. `"none"`, `"required"`,
+/// and named function choices are not currently supported.
+/// ```
+///
+/// The runtime sets `tool_choice: "none"` on a routing transition that must
+/// not call a tool, which is exactly the value such an upstream refuses. Six
+/// of the eight r7 Muse runs died at `verify` on this, each with a 400 and no
+/// `submit_output`. The remedy is the one a refused temperature already gets:
+/// drop the field and ask again, since the call's own tools still let the
+/// model answer without one.
+///
+/// Keyed on the two phrases the API uses rather than a model list, for the
+/// same reason [`temperature_refused`] is: the next model to do this is not
+/// in any list this build could ship.
+pub(crate) fn tool_choice_refused(detail: &str) -> bool {
+    let detail = detail.to_ascii_lowercase();
+    detail.contains("tool_choice") && detail.contains("not currently supported")
+}
+
 /// The request's tools in the OpenAI `tools` wire shape.
 ///
 /// One function for the three OpenAI-shaped providers (OpenAI-compatible
@@ -1269,6 +1294,32 @@ mod tests {
             "temperature must be between 0 and 2"
         ));
         assert!(!super::temperature_refused("rate limited"));
+    }
+
+    /// The r7 `tool_choice` refusal, and the shapes that must not trip it.
+    ///
+    /// The message arrives nested as a JSON string inside `metadata.raw`, so
+    /// the escaping is real and the test uses the exact bytes the gateway sent.
+    /// A false positive here silently drops a routing constraint the caller
+    /// asked for.
+    #[test]
+    fn a_tool_choice_refusal_is_told_apart_from_other_errors() {
+        assert!(super::tool_choice_refused(
+            r#"Provider returned error: only `\"auto\"` is supported for `tool_choice`. `\"none\"`, `\"required\"`, and named function choices are not currently supported."#
+        ));
+        // Case is not guaranteed by the API.
+        assert!(super::tool_choice_refused(
+            "ONLY \"AUTO\" IS SUPPORTED FOR TOOL_CHOICE. ... NOT CURRENTLY SUPPORTED"
+        ));
+        // A different unsupported field is not ours to fix.
+        assert!(!super::tool_choice_refused(
+            "Unsupported value: 'reasoning_effort' does not support 'none' with this model."
+        ));
+        // Naming tool_choice next to a different problem is not a refusal of it.
+        assert!(!super::tool_choice_refused(
+            "tool_choice must be one of auto, none, required"
+        ));
+        assert!(!super::tool_choice_refused("rate limited"));
     }
 
     use super::*;
