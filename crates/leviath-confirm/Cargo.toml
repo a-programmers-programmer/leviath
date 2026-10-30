@@ -1,0 +1,30 @@
+[package]
+name = "leviath-confirm"
+description = "Opaque confirmation values and the confirm gate: sensitive values unwrap only through an authorised, intent-bound, single-use approval"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.97"
+publish = false
+
+# A workspace member like every other crate under `crates/`.
+#
+# It has no dependency on any sibling crate, so it would also build standalone -
+# but `cargo xtask structure` walks `crates/` and reads every manifest it finds
+# there, whether or not the crate is a member, and requires each to inherit the
+# workspace lint table. A directory under `crates/` that is not a member is
+# therefore a state the tree's own rules reject, so the crate joins the
+# workspace and inherits `[lints]` the ordinary way.
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+zeroize = "1"
+
+[dev-dependencies]
+# No dev-dependencies on purpose: the DoD matrix is driven by the public API in
+# `tests/gate_dod.rs` with hand-rolled assertions, so the tests prove the API is
+# usable from outside the crate.
+
+[lints]
+workspace = true
